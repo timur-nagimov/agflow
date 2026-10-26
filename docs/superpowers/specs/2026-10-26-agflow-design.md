@@ -41,6 +41,7 @@ agflow is a thin "project brain". It builds only what the CLIs do not provide �
 | R6 | A web UI shows live agents, tasks and progress, and lets people edit the global goal. |
 | R7 | The hub runs on a small shared server and runs no models. |
 | R8 | One lead manager plus optional area managers, at most two levels. |
+| R9 | "Workflows" means two things. First, the plan itself — the task graph — which people edit by changing the goal and sending steering messages. Second, any agent may carry out its task with its CLI's own multi-step features (Claude Code dynamic workflows, Codex goals). Reusable process templates ("research → decide → build → cross-review") can be added in M4 if needed. |
 
 ## 4. Architecture
 
@@ -51,7 +52,7 @@ agflow is a thin "project brain". It builds only what the CLIs do not provide �
                       │     agflow hub (server)      │
                       │ state + event log (SQLite)   │
                       │ scheduler · context compiler │
-                      │ validation records · MCP     │
+                      │ validation records · REST    │
                       └──▲───────────▲───────────▲───┘
           runner link (WSS,│           │           │ MCP (via local bridge)
           outbound only)   │           │           │
@@ -66,7 +67,7 @@ agflow is a thin "project brain". It builds only what the CLIs do not provide �
 
 | Component | Runs on | Responsibility |
 |---|---|---|
-| Hub | Small shared server | Source of truth for project state and the event log. Scheduler, leases, budgets, context compiler, validation records, MCP endpoint, web UI, runner gateway. Holds no AI keys and no git credentials. |
+| Hub | Small shared server | Source of truth for project state and the event log. Scheduler, leases, budgets, context compiler, validation records, REST API with live events, web UI, runner gateway. Holds no AI keys and no git credentials. Agents get MCP tools from the local bridge (`agflow mcp`), which calls this API. |
 | Runner | Each teammate's laptop | Starts, drives and stops agents. Manages worktrees. Pushes, opens PRs and merges with its owner's existing git login. Runs checks. Streams events to the hub. |
 | Agent | Laptops | A Claude Code or Codex session with one role: lead, area manager, worker, reviewer or curator. |
 | Live chat | Laptops | A teammate's interactive Claude Code or Codex session connected with `agflow join`. |
@@ -205,7 +206,14 @@ Agents started by runners do not depend on hooks. When a turn ends and the agent
 
 A live chat can list, claim and submit tasks and goes through exactly the same validation as other agents.
 
-Each live session starts its own bridge process. That process becomes the chat's agent identity when it claims a task. Environment variables are not used for identity, because the shared Codex daemon passes one environment to every session it hosts. After a restart, the same person can re-attach to their claim with `resume_claim`. agflow only delivers messages addressed to that chat, and it never answers a live chat's permission or approval prompts.
+Identity is keyed on the CLI session:
+1. The `SessionStart` hook registers the session (vendor plus session id) with the hub. It receives a brief that contains a short hello code.
+2. The model calls the MCP tool `hello(code)`. This binds that session's bridge to the agent, and from then on the bridge names the agent on every call.
+3. Hooks look the agent up by session id.
+
+Process ancestry and environment variables are not used: the shared Codex daemon runs every session's hooks and MCP servers under one process and one environment. After a restart, the same person can re-attach a claim from an old session with `resume_claim`.
+
+When a live chat claims a task, the bridge creates the task branch `agflow/T-<id>-<slug>` in a separate worktree. It then pushes the branch on `submit`, which carries the branch and head commit. agflow only delivers messages addressed to that chat, and it never answers a live chat's permission or approval prompts.
 
 ### 6.6 Message delivery
 
@@ -492,7 +500,14 @@ Live updates arrive over SSE from the hub's event log. Every person on the team 
 
 ### 11.1 MCP tools
 
-All agents reach the hub through a local stdio bridge, `agflow mcp`. For agents started by a runner, the bridge uses the agent's scoped credential, which the runner passes in the agent's environment. For live chats, it uses the person's login. No tokens are written into CLI config files.
+All agents reach the hub through a local stdio bridge, `agflow mcp`. For agents started by a runner, the bridge uses the agent's scoped credential, which the runner passes in the agent's environment. For live chats, it uses the person's CLI login, and the hub treats a call as an agent's only after `hello`. No tokens are written into CLI config files.
+
+Human authority is never inferred from a CLI login, because agents on the same laptop can reach it. The following are accepted only from a browser session:
+- goal edits,
+- standing rules,
+- pausing the project,
+- forced releases,
+- approving CLI logins.
 
 | Role | Tools |
 |---|---|
@@ -518,6 +533,7 @@ Commands carry IDs and are idempotent. Delivery is at-least-once.
 ## 12. Security
 
 - **Login.** People sign in to the hub with GitHub or GitLab OAuth. Access is an allowlist of usernames configured on the hub.
+- **Human authority** comes only from browser sessions. CLI tokens can act only as agents, call hook endpoints, or read (§11.1).
 - **Runner identity.** A runner acts as its owner, using the login from `agflow login` (stored in the OS keychain).
 - **Agent identity.** Each agent gets a short-lived credential scoped to its agent ID, attempt, role and fencing token.
 - **What the hub stores.** Only the OAuth application settings and its own data. No AI credentials and no git credentials.
@@ -565,7 +581,7 @@ Commands carry IDs and are idempotent. Delivery is at-least-once.
 
 ```
 packages/core      domain model, state machine, scheduler, policies (pure; unit-tested)
-packages/hub       HTTP API, SSE, MCP endpoint, runner gateway, auth, storage
+packages/hub       HTTP API, SSE, runner gateway, auth, storage
 packages/runner    runner daemon, worktrees, git operations, checks, adapters/claude, adapters/codex
 packages/cli       agflow login | runner | join | mcp | brief | hook entry points
 packages/web       React UI
@@ -576,7 +592,7 @@ packages/testkit   fake CLIs, recorded sessions, end-to-end harness
 
 | Milestone | Scope | Exit criteria |
 |---|---|---|
-| **M1: Project brain** | Hub (login, state, events, API, SSE); MCP bridge with worker and lead tools; web UI (goal editor, board, agents, timeline, steering chat); `agflow join` for both CLIs; the lead runs as a live chat started by a person, so it wakes when its turn ends or its person prompts it (immediate wake-ups arrive with runners in M2); tasks are accepted by the lead and merged by people. | On a toy repo, a person starts a Claude lead and two workers (one Claude, one Codex) with `agflow join`. The lead plans from the goal, workers claim and submit, a goal edit produces a visible re-plan, and a steering message reaches a worker through its `Stop` hook. |
+| **M1: Project brain** | Hub (login, state, events, API, SSE); the task contract with structural checks (unknown or batch-local dependencies, cycles, owned-path overlap at claim time); guards (open-task and hourly creation limits); pause and resume; standing rules; daily backups with an integrity check; MCP bridge with worker and lead tools; web UI (goal editor, board with people's task actions, agents, timeline, steering chat, knowledge); `agflow join` for both CLIs, with a task branch per claim; the lead runs as a live chat started by a person, so it wakes when its turn ends or its person prompts it (immediate wake-ups arrive with runners in M2); tasks are accepted by the lead and marked merged by people. | On a toy repo, a person starts a Claude lead and two workers (one Claude, one Codex) with `agflow join`. The lead plans from the goal, workers claim and submit, a goal edit produces a visible re-plan, and a steering message reaches a worker through its `Stop` hook. |
 | **M2: Runners** | Runner daemon; Claude and Codex adapters; worktrees and WIP pushes; leases, stall detection, replacement and handoff; `request_agents` and auto-fill; quota-aware routing; permission profiles; keep-awake; take-over; lead failover. | Killing an agent and closing a laptop mid-task both end with the task finished on another runner from the handoff note; the lead survives losing its laptop. |
 | **M3: Validation and merge** | Task contracts and plan checks; checks in verification worktrees; tamper and scope checks; cross-vendor review; research review; evidence log; retry ladder; PR per task; merge queue; protected paths. | A planted test-weakening agent is caught. A 10-task toy project goes from goal to merged main with no human action, and main stays green throughout. |
 | **M4: Scale and knowledge** | Area managers; learnings curation and curator tasks; context linter; hidden checks; plan critic; usage dashboards. | A two-area project runs with a lead and two area managers. A proposed learning reaches `AGENTS.md` through a curation task. |
@@ -600,7 +616,31 @@ Open questions to settle during implementation:
 3. What is the exact config override that marks a Codex worktree as trusted?
 4. How much quota does a typical task consume per vendor and plan? Measure during M2 and adjust the default caps.
 
-## 18. References
+## 18. Review findings to resolve before the M2 and M3 plans
+
+A four-reviewer adversarial review of this spec (2026-10-26) found the issues below. M1 already absorbs the ones that affect it. The ones listed here must be designed into the M2 and M3 plans; until then the matching sections above are incomplete.
+
+| # | Area | Problem | Required direction |
+|---|---|---|---|
+| 1 | Git credentials | Agents run as the laptop owner and can reach the owner's git login, so they could push to `main` and bypass the merge queue, fencing and the tamper scan. | Start agents with a credential-free git setup (own `GIT_CONFIG_GLOBAL` without credential helpers, empty `GH_CONFIG_DIR`, `GIT_TERMINAL_PROMPT=0`). Keep the git host off the agents' network allowlist. Deny `git push`, `gh` and `glab` in both CLIs. Only the runner pushes. |
+| 2 | Sandboxing | Allow rules decide which commands start, not what they do. Checks run agent-written code outside any sandbox. | One OS-level sandbox profile for every agent tool call and every runner-run check. Claude: the Bash sandbox via `--settings` with the unsandboxed fallback off. Codex: `network_access = false`, with the runner installing dependencies first. Checks: a macOS sandbox profile with no keychain or credential access. |
+| 3 | Repo-controlled config | Both CLIs load hooks, MCP servers and settings from the task branch at every start, so a tampered branch runs code on the next laptop before any scan. | Before every agent start, the runner restores people-only paths from the base. It strips them from work-in-progress commits and runs git with its own git directory and hooks disabled. |
+| 4 | Fencing on pushes | The git host knows nothing about fencing tokens, so a cut-off runner can keep pushing to a branch its successor uses. | Push work in progress to per-attempt refs (`agflow/T-42/a3`). The PR branch moves only after a fenced `submit`, via `--force-with-lease` against the commit the hub recorded. |
+| 5 | Leases after submit | An author waiting for checks and review looks stalled. | Only `claimed` and `working` hold leases. At `submit`, the hub keeps a hold instead. The process stops but its session id is kept, and it is resumed for step-1 fixes. Add `rebut_review`. |
+| 6 | Hub restarts | After an outage longer than the lease, every lease looks expired. | On start, a recovery window extends leases by the downtime and waits for runners to reconnect and replay before reconciling. A claim, its attempt and the start command are written in one transaction. |
+| 7 | Quota and long builds | Usage limits and long builds look like stalls and burn attempts. | A `quota_wait` attempt state freezes the lease, the stall timer and the budget. Stall windows are set per command. |
+| 8 | Merge queue | Merge jobs have no lease or fencing, and the git host cannot enforce the hub's verdict. | A short-lived merge permit bound to (task, head SHA, main SHA). Merges are conditional on the expected head SHA. A hub-signed acceptance attestation is checked by a required CI status. |
+| 9 | Validation inputs | Diffs use the frozen `base_commit` although branches are rebased. | Compute every diff as `merge-base(origin/main, HEAD)..HEAD`, and restore protected paths from the rebase target. |
+| 10 | Review blind spots | Some defects (data exfiltration, new dependencies, leaked secrets) cannot be shown by a failing test, so they would merge automatically. | Security-class findings block without a reproduction and go to a person. Add deterministic tamper rules for new outbound hosts and new dependencies. |
+| 11 | Per-role lifecycles | Continuation and stall rules assume workers, so managers would loop. | Managers are idle between wake-ups and hold a role lease. Reviewers end with `submit_review`. |
+| 12 | Guards | "Re-plan" is undefined, create-and-cancel loops evade the limits, and one hard task should not pause everything. | Count every mutating planning call and add a churn budget. Reaching the attempt limit triggers only a re-plan (§9.5 step 4). |
+| 13 | Vendor rules | §6.8 and §9.3 disagree about same-vendor review. | A reviewer uses the other vendor when it is available, otherwise the §9.3 fallback after a stated wait. |
+| 14 | Claude adapter | The SDK bundles a different Claude version than the installed CLI, auto mode may be unavailable, and API-key variables silently override the subscription. | Pin the binary and check its version at start. Fall back to `acceptEdits` plus the sandbox when auto mode is off. Build the agent environment from an allowlist and verify subscription auth before dispatch. |
+| 15 | Codex adapter | Codex forwards only allowlisted environment variables to stdio MCP servers, and `turn/steer` carries user authority. | Declare `mcp_servers.agflow.env_vars`. Send agent messages as tool-output items, and keep `turn/steer` for human steering. |
+| 16 | Restore | Restoring a daily backup rolls back counters and fencing tokens. | Continuous WAL replication or hourly snapshots, plus a hub epoch embedded in tokens and bumped on restore. |
+| 17 | Repo-derived context | The hub cannot read the repository, so it cannot build repo maps, pitfalls or the research index. | Runners and bridges build that context from the worktree and upload a derived index keyed by commit. |
+
+## 19. References
 
 - Claude Code docs: [headless and Agent SDK](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks), [memory and AGENTS.md](https://code.claude.com/docs/en/memory), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent teams](https://code.claude.com/docs/en/agent-teams)
 - Codex docs: [AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md), [hooks](https://learn.chatgpt.com/docs/hooks), [subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents); app-server protocol generated locally with `codex app-server generate-json-schema`
