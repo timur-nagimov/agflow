@@ -7,3 +7,5 @@ data/
 *.db-wal
 .DS_Store
 coverage/
+.env
+.env.*
