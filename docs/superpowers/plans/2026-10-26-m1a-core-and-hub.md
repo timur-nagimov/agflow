@@ -150,9 +150,10 @@ packages/hub/
 }
 ```
 
-- [ ] **Step 3: Create `.gitignore`**
+- [ ] **Step 3: Replace `.gitignore`** (it already exists with the `.worktrees/` line; keep that line)
 
 ```
+.worktrees/
 node_modules/
 dist/
 data/
