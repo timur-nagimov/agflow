@@ -1,1 +1,9 @@
 .worktrees/
+node_modules/
+dist/
+data/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+coverage/
