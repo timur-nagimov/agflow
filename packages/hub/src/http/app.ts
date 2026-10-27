@@ -8,6 +8,7 @@ import { HubError, forbidden } from '../errors';
 import { mountAgentRoutes } from './agent-routes';
 import { mountAuthRoutes } from './auth-routes';
 import { mountGithubRoutes } from './github-routes';
+import { mountMessageRoutes } from './message-routes';
 import { mountProjectRoutes } from './project-routes';
 import { mountTaskRoutes } from './task-routes';
 
@@ -66,5 +67,6 @@ export function createApp(ctx: HubContext): App {
   mountProjectRoutes(app, ctx);
   mountTaskRoutes(app, ctx);
   mountAgentRoutes(app, ctx);
+  mountMessageRoutes(app, ctx);
   return app;
 }
