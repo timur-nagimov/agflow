@@ -12,6 +12,7 @@ import {
   type TaskStatus,
   canTransition,
   isClosed,
+  isHeld,
 } from '@agflow/core';
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,33 @@ export function actionBody(action: TaskAction, text: string): Record<string, str
   return { [spec.field]: value };
 }
 
+/** Where a person's message in a task's thread goes, and what the box says about it. */
+export interface ThreadTarget {
+  to: string;
+  /** Set when the message is not addressed to the task's own thread, so that it still shows there. */
+  taskId?: string;
+  placeholder: string;
+}
+
+/**
+ * The hub hands a task-thread message to the agent that holds the task, or to the next agent that claims
+ * it. Once the work is handed in, or the task is finished or closed, nobody reads the thread any more,
+ * although `assignee` stays set. A message then goes to the lead, who reviews the task.
+ */
+export function threadTarget(task: Pick<Task, 'id' | 'status' | 'assignee'>): ThreadTarget {
+  if (isHeld(task.status)) {
+    return { to: `task:${task.id}`, placeholder: `Write to ${task.assignee ?? 'the agent'}, who holds this task…` };
+  }
+  if (task.status === 'draft' || task.status === 'ready' || task.status === 'blocked') {
+    return { to: `task:${task.id}`, placeholder: 'Nobody holds this task; the next agent to claim it gets your message…' };
+  }
+  return {
+    to: 'lead',
+    taskId: task.id,
+    placeholder: 'Nobody is working on this task. Your message goes to the lead, who reviews the task…',
+  };
+}
+
 // ---------------------------------------------------------------------------
 // People, agents and message targets
 // ---------------------------------------------------------------------------
@@ -357,7 +385,7 @@ export function describeEvent(event: HubEvent): string {
     case 'task.impossible':
       return `${by} says ${on} cannot be done as written: ${text(d.reason)}`;
     case 'task.unblocked':
-      return `${by} unblocked ${on}`;
+      return `${by} unblocked ${on}${d.note ? `: ${text(d.note)}` : ''}`;
     case 'task.submitted':
       return `${by} submitted ${on} for review${d.branch ? ` on ${text(d.branch)}` : ''}`;
     case 'task.accepted':

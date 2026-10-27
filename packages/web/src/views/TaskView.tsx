@@ -23,6 +23,7 @@ import {
   actionsFor,
   duration,
   evidenceText,
+  threadTarget,
   who,
 } from '../format';
 import { useAction, useData, useNow } from '../hooks';
@@ -36,6 +37,7 @@ export function TaskView({ id }: { id: string }) {
   const { task, notes, events, messages } = detail.data;
   const repo = status.data?.project.repo;
   const goalVersion = status.data?.goalVersion;
+  const thread = threadTarget(task);
 
   return (
     <div className="page">
@@ -80,14 +82,7 @@ export function TaskView({ id }: { id: string }) {
         <div className="stack">
           <Section title="Thread">
             <MessageList messages={[...messages].reverse()} />
-            <Composer
-              to={`task:${task.id}`}
-              placeholder={
-                task.assignee
-                  ? `Write to ${task.assignee}, who holds this task…`
-                  : 'Nobody holds this task; the next agent to claim it gets your message…'
-              }
-            />
+            <Composer to={thread.to} taskId={thread.taskId} placeholder={thread.placeholder} />
           </Section>
           <Section title="History">
             <EventList events={[...events].reverse()} />

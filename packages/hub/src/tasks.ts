@@ -666,13 +666,18 @@ export function unblockTask(ctx: HubContext, id: string, actor: string, note?: s
     if (waiting.length > 0) {
       writeTask(ctx, id, { blockedKind: 'deps', blockedReason: waitingReason(waiting) });
       emit({ type: 'task.updated', actor, subject: id, data: { fields: ['blocked'] } });
-      return getTask(ctx, id);
+    } else {
+      move(ctx, emit, task, 'ready', actor, {
+        changes: { blockedKind: null, blockedReason: null },
+        event: 'task.unblocked',
+        data: { note: note ?? null },
+      });
     }
-    return move(ctx, emit, task, 'ready', actor, {
-      changes: { blockedKind: null, blockedReason: null },
-      event: 'task.unblocked',
-      data: { note: note ?? null },
-    });
+    // The note answers whatever blocked the task, and it is for the next agent to claim the task. It goes to
+    // the task's thread, so that agent's inbox and the task page both carry it, whether the task is ready now
+    // or still waiting on other tasks. Left in the event alone, nobody would read it.
+    if (note) insertMessage(ctx, emit, { from: actor, to: `task:${id}`, taskId: id, body: note });
+    return getTask(ctx, id);
   });
 }
 

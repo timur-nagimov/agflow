@@ -95,6 +95,14 @@ async function main(): Promise<void> {
       await statusIs(page, 'Accepted');
     });
     await shot(page, 'task');
+    await check('a comment on a task nobody holds goes to the lead and shows in the thread', async () => {
+      const placeholder = (await page.getAttribute('.composer textarea', 'placeholder')) ?? '';
+      if (!placeholder.includes('the lead')) throw new Error(`the box says: ${placeholder}`);
+      await page.fill('.composer textarea', 'Thanks. Merge it after the freeze.');
+      await page.click('.composer button.primary');
+      const sent = page.locator('.message', { hasText: 'Merge it after the freeze' });
+      await sent.locator('.message-head', { hasText: 'the lead' }).waitFor();
+    });
 
     await open(page, '#/task/T-2', '.task-head');
     await check('a bad merge commit shows the hub error, a good one marks the task merged', async () => {
@@ -113,6 +121,10 @@ async function main(): Promise<void> {
       await page.fill('.action-form textarea', 'Reject refunds below 1.00 EUR with a clear error.');
       await page.click('.action-form .confirm-action');
       await statusIs(page, 'Ready');
+    });
+    await check('the note given when unblocking is in the thread and in the history', async () => {
+      await page.locator('.message-body', { hasText: 'Reject refunds below 1.00 EUR' }).waitFor();
+      await page.locator('.log-text', { hasText: 'unblocked T-6: Reject refunds below 1.00 EUR' }).waitFor();
     });
 
     await open(page, '#/task/T-5', '.task-head');

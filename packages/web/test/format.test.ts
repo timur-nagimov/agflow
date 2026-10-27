@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import type { Agent, HubEvent, MessageView, Task } from '@agflow/core';
+import type { Agent, HubEvent, MessageView, Task, TaskStatus } from '@agflow/core';
 import {
   actionBody,
   actionHint,
@@ -19,9 +19,11 @@ import {
   mergeEvents,
   repoLink,
   splitTaskMentions,
+  STATUS_LABELS,
   statusLabel,
   targetLabel,
   targetOptions,
+  threadTarget,
   who,
 } from '../src/format';
 
@@ -115,6 +117,43 @@ describe('task actions', () => {
     expect(actionBody('merged', 'abc1234')).toEqual({ sha: 'abc1234' });
     expect(actionBody('merged', ' ABC1234 ')).toEqual({ sha: 'abc1234' });
     expect(actionBody('release', 'went home')).toEqual({ reason: 'went home' });
+  });
+});
+
+describe('the thread on a task', () => {
+  test('a message goes to the agent that holds the task', () => {
+    for (const status of ['claimed', 'working'] as const) {
+      expect(threadTarget(task({ status, assignee: 'A-2' }))).toEqual({
+        to: 'task:T-1',
+        placeholder: 'Write to A-2, who holds this task…',
+      });
+    }
+  });
+
+  test('on a task nobody holds yet it waits for the next agent to claim the task', () => {
+    for (const status of ['draft', 'ready', 'blocked'] as const) {
+      const target = threadTarget(task({ status }));
+      expect(target.to).toBe('task:T-1');
+      expect(target).not.toHaveProperty('taskId');
+      expect(target.placeholder).toBe('Nobody holds this task; the next agent to claim it gets your message…');
+    }
+  });
+
+  test('once the work is handed in or the task is closed, a message goes to the lead and stays in the thread', () => {
+    // After submitting, the task keeps its assignee, but the agent no longer reads the task's thread.
+    expect(threadTarget(task({ status: 'submitted', assignee: 'A-2' }))).toEqual({
+      to: 'lead',
+      taskId: 'T-1',
+      placeholder: 'Nobody is working on this task. Your message goes to the lead, who reviews the task…',
+    });
+  });
+
+  test('only the statuses an agent reads the thread in use the thread', () => {
+    const own: TaskStatus[] = ['draft', 'ready', 'claimed', 'working', 'blocked'];
+    for (const status of Object.keys(STATUS_LABELS) as TaskStatus[]) {
+      const target = threadTarget(task({ status, assignee: 'A-2' }));
+      expect([status, target.to]).toEqual([status, own.includes(status) ? 'task:T-1' : 'lead']);
+    }
   });
 });
 
@@ -214,6 +253,11 @@ describe('events', () => {
       'bob took T-3 back from A-2: went home',
     );
     expect(describeEvent(event('task.blocked', { from: 'ready' }, 'system'))).toBe('T-3 is waiting on other tasks');
+    expect(describeEvent(event('task.unblocked', { note: 'Reject refunds below 1.00 EUR.' }, 'user:alice'))).toBe(
+      'alice unblocked T-3: Reject refunds below 1.00 EUR.',
+    );
+    expect(describeEvent(event('task.unblocked', { note: null }, 'user:alice'))).toBe('alice unblocked T-3');
+    expect(describeEvent(event('task.unblocked', {}, 'user:alice'))).toBe('alice unblocked T-3');
     expect(describeEvent(event('goal.updated', { version: 4 }, 'user:alice', null))).toBe('alice changed the goal to v4');
     expect(describeEvent(event('message.sent', { to: 'lead', standingRule: true }, 'user:alice', null))).toBe(
       'alice wrote to the lead (standing rule)',

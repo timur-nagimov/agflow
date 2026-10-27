@@ -238,10 +238,13 @@ export function MessageList({ messages, newAfter }: { messages: (Message | Messa
 
 export function Composer({
   to,
+  taskId,
   allowRule = false,
   placeholder,
 }: {
   to: string;
+  /** The task the message is about, for a message that is not addressed to the task's own thread. */
+  taskId?: string;
   allowRule?: boolean;
   placeholder: string;
 }) {
@@ -253,7 +256,9 @@ export function Composer({
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
     if (!text || action.busy) return;
-    const sent = await action.run(() => api.sendMessage({ to, body: text, standingRule: allowRule && rule ? true : undefined }));
+    const sent = await action.run(() =>
+      api.sendMessage({ to, body: text, taskId, standingRule: allowRule && rule ? true : undefined }),
+    );
     if (sent.ok) {
       setBody('');
       setRule(false);

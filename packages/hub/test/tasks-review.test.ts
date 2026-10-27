@@ -3,7 +3,7 @@ import { formatMessage } from '@agflow/core';
 import { ACTIVE_MS, getAgent } from '../src/agents';
 import { HubError } from '../src/errors';
 import { listEvents } from '../src/events';
-import { listMessages } from '../src/messages';
+import { listMessages, takeInbox } from '../src/messages';
 import {
   acceptTask,
   blockTask,
@@ -11,6 +11,7 @@ import {
   createTasks,
   declareImpossible,
   getTask,
+  getTaskDetail,
   listTasks,
   markMerged,
   rejectTask,
@@ -236,6 +237,38 @@ describe('blocking', () => {
     claimTask(ctx, task.id, agent);
     expect(declareImpossible(ctx, task.id, agent, 'A1 contradicts A2.').blockedKind).toBe('impossible');
     expect(listEvents(ctx.db, { subject: task.id }).map((event) => event.type)).toContain('task.impossible');
+  });
+
+  test('the note given when unblocking goes to the task thread, where the next agent to claim the task gets it', () => {
+    const { ctx } = createTestContext();
+    const asker = addAgent(ctx);
+    const next = addAgent(ctx, 'bob');
+    const [task] = createTasks(ctx, [newTask({ title: 'Refunds' })], 'user:alice');
+    claimTask(ctx, task.id, asker);
+    blockTask(ctx, task.id, asker, 'Round up, or reject them?');
+    const answer = 'Reject refunds below 1.00 EUR with a clear error.';
+    expect(unblockTask(ctx, task.id, 'user:alice', answer).status).toBe('ready');
+    const thread = getTaskDetail(ctx, task.id).messages.filter((message) => message.to === `task:${task.id}`);
+    expect(thread).toMatchObject([{ from: 'user:alice', to: `task:${task.id}`, taskId: task.id, body: answer }]);
+    claimTask(ctx, task.id, next);
+    expect(takeInbox(ctx, getAgent(ctx, next.id)).map((message) => message.body)).toEqual([answer]);
+  });
+
+  test('the note is kept in the thread when the task stays blocked on its dependencies', () => {
+    const { ctx } = createTestContext();
+    const [, b] = createTasks(ctx, [newTask({ title: 'A' }), newTask({ title: 'B', dependsOn: ['#1'] })], 'user:alice');
+    expect(unblockTask(ctx, b.id, 'user:alice', 'Start with the schema.').status).toBe('blocked');
+    expect(listMessages(ctx, { target: `task:${b.id}` }).map((message) => message.body)).toEqual(['Start with the schema.']);
+  });
+
+  test('unblocking without a note leaves the thread alone', () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [task] = createTasks(ctx, [newTask()], 'user:alice');
+    claimTask(ctx, task.id, agent);
+    blockTask(ctx, task.id, agent, 'Need DB credentials.');
+    expect(unblockTask(ctx, task.id, 'user:alice').status).toBe('ready');
+    expect(listMessages(ctx, { target: `task:${task.id}` })).toEqual([]);
   });
 
   test('unblocking keeps a task blocked while its dependencies are unmet', () => {
