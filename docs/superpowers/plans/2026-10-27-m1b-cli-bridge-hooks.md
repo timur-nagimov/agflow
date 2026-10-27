@@ -35,7 +35,7 @@
 1. **Credentials file.** Credentials live in `<config dir>/credentials.json` with mode 0600, where the config dir defaults to `~/.config/agflow`. The spec's OS keychain is deferred: storing a token through `security add-generic-password` would put it on a process command line.
 2. **CLI sign-in.** `agflow login` opens `<hub>/cli-login?code=…&label=<hostname>` and polls `/api/cli-login/poll`. The page shows a verification code derived from the login code, and so does the terminal. A person approves only when the two match. This protects against someone sending a ready-made approval link.
 3. **Identity.** Identity follows M1a decision 2. The `SessionStart` hook registers the session and returns the brief with a hello code; the model calls `hello(code)`, and the bridge then sends `X-Agflow-Agent` on every call.
-4. **Task branches.** `claim_task` creates the task branch in a worktree at `<repo>/.worktrees/agflow/<task id>`, starting from the task's existing branch on `origin` if there is one, otherwise from `origin/<default branch>`. `submit` refuses uncommitted changes, pushes the branch with the person's own git login, and sends the branch and head commit to the hub.
+4. **Task branches.** `claim_task` creates the task branch in a worktree at `<repo>/.worktrees/agflow/<task id>`, starting from the task's existing branch on `origin` if there is one, otherwise from `origin/<default branch>`. `submit` refuses uncommitted changes, pushes the branch with the person's own git login, and sends the branch and head commit to the hub. `resume_claim` gives a chat that takes a claim over the same worktree in its own repository, and `submit` refuses unless the chat still holds the task and, for a task on an agflow branch, the worktree is in this repository (amended in the final review; see the notes under Tasks 6, 11 and 12).
 5. **Waking idle chats.** For Claude Code, `join` also installs `agflow hook wait-inbox` as an `asyncRewake` hook on `SessionStart` and `Stop`. It polls the hub's read-only peek endpoint every 15 seconds. When messages arrive it exits 2, which wakes Claude with a short notice. Only one waiter runs per session, and it stops when its chat process ends. Codex has no equivalent, so Codex chats receive messages when a turn ends or a prompt is sent.
 6. **Codex configuration** goes in `<repo>/.codex/config.toml` (a marked block) and `<repo>/.codex/hooks.json`. `join` refuses if git tracks either file. Codex loads project configuration only for trusted projects and runs new hooks only after `/hooks` review, so `join` prints both steps.
 7. **Hook markers.** Every hook entry that `join` writes carries `"statusMessage": "agflow"`. That marker is how `leave` and a repeated `join` find agflow's entries without touching anyone else's.
@@ -1553,6 +1553,8 @@ export function slugify(text: string): string {
 }
 ```
 
+> **Deviation from the snippet above (found in the final review):** `defaultBranch` does not stop at `origin/HEAD`. `git clone` sets it, but a repository made with `git init` and pushed does not have it, and with only that and the hard-coded `main`, `claim_task` could never succeed in such a repository when its branch is `master`. It returns the first usable name from `origin/HEAD`, then `git ls-remote --symref origin HEAD`, then the checked-out branch, and only then `main`. A name that starts with `-` or is not a valid ref name is skipped, because a remote reports its HEAD in its own words and the name is passed on to `git fetch origin <name>`. Tests: `defaultBranch` in `packages/cli/test/self-git.test.ts`, and `claim_task in a repository whose default branch is not main` in `packages/cli/test/tools-git.test.ts`.
+
 - [ ] **Step 6: Run tests and the typecheck**
 
 Run: `bun test packages/cli && bun run typecheck`
@@ -2916,6 +2918,8 @@ export const workerTools: ToolDef[] = [
 export const allTools: ToolDef[] = [...sharedTools, ...workerTools];
 ```
 
+> **Deviation from the snippet above (found in the final review):** for a task on an agflow branch (`isTaskBranch`), `resume_claim` also creates the task worktree in the repository the chat runs in, or reuses the one that is there, and ends with the same `Work only inside <path> (branch <b>)` line as `claim_task`. As in `claim_task`, the worktree is made before the hub call and removed again if the hub refuses, and outside a git repository the call is refused before anything changes. Without it, a chat that took a claim over from another clone, another computer or a chat outside the repository had no worktree and was never told where to work. Tests: `resume_claim and the task worktree` in `packages/cli/test/tools-git.test.ts`.
+
 - [ ] **Step 4: Run tests and the typecheck**
 
 Run: `bun test packages/cli && bun run typecheck`
@@ -3153,6 +3157,8 @@ Change the `allTools` line to:
 ```ts
 export const allTools: ToolDef[] = [...sharedTools, ...workerTools, ...gitTools];
 ```
+
+> **Deviation from the snippets above (found in the final review):** `submit` makes two checks before any git work. (1) It refuses unless the caller still holds the task: `task.assignee` is its agent and the status is `claimed` or `working`. The hub refuses a non-holder only after the push, and a push from a chat whose lease expired lands on the branch the new holder works on, so that holder's own push is rejected. (2) For a task that has a branch, it checks that the branch is an agflow task branch and refuses when this repository has no worktree for the task, naming `resume_claim`. The snippet's "no worktree, no push" recorded a submission with `headSha` null for a branch that was never pushed. A task with no branch is still submitted without a push. Tests: `submit without the right to push` in `packages/cli/test/tools-git.test.ts`.
 
 - [ ] **Step 5: Run tests and the typecheck**
 
@@ -3849,6 +3855,8 @@ try {
   console.log(results.join('\n'));
 }
 ```
+
+> **Deviation from the snippet above (found in the review of batch 6):** its Codex line does not work with codex-cli 0.159.2. Codex splits the `-c` key on dots and keeps the quote characters in it, so `projects."<work>".trust_level="trusted"` leaves the repository untrusted, and Codex then ignores its `.codex/config.toml` and `.codex/hooks.json`. The script passes the inline-table form instead, `-c 'projects={"<work>"={trust_level="trusted"}}'`, built by `codexTrustOverride()` in `packages/cli/scripts/codex-trust.ts` and tested in `packages/cli/test/codex-trust.test.ts`. It replaces the `projects` table for that one run only.
 
 - [ ] **Step 2: Add the script to the root `package.json`**
 

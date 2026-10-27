@@ -6,7 +6,7 @@ The design is in [docs/superpowers/specs/2026-10-26-agflow-design.md](docs/super
 
 ## Status
 
-Milestone M1 is in progress. This repository currently contains the hub: shared state, the REST API and the live event stream. The `agflow` CLI (plan M1b) and the web UI (plan M1c) come next.
+Milestone M1 ("project brain") is built: the hub (shared state, the REST API and the live event stream), the web UI, and the `agflow` CLI with its hooks and MCP bridge for Claude Code and Codex chats. Next is M1's end-to-end check with real chats, then M2 (runners that start agents on teammates' laptops).
 
 ## Run the hub locally
 
@@ -48,6 +48,32 @@ To try the UI without agents, run the demo hub. It keeps a made-up project in me
 bun run build:web && bun run demo   # http://localhost:8790, sign in as "demo"
 ```
 
+## Connect your Claude Code and Codex chats
+
+Build the `agflow` command once, and put it on your PATH:
+
+```bash
+bun run build:cli
+cp dist/agflow ~/.local/bin/agflow
+```
+
+Sign this computer in to your team's hub. A browser page opens; approve it after checking that it shows the same code as your terminal:
+
+```bash
+agflow login --hub https://agflow.example.com
+```
+
+In the project's repository, connect your chats (the lead uses `--role lead`):
+
+```bash
+agflow join --role worker --vendor both
+```
+
+- **Claude Code.** Start a new chat in the repository. It receives an agflow brief and the agflow tools.
+- **Codex.** Trust the project if Codex asks, then run `/hooks` once and trust the three agflow hooks.
+
+Each chat calls `hello` with the code from its brief, then works with `list_tasks`, `claim_task` and `submit`. A claimed task gets its own branch in `.worktrees/agflow/<task>`. `agflow leave` undoes `join`, and `agflow status` shows the hub, your account and the joined repositories.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -80,6 +106,7 @@ Create an OAuth app under GitHub → Settings → Developer settings → OAuth A
 bun test            # all tests
 bun run typecheck   # TypeScript
 bun run smoke:hub   # start a real hub, check it is off the network, sign in, save a goal
+bun run smoke:cli   # real hub + CLI: login, join, hooks, MCP bridge, claim, submit
 bun run build:web   # build the web UI into packages/web/dist
 bun run demo        # a hub with a made-up project and the UI, on port 8790
 bun run check:ui    # drive the UI in headless Chromium against the demo hub

@@ -7,6 +7,7 @@ import type { HubContext } from '../context';
 import { HubError, forbidden } from '../errors';
 import { mountAgentRoutes } from './agent-routes';
 import { mountAuthRoutes } from './auth-routes';
+import { mountCliLoginPage } from './cli-login-page';
 import { mountEventRoutes } from './event-routes';
 import { mountGithubRoutes } from './github-routes';
 import { mountMessageRoutes } from './message-routes';
@@ -115,6 +116,7 @@ export function createApp(ctx: HubContext): App {
   mountAgentRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
   mountEventRoutes(app, ctx);
+  mountCliLoginPage(app, ctx);
   if (ctx.config.webDist) mountStatic(app, ctx.config.webDist);
   return app;
 }

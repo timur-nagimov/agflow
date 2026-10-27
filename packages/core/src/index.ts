@@ -5,5 +5,6 @@ export * from './schemas';
 export * from './goal-diff';
 export * from './paths';
 export * from './format';
+export * from './cli-login';
 
 export const AGFLOW_VERSION = '0.1.0';
