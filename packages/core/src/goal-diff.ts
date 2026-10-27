@@ -5,9 +5,43 @@ export interface DiffLine {
   text: string;
 }
 
+/**
+ * The most edits (lines removed plus lines added) that `diffGoal` searches for. Finding a minimal diff
+ * takes longer the more the two texts differ: two unrelated 20,000-character goals took 14 seconds,
+ * and the diff runs on the hub's single thread. Up to this bound the diff is exact (rewording 200
+ * lines is 400 edits); past it the texts are reported as replaced. In the worst case that costs
+ * a few tens of milliseconds.
+ */
+const MAX_EDIT_LENGTH = 500;
+
+/** The lines of a text as `diffGoal` counts them: CRLF is one line break, and a final newline ends the last line. */
+function splitLines(text: string): string[] {
+  if (text === '') return [];
+  const lines = text.split(/\r?\n/);
+  if (text.endsWith('\n')) lines.pop();
+  return lines;
+}
+
+/**
+ * Line diff of two goal versions. A goal often has no final newline (a textarea does not add one) and
+ * may use CRLF line endings. Neither is a change to a requirement, so adding a line at the end shows
+ * only that line. When the texts differ by more than `MAX_EDIT_LENGTH` lines, every old line is
+ * reported as removed and every new line as added.
+ */
 export function diffGoal(before: string, after: string): DiffLine[] {
+  const parts = diffLines(before, after, {
+    ignoreNewlineAtEof: true,
+    stripTrailingCr: true,
+    maxEditLength: MAX_EDIT_LENGTH,
+  });
+  if (!parts) {
+    return [
+      ...splitLines(before).map((text): DiffLine => ({ op: '-', text })),
+      ...splitLines(after).map((text): DiffLine => ({ op: '+', text })),
+    ];
+  }
   const lines: DiffLine[] = [];
-  for (const part of diffLines(before, after)) {
+  for (const part of parts) {
     const op: DiffLine['op'] = part.added ? '+' : part.removed ? '-' : ' ';
     const value = part.value.endsWith('\n') ? part.value.slice(0, -1) : part.value;
     for (const text of value.split('\n')) lines.push({ op, text });

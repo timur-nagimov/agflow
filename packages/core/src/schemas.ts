@@ -8,7 +8,33 @@ export const VendorSchema = z.enum(['claude', 'codex']);
 export const RoleSchema = z.enum(['lead', 'worker']);
 export const TaskKindSchema = z.enum(['code', 'research', 'review', 'curation']);
 export const TaskIdSchema = z.string().regex(/^T-\d+$/, 'expected a task id like T-12');
-export const BranchSchema = z.string().regex(/^[A-Za-z0-9._\/-]{1,200}$/, 'expected a git branch name');
+/**
+ * The rules of `git check-ref-format --branch` for where dots, slashes and dashes may go. The
+ * character class in BranchSchema already keeps out the characters git forbids (space, control
+ * characters, ~ ^ : ? * [ \ and "@{") and a lone "@". Agents supply branch names, and the hub repeats
+ * them in prompts and later gives them to git, where a name that starts with "-" is read as an
+ * option and ".." climbs out of a directory. So a name git itself refuses must not get through.
+ */
+function isGitBranchName(name: string): boolean {
+  return (
+    name !== 'HEAD' &&
+    !name.startsWith('-') &&
+    !name.includes('..') &&
+    !name.endsWith('.') &&
+    // An empty part is a leading, trailing or doubled "/".
+    name.split('/').every((part) => part !== '' && !part.startsWith('.') && !part.endsWith('.lock'))
+  );
+}
+
+export const BranchSchema = z
+  .string()
+  // abort: a name outside the alphabet gets this one error, not the rule error as well.
+  .regex(/^[A-Za-z0-9._\/-]{1,200}$/, { error: 'expected a git branch name', abort: true })
+  .refine(
+    isGitBranchName,
+    'expected a name git accepts for a branch: no leading "-", no "..", no trailing ".", no leading, trailing ' +
+      'or doubled "/", no part that starts with "." or ends with ".lock", and not HEAD',
+  );
 export const CommitShaSchema = z.string().regex(/^[0-9a-f]{7,40}$/, 'expected a commit sha');
 const TaskRefSchema = z
   .string()

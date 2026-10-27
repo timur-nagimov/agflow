@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { type ZodType, prettifyError } from 'zod';
 import {
   AckInputSchema,
+  BranchSchema,
   ClaimInputSchema,
   CliLoginApproveInputSchema,
   CreateTasksInputSchema,
@@ -219,5 +220,69 @@ describe('ownedPaths', () => {
     const result = NewTaskSchema.safeParse({ ...task, ownedPaths: ['src/(auth|billing)/**'] });
     expect(result.success).toBe(false);
     if (!result.success) expect(prettifyError(result.error)).toContain('write alternatives as {a,b}');
+  });
+});
+
+// Agents supply branch names; the hub repeats them in prompts and later hands them to git. The rules
+// are those of `git check-ref-format --branch`, within a plain ASCII alphabet.
+describe('BranchSchema', () => {
+  const accepts = (names: string[]) => {
+    for (const name of names) expect([name, BranchSchema.safeParse(name).success]).toEqual([name, true]);
+  };
+  const rejects = (names: string[]) => {
+    for (const name of names) expect([name, BranchSchema.safeParse(name).success]).toEqual([name, false]);
+  };
+
+  test('accepts ordinary branch names', () => {
+    accepts(['main', 'agflow/T-1-login', 'feature/a.b', 'release-1.2.3', 'a_b/C', 'a'.repeat(200)]);
+  });
+
+  test('accepts dots and dashes where git allows them', () => {
+    accepts(['x.locked', 'lock', 'a./b', 'a/-b', 'user/HEAD', 'head', 'HEAD2']);
+  });
+
+  test('rejects a name git would read as an option', () => {
+    rejects(['-', '-x', '--force', '--mirror']);
+  });
+
+  test('rejects a name that climbs out of its folder', () => {
+    rejects(['..', '../x', '../../etc/x', 'a/../b', 'a/..']);
+  });
+
+  test('rejects the other names git refuses as a branch', () => {
+    rejects(['HEAD', 'a..b', '.', '.hidden', 'a/.hidden', 'a/./b', 'a.', 'a/b.']);
+    rejects(['x.lock', 'a/x.lock', 'x.lock/a', 'a.lock.lock']);
+    rejects(['/', '/x', 'x/', 'a//b']);
+  });
+
+  test('rejects characters outside the plain alphabet', () => {
+    rejects(['', '@', 'bad branch', 'a~1', 'a^', 'a:b', 'a?', 'a*', 'a[0]', 'a\\b', 'a@{1}', 'a\nb', 'café']);
+    rejects(['a'.repeat(201)]);
+  });
+
+  test('the claim and submit inputs apply the same rules', () => {
+    for (const branch of ['--force', '../x', 'a..b']) {
+      expect(ClaimInputSchema.safeParse({ branch }).success).toBe(false);
+      expect(SubmitInputSchema.safeParse({ summary: 's', branch }).success).toBe(false);
+    }
+    expect(ClaimInputSchema.safeParse({}).success).toBe(true);
+    expect(SubmitInputSchema.safeParse({ summary: 's', branch: 'agflow/T-1-login' }).success).toBe(true);
+  });
+
+  test('the error says which names are refused', () => {
+    const result = BranchSchema.safeParse('--force');
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toHaveLength(1);
+      expect(prettifyError(result.error)).toContain('no leading "-"');
+    }
+  });
+
+  test('a name outside the alphabet is reported once', () => {
+    const result = BranchSchema.safeParse('-- x');
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.message)).toEqual(['expected a git branch name']);
+    }
   });
 });
