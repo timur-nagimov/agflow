@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { migrate, nextId, openDb } from '../src/db';
 
 describe('openDb', () => {
@@ -17,6 +20,14 @@ describe('openDb', () => {
     migrate(db);
     const row = db.query('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number };
     expect(row.n).toBe(1);
+  });
+
+  test('refuses a database written by a newer hub', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'agflow-db-')), 'agflow.db');
+    const db = openDb(path);
+    db.run('INSERT INTO schema_migrations (version, applied_at) VALUES (1000, 0)');
+    db.close();
+    expect(() => openDb(path)).toThrow('database schema version 1000 is newer than this hub supports');
   });
 });
 

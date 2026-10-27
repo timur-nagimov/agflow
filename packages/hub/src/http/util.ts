@@ -1,12 +1,18 @@
 import type { Agent } from '@agflow/core';
 import type { Context } from 'hono';
 import { z } from 'zod';
-import { badRequest, forbidden, unauthorized } from '../errors';
+import { badRequest, forbidden, unauthorized, unsupportedMediaType } from '../errors';
 import type { AppEnv, Principal } from './app';
 
 export type Ctx = Context<AppEnv>;
 
 export async function readBody<S extends z.ZodType>(c: Ctx, schema: S): Promise<z.output<S>> {
+  // Pages on other sites can send text/plain and form bodies without a CORS preflight, but not JSON ones, so a body
+  // must be declared as JSON. A missing or unreadable body is left to the parse below.
+  const type = c.req.header('content-type')?.split(';')[0].trim().toLowerCase();
+  if (type !== 'application/json' && (await c.req.text().catch(() => ''))) {
+    throw unsupportedMediaType('the request body must be sent as application/json');
+  }
   let json: unknown;
   try {
     json = await c.req.json();

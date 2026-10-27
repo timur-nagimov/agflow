@@ -215,6 +215,16 @@ function unmetDependencies(ctx: HubContext, dependsOn: string[]): string[] {
 const waitingReason = (ids: string[]) => `waiting on ${ids.join(', ')}`;
 
 /**
+ * Why a task is blocked on its dependencies. A cancelled dependency will never be done, so instead of
+ * naming it among the tasks it waits on, the reason asks for a decision.
+ */
+function dependencyReason(ctx: HubContext, waiting: string[]): string {
+  const cancelled = waiting.filter((id) => findTask(ctx, id)?.status === 'cancelled');
+  if (cancelled.length === 0) return waitingReason(waiting);
+  return `${cancelled.join(', ')} ${cancelled.length === 1 ? 'was' : 'were'} cancelled; amend or cancel this task`;
+}
+
+/**
  * What an agent wrote, inside a notice that the hub sends. Messages from "system" are the hub's own
  * words, so the agent's text is set apart: named on a line of its own, then quoted line by line.
  */
@@ -320,7 +330,7 @@ export function createTasks(ctx: HubContext, inputs: NewTask[], actor: string): 
           contract: JSON.stringify(contract),
           goalVersion,
           blockedKind: waiting.length > 0 ? 'deps' : null,
-          blockedReason: waiting.length > 0 ? waitingReason(waiting) : null,
+          blockedReason: waiting.length > 0 ? dependencyReason(ctx, waiting) : null,
           actor,
           now,
         });
@@ -340,6 +350,13 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
       if (reaches(ctx, dependency, id)) throw badRequest(`depending on ${dependency} would create a dependency cycle`);
     }
     const contract: TaskContract = { ...contractOf(task), ...patch };
+    if (isHeld(task.status)) {
+      // Decision 8 also covers paths a held task gains. Only the added ones are checked, so an overlap
+      // that is already there does not block an unrelated change.
+      const added = contract.ownedPaths.filter((path) => !task.ownedPaths.includes(path));
+      const clash = overlappingHeldTask(ctx, { ...task, ownedPaths: added });
+      if (clash) throw conflict(`${id} would own paths that overlap ${holding(clash)}`);
+    }
     writeTask(ctx, id, { contract });
     emit({ type: 'task.updated', actor, subject: id, data: { fields: Object.keys(patch) } });
     const fresh = getTask(ctx, id);
@@ -347,12 +364,25 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
     if (patch.dependsOn && (fresh.status === 'ready' || dependencyBlocked)) {
       const waiting = unmetDependencies(ctx, fresh.dependsOn);
       if (waiting.length > 0 && fresh.status === 'ready') {
-        move(ctx, emit, fresh, 'blocked', 'system', { changes: { blockedKind: 'deps', blockedReason: waitingReason(waiting) } });
+        move(ctx, emit, fresh, 'blocked', 'system', {
+          changes: { blockedKind: 'deps', blockedReason: dependencyReason(ctx, waiting) },
+        });
       } else if (waiting.length === 0 && dependencyBlocked) {
         move(ctx, emit, fresh, 'ready', 'system', { changes: { blockedKind: null, blockedReason: null } });
       } else if (waiting.length > 0) {
-        writeTask(ctx, id, { blockedReason: waitingReason(waiting) });
+        writeTask(ctx, id, { blockedReason: dependencyReason(ctx, waiting) });
       }
+    }
+    const changed = (Object.keys(patch) as (keyof TaskContract)[]).filter(
+      (field) => JSON.stringify(contract[field]) !== JSON.stringify(task[field]),
+    );
+    if (isHeld(task.status) && task.assignee && changed.length > 0) {
+      insertMessage(ctx, emit, {
+        from: 'system',
+        to: `agent:${task.assignee}`,
+        taskId: id,
+        body: `${actor} amended ${id}, which you hold. Changed: ${changed.join(', ')}.\nCall get_task to read the new contract and follow it from now on.`,
+      });
     }
     return getTask(ctx, id);
   });
@@ -363,7 +393,7 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
     const task = getTask(ctx, id);
     const holder = isHeld(task.status) ? task.assignee : null;
     const cancelled = move(ctx, emit, task, 'cancelled', actor, {
-      changes: { assignee: null, leaseExpiresAt: null },
+      changes: { assignee: null, leaseExpiresAt: null, blockedKind: null, blockedReason: null },
       data: { reason },
     });
     if (holder) {
@@ -373,6 +403,27 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
         to: `agent:${holder}`,
         taskId: id,
         body: `Task ${id} was cancelled: ${reason}\nStop working on it. Commit and push anything worth keeping to ${task.branch ?? 'its branch'}.`,
+      });
+    }
+    // A cancelled task is never done, so the open tasks that depend on it need the lead's decision.
+    const dependents = listTasks(ctx).filter((other) => !isClosed(other.status) && other.dependsOn.includes(id));
+    for (const dependent of dependents) {
+      if (dependent.status === 'blocked' && dependent.blockedKind === 'deps') {
+        writeTask(ctx, dependent.id, { blockedReason: dependencyReason(ctx, unmetDependencies(ctx, dependent.dependsOn)) });
+      }
+    }
+    if (dependents.length > 0) {
+      insertMessage(ctx, emit, {
+        from: 'system',
+        to: 'lead',
+        taskId: id,
+        body: [
+          `${id} ("${clip(task.title, 120)}") was cancelled by ${actor}.`,
+          wrote(actor, clip(reason, 500)),
+          `${dependents.length === 1 ? 'This open task depends' : 'These open tasks depend'} on it:`,
+          ...dependents.map((dependent) => `- ${dependent.id} ("${clip(dependent.title, 80)}") [${dependent.status}]`),
+          'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
+        ].join('\n'),
       });
     }
     return cancelled;
@@ -390,34 +441,59 @@ function heldTaskOf(ctx: HubContext, agentId: string): Task | null {
   return row ? rowToTask(row) : null;
 }
 
+/**
+ * Decision 8, owned paths: a task cannot be claimed, sent back to its author or given more paths while
+ * it is held, if another task whose owned paths overlap it is held or waiting for review. Work waiting
+ * for review keeps its paths until it is accepted, rejected or cancelled, because a second branch on
+ * the same paths would conflict with it. The overlap test is conservative: it may block a pair that a
+ * full glob engine would allow, never the reverse.
+ */
+const PATH_HOLDERS: TaskStatus[] = ['claimed', 'working', 'submitted', 'checking', 'reviewing'];
+
 function overlappingHeldTask(ctx: HubContext, task: Task): Task | null {
   if (task.ownedPaths.length === 0) return null;
   return (
-    listTasks(ctx, { status: ['claimed', 'working'] }).find(
+    listTasks(ctx, { status: PATH_HOLDERS }).find(
       (other) => other.id !== task.id && pathsOverlap(task.ownedPaths, other.ownedPaths),
     ) ?? null
   );
 }
+
+/** Names the task that holds overlapping paths, for a refusal. */
+const holding = (task: Task): string =>
+  isHeld(task.status) ? `${task.id}, which ${task.assignee} is working on` : `${task.id}, which is waiting for review`;
 
 function requireHolder(task: Task, agent: Agent): void {
   if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
 }
 
 export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: string): Task {
-  return tx(ctx, (emit) => {
+  const outcome = tx(ctx, (emit): { claimed: Task } | { waiting: string[] } => {
     if (getProject(ctx).paused) throw conflict('the project is paused, so no new work can start');
     const held = heldTaskOf(ctx, agent.id);
     if (held) throw conflict(`you already hold ${held.id}; submit, release or hand it off first`);
     const task = getTask(ctx, id);
     if (task.status !== 'ready') throw conflict(`${id} is ${task.status}, not ready`);
+    // A dependency added while the task was held does not stop it from coming back to the pool ready.
+    // So the claim checks again, and moves the task to blocked, where the board shows it waiting.
+    const waiting = unmetDependencies(ctx, task.dependsOn);
+    if (waiting.length > 0) {
+      move(ctx, emit, task, 'blocked', 'system', {
+        changes: { blockedKind: 'deps', blockedReason: dependencyReason(ctx, waiting) },
+      });
+      return { waiting };
+    }
     const clash = overlappingHeldTask(ctx, task);
-    if (clash) throw conflict(`${id} owns paths that overlap ${clash.id}, which ${clash.assignee} is working on`);
+    if (clash) throw conflict(`${id} owns paths that overlap ${holding(clash)}`);
     const claimed = move(ctx, emit, task, 'claimed', `agent:${agent.id}`, {
       changes: { assignee: agent.id, branch: branch ?? task.branch, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
     });
     setAgentTask(ctx, agent.id, id);
-    return claimed;
+    return { claimed };
   });
+  // Refused after the transaction, so that the move to blocked is kept.
+  if ('waiting' in outcome) throw conflict(`${id} cannot be claimed: it is ${waitingReason(outcome.waiting)}`);
+  return outcome.claimed;
 }
 
 export function resumeClaim(ctx: HubContext, id: string, agent: Agent): Task {
@@ -664,7 +740,7 @@ export function unblockTask(ctx: HubContext, id: string, actor: string, note?: s
     if (task.status !== 'blocked') throw conflict(`${id} is not blocked`);
     const waiting = unmetDependencies(ctx, task.dependsOn);
     if (waiting.length > 0) {
-      writeTask(ctx, id, { blockedKind: 'deps', blockedReason: waitingReason(waiting) });
+      writeTask(ctx, id, { blockedKind: 'deps', blockedReason: dependencyReason(ctx, waiting) });
       emit({ type: 'task.updated', actor, subject: id, data: { fields: ['blocked'] } });
     } else {
       move(ctx, emit, task, 'ready', actor, {
@@ -696,8 +772,8 @@ function refreshDependents(ctx: HubContext, emit: Emit): void {
     const waiting = unmetDependencies(ctx, task.dependsOn);
     if (waiting.length === 0) {
       move(ctx, emit, task, 'ready', 'system', { changes: { blockedKind: null, blockedReason: null } });
-    } else if (task.blockedReason !== waitingReason(waiting)) {
-      writeTask(ctx, task.id, { blockedReason: waitingReason(waiting) });
+    } else if (task.blockedReason !== dependencyReason(ctx, waiting)) {
+      writeTask(ctx, task.id, { blockedReason: dependencyReason(ctx, waiting) });
     }
   }
 }

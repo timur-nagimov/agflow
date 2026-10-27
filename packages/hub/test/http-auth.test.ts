@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { CLI_LOGIN_TTL, sweepAuth } from '../src/auth';
 import { addAgent } from './helpers';
 import { createTestHub } from './http-helpers';
 
@@ -83,6 +84,50 @@ describe('sign-in and principals', () => {
   });
 });
 
+describe('dev hub host names', () => {
+  // A web page can point a domain of its own at 127.0.0.1 (DNS rebinding) and then reach a dev hub through the
+  // browser as its own origin. The browser still sends the page's host name in the Host header.
+  const rebound = { host: 'rebind.attacker.example:8787' };
+
+  test('dev sign-in refuses a host name that is not loopback or the public URL', async () => {
+    const hub = createTestHub();
+    const result = await hub.call('GET', '/auth/dev?user=alice', { headers: rebound });
+    expect(result.status).toBe(403);
+    expect(result.headers.get('set-cookie')).toBeNull();
+  });
+
+  test('dev sign-in works at loopback names and the public URL host, on any port', async () => {
+    const hub = createTestHub();
+    for (const host of ['localhost:8787', 'LOCALHOST', '127.0.0.1:8787', '[::1]:8787', 'hub.test', 'hub.test:8080']) {
+      const result = await hub.call('GET', '/auth/dev?user=alice', { headers: { host } });
+      expect(result.status).toBe(302);
+      expect(result.headers.get('set-cookie')).toContain('agflow_session=');
+    }
+  });
+
+  test('a session cookie is refused at a rebound host name too', async () => {
+    const hub = createTestHub();
+    const web = { user: 'alice', via: 'web' as const };
+    expect((await hub.call('GET', '/api/status', { ...web, headers: { host: 'localhost:8787' } })).status).toBe(200);
+    expect((await hub.call('GET', '/api/status', { ...web, headers: rebound })).status).toBe(403);
+    const headers = { ...rebound, origin: 'http://rebind.attacker.example:8787' };
+    expect((await hub.call('PUT', '/api/goal', { ...web, headers, body: { text: 'Rebound', baseVersion: 0 } })).status).toBe(403);
+    expect((await hub.call('GET', '/api/auth-config', { headers: rebound })).status).toBe(403);
+    expect((await hub.call('GET', '/api/status', web)).json.goalVersion).toBe(0);
+  });
+
+  test('without a Host header the host name in the request URL is checked', async () => {
+    const hub = createTestHub();
+    expect((await hub.app.request('http://rebind.attacker.example/api/auth-config')).status).toBe(403);
+    expect((await hub.app.request('http://hub.test/api/auth-config')).status).toBe(200);
+  });
+
+  test('a hub with GitHub sign-in is not limited to these names, since it may sit behind a proxy', async () => {
+    const hub = createTestHub({ auth: 'github' });
+    expect((await hub.call('GET', '/api/auth-config', { headers: rebound })).status).toBe(200);
+  });
+});
+
 describe('CLI login', () => {
   const code = 'x'.repeat(32);
 
@@ -101,5 +146,23 @@ describe('CLI login', () => {
   test('a CLI token cannot approve CLI logins', async () => {
     const hub = createTestHub();
     expect((await hub.call('POST', '/api/cli-login/approve', { user: 'alice', via: 'cli', body: { code } })).status).toBe(403);
+  });
+
+  test('approving the same code twice is a conflict', async () => {
+    const hub = createTestHub();
+    const approve = () => hub.call('POST', '/api/cli-login/approve', { user: 'alice', via: 'web', body: { code } });
+    expect((await approve()).status).toBe(200);
+    const again = await approve();
+    expect(again.status).toBe(409);
+    expect(again.json.error).toBe('conflict');
+    expect((await hub.call('GET', `/api/cli-login/poll?code=${code}`)).json.status).toBe('approved');
+  });
+
+  test('a CLI that polls after its approval expired hears so even after a sweep', async () => {
+    const hub = createTestHub();
+    await hub.call('POST', '/api/cli-login/approve', { user: 'alice', via: 'web', body: { code } });
+    hub.clock.advance(CLI_LOGIN_TTL + 1);
+    sweepAuth(hub.ctx);
+    expect((await hub.call('GET', `/api/cli-login/poll?code=${code}`)).json).toEqual({ status: 'expired' });
   });
 });

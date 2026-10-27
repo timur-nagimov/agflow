@@ -18,6 +18,7 @@ import {
   releaseTask,
   submitTask,
   unblockTask,
+  updateTask,
 } from '../src/tasks';
 import { addAgent, createTestContext, newTask } from './helpers';
 
@@ -126,20 +127,32 @@ describe('reviewing', () => {
     const { ctx } = createTestContext();
     const author = addAgent(ctx);
     const other = addAgent(ctx, 'bob');
-    const [a, b] = createTasks(
-      ctx,
-      [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['src/auth/login.ts'] })],
-      'user:alice',
-    );
+    const [a, b] = createTasks(ctx, [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['docs/**'] })], 'user:alice');
     claimTask(ctx, a.id, author);
     submitTask(ctx, a.id, author, { summary: 'Done.', evidence: [] });
     claimTask(ctx, b.id, other);
+    // In review, the lead finds that a has to change the docs too.
+    updateTask(ctx, a.id, { ownedPaths: ['src/auth/**', 'docs/auth.md'] }, 'user:alice');
     expect(rejectTask(ctx, a.id, 'user:alice', 'Redo.')).toMatchObject({ status: 'ready', assignee: null, feedback: 'Redo.' });
     expect(getAgent(ctx, author.id).currentTask).toBeNull();
     expect(listTasks(ctx, { status: ['claimed', 'working'] }).map((task) => task.id)).toEqual([b.id]);
     expect(() => claimTask(ctx, a.id, author)).toThrow(`overlap ${b.id}`);
     releaseTask(ctx, b.id, other, 'switching tasks');
     expect(claimTask(ctx, a.id, author).status).toBe('claimed');
+  });
+
+  test('rejected work returns to the pool when sending it back would overlap work waiting for review', () => {
+    const { ctx } = createTestContext();
+    const author = addAgent(ctx);
+    const other = addAgent(ctx, 'bob');
+    const [a, b] = createTasks(ctx, [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['docs/**'] })], 'user:alice');
+    claimTask(ctx, a.id, author);
+    submitTask(ctx, a.id, author, { summary: 'Done.', evidence: [] });
+    claimTask(ctx, b.id, other);
+    submitTask(ctx, b.id, other, { summary: 'Done.', evidence: [] });
+    updateTask(ctx, a.id, { ownedPaths: ['src/auth/**', 'docs/auth.md'] }, 'user:alice');
+    expect(rejectTask(ctx, a.id, 'user:alice', 'Redo.')).toMatchObject({ status: 'ready', assignee: null, feedback: 'Redo.' });
+    expect(getAgent(ctx, author.id).currentTask).toBeNull();
   });
 
   test('rejected work still goes back to its author when held tasks own other paths', () => {

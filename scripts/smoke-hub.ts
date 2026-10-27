@@ -1,5 +1,5 @@
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, readdirSync } from 'node:fs';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const dir = mkdtempSync(join(tmpdir(), 'agflow-smoke-'));
@@ -34,6 +34,23 @@ async function waitForHub(): Promise<void> {
 
 try {
   await waitForHub();
+  const lan = Object.values(networkInterfaces()).flat().find((info) => info?.family === 'IPv4' && !info.internal);
+  if (lan) {
+    const signal = AbortSignal.timeout(2000);
+    const exposed = await fetch(`http://${lan.address}:${port}/api/auth-config`, { signal }).then(() => true, () => false);
+    if (exposed) throw new Error(`dev sign-in is reachable from the network at ${lan.address}`);
+  }
+  // A web page that points a domain of its own at 127.0.0.1 (DNS rebinding) must not be signed in.
+  const host = `rebind.attacker.example:${port}`;
+  const rebound = await fetch(`${base}/auth/dev?user=alice`, { headers: { host }, redirect: 'manual' });
+  if (rebound.status !== 403 || rebound.headers.has('set-cookie')) {
+    throw new Error(`dev sign-in answered a request addressed to ${host} with ${rebound.status}`);
+  }
+  // A start snapshot, plus the day's daily snapshot because the folder had none yet.
+  const backups = readdirSync(join(dir, 'backups')).sort();
+  if (backups.length !== 2 || !backups[0]?.startsWith('agflow-daily-') || !backups[1]?.startsWith('agflow-start-')) {
+    throw new Error(`unexpected backups: ${backups.join(', ')}`);
+  }
   const login = await fetch(`${base}/auth/dev?user=alice`, { redirect: 'manual' });
   const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
   const goal = await fetch(`${base}/api/goal`, {
@@ -48,7 +65,7 @@ try {
   if (goal.status !== 200 || status.goalVersion !== 1 || status.project.name !== 'smoke') {
     throw new Error(`unexpected result: goal ${goal.status}, status ${JSON.stringify(status)}`);
   }
-  console.log('smoke test passed: hub started, dev sign-in worked, goal v1 saved');
+  console.log('smoke test passed: hub started, snapshots written, dev sign-in worked, goal v1 saved');
 } finally {
   hub.kill();
 }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { createTasks } from '../src/tasks';
+import { claimTask, createTasks, releaseTask, updateTask } from '../src/tasks';
 import { addAgent, newTask } from './helpers';
 import { createTestHub } from './http-helpers';
 
@@ -43,6 +43,21 @@ describe('task routes', () => {
     const release = { reason: 'went home' };
     expect((await hub.call('POST', `/api/tasks/${task.id}/release-claim`, { user: 'alice', via: 'cli', body: release })).status).toBe(403);
     expect((await hub.call('POST', `/api/tasks/${task.id}/release-claim`, { user: 'alice', via: 'web', body: release })).json.task.status).toBe('ready');
+  });
+
+  test('claiming a task whose dependencies are unmet is a 409 that leaves the task blocked', async () => {
+    const hub = createTestHub();
+    const first = addAgent(hub.ctx, 'bob');
+    const second = addAgent(hub.ctx, 'alice');
+    const [a, b] = createTasks(hub.ctx, [newTask({ title: 'A' }), newTask({ title: 'B' })], 'user:alice');
+    claimTask(hub.ctx, b.id, first);
+    updateTask(hub.ctx, b.id, { dependsOn: [a.id] }, 'user:alice');
+    releaseTask(hub.ctx, b.id, first, 'A has to come first');
+    const claim = await hub.call('POST', `/api/tasks/${b.id}/claim`, { user: 'alice', agent: second.id, body: {} });
+    expect(claim.status).toBe(409);
+    expect(claim.json).toEqual({ error: 'conflict', message: `${b.id} cannot be claimed: it is waiting on ${a.id}` });
+    const detail = await hub.call('GET', `/api/tasks/${b.id}`, { user: 'alice', via: 'web' });
+    expect(detail.json.task).toMatchObject({ status: 'blocked', blockedKind: 'deps', blockedReason: `waiting on ${a.id}` });
   });
 
   test('invalid transitions are 409, unknown tasks 404', async () => {

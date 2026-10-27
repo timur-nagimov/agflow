@@ -2,6 +2,7 @@ import type { HubConfig } from './context';
 
 export interface LoadedConfig {
   config: HubConfig;
+  host: string;
   port: number;
   dbPath: string;
   backupDir: string;
@@ -9,11 +10,12 @@ export interface LoadedConfig {
 
 type Env = Record<string, string | undefined>;
 
-function positiveInt(env: Env, key: string, fallback: number): number {
+function positiveInt(env: Env, key: string, fallback: number, max = Infinity): number {
   const raw = env[key];
   if (raw === undefined || raw === '') return fallback;
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${key} must be a positive integer`);
+  if (value > max) throw new Error(`${key} must be at most ${max}`);
   return value;
 }
 
@@ -31,9 +33,17 @@ export function loadConfig(env: Env): LoadedConfig {
   if (auth === 'github' && (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET)) {
     throw new Error('GitHub sign-in needs GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET');
   }
-  const port = positiveInt(env, 'AGFLOW_PORT', 8787);
-  const publicUrl = (env.AGFLOW_PUBLIC_URL ?? `http://localhost:${port}`).replace(/\/+$/, '');
+  const port = positiveInt(env, 'AGFLOW_PORT', 8787, 65535);
+  // Dev sign-in needs no password, so a dev hub stays off the network unless AGFLOW_HOST says otherwise.
+  const host = env.AGFLOW_HOST || (auth === 'dev' ? '127.0.0.1' : '0.0.0.0');
+  const url = URL.parse(env.AGFLOW_PUBLIC_URL ?? `http://localhost:${port}`);
+  if (url?.protocol !== 'http:' && url?.protocol !== 'https:') throw new Error('AGFLOW_PUBLIC_URL must be an http or https URL');
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('AGFLOW_PUBLIC_URL must not contain credentials, a query or a fragment');
+  }
+  const publicUrl = `${url.origin}${url.pathname}`.replace(/\/+$/, '');
   return {
+    host,
     port,
     dbPath: env.AGFLOW_DB ?? 'data/agflow.db',
     backupDir: env.AGFLOW_BACKUP_DIR ?? 'data/backups',
@@ -49,7 +59,7 @@ export function loadConfig(env: Env): LoadedConfig {
       reminderMs: positiveInt(env, 'AGFLOW_REMINDER_MINUTES', 30) * 60_000,
       maxOpenTasks: positiveInt(env, 'AGFLOW_MAX_OPEN_TASKS', 200),
       maxTasksPerHour: positiveInt(env, 'AGFLOW_MAX_TASKS_PER_HOUR', 60),
-      secureCookies: publicUrl.startsWith('https://'),
+      secureCookies: url.protocol === 'https:',
       webDist: env.AGFLOW_WEB_DIST,
     },
   };
