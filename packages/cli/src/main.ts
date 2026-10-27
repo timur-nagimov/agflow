@@ -2,6 +2,7 @@
 import { AGFLOW_VERSION } from '@agflow/core';
 import { type ParsedArgs, UsageError, parseArgs } from './args';
 import { type Io, stdio } from './io';
+import { loginCommand, logoutCommand, statusCommand } from './login';
 
 export const HELP = `agflow ${AGFLOW_VERSION}
 
@@ -20,7 +21,11 @@ Run by Claude Code and Codex, not by people:
 
 export type Command = (args: ParsedArgs, io: Io) => Promise<number>;
 
-const commands: Record<string, Command> = {};
+const commands: Record<string, Command> = {
+  login: loginCommand,
+  logout: logoutCommand,
+  status: statusCommand,
+};
 
 export async function main(argv: string[], io: Io = stdio): Promise<number> {
   const args = parseArgs(argv);
