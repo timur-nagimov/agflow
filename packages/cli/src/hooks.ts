@@ -6,6 +6,7 @@ import { loadCredentials } from './credentials';
 import { type FetchFn, HubClient } from './hub-client';
 import type { Io } from './io';
 import { configDir } from './paths';
+import { waitInboxCommand } from './wait-inbox';
 
 export type HookEvent = 'session-start' | 'user-prompt-submit' | 'stop';
 export const HOOK_EVENTS: readonly HookEvent[] = ['session-start', 'user-prompt-submit', 'stop'];
@@ -102,6 +103,7 @@ export async function hookCommand(args: ParsedArgs, io: Io): Promise<number> {
   const event = args.positional[1] ?? '';
   const vendor: Vendor = args.flags.vendor === 'codex' ? 'codex' : 'claude';
   const role: AgentRole = args.flags.role === 'lead' ? 'lead' : 'worker';
+  if (event === 'wait-inbox') return waitInboxCommand(vendor, io);
   if (!(HOOK_EVENTS as readonly string[]).includes(event)) {
     io.err(`agflow: unknown hook event "${event}"\n`);
     io.out('{}');
