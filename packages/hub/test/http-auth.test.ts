@@ -83,6 +83,50 @@ describe('sign-in and principals', () => {
   });
 });
 
+describe('dev hub host names', () => {
+  // A web page can point a domain of its own at 127.0.0.1 (DNS rebinding) and then reach a dev hub through the
+  // browser as its own origin. The browser still sends the page's host name in the Host header.
+  const rebound = { host: 'rebind.attacker.example:8787' };
+
+  test('dev sign-in refuses a host name that is not loopback or the public URL', async () => {
+    const hub = createTestHub();
+    const result = await hub.call('GET', '/auth/dev?user=alice', { headers: rebound });
+    expect(result.status).toBe(403);
+    expect(result.headers.get('set-cookie')).toBeNull();
+  });
+
+  test('dev sign-in works at loopback names and the public URL host, on any port', async () => {
+    const hub = createTestHub();
+    for (const host of ['localhost:8787', 'LOCALHOST', '127.0.0.1:8787', '[::1]:8787', 'hub.test', 'hub.test:8080']) {
+      const result = await hub.call('GET', '/auth/dev?user=alice', { headers: { host } });
+      expect(result.status).toBe(302);
+      expect(result.headers.get('set-cookie')).toContain('agflow_session=');
+    }
+  });
+
+  test('a session cookie is refused at a rebound host name too', async () => {
+    const hub = createTestHub();
+    const web = { user: 'alice', via: 'web' as const };
+    expect((await hub.call('GET', '/api/status', { ...web, headers: { host: 'localhost:8787' } })).status).toBe(200);
+    expect((await hub.call('GET', '/api/status', { ...web, headers: rebound })).status).toBe(403);
+    const headers = { ...rebound, origin: 'http://rebind.attacker.example:8787' };
+    expect((await hub.call('PUT', '/api/goal', { ...web, headers, body: { text: 'Rebound', baseVersion: 0 } })).status).toBe(403);
+    expect((await hub.call('GET', '/api/auth-config', { headers: rebound })).status).toBe(403);
+    expect((await hub.call('GET', '/api/status', web)).json.goalVersion).toBe(0);
+  });
+
+  test('without a Host header the host name in the request URL is checked', async () => {
+    const hub = createTestHub();
+    expect((await hub.app.request('http://rebind.attacker.example/api/auth-config')).status).toBe(403);
+    expect((await hub.app.request('http://hub.test/api/auth-config')).status).toBe(200);
+  });
+
+  test('a hub with GitHub sign-in is not limited to these names, since it may sit behind a proxy', async () => {
+    const hub = createTestHub({ auth: 'github' });
+    expect((await hub.call('GET', '/api/auth-config', { headers: rebound })).status).toBe(200);
+  });
+});
+
 describe('CLI login', () => {
   const code = 'x'.repeat(32);
 

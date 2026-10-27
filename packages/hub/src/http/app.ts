@@ -57,6 +57,18 @@ export function createApp(ctx: HubContext): App {
     return c.json({ error: 'internal', message: 'internal error' }, 500);
   });
   app.notFound((c) => c.json({ error: 'not_found', message: `no route for ${c.req.method} ${c.req.path}` }, 404));
+  if (ctx.config.auth === 'dev') {
+    // Dev sign-in needs no password. Listening on loopback keeps other machines out, but a web page can still reach
+    // the hub through the browser by pointing a domain of its own at 127.0.0.1 (DNS rebinding). The browser then
+    // sends that domain in the Host header, so a dev hub answers only requests addressed to loopback or its public URL.
+    const hosts = new Set(['localhost', '127.0.0.1', '[::1]', URL.parse(ctx.config.publicUrl)?.hostname]);
+    app.use('*', async (c, next) => {
+      const host = c.req.header('host');
+      const hostname = URL.parse(host === undefined ? c.req.url : `http://${host}`)?.hostname;
+      if (!hostname || !hosts.has(hostname)) throw forbidden('a dev hub answers only at localhost or its public URL');
+      await next();
+    });
+  }
   app.use('*', async (c, next) => {
     c.set(
       'principal',

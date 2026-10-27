@@ -40,6 +40,12 @@ try {
     const exposed = await fetch(`http://${lan.address}:${port}/api/auth-config`, { signal }).then(() => true, () => false);
     if (exposed) throw new Error(`dev sign-in is reachable from the network at ${lan.address}`);
   }
+  // A web page that points a domain of its own at 127.0.0.1 (DNS rebinding) must not be signed in.
+  const host = `rebind.attacker.example:${port}`;
+  const rebound = await fetch(`${base}/auth/dev?user=alice`, { headers: { host }, redirect: 'manual' });
+  if (rebound.status !== 403 || rebound.headers.has('set-cookie')) {
+    throw new Error(`dev sign-in answered a request addressed to ${host} with ${rebound.status}`);
+  }
   const login = await fetch(`${base}/auth/dev?user=alice`, { redirect: 'manual' });
   const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
   const goal = await fetch(`${base}/api/goal`, {

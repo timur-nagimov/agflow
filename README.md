@@ -21,7 +21,7 @@ AGFLOW_PROJECT_REPO=https://github.com/you/demo \
 bun run hub
 ```
 
-Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only, so with `AGFLOW_AUTH=dev` the hub listens on loopback (`127.0.0.1`) and other machines cannot reach it. Do not point `AGFLOW_HOST` at a network address in dev mode: anyone who can reach the hub could sign in as any allowed user.
+Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only, so with `AGFLOW_AUTH=dev` the hub listens on loopback (`127.0.0.1`) and other machines cannot reach it. It also answers only requests addressed to `localhost`, `127.0.0.1`, `[::1]` or the host in `AGFLOW_PUBLIC_URL`, so a web page cannot reach it through your browser by pointing a domain of its own at `127.0.0.1`. Do not point `AGFLOW_HOST` at a network address in dev mode: anyone who can reach the hub could sign in as any allowed user.
 
 ## Configuration
 
