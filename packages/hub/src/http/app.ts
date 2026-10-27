@@ -11,6 +11,7 @@ import { mountEventRoutes } from './event-routes';
 import { mountGithubRoutes } from './github-routes';
 import { mountMessageRoutes } from './message-routes';
 import { mountProjectRoutes } from './project-routes';
+import { mountStatic } from './static';
 import { mountTaskRoutes } from './task-routes';
 
 export const SESSION_COOKIE = 'agflow_session';
@@ -70,5 +71,6 @@ export function createApp(ctx: HubContext): App {
   mountAgentRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
   mountEventRoutes(app, ctx);
+  if (ctx.config.webDist) mountStatic(app, ctx.config.webDist);
   return app;
 }
