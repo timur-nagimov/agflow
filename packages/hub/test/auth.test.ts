@@ -75,11 +75,58 @@ describe('CLI login', () => {
     expect(pollCliLogin(ctx, code)).toEqual({ status: 'pending' });
   });
 
-  test('an approval older than the TTL has expired', () => {
+  test('an approval stores no token; the session starts when the CLI collects it', () => {
+    const { ctx, clock } = createTestContext();
+    approveCliLogin(ctx, code, 'alice', 'laptop');
+    expect(ctx.db.query('SELECT * FROM cli_logins').all()).toEqual([
+      { code, created_at: clock.t, login: 'alice', label: 'laptop' },
+    ]);
+    expect(count(ctx, 'sessions')).toBe(0);
+    const result = pollCliLogin(ctx, code);
+    if (result.status !== 'approved') throw new Error(`expected approved, got ${result.status}`);
+    expect(count(ctx, 'cli_logins')).toBe(0);
+    expect(ctx.db.query('SELECT token_hash, login, kind, label FROM sessions').all()).toEqual([
+      { token_hash: hashToken(result.token), login: 'alice', kind: 'cli', label: 'laptop' },
+    ]);
+  });
+
+  test('a code can be approved only once', () => {
+    const { ctx } = createTestContext();
+    approveCliLogin(ctx, code, 'alice', 'laptop');
+    expect(() => approveCliLogin(ctx, code, 'bob', 'desktop')).toThrow('already approved');
+    expect(pollCliLogin(ctx, code)).toMatchObject({ status: 'approved', user: 'alice' });
+    expect(count(ctx, 'sessions')).toBe(1);
+  });
+
+  test('an approval older than the TTL has expired and never became a session', () => {
     const { ctx, clock } = createTestContext();
     approveCliLogin(ctx, code, 'alice');
     clock.advance(CLI_LOGIN_TTL + 1);
     expect(pollCliLogin(ctx, code)).toEqual({ status: 'expired' });
+    expect(count(ctx, 'sessions')).toBe(0);
+  });
+
+  test('an expired approval answers expired through sweeps for another TTL', () => {
+    const { ctx, clock } = createTestContext();
+    approveCliLogin(ctx, code, 'alice');
+    clock.advance(CLI_LOGIN_TTL + 1);
+    sweepAuth(ctx);
+    expect(pollCliLogin(ctx, code)).toEqual({ status: 'expired' });
+    clock.advance(CLI_LOGIN_TTL - 2);
+    sweepAuth(ctx);
+    expect(pollCliLogin(ctx, code)).toEqual({ status: 'expired' });
+    clock.advance(1);
+    sweepAuth(ctx);
+    expect(count(ctx, 'cli_logins')).toBe(0);
+  });
+
+  test('a person removed from the allowlist before the CLI collects gets no session', () => {
+    const { ctx } = createTestContext();
+    approveCliLogin(ctx, code, 'bob');
+    ctx.config.allowedUsers = ['alice'];
+    expect(() => pollCliLogin(ctx, code)).toThrow('allowlist');
+    expect(count(ctx, 'sessions')).toBe(0);
+    expect(count(ctx, 'cli_logins')).toBe(1);
   });
 });
 

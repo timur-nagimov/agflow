@@ -121,7 +121,6 @@ CREATE TABLE cli_logins (
   code TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL,
   login TEXT NOT NULL,
-  token TEXT NOT NULL,
   label TEXT
 );
 

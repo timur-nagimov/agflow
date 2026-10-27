@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { CLI_LOGIN_TTL, sweepAuth } from '../src/auth';
 import { addAgent } from './helpers';
 import { createTestHub } from './http-helpers';
 
@@ -145,5 +146,23 @@ describe('CLI login', () => {
   test('a CLI token cannot approve CLI logins', async () => {
     const hub = createTestHub();
     expect((await hub.call('POST', '/api/cli-login/approve', { user: 'alice', via: 'cli', body: { code } })).status).toBe(403);
+  });
+
+  test('approving the same code twice is a conflict', async () => {
+    const hub = createTestHub();
+    const approve = () => hub.call('POST', '/api/cli-login/approve', { user: 'alice', via: 'web', body: { code } });
+    expect((await approve()).status).toBe(200);
+    const again = await approve();
+    expect(again.status).toBe(409);
+    expect(again.json.error).toBe('conflict');
+    expect((await hub.call('GET', `/api/cli-login/poll?code=${code}`)).json.status).toBe('approved');
+  });
+
+  test('a CLI that polls after its approval expired hears so even after a sweep', async () => {
+    const hub = createTestHub();
+    await hub.call('POST', '/api/cli-login/approve', { user: 'alice', via: 'web', body: { code } });
+    hub.clock.advance(CLI_LOGIN_TTL + 1);
+    sweepAuth(hub.ctx);
+    expect((await hub.call('GET', `/api/cli-login/poll?code=${code}`)).json).toEqual({ status: 'expired' });
   });
 });
