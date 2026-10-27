@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { sweepAuth } from './auth';
-import { backupDatabase, checkIntegrity } from './backup';
+import { type BackupKind, backupDatabase, checkIntegrity, dailyBackupDue } from './backup';
 import { loadConfig } from './config';
 import { createContext } from './context';
 import { createApp } from './http/app';
@@ -12,16 +12,18 @@ mkdirSync(dirname(dbPath), { recursive: true });
 const ctx = createContext({ dbPath, config });
 checkIntegrity(ctx);
 
-function backup(): void {
+function backup(kind: BackupKind): void {
   try {
-    console.log(`backup written to ${backupDatabase(ctx, backupDir)}`);
+    console.log(`backup written to ${backupDatabase(ctx, backupDir, kind)}`);
   } catch (error) {
-    console.error('backup failed', error);
+    console.error(`${kind} backup failed`, error);
   }
 }
 
-backup();
-setInterval(backup, 24 * 60 * 60_000);
+backup('start');
+// A hub restarted more often than every 24 hours never reaches the timer, so a start also writes a missing daily.
+if (dailyBackupDue(ctx, backupDir)) backup('daily');
+setInterval(() => backup('daily'), 24 * 60 * 60_000);
 setInterval(() => {
   try {
     sweepLeases(ctx);
