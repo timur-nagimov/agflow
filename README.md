@@ -44,7 +44,7 @@ Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sig
 
 ### GitHub sign-in
 
-Create an OAuth app under GitHub → Settings → Developer settings → OAuth Apps. Set the callback URL to `<AGFLOW_PUBLIC_URL>/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The hub reads only the person's GitHub login and keeps no GitHub token.
+Create an OAuth app under GitHub → Settings → Developer settings → OAuth Apps. Set the callback URL to `<AGFLOW_PUBLIC_URL>/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The hub asks GitHub for no scopes, reads only the person's GitHub login and keeps no GitHub token. Open the hub at `AGFLOW_PUBLIC_URL` to sign in: a short-lived cookie for that address ties each sign-in to the browser that started it.
 
 ## Development
 
