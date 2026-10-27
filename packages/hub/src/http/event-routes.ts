@@ -18,6 +18,7 @@ export function mountEventRoutes(app: App, ctx: HubContext): void {
         after: intParam(c.req.query('after')),
         limit: intParam(c.req.query('limit')),
         subject: c.req.query('subject') || undefined,
+        latest: c.req.query('latest') === '1',
       }),
     });
   });
@@ -49,6 +50,8 @@ export function mountEventRoutes(app: App, ctx: HubContext): void {
         await stream.writeSSE({ event: 'hub', id: String(event.id), data: JSON.stringify(event) });
         lastId = event.id;
       };
+      // Browsers report the connection open only once the first bytes arrive.
+      await stream.writeSSE({ event: 'ready', data: '' });
       // Page through everything stored after lastId, so a long disconnect leaves no hole before the live events.
       // send() skips ids at or below lastId, so events that were queued meanwhile are not sent twice.
       for (;;) {
