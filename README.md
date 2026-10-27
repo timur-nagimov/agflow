@@ -35,7 +35,7 @@ Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sig
 | `AGFLOW_HOST` | `127.0.0.1` with `AGFLOW_AUTH=dev`, otherwise `0.0.0.0` | Listening address; `::` accepts IPv6 as well as IPv4 |
 | `AGFLOW_PORT` | `8787` | Listening port, 1 to 65535 |
 | `AGFLOW_DB` | `data/agflow.db` | SQLite database file |
-| `AGFLOW_BACKUP_DIR` | `data/backups` | Daily snapshots; the newest 7 are kept |
+| `AGFLOW_BACKUP_DIR` | `data/backups` | Database snapshots: one a day (the newest 7 are kept) and one at every start (the newest 3 are kept) |
 | `AGFLOW_WEB_DIST` | (unset) | Folder with the built web UI |
 | `AGFLOW_LEASE_MINUTES` | `120` | How long a claim survives without agent activity |
 | `AGFLOW_REMINDER_MINUTES` | `30` | Minimum time between "you hold a task" reminders |

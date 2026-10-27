@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readdirSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -46,6 +46,11 @@ try {
   if (rebound.status !== 403 || rebound.headers.has('set-cookie')) {
     throw new Error(`dev sign-in answered a request addressed to ${host} with ${rebound.status}`);
   }
+  // A start snapshot, plus the day's daily snapshot because the folder had none yet.
+  const backups = readdirSync(join(dir, 'backups')).sort();
+  if (backups.length !== 2 || !backups[0]?.startsWith('agflow-daily-') || !backups[1]?.startsWith('agflow-start-')) {
+    throw new Error(`unexpected backups: ${backups.join(', ')}`);
+  }
   const login = await fetch(`${base}/auth/dev?user=alice`, { redirect: 'manual' });
   const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
   const goal = await fetch(`${base}/api/goal`, {
@@ -60,7 +65,7 @@ try {
   if (goal.status !== 200 || status.goalVersion !== 1 || status.project.name !== 'smoke') {
     throw new Error(`unexpected result: goal ${goal.status}, status ${JSON.stringify(status)}`);
   }
-  console.log('smoke test passed: hub started, dev sign-in worked, goal v1 saved');
+  console.log('smoke test passed: hub started, snapshots written, dev sign-in worked, goal v1 saved');
 } finally {
   hub.kill();
 }
