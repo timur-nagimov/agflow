@@ -21,7 +21,7 @@ AGFLOW_PROJECT_REPO=https://github.com/you/demo \
 bun run hub
 ```
 
-Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only.
+Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only, so with `AGFLOW_AUTH=dev` the hub listens on loopback (`127.0.0.1`) and other machines cannot reach it. Do not point `AGFLOW_HOST` at a network address in dev mode: anyone who can reach the hub could sign in as any allowed user.
 
 ## Configuration
 
@@ -31,8 +31,9 @@ Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sig
 | `AGFLOW_ALLOWED_USERS` | (required) | Comma-separated GitHub logins allowed to sign in |
 | `AGFLOW_PROJECT_NAME` | (required) | Project name shown to people and agents |
 | `AGFLOW_PROJECT_REPO` | (required) | URL of the project's git repository |
-| `AGFLOW_PUBLIC_URL` | `http://localhost:<port>` | Address people and laptops use to reach the hub |
-| `AGFLOW_PORT` | `8787` | Listening port |
+| `AGFLOW_PUBLIC_URL` | `http://localhost:<port>` | Address people and laptops use to reach the hub, an `http://` or `https://` URL; `https://` makes session cookies secure |
+| `AGFLOW_HOST` | `127.0.0.1` with `AGFLOW_AUTH=dev`, otherwise `0.0.0.0` | Listening address; `::` accepts IPv6 as well as IPv4 |
+| `AGFLOW_PORT` | `8787` | Listening port, 1 to 65535 |
 | `AGFLOW_DB` | `data/agflow.db` | SQLite database file |
 | `AGFLOW_BACKUP_DIR` | `data/backups` | Daily snapshots; the newest 7 are kept |
 | `AGFLOW_WEB_DIST` | (unset) | Folder with the built web UI |
@@ -51,5 +52,5 @@ Create an OAuth app under GitHub → Settings → Developer settings → OAuth A
 ```bash
 bun test            # all tests
 bun run typecheck   # TypeScript
-bun run smoke:hub   # start a real hub, sign in, save a goal
+bun run smoke:hub   # start a real hub, check it is off the network, sign in, save a goal
 ```

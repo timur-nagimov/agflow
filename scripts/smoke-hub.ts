@@ -1,5 +1,5 @@
 import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const dir = mkdtempSync(join(tmpdir(), 'agflow-smoke-'));
@@ -34,6 +34,12 @@ async function waitForHub(): Promise<void> {
 
 try {
   await waitForHub();
+  const lan = Object.values(networkInterfaces()).flat().find((info) => info?.family === 'IPv4' && !info.internal);
+  if (lan) {
+    const signal = AbortSignal.timeout(2000);
+    const exposed = await fetch(`http://${lan.address}:${port}/api/auth-config`, { signal }).then(() => true, () => false);
+    if (exposed) throw new Error(`dev sign-in is reachable from the network at ${lan.address}`);
+  }
   const login = await fetch(`${base}/auth/dev?user=alice`, { redirect: 'manual' });
   const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
   const goal = await fetch(`${base}/api/goal`, {
