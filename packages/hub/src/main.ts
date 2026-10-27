@@ -7,7 +7,7 @@ import { createContext } from './context';
 import { createApp } from './http/app';
 import { sweepLeases } from './tasks';
 
-const { config, port, dbPath, backupDir } = loadConfig(process.env);
+const { config, host, port, dbPath, backupDir } = loadConfig(process.env);
 mkdirSync(dirname(dbPath), { recursive: true });
 const ctx = createContext({ dbPath, config });
 checkIntegrity(ctx);
@@ -31,5 +31,5 @@ setInterval(() => {
   }
 }, 30_000);
 
-const server = Bun.serve({ port, fetch: createApp(ctx).fetch, idleTimeout: 120 });
-console.log(`agflow hub for "${config.projectName}" on ${config.publicUrl} (port ${server.port}, sign-in: ${config.auth})`);
+const server = Bun.serve({ hostname: host, port, fetch: createApp(ctx).fetch, idleTimeout: 120 });
+console.log(`agflow hub for "${config.projectName}" on ${config.publicUrl} (listening on ${server.url.host}, sign-in: ${config.auth})`);
