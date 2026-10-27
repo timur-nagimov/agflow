@@ -5,6 +5,7 @@ import { hookCommand } from './hooks';
 import { type Io, stdio } from './io';
 import { joinCommand, leaveCommand } from './join';
 import { loginCommand, logoutCommand, statusCommand } from './login';
+import { mcpCommand } from './mcp/server';
 
 export const HELP = `agflow ${AGFLOW_VERSION}
 
@@ -30,6 +31,7 @@ const commands: Record<string, Command> = {
   join: joinCommand,
   leave: leaveCommand,
   hook: hookCommand,
+  mcp: mcpCommand,
 };
 
 export async function main(argv: string[], io: Io = stdio): Promise<number> {
