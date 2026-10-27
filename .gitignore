@@ -9,3 +9,4 @@ data/
 coverage/
 .env
 .env.*
+*.bun-build
