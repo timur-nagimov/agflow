@@ -8,7 +8,8 @@
     "build:web": "bun run --cwd packages/web build",
     "test": "bun test",
     "hub": "bun packages/hub/src/main.ts",
-    "smoke:hub": "bun scripts/smoke-hub.ts"
+    "smoke:hub": "bun scripts/smoke-hub.ts",
+    "demo": "bun scripts/demo-hub.ts"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",
