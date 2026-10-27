@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { type AgentRole, type Task, type TaskStatus, TargetSchema, TaskIdSchema, formatMessages } from '@agflow/core';
+import { type AgentRole, NewTaskSchema, type Task, type TaskStatus, TargetSchema, TaskIdSchema, TaskPatchSchema, formatMessages } from '@agflow/core';
 import { z } from 'zod';
 import { repoRoot } from '../git';
 import type { HubClient } from '../hub-client';
@@ -257,4 +257,107 @@ export const gitTools: ToolDef[] = [
   ),
 ];
 
-export const allTools: ToolDef[] = [...sharedTools, ...workerTools, ...gitTools];
+export const leadTools: ToolDef[] = [
+  defineTool(
+    'get_status',
+    'Project status: goal version, lead, task counts, active agents and recent messages to people.',
+    {},
+    async (_args, ctx) => {
+      const status = await hub(ctx).status();
+      const counts = Object.entries(status.counts).map(([state, n]) => `${state} ${n}`).join(' · ') || 'none';
+      return lines([
+        `Project: ${status.project.name}${status.project.paused ? ' (PAUSED)' : ''}`,
+        `Goal: v${status.goalVersion}`,
+        `Lead: ${status.lead ? `${status.lead.id} (${status.lead.user})` : 'none'}`,
+        `Tasks: ${counts}`,
+        `Active agents: ${status.activeAgents}`,
+        status.humansInbox.length > 0 && `Messages to people:\n${formatMessages(status.humansInbox.slice(0, 5))}`,
+      ]);
+    },
+  ),
+  defineTool(
+    'create_tasks',
+    'Lead: create tasks from the goal. Each needs a title, an objective and acceptance criteria. Use "#1" in dependsOn to refer to an earlier task in the same call.',
+    { tasks: z.array(NewTaskSchema).min(1).max(20) },
+    async ({ tasks }, ctx) => {
+      const created = await asAgent(ctx).createTasks(tasks);
+      return `Created:\n${created.tasks.map(taskLine).join('\n')}`;
+    },
+  ),
+  defineTool(
+    'update_task',
+    'Lead: change fields of an open task (title, objective, why, acceptance, checks, ownedPaths, dependsOn, priority, nonGoals, kind).',
+    { id: TaskIdSchema, patch: TaskPatchSchema },
+    async ({ id, patch }, ctx) => {
+      const { task } = await asAgent(ctx).updateTask(id, patch);
+      return `Updated ${task.id}: ${taskLine(task)}`;
+    },
+  ),
+  defineTool(
+    'cancel_task',
+    'Lead: cancel a task, giving the reason. Its holder is told to stop.',
+    { id: TaskIdSchema, reason: z.string().min(1).max(4000) },
+    async ({ id, reason }, ctx) => {
+      await asAgent(ctx).cancel(id, reason);
+      return `Cancelled ${id}.`;
+    },
+  ),
+  defineTool(
+    'accept_task',
+    'Lead: accept a submitted task.',
+    { id: TaskIdSchema, note: z.string().min(1).max(4000).optional() },
+    async ({ id, note }, ctx) => {
+      await asAgent(ctx).accept(id, note);
+      return `Accepted ${id}.`;
+    },
+  ),
+  defineTool(
+    'reject_task',
+    'Lead: reject a submitted task with concrete feedback. It goes back to its author when possible.',
+    { id: TaskIdSchema, feedback: z.string().min(1).max(8000) },
+    async ({ id, feedback }, ctx) => {
+      const { task } = await asAgent(ctx).reject(id, feedback);
+      return task.status === 'claimed' ? `Rejected ${id}; it is claimed by ${task.assignee} with your feedback.` : `Rejected ${id}; it is ready for anyone.`;
+    },
+  ),
+  defineTool(
+    'unblock_task',
+    'Lead: return a blocked task to the pool once its blocker is resolved.',
+    { id: TaskIdSchema, note: z.string().min(1).max(4000).optional() },
+    async ({ id, note }, ctx) => {
+      const { task } = await asAgent(ctx).unblock(id, note);
+      return task.status === 'ready' ? `${id} is ready.` : `${id} is still blocked: ${task.blockedReason ?? 'unknown reason'}.`;
+    },
+  ),
+  defineTool(
+    'mark_merged',
+    'Lead: record that an accepted task was merged, optionally with the merge commit.',
+    { id: TaskIdSchema, sha: z.string().regex(/^[0-9a-f]{7,40}$/).optional() },
+    async ({ id, sha }, ctx) => {
+      await asAgent(ctx).markMerged(id, sha);
+      return `${id} is merged${sha ? ` (${sha})` : ''}.`;
+    },
+  ),
+  defineTool(
+    'add_goal_note',
+    'Lead: record how you interpret the goal. People see the note next to the goal.',
+    { text: z.string().min(1).max(4000) },
+    async ({ text }, ctx) => {
+      const note = await asAgent(ctx).addGoalNote(text);
+      return `Note added to goal v${note.goalVersion}.`;
+    },
+  ),
+  defineTool(
+    'get_events',
+    'Recent project events, oldest first, after the given event id.',
+    { after: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(200).optional() },
+    async ({ after, limit }, ctx) => {
+      const { events } = await hub(ctx).events(after ?? 0, limit ?? 50);
+      return events.length > 0
+        ? events.map((event) => `#${event.id} ${new Date(event.ts).toISOString()} ${event.type}${event.subject ? ` ${event.subject}` : ''} by ${event.actor}`).join('\n')
+        : 'No events.';
+    },
+  ),
+];
+
+export const allTools: ToolDef[] = [...sharedTools, ...workerTools, ...gitTools, ...leadTools];
