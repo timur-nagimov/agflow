@@ -1,3 +1,6 @@
+import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AgentRole, Vendor } from '@agflow/core';
 import { startLiveSession } from '@agflow/hub/src/agents';
 import { createSession } from '@agflow/hub/src/auth';
@@ -69,4 +72,26 @@ export function hubFixture(overrides: Partial<HubConfig> = {}): HubFixture {
 /** Extracts the hello code from a brief. */
 export function helloCodeIn(brief: string): string {
   return brief.match(/code "([A-Z2-9]{6})"/)?.[1] ?? '';
+}
+
+export function run(cmd: string[], cwd: string): string {
+  const result = Bun.spawnSync(cmd, { cwd, stdout: 'pipe', stderr: 'pipe' });
+  if (result.exitCode !== 0) throw new Error(`${cmd.join(' ')} failed: ${result.stderr.toString()}`);
+  return result.stdout.toString().trim();
+}
+
+/** A bare "origin" repository and a clone with one commit on main, pushed. */
+export function tempRepo(): { dir: string; origin: string; root: string } {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-git-')));
+  const origin = join(dir, 'origin.git');
+  const root = join(dir, 'work');
+  run(['git', 'init', '--quiet', '--bare', '-b', 'main', origin], dir);
+  run(['git', 'clone', '--quiet', origin, root], dir);
+  run(['git', 'config', 'user.email', 'dev@example.com'], root);
+  run(['git', 'config', 'user.name', 'Dev'], root);
+  writeFileSync(join(root, 'README.md'), '# demo\n');
+  run(['git', 'add', 'README.md'], root);
+  run(['git', 'commit', '--quiet', '-m', 'init'], root);
+  run(['git', 'push', '--quiet', '-u', 'origin', 'main'], root);
+  return { dir, origin, root };
 }
