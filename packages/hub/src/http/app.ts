@@ -6,6 +6,7 @@ import { verifySession } from '../auth';
 import type { HubContext } from '../context';
 import { HubError, forbidden } from '../errors';
 import { mountAuthRoutes } from './auth-routes';
+import { mountGithubRoutes } from './github-routes';
 
 export const SESSION_COOKIE = 'agflow_session';
 
@@ -58,5 +59,6 @@ export function createApp(ctx: HubContext): App {
     await next();
   });
   mountAuthRoutes(app, ctx);
+  mountGithubRoutes(app, ctx);
   return app;
 }
