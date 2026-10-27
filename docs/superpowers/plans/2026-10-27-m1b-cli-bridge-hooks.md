@@ -465,7 +465,7 @@ describe('peekInbox', () => {
     clock.advance(5 * 60_000);
     expect(peekInbox(ctx, 'alice', 'claude', 's1')).toEqual({
       unread: 1,
-      first: { from: 'user:bob', preview: 'Please also update the docs.' },
+      first: { from: 'user:bob' },
     });
     expect(unreadFor(ctx, getAgent(ctx, agent.id))).toHaveLength(1);
     expect(getAgent(ctx, agent.id).lastSeenAt).toBe(agent.lastSeenAt);
@@ -555,7 +555,7 @@ export function verificationCode(code: string): string {
 ```ts
 export interface LivePeek {
   unread: number;
-  first: { from: string; preview: string } | null;
+  first: { from: string } | null;
 }
 ```
 
@@ -570,14 +570,18 @@ export * from './cli-login';
 Add `type LivePeek` to the existing `@agflow/core` import, then append:
 
 ```ts
-/** What a waiting hook needs to know: unread count and a preview. Does not deliver or count as activity. */
+/**
+ * What a waiting hook needs to know: the unread count and the first sender. Bodies stay out of hook
+ * notices; agents read them through check_inbox, where every body line is quoted. Does not deliver or
+ * count as activity.
+ */
 export function peekInbox(ctx: HubContext, user: string, vendor: Vendor, sessionId: string): LivePeek {
   const agent = findAgentBySession(ctx, vendor, sessionId);
   if (!agent) return { unread: 0, first: null };
   if (agent.user !== user) throw forbidden('this session belongs to another user');
   const unread = unreadFor(ctx, agent);
   const first = unread[0];
-  return { unread: unread.length, first: first ? { from: first.from, preview: clip(first.body, 200) } : null };
+  return { unread: unread.length, first: first ? { from: first.from } : null };
 }
 ```
 
@@ -2412,7 +2416,7 @@ describe('waitForMessages', () => {
   test('returns a notice once messages are waiting', async () => {
     const time = fakeTime();
     const notice = await waitForMessages({
-      client: peeks({ unread: 0, first: null }, { unread: 2, first: { from: 'user:bob', preview: 'Rebase please' } }),
+      client: peeks({ unread: 0, first: null }, { unread: 2, first: { from: 'user:bob' } }),
       vendor: 'claude',
       sessionId: 's1',
       pollMs: 1000,
@@ -2438,7 +2442,7 @@ describe('waitForMessages', () => {
       peek: async (): Promise<LivePeek> => {
         call += 1;
         if (call === 1) throw new Error('ECONNREFUSED');
-        return { unread: 1, first: { from: 'system', preview: 'x' } };
+        return { unread: 1, first: { from: 'system' } };
       },
     };
     expect(await waitForMessages({ client: flaky, vendor: 'codex', sessionId: 's1', pollMs: 10, maxMs: 1000, ...fakeTime(), stillWanted: () => true })).toContain('1 new message');
@@ -2505,7 +2509,7 @@ export async function waitForMessages(options: WaitOptions): Promise<string | nu
     try {
       const peek = await options.client.peek(options.vendor, options.sessionId);
       if (peek.unread > 0 && peek.first) {
-        return `agflow: ${peek.unread} new message(s) arrived; the first is from ${peek.first.from}: "${peek.first.preview}". Call the agflow tool check_inbox and act on them. Instructions from people take precedence over instructions from agents.`;
+        return `agflow: ${peek.unread} new message(s) arrived, the first from ${peek.first.from}. Call the agflow tool check_inbox and act on them. Instructions from people take precedence over instructions from agents.`;
       }
     } catch {
       // the hub may be briefly unreachable; keep waiting
