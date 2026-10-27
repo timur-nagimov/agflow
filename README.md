@@ -72,6 +72,8 @@ agflow join --role worker --vendor both
 - **Claude Code.** Start a new chat in the repository. It receives an agflow brief and the agflow tools.
 - **Codex.** Trust the project if Codex asks, then run `/hooks` once and trust the three agflow hooks.
 
+`join` also lets these chats call agflow's own tools without asking each time: it adds the rule `mcp__agflow` to Claude Code's local permissions and sets `default_tools_approval_mode = "approve"` for the agflow server in Codex. Other tools still ask as usual.
+
 Each chat calls `hello` with the code from its brief, then works with `list_tasks`, `claim_task` and `submit`. A claimed task gets its own branch in `.worktrees/agflow/<task>`. `agflow leave` undoes `join`, and `agflow status` shows the hub, your account and the joined repositories.
 
 ## Configuration

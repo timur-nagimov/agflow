@@ -63,10 +63,15 @@ export function writeJsonFile(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-/** Writes the settings back without agflow's hooks, deleting the file if nothing else is left in it. */
-export function stripAgflowHooksFile(path: string): void {
+type Settings = Record<string, unknown>;
+
+/**
+ * Writes the settings back without agflow's hooks, and without whatever else `strip` takes out,
+ * deleting the file if nothing else is left in it.
+ */
+export function stripAgflowHooksFile(path: string, strip: (settings: Settings) => Settings = (settings) => settings): void {
   if (!existsSync(path)) return;
-  const settings = readJsonFile(path);
+  const settings = strip(readJsonFile(path));
   const hooks = withoutAgflowHooks(settings.hooks as HooksConfig | undefined);
   const next: Record<string, unknown> = { ...settings };
   if (Object.keys(hooks).length > 0) next.hooks = hooks;
@@ -80,6 +85,31 @@ export function stripAgflowHooksFile(path: string): void {
 // ---------------------------------------------------------------------------
 
 export const CLAUDE_SETTINGS = '.claude/settings.local.json';
+
+/**
+ * The permission rule for every tool of the agflow MCP server. Joining a repository is the person's
+ * consent, so a chat uses agflow's own tools without asking each time.
+ */
+export const CLAUDE_TOOLS_RULE = 'mcp__agflow';
+
+function withAgflowPermission(settings: Settings): Settings {
+  const permissions = (settings.permissions ?? {}) as Settings;
+  const allow = Array.isArray(permissions.allow) ? (permissions.allow as string[]) : [];
+  if (allow.includes(CLAUDE_TOOLS_RULE)) return settings;
+  return { ...settings, permissions: { ...permissions, allow: [...allow, CLAUDE_TOOLS_RULE] } };
+}
+
+function withoutAgflowPermission(settings: Settings): Settings {
+  const permissions = settings.permissions as Settings | undefined;
+  if (!permissions || !Array.isArray(permissions.allow)) return settings;
+  const allow = (permissions.allow as string[]).filter((rule) => rule !== CLAUDE_TOOLS_RULE);
+  const rest: Settings = { ...permissions };
+  if (allow.length > 0) rest.allow = allow;
+  else delete rest.allow;
+  const next: Settings = { ...settings, permissions: rest };
+  if (Object.keys(rest).length === 0) delete next.permissions;
+  return next;
+}
 
 export function claudeHooks(self: SelfCommand, role: AgentRole): HooksConfig {
   const handler = (event: string, extra: Record<string, unknown> = {}): HookHandler => ({
@@ -112,13 +142,13 @@ export function joinClaude(root: string, self: SelfCommand, role: AgentRole, run
   const path = join(root, CLAUDE_SETTINGS);
   const settings = readJsonFile(path);
   const hooks = addHookGroups(withoutAgflowHooks(settings.hooks as HooksConfig | undefined), claudeHooks(self, role));
-  writeJsonFile(path, { ...settings, hooks });
+  writeJsonFile(path, withAgflowPermission({ ...settings, hooks }));
   addExclude(root, CLAUDE_SETTINGS);
 }
 
 export function leaveClaude(root: string, run: Runner): void {
   run(['claude', 'mcp', 'remove', '--scope', 'local', 'agflow'], root);
-  stripAgflowHooksFile(join(root, CLAUDE_SETTINGS));
+  stripAgflowHooksFile(join(root, CLAUDE_SETTINGS), withoutAgflowPermission);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +170,11 @@ export function codexMcpBlock(self: SelfCommand, root: string): string {
     `command = ${tomlString(self.command)}`,
     `args = [${args.map(tomlString).join(', ')}]`,
     `cwd = ${tomlString(root)}`,
+    // Joining is the person's consent, so agflow's own tools run without asking each time. Without it,
+    // `codex exec` cancels every agflow call.
+    'default_tools_approval_mode = "approve"',
+    // Codex starts MCP servers with a clean environment; a custom config folder must reach the bridge.
+    'env_vars = ["AGFLOW_CONFIG_DIR"]',
     BLOCK_END,
   ].join('\n');
 }
