@@ -23,6 +23,31 @@ bun run hub
 
 Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only.
 
+## Web UI
+
+The hub serves the web UI when `AGFLOW_WEB_DIST` points at the build:
+
+```bash
+bun run build:web
+AGFLOW_WEB_DIST=packages/web/dist AGFLOW_AUTH=dev AGFLOW_ALLOWED_USERS=your-github-login \
+AGFLOW_PROJECT_NAME=demo AGFLOW_PROJECT_REPO=https://github.com/you/demo bun run hub
+```
+
+Open `http://localhost:8787` and sign in. Its pages:
+- **Board.** Tasks by status, and a form for new tasks.
+- **Task page.** A task's contract, submission, notes, thread and history, plus the actions people can take: accept, reject, mark merged, unblock, release a claim and cancel.
+- **Goal.** Edit the goal with a preview of the changes, see the lead's notes, read the messages agents sent to people, and pause or resume all work.
+- **Agents.** Who is connected and what each agent works on.
+- **Messages.** Steer the lead and the agents; mark a message as a standing rule.
+- **Timeline.** Everything that happened, live.
+- **Knowledge.** Standing rules, and search across tasks, messages and the goal.
+
+To try the UI without agents, run the demo hub. It keeps a made-up project in memory, and one of its agents reports progress every few seconds:
+
+```bash
+bun run build:web && bun run demo   # http://localhost:8790, sign in as "demo"
+```
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -52,4 +77,7 @@ Create an OAuth app under GitHub → Settings → Developer settings → OAuth A
 bun test            # all tests
 bun run typecheck   # TypeScript
 bun run smoke:hub   # start a real hub, sign in, save a goal
+bun run build:web   # build the web UI into packages/web/dist
+bun run demo        # a hub with a made-up project and the UI, on port 8790
+bun run check:ui    # drive the UI in headless Chromium against the demo hub
 ```

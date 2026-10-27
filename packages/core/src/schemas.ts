@@ -85,6 +85,9 @@ const OwnedPathSchema = z
     'expected a repo-relative glob without a leading "/" or "!", a ".." segment, "\\" or "|" (write alternatives as {a,b})',
   );
 
+/** Shown to the lead in its task tools; the web board sorts the same way. */
+export const PRIORITY_HELP = '0 is the most urgent, 9 the least';
+
 const contractFields = {
   title: z.string().min(1).max(200).refine(isSingleLine, SINGLE_LINE),
   kind: TaskKindSchema,
@@ -95,7 +98,7 @@ const contractFields = {
   checks: z.array(TaskCheckSchema).max(20),
   ownedPaths: z.array(OwnedPathSchema).max(50),
   dependsOn: z.array(TaskIdSchema).max(50),
-  priority: z.number().int().min(0).max(9),
+  priority: z.number().int().min(0).max(9).describe(PRIORITY_HELP),
 };
 
 export const NewTaskSchema = z.strictObject({
