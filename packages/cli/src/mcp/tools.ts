@@ -1,9 +1,19 @@
 import { existsSync } from 'node:fs';
-import { type AgentRole, NewTaskSchema, type Task, type TaskStatus, TargetSchema, TaskIdSchema, TaskPatchSchema, formatMessages } from '@agflow/core';
+import {
+  type AgentRole,
+  NewTaskSchema,
+  type Task,
+  type TaskStatus,
+  TargetSchema,
+  TaskIdSchema,
+  TaskPatchSchema,
+  formatMessages,
+  quoteLines,
+} from '@agflow/core';
 import { z } from 'zod';
 import { repoRoot } from '../git';
 import type { HubClient } from '../hub-client';
-import { prepareTaskWorktree, pushTaskBranch, removeTaskWorktree, taskBranchName, taskWorktreePath } from './task-git';
+import { isTaskBranch, prepareTaskWorktree, pushTaskBranch, removeTaskWorktree, taskBranchName, taskWorktreePath } from './task-git';
 
 export interface ToolState {
   agentId: string | null;
@@ -48,10 +58,36 @@ export function asAgent(ctx: ToolContext): HubClient {
   return client;
 }
 
+/** Control characters and the Unicode line and paragraph separators: whatever ends a line or has no place in one. */
+const LINE_BREAKS = /[\p{Cc}\p{Zl}\p{Zp}]+/gu;
+const SPANS_LINES = /[\p{Cc}\p{Zl}\p{Zp}]/u;
+
+/** At most `max` characters of `text` on a single line. Line breaks and other control characters become spaces. */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(LINE_BREAKS, ' ').trim();
+  const chars = Array.from(flat);
+  return chars.length <= max ? flat : `${chars.slice(0, max - 1).join('')}…`;
+}
+
+/**
+ * Text that a person or an agent wrote, after a label of ours. A value of one line stays on the label's
+ * line. A longer one goes below it, every line quoted, so that no line of it can pose as a heading, a
+ * bullet or a message header of the hub's (spec section 12; the hub's brief does the same).
+ */
+function labelled(label: string, text: string): string {
+  return SPANS_LINES.test(text) ? `${label}\n${quoteLines(text)}` : `${label} ${text}`;
+}
+
+const acceptanceLines = (task: Task): string =>
+  task.acceptance.map((criterion) => labelled(`- ${criterion.id}:`, criterion.assertion)).join('\n');
+
+const BLOCKED_REASON_LIMIT = 150;
+
 export function taskLine(task: Task): string {
   const owner = task.assignee ? ` · ${task.assignee}` : '';
-  const blocked = task.status === 'blocked' && task.blockedReason ? ` · ${task.blockedReason}` : '';
-  return `${task.id} [${task.status}] p${task.priority} ${task.title}${owner}${blocked}`;
+  // An agent writes the reason, and it may run over several lines. One clipped line keeps it on its task's line.
+  const reason = task.status === 'blocked' && task.blockedReason ? oneLine(task.blockedReason, BLOCKED_REASON_LIMIT) : '';
+  return `${task.id} [${task.status}] p${task.priority} ${task.title}${owner}${reason ? ` · ${reason}` : ''}`;
 }
 
 export const lines = (parts: Array<string | false | null | undefined | 0>) => parts.filter(Boolean).join('\n');
@@ -83,7 +119,7 @@ export const sharedTools: ToolDef[] = [
     return lines([
       `Goal v${current.version} (by ${current.author}):`,
       current.text,
-      notes.length > 0 && `\nInterpretation notes:\n${notes.map((note) => `- ${note.text} (${note.author})`).join('\n')}`,
+      notes.length > 0 && `\nInterpretation notes:\n${notes.map((note) => labelled(`- Note by ${note.author}:`, note.text)).join('\n')}`,
     ]);
   }),
   defineTool(
@@ -100,15 +136,15 @@ export const sharedTools: ToolDef[] = [
     const task = detail.task;
     return lines([
       taskLine(task),
-      `Objective: ${task.objective}`,
-      task.why && `Why: ${task.why}`,
-      `Acceptance criteria:\n${task.acceptance.map((criterion) => `- ${criterion.id}: ${criterion.assertion}`).join('\n')}`,
+      labelled('Objective:', task.objective),
+      task.why && labelled('Why:', task.why),
+      `Acceptance criteria:\n${acceptanceLines(task)}`,
       task.ownedPaths.length > 0 && `Owned paths: ${task.ownedPaths.join(', ')}`,
       task.dependsOn.length > 0 && `Depends on: ${task.dependsOn.join(', ')}`,
       task.branch && `Branch: ${task.branch}`,
-      task.feedback && `Latest review feedback: ${task.feedback}`,
-      task.submission && `Submission: ${task.submission.summary}`,
-      detail.notes.length > 0 && `Notes:\n${detail.notes.map((note) => `- [${note.kind}] ${note.body}`).join('\n')}`,
+      task.feedback && labelled('Latest review feedback:', task.feedback),
+      task.submission && labelled('Submission:', task.submission.summary),
+      detail.notes.length > 0 && `Notes:\n${detail.notes.map((note) => labelled(`- [${note.kind}]`, note.body)).join('\n')}`,
       detail.messages.length > 0 && `Recent messages:\n${formatMessages(detail.messages.slice(0, 10).reverse())}`,
     ]);
   }),
@@ -217,7 +253,10 @@ export const gitTools: ToolDef[] = [
       const root = repoRoot(ctx.cwd);
       if (!root) throw new ToolError(`${ctx.cwd} is not inside a git repository, so agflow cannot create the task branch.`);
       const { task } = await client.task(id);
-      const branch = task.branch ?? taskBranchName(task.id, task.title);
+      // The hub keeps the branch name a claim last gave it, and any agent can give it any valid name (say
+      // "production"). Only a name inside this task's own namespace is used; any other is replaced, and the
+      // claim below stores the replacement on the hub.
+      const branch = isTaskBranch(task.id, task.branch) ? task.branch : taskBranchName(task.id, task.title);
       const worktree = prepareTaskWorktree(root, task.id, branch);
       let claimed: Task;
       try {
@@ -229,10 +268,10 @@ export const gitTools: ToolDef[] = [
       return lines([
         `You hold ${claimed.id}: ${claimed.title}`,
         `Work only inside ${worktree.path} (branch ${branch}). Commit there; submit pushes the branch.`,
-        `Objective: ${claimed.objective}`,
-        `Acceptance criteria:\n${claimed.acceptance.map((criterion) => `- ${criterion.id}: ${criterion.assertion}`).join('\n')}`,
+        labelled('Objective:', claimed.objective),
+        `Acceptance criteria:\n${acceptanceLines(claimed)}`,
         claimed.ownedPaths.length > 0 && `Change only: ${claimed.ownedPaths.join(', ')}`,
-        claimed.feedback && `Latest review feedback: ${claimed.feedback}`,
+        claimed.feedback && labelled('Latest review feedback:', claimed.feedback),
       ]);
     },
   ),
@@ -249,7 +288,7 @@ export const gitTools: ToolDef[] = [
       const { task } = await client.task(task_id);
       const root = repoRoot(ctx.cwd);
       const worktree = root ? taskWorktreePath(root, task_id) : null;
-      const headSha = worktree && task.branch && existsSync(worktree) ? pushTaskBranch(worktree, task.branch) : undefined;
+      const headSha = worktree && task.branch && existsSync(worktree) ? pushTaskBranch(worktree, task.id, task.branch) : undefined;
       const submitted = (await client.submit(task_id, { summary, evidence: evidence ?? [], branch: task.branch ?? undefined, headSha })).task;
       const where = headSha ? ` at ${headSha.slice(0, 7)} on ${task.branch}` : '';
       return `${submitted.id} is ${submitted.status}${where}. The lead will review it; you may claim another task.`;
