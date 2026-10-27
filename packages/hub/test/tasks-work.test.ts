@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { getAgent, touchAgent } from '../src/agents';
+import { ACTIVE_MS, getAgent, touchAgent } from '../src/agents';
 import { HubError } from '../src/errors';
 import { listEvents } from '../src/events';
 import { listMessages } from '../src/messages';
@@ -13,6 +13,7 @@ import {
   getTask,
   getTaskDetail,
   listTaskNotes,
+  rejectTask,
   releaseTask,
   reportProgress,
   resumeClaim,
@@ -65,6 +66,28 @@ describe('claiming', () => {
     expect(claimTask(ctx, c.id, second).status).toBe('claimed');
   });
 
+  for (const outcome of ['accepted', 'rejected', 'cancelled'] as const) {
+    test(`work waiting for review keeps its owned paths until it is ${outcome}`, () => {
+      const { ctx, clock } = createTestContext();
+      const author = addAgent(ctx);
+      const [a, b] = createTasks(
+        ctx,
+        [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['src/auth/login.ts'] })],
+        'user:alice',
+      );
+      claimTask(ctx, a.id, author);
+      submitTask(ctx, a.id, author, { summary: 'Done.', evidence: [] });
+      // The author has left, so rejected work returns to the pool instead of to them.
+      clock.advance(ACTIVE_MS + 1);
+      const other = addAgent(ctx, 'bob');
+      expect(() => claimTask(ctx, b.id, other)).toThrow(`${b.id} owns paths that overlap ${a.id}, which is waiting for review`);
+      if (outcome === 'accepted') acceptTask(ctx, a.id, 'user:alice');
+      if (outcome === 'rejected') rejectTask(ctx, a.id, 'user:alice', 'Redo.');
+      if (outcome === 'cancelled') cancelTask(ctx, a.id, 'Not needed.', 'user:alice');
+      expect(claimTask(ctx, b.id, other).status).toBe('claimed');
+    });
+  }
+
   test('a task with unmet dependencies is moved to blocked instead of being claimed', () => {
     const { ctx } = createTestContext();
     const first = addAgent(ctx);
@@ -87,6 +110,73 @@ describe('claiming', () => {
     submitTask(ctx, a.id, second, { summary: 'Done.', evidence: [] });
     acceptTask(ctx, a.id, 'user:alice');
     expect(claimTask(ctx, b.id, first).status).toBe('claimed');
+  });
+});
+
+describe('amending a held task', () => {
+  test('the holder is told which parts of the contract changed', () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [task] = createTasks(ctx, [newTask({ title: 'Parser' })], 'user:alice');
+    updateTask(ctx, task.id, { title: 'JSON parser' }, 'user:alice');
+    claimTask(ctx, task.id, agent);
+    // A patch that changes nothing sends nothing, and unchanged fields are left out.
+    updateTask(ctx, task.id, { priority: 5 }, 'agent:A-9');
+    updateTask(ctx, task.id, { objective: 'Parse JSON and YAML', priority: 5, ownedPaths: ['src/parser/**'] }, 'agent:A-9');
+    const notices = listMessages(ctx, { target: `agent:${agent.id}` });
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ from: 'system', taskId: task.id });
+    expect(notices[0]?.body).toBe(
+      [
+        `agent:A-9 amended ${task.id}, which you hold. Changed: objective, ownedPaths.`,
+        'Call get_task to read the new contract and follow it from now on.',
+      ].join('\n'),
+    );
+  });
+
+  test('a held task cannot gain owned paths that overlap another held task', () => {
+    const { ctx } = createTestContext();
+    const first = addAgent(ctx);
+    const second = addAgent(ctx, 'bob');
+    const third = addAgent(ctx, 'bob');
+    const [a, b, c] = createTasks(
+      ctx,
+      [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['docs/**'] }), newTask({ ownedPaths: ['src/billing/**'] })],
+      'user:alice',
+    );
+    claimTask(ctx, a.id, first);
+    claimTask(ctx, b.id, second);
+    expect(() => updateTask(ctx, b.id, { ownedPaths: ['docs/**', 'src/auth/login.ts'] }, 'user:alice')).toThrow(
+      `${b.id} would own paths that overlap ${a.id}, which ${first.id} is working on`,
+    );
+    expect(getTask(ctx, b.id).ownedPaths).toEqual(['docs/**']);
+    expect(listMessages(ctx, { target: `agent:${second.id}` })).toEqual([]);
+    // Nobody holds c yet, so b may take its paths; it is c's claim that is refused.
+    expect(updateTask(ctx, b.id, { ownedPaths: ['docs/**', 'src/billing/**'] }, 'user:alice').ownedPaths).toEqual([
+      'docs/**',
+      'src/billing/**',
+    ]);
+    expect(() => claimTask(ctx, c.id, third)).toThrow(`overlap ${b.id}`);
+  });
+
+  test('only the paths a held task gains are checked, against work waiting for review too', () => {
+    const { ctx } = createTestContext();
+    const first = addAgent(ctx);
+    const second = addAgent(ctx, 'bob');
+    const [a, b] = createTasks(ctx, [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['docs/**'] })], 'user:alice');
+    claimTask(ctx, a.id, first);
+    claimTask(ctx, b.id, second);
+    submitTask(ctx, b.id, second, { summary: 'Done.', evidence: [] });
+    // Nobody works on b during its review, so its paths may change, here into a's.
+    updateTask(ctx, b.id, { ownedPaths: ['docs/**', 'src/auth/README.md'] }, 'user:alice');
+    expect(() => updateTask(ctx, a.id, { ownedPaths: ['src/auth/**', 'docs/auth.md'] }, 'user:alice')).toThrow(
+      `${a.id} would own paths that overlap ${b.id}, which is waiting for review`,
+    );
+    // The overlap that is already there does not stop a change that adds no new one.
+    expect(updateTask(ctx, a.id, { ownedPaths: ['src/auth/**', 'tests/auth/**'] }, 'user:alice').ownedPaths).toEqual([
+      'src/auth/**',
+      'tests/auth/**',
+    ]);
   });
 });
 

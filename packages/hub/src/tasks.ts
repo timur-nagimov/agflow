@@ -350,6 +350,13 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
       if (reaches(ctx, dependency, id)) throw badRequest(`depending on ${dependency} would create a dependency cycle`);
     }
     const contract: TaskContract = { ...contractOf(task), ...patch };
+    if (isHeld(task.status)) {
+      // Decision 8 also covers paths a held task gains. Only the added ones are checked, so an overlap
+      // that is already there does not block an unrelated change.
+      const added = contract.ownedPaths.filter((path) => !task.ownedPaths.includes(path));
+      const clash = overlappingHeldTask(ctx, { ...task, ownedPaths: added });
+      if (clash) throw conflict(`${id} would own paths that overlap ${holding(clash)}`);
+    }
     writeTask(ctx, id, { contract });
     emit({ type: 'task.updated', actor, subject: id, data: { fields: Object.keys(patch) } });
     const fresh = getTask(ctx, id);
@@ -365,6 +372,17 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
       } else if (waiting.length > 0) {
         writeTask(ctx, id, { blockedReason: dependencyReason(ctx, waiting) });
       }
+    }
+    const changed = (Object.keys(patch) as (keyof TaskContract)[]).filter(
+      (field) => JSON.stringify(contract[field]) !== JSON.stringify(task[field]),
+    );
+    if (isHeld(task.status) && task.assignee && changed.length > 0) {
+      insertMessage(ctx, emit, {
+        from: 'system',
+        to: `agent:${task.assignee}`,
+        taskId: id,
+        body: `${actor} amended ${id}, which you hold. Changed: ${changed.join(', ')}.\nCall get_task to read the new contract and follow it from now on.`,
+      });
     }
     return getTask(ctx, id);
   });
@@ -423,14 +441,27 @@ function heldTaskOf(ctx: HubContext, agentId: string): Task | null {
   return row ? rowToTask(row) : null;
 }
 
+/**
+ * Decision 8, owned paths: a task cannot be claimed, sent back to its author or given more paths while
+ * it is held, if another task whose owned paths overlap it is held or waiting for review. Work waiting
+ * for review keeps its paths until it is accepted, rejected or cancelled, because a second branch on
+ * the same paths would conflict with it. The overlap test is conservative: it may block a pair that a
+ * full glob engine would allow, never the reverse.
+ */
+const PATH_HOLDERS: TaskStatus[] = ['claimed', 'working', 'submitted', 'checking', 'reviewing'];
+
 function overlappingHeldTask(ctx: HubContext, task: Task): Task | null {
   if (task.ownedPaths.length === 0) return null;
   return (
-    listTasks(ctx, { status: ['claimed', 'working'] }).find(
+    listTasks(ctx, { status: PATH_HOLDERS }).find(
       (other) => other.id !== task.id && pathsOverlap(task.ownedPaths, other.ownedPaths),
     ) ?? null
   );
 }
+
+/** Names the task that holds overlapping paths, for a refusal. */
+const holding = (task: Task): string =>
+  isHeld(task.status) ? `${task.id}, which ${task.assignee} is working on` : `${task.id}, which is waiting for review`;
 
 function requireHolder(task: Task, agent: Agent): void {
   if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
@@ -453,7 +484,7 @@ export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: st
       return { waiting };
     }
     const clash = overlappingHeldTask(ctx, task);
-    if (clash) throw conflict(`${id} owns paths that overlap ${clash.id}, which ${clash.assignee} is working on`);
+    if (clash) throw conflict(`${id} owns paths that overlap ${holding(clash)}`);
     const claimed = move(ctx, emit, task, 'claimed', `agent:${agent.id}`, {
       changes: { assignee: agent.id, branch: branch ?? task.branch, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
     });
