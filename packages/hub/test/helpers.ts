@@ -1,4 +1,6 @@
+import type { Agent, AgentRole, Vendor } from '@agflow/core';
 import { type NewTask, type NewTaskInput, NewTaskSchema } from '@agflow/core';
+import { startLiveSession } from '../src/agents';
 import { type FetchFn, type HubConfig, type HubContext, createContext } from '../src/context';
 
 export class TestClock {
@@ -41,4 +43,12 @@ export function newTask(overrides: Partial<NewTaskInput> = {}): NewTask {
     acceptance: [{ id: 'A1', assertion: 'The thing works' }],
     ...overrides,
   });
+}
+
+let sessionCounter = 0;
+
+/** Registers a live agent the way the SessionStart hook does. */
+export function addAgent(ctx: HubContext, user = 'alice', role: AgentRole = 'worker', vendor: Vendor = 'claude'): Agent {
+  sessionCounter += 1;
+  return startLiveSession(ctx, user, { vendor, sessionId: `session-${sessionCounter}`, role }).agent;
 }
