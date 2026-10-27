@@ -8,6 +8,7 @@ import { HubError, forbidden } from '../errors';
 import { mountAuthRoutes } from './auth-routes';
 import { mountGithubRoutes } from './github-routes';
 import { mountProjectRoutes } from './project-routes';
+import { mountTaskRoutes } from './task-routes';
 
 export const SESSION_COOKIE = 'agflow_session';
 
@@ -62,5 +63,6 @@ export function createApp(ctx: HubContext): App {
   mountAuthRoutes(app, ctx);
   mountGithubRoutes(app, ctx);
   mountProjectRoutes(app, ctx);
+  mountTaskRoutes(app, ctx);
   return app;
 }
