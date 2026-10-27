@@ -74,6 +74,7 @@ describe('joinClaude and leaveClaude', () => {
     ]);
     const settings = settingsOf(repo.root);
     expect(settings.model).toBe('opus');
+    expect(settings.permissions.allow).toEqual(['mcp__agflow']);
     expect(settings.hooks.Stop).toHaveLength(2);
     expect(settings.hooks.Stop[0].hooks[0].command).toBe('say done');
     expect(readFileSync(join(repo.root, '.git', 'info', 'exclude'), 'utf8')).toContain(CLAUDE_SETTINGS);
@@ -88,6 +89,18 @@ describe('joinClaude and leaveClaude', () => {
     const hooks = settingsOf(repo.root).hooks;
     expect(hooks.SessionStart).toHaveLength(1);
     expect(hooks.SessionStart[0].hooks[0].args).toContain('lead');
+  });
+
+  test('lets the chat call agflow tools without asking, keeping other permission rules', () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo.root, '.claude'));
+    writeFileSync(join(repo.root, CLAUDE_SETTINGS), JSON.stringify({ permissions: { allow: ['Bash(bun test)'], deny: ['Read(.env)'] } }));
+    const claude = fakeClaude();
+    joinClaude(repo.root, self, 'worker', claude.runner);
+    joinClaude(repo.root, self, 'worker', claude.runner);
+    expect(settingsOf(repo.root).permissions).toEqual({ allow: ['Bash(bun test)', 'mcp__agflow'], deny: ['Read(.env)'] });
+    leaveClaude(repo.root, claude.runner);
+    expect(settingsOf(repo.root)).toEqual({ permissions: { allow: ['Bash(bun test)'], deny: ['Read(.env)'] } });
   });
 
   test('leave removes only what agflow added', () => {

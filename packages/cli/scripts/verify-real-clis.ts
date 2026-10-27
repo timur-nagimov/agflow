@@ -73,7 +73,8 @@ try {
   results.push(`join: ${joined.code === 0 ? 'ok' : `failed\n${joined.out}`}`);
 
   const claude = sh(
-    ['claude', '-p', PROMPT, '--output-format', 'json', '--max-turns', '8', '--permission-mode', 'acceptEdits', '--allowedTools', 'mcp__agflow'],
+    // No --allowedTools: the permission rule that `agflow join` writes must be enough.
+    ['claude', '-p', PROMPT, '--output-format', 'json', '--max-turns', '8'],
     work,
     300_000,
   );

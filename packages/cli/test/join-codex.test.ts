@@ -30,6 +30,8 @@ describe('joinCodex and leaveCodex', () => {
     expect(config).toContain('command = "/Apps/My Tools/agflow"');
     expect(config).toContain('args = ["mcp", "--vendor", "codex"]');
     expect(config).toContain(`cwd = ${JSON.stringify(repo.root)}`);
+    expect(config).toContain('default_tools_approval_mode = "approve"');
+    expect(config).toContain('env_vars = ["AGFLOW_CONFIG_DIR"]');
     const hooks = JSON.parse(readFileSync(join(repo.root, CODEX_HOOKS), 'utf8')).hooks;
     expect(hooks.SessionStart[0].hooks[0]).toMatchObject({
       command: "'/Apps/My Tools/agflow' hook session-start --vendor codex --role worker",
