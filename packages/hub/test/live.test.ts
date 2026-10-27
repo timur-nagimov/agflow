@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { formatMessage } from '@agflow/core';
 import { startLiveSession } from '../src/agents';
-import { LIVE_INBOX_CHAR_LIMIT, liveInbox, stopCheck } from '../src/live';
+import { LIVE_INBOX_CHAR_LIMIT, LIVE_INBOX_HARD_LIMIT, liveInbox, stopCheck } from '../src/live';
 import { sendMessage, unreadFor } from '../src/messages';
 import { claimTask, createTasks } from '../src/tasks';
 import { createTestContext, newTask } from './helpers';
@@ -24,6 +25,28 @@ describe('liveInbox', () => {
     expect(first.messages).toHaveLength(1);
     expect(first.more).toBe(1);
     expect(liveInbox(ctx, 'alice', 'claude', 's-alice').messages.map((m) => m.body)).toEqual(['second']);
+  });
+
+  test('delivers a first message over the budget whole when it fits in hook context', () => {
+    const { ctx } = createTestContext();
+    const agent = session(ctx);
+    sendMessage(ctx, { from: 'user:bob', to: `agent:${agent.id}`, body: 'a'.repeat(8000) });
+    const inbox = liveInbox(ctx, 'alice', 'claude', 's-alice');
+    expect(inbox.messages.map((m) => m.body.length)).toEqual([8000]);
+    expect(formatMessage(inbox.messages[0]).length).toBeLessThanOrEqual(LIVE_INBOX_HARD_LIMIT);
+  });
+
+  test('leaves a message too long for hook context unread, for check_inbox to return whole', () => {
+    const { ctx } = createTestContext();
+    const agent = session(ctx);
+    // Quoting doubles 8,000 characters of short lines; Claude Code would cut the tail of that hook context.
+    sendMessage(ctx, { from: 'user:bob', to: `agent:${agent.id}`, body: 'a\n'.repeat(4000) });
+    sendMessage(ctx, { from: 'user:bob', to: `agent:${agent.id}`, body: 'second' });
+    expect(liveInbox(ctx, 'alice', 'claude', 's-alice')).toEqual({ messages: [], more: 2 });
+    expect(unreadFor(ctx, agent)).toHaveLength(2);
+    const stop = stopCheck(ctx, 'alice', { vendor: 'claude', sessionId: 's-alice', stopHookActive: false });
+    if (stop.action !== 'block') throw new Error('expected block');
+    expect(stop.reason).toContain('2 new agflow message(s)');
   });
 
   test("another user cannot read someone's session inbox", () => {
