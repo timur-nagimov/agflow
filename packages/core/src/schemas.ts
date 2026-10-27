@@ -40,6 +40,21 @@ const TaskRefSchema = z
   .string()
   .regex(/^(T-\d+|#\d+)$/, 'expected a task id like T-12 or a batch reference like #1');
 
+/**
+ * Control characters (tab, NUL, CR, LF and NEL among them) and the Unicode line and paragraph
+ * separators: what ends a line or has no place in a one-line field.
+ */
+const CONTROL_OR_LINE_BREAK = /[\p{Cc}\p{Zl}\p{Zp}]/u;
+
+/**
+ * A title, an acceptance id, a check name or an owned path is written into a single line of the
+ * prompts agents read. A line break would let its author start a new line there, and so forge a
+ * heading or a bullet of the hub's. Check it with `.refine`, not `.transform`: a transform cannot be
+ * written as JSON Schema, and the MCP bridge (M1b) offers these schemas to the model as tool inputs.
+ */
+const isSingleLine = (text: string): boolean => !CONTROL_OR_LINE_BREAK.test(text);
+const SINGLE_LINE = 'expected one line, without line breaks or other control characters';
+
 export const EvidenceSchema = z.strictObject({
   kind: z.enum(['command', 'artifact', 'review']),
   cmd: z.string().max(1000).optional(),
@@ -49,13 +64,13 @@ export const EvidenceSchema = z.strictObject({
 });
 
 export const AcceptanceCriterionSchema = z.strictObject({
-  id: z.string().min(1).max(20),
+  id: z.string().min(1).max(20).refine(isSingleLine, SINGLE_LINE),
   assertion: z.string().min(1).max(2000),
   evidence: EvidenceSchema.optional(),
 });
 
 export const TaskCheckSchema = z.strictObject({
-  name: z.string().min(1).max(100),
+  name: z.string().min(1).max(100).refine(isSingleLine, SINGLE_LINE),
   cmd: z.string().min(1).max(1000),
   timeoutS: z.number().int().positive().max(86_400).optional(),
 });
@@ -64,13 +79,14 @@ const OwnedPathSchema = z
   .string()
   .min(1)
   .max(300)
+  .refine(isSingleLine, SINGLE_LINE)
   .refine(
     isSupportedPattern,
     'expected a repo-relative glob without a leading "/" or "!", a ".." segment, "\\" or "|" (write alternatives as {a,b})',
   );
 
 const contractFields = {
-  title: z.string().min(1).max(200),
+  title: z.string().min(1).max(200).refine(isSingleLine, SINGLE_LINE),
   kind: TaskKindSchema,
   objective: z.string().min(1).max(4000),
   why: z.string().max(2000),

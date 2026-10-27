@@ -159,7 +159,9 @@ export interface HubEvent {
 export interface TaskDetail {
   task: Task;
   notes: TaskNote[];
+  /** The newest 500 events of the task, oldest first. */
   events: HubEvent[];
+  /** The newest 100 messages about the task, newest first. */
   messages: MessageView[];
 }
 

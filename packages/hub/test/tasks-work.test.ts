@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { getAgent, touchAgent } from '../src/agents';
 import { HubError } from '../src/errors';
+import { listEvents } from '../src/events';
 import { listMessages } from '../src/messages';
 import { setPaused } from '../src/project';
 import {
@@ -9,6 +10,7 @@ import {
   createTasks,
   forceRelease,
   getTask,
+  getTaskDetail,
   listTaskNotes,
   releaseTask,
   reportProgress,
@@ -106,6 +108,37 @@ describe('working on a task', () => {
     cancelTask(ctx, task.id, 'goal changed', 'agent:A-9');
     expect(getAgent(ctx, agent.id).currentTask).toBeNull();
     expect(listMessages(ctx, { target: `agent:${agent.id}` })[0]?.body).toContain('was cancelled: goal changed');
+  });
+});
+
+describe('task detail', () => {
+  test('lists a short history whole, oldest first', () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [task] = createTasks(ctx, [newTask()], 'user:alice');
+    claimTask(ctx, task.id, agent);
+    reportProgress(ctx, task.id, agent, 'first');
+    const { events } = getTaskDetail(ctx, task.id);
+    expect(events.map((event) => event.type)).toEqual(['task.created', 'task.claimed', 'task.working', 'task.progress']);
+    expect(events).toEqual(listEvents(ctx.db, { subject: task.id }));
+  });
+
+  test('past 500 events it keeps the newest ones, still oldest first', () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [task] = createTasks(ctx, [newTask()], 'user:alice');
+    claimTask(ctx, task.id, agent);
+    for (let step = 0; step < 600; step++) reportProgress(ctx, task.id, agent, `step ${step}`);
+    const everything = listEvents(ctx.db, { subject: task.id, limit: 1000 });
+    expect(everything.length).toBeGreaterThan(500);
+    const { events } = getTaskDetail(ctx, task.id);
+    expect(events).toHaveLength(500);
+    // The last events are in, so a history that shows the newest first keeps up with the task.
+    expect(events.at(-1)?.data).toMatchObject({ note: 'step 599' });
+    expect(events).toEqual(everything.slice(-500));
+    expect(events.map((event) => event.id)).toEqual(events.map((event) => event.id).sort((a, b) => a - b));
+    // The oldest ones are the ones that drop out.
+    expect(events.map((event) => event.type)).not.toContain('task.created');
   });
 });
 

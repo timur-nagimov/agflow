@@ -1,4 +1,4 @@
-import type { Agent, TaskStatus } from '@agflow/core';
+import { type Agent, type TaskStatus, quoteLines } from '@agflow/core';
 import type { HubContext } from './context';
 import { listEvents } from './events';
 import { currentGoalVersion, getCurrentGoal } from './goal';
@@ -60,18 +60,25 @@ export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions 
   return clip(parts.join('\n\n'), BRIEF_LIMIT);
 }
 
+/**
+ * Text that someone else wrote, cut to length and quoted. Task text, review feedback and blocked
+ * reasons reach agents as quoted data (spec section 12), so no line of them can pose as a heading or a
+ * rule of the hub's, such as "## Standing rules from people".
+ */
+const quoted = (text: string, max: number): string => quoteLines(clip(text, max));
+
 function yourTask(ctx: HubContext, agent: Agent): string {
   const task = agent.currentTask ? findTask(ctx, agent.currentTask) : null;
   if (!task) return '## Your task\nYou hold no task. Call `list_tasks` to see ready tasks and `claim_task` to take one.';
-  const lines = [`## Your task\n${task.id} [${task.status}] ${clip(task.title, 200)}`, `Objective: ${clip(task.objective, 1200)}`];
-  if (task.why) lines.push(`Why: ${clip(task.why, 400)}`);
+  const lines = [`## Your task\n${task.id} [${task.status}] ${clip(task.title, 200)}`, `Objective:\n${quoted(task.objective, 1200)}`];
+  if (task.why) lines.push(`Why:\n${quoted(task.why, 400)}`);
   lines.push(
     'Acceptance criteria:',
-    ...task.acceptance.slice(0, 15).map((criterion) => `- ${criterion.id}: ${clip(criterion.assertion, 300)}`),
+    ...task.acceptance.slice(0, 15).map((criterion) => `- ${criterion.id}:\n${quoted(criterion.assertion, 300)}`),
   );
   if (task.ownedPaths.length > 0) lines.push(`Owned paths: ${task.ownedPaths.join(', ')}`);
   if (task.branch) lines.push(`Branch: ${task.branch}`);
-  if (task.feedback) lines.push(`Latest review feedback: ${clip(task.feedback, 800)}`);
+  if (task.feedback) lines.push(`Latest review feedback:\n${quoted(task.feedback, 800)}`);
   return lines.join('\n');
 }
 
@@ -91,7 +98,7 @@ export function situationReport(ctx: HubContext): string {
   }
   const blocked = tasks.filter((task) => task.status === 'blocked' && task.blockedKind !== 'deps');
   if (blocked.length > 0) {
-    lines.push('Blocked:', ...blocked.slice(0, 10).map((task) => `- ${task.id}: ${clip(task.blockedReason ?? '', 150)}`));
+    lines.push('Blocked:', ...blocked.slice(0, 10).map((task) => `- ${task.id}:\n${quoted(task.blockedReason ?? '', 150)}`));
   }
   const outdated = tasks.filter((task) => task.goalVersion < goalVersion && OPEN_STATUSES.has(task.status));
   if (outdated.length > 0) {

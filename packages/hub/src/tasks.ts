@@ -13,6 +13,7 @@ import {
   isDone,
   isHeld,
   pathsOverlap,
+  quoteLines,
 } from '@agflow/core';
 import { statusFor } from './agents';
 import { type HubContext, tx } from './context';
@@ -130,7 +131,8 @@ export function getTaskDetail(ctx: HubContext, id: string): TaskDetail {
   return {
     task,
     notes: listTaskNotes(ctx, id),
-    events: listEvents(ctx.db, { subject: id, limit: 500 }),
+    // The newest 500, oldest first: a long task drops its oldest history, never its latest changes.
+    events: listEvents(ctx.db, { subject: id, latest: true, limit: 500 }).reverse(),
     messages: listMessages(ctx, { taskId: id }),
   };
 }
@@ -211,6 +213,12 @@ function unmetDependencies(ctx: HubContext, dependsOn: string[]): string[] {
 }
 
 const waitingReason = (ids: string[]) => `waiting on ${ids.join(', ')}`;
+
+/**
+ * What an agent wrote, inside a notice that the hub sends. Messages from "system" are the hub's own
+ * words, so the agent's text is set apart: named on a line of its own, then quoted line by line.
+ */
+const wrote = (agentId: string, text: string): string => `${agentId} wrote:\n${quoteLines(text)}`;
 
 /** True when following dependsOn links from `from` reaches `target`. */
 function reaches(ctx: HubContext, from: string, target: string, seen = new Set<string>()): boolean {
@@ -553,7 +561,7 @@ export function submitTask(ctx: HubContext, id: string, agent: Agent, input: Sub
       from: 'system',
       to: 'lead',
       taskId: id,
-      body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\nSummary: ${clip(input.summary, 1500)}\nReview it with accept_task or reject_task.`,
+      body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\n${wrote(agent.id, clip(input.summary, 1500))}\nReview it with accept_task or reject_task.`,
     });
     return result;
   });
@@ -639,8 +647,8 @@ export function blockTask(
     setAgentTask(ctx, agent.id, null);
     const body =
       kind === 'impossible'
-        ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified:\n${reason}\nDecide: amend it with update_task and then unblock_task, split it, or cancel it.`
-        : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}:\n${reason}\nUnblock it with unblock_task once this is resolved.`;
+        ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified.\n${wrote(agent.id, reason)}\nDecide: amend it with update_task and then unblock_task, split it, or cancel it.`
+        : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}.\n${wrote(agent.id, reason)}\nUnblock it with unblock_task once this is resolved.`;
     insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: id, body });
     return blocked;
   });
