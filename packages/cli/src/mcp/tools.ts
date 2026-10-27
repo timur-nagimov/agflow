@@ -1,6 +1,9 @@
+import { existsSync } from 'node:fs';
 import { type AgentRole, type Task, type TaskStatus, TargetSchema, TaskIdSchema, formatMessages } from '@agflow/core';
 import { z } from 'zod';
+import { repoRoot } from '../git';
 import type { HubClient } from '../hub-client';
+import { prepareTaskWorktree, pushTaskBranch, removeTaskWorktree, taskBranchName, taskWorktreePath } from './task-git';
 
 export interface ToolState {
   agentId: string | null;
@@ -204,4 +207,54 @@ export const workerTools: ToolDef[] = [
   ),
 ];
 
-export const allTools: ToolDef[] = [...sharedTools, ...workerTools];
+export const gitTools: ToolDef[] = [
+  defineTool(
+    'claim_task',
+    'Claim a ready task. agflow creates its branch in a separate git worktree inside this repository; do all work for the task there.',
+    { id: TaskIdSchema },
+    async ({ id }, ctx) => {
+      const client = asAgent(ctx);
+      const root = repoRoot(ctx.cwd);
+      if (!root) throw new ToolError(`${ctx.cwd} is not inside a git repository, so agflow cannot create the task branch.`);
+      const { task } = await client.task(id);
+      const branch = task.branch ?? taskBranchName(task.id, task.title);
+      const worktree = prepareTaskWorktree(root, task.id, branch);
+      let claimed: Task;
+      try {
+        claimed = (await client.claim(id, branch)).task;
+      } catch (error) {
+        removeTaskWorktree(root, worktree, branch);
+        throw error;
+      }
+      return lines([
+        `You hold ${claimed.id}: ${claimed.title}`,
+        `Work only inside ${worktree.path} (branch ${branch}). Commit there; submit pushes the branch.`,
+        `Objective: ${claimed.objective}`,
+        `Acceptance criteria:\n${claimed.acceptance.map((criterion) => `- ${criterion.id}: ${criterion.assertion}`).join('\n')}`,
+        claimed.ownedPaths.length > 0 && `Change only: ${claimed.ownedPaths.join(', ')}`,
+        claimed.feedback && `Latest review feedback: ${claimed.feedback}`,
+      ]);
+    },
+  ),
+  defineTool(
+    'submit',
+    'Submit your task for review. Commit all changes in the task worktree first; this pushes the branch and records its head commit.',
+    {
+      task_id: TaskIdSchema,
+      summary: z.string().min(1).max(8000),
+      evidence: z.array(z.string().min(1).max(2000)).max(50).optional(),
+    },
+    async ({ task_id, summary, evidence }, ctx) => {
+      const client = asAgent(ctx);
+      const { task } = await client.task(task_id);
+      const root = repoRoot(ctx.cwd);
+      const worktree = root ? taskWorktreePath(root, task_id) : null;
+      const headSha = worktree && task.branch && existsSync(worktree) ? pushTaskBranch(worktree, task.branch) : undefined;
+      const submitted = (await client.submit(task_id, { summary, evidence: evidence ?? [], branch: task.branch ?? undefined, headSha })).task;
+      const where = headSha ? ` at ${headSha.slice(0, 7)} on ${task.branch}` : '';
+      return `${submitted.id} is ${submitted.status}${where}. The lead will review it; you may claim another task.`;
+    },
+  ),
+];
+
+export const allTools: ToolDef[] = [...sharedTools, ...workerTools, ...gitTools];
