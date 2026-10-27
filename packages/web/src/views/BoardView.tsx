@@ -99,8 +99,8 @@ function NewTaskForm({ onCreated }: { onCreated: (task: Task) => void }) {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const task = await action.run(() => api.createTask(draftToTask(draft)));
-    if (task) onCreated(task);
+    const created = await action.run(() => api.createTask(draftToTask(draft)));
+    if (created.ok) onCreated(created.value);
   };
 
   return (

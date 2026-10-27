@@ -236,7 +236,8 @@ export function actionHint(task: Pick<Task, 'status' | 'assignee' | 'submission'
 /** The request body for an action, or null while a required text is missing. */
 export function actionBody(action: TaskAction, text: string): Record<string, string> | null {
   const spec = TASK_ACTIONS[action];
-  const value = text.trim();
+  // Commit SHAs are lowercase hex; people often paste them in capitals.
+  const value = spec.field === 'sha' ? text.trim().toLowerCase() : text.trim();
   if (!value) return spec.required ? null : {};
   return { [spec.field]: value };
 }
@@ -504,7 +505,7 @@ export function evidenceText(evidence: Evidence): string {
 
 /** A link to a branch or commit when the project's repository is on GitHub or GitLab. */
 export function repoLink(repo: string, kind: 'branch' | 'commit', ref: string): string | null {
-  const base = repo.replace(/\.git$/, '').replace(/\/+$/, '');
+  const base = repo.replace(/\/+$/, '').replace(/\.git$/, '');
   const host = base.match(/^https:\/\/(github\.com|gitlab\.com)\/[^/]+\/[^/]+$/)?.[1];
   if (!host) return null;
   const path = ref.split('/').map(encodeURIComponent).join('/');

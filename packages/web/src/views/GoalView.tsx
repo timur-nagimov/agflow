@@ -119,7 +119,7 @@ function GoalEditor({ base, latest, onClose }: { base: GoalVersion | null; lates
   const changed = text.trim() !== '' && text !== before;
 
   const save = async () => {
-    if (await action.run(() => api.saveGoal(text, baseVersion))) onClose();
+    if ((await action.run(() => api.saveGoal(text, baseVersion))).ok) onClose();
   };
 
   return (

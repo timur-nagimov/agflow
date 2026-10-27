@@ -158,7 +158,7 @@ function Actions({ task, onDone }: { task: Task; onDone: () => void }) {
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!open || !body) return;
-    if (await action.run(() => api.taskAction(task.id, open, body))) {
+    if ((await action.run(() => api.taskAction(task.id, open, body))).ok) {
       setOpen(null);
       onDone();
     }

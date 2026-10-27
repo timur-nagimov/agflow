@@ -10,7 +10,7 @@ const MAX = 1000;
 
 export function TimelineView() {
   const [limit, setLimit] = useState(PAGE);
-  const history = useData(() => api.events({ latest: true, limit }), [limit]);
+  const history = useData(() => api.events({ latest: true, limit }), [limit], { keep: true });
   const recent = useRecentEvents();
   const [category, setCategory] = useState<EventCategory | 'all'>('all');
   const events = useMemo(() => mergeEvents(recent, history.data ?? []), [recent, history.data]);

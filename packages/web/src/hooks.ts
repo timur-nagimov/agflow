@@ -1,5 +1,5 @@
 import type { HubEvent } from '@agflow/core';
-import { type DependencyList, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type DependencyList, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { subscribe } from './live';
 import { type Route, parseRoute } from './route';
 
@@ -13,14 +13,34 @@ export function useRoute(): Route {
   return route;
 }
 
-/** The current time, refreshed every `intervalMs` so relative times stay right. */
-export function useNow(intervalMs = 30_000): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(timer);
-  }, [intervalMs]);
-  return now;
+const CLOCK_MS = 30_000;
+const clock: { now: number; listeners: Set<() => void>; timer: ReturnType<typeof setInterval> | undefined } = {
+  now: Date.now(),
+  listeners: new Set(),
+  timer: undefined,
+};
+
+function subscribeClock(listener: () => void): () => void {
+  clock.listeners.add(listener);
+  if (clock.timer === undefined) {
+    clock.now = Date.now();
+    clock.timer = setInterval(() => {
+      clock.now = Date.now();
+      for (const notify of clock.listeners) notify();
+    }, CLOCK_MS);
+  }
+  return () => {
+    clock.listeners.delete(listener);
+    if (clock.listeners.size === 0) {
+      clearInterval(clock.timer);
+      clock.timer = undefined;
+    }
+  };
+}
+
+/** The current time, from one clock shared by every component and refreshed every 30 seconds. */
+export function useNow(): number {
+  return useSyncExternalStore(subscribeClock, () => clock.now);
 }
 
 export interface Loaded<T> {
@@ -34,6 +54,8 @@ export interface LoadOptions {
   relevant?: (event: HubEvent) => boolean;
   /** Also reload on a timer, for values that change with time alone. */
   refreshMs?: number;
+  /** Keep showing the previous data while new inputs load, instead of starting empty. */
+  keep?: boolean;
 }
 
 const RELOAD_DELAY_MS = 250;
@@ -50,8 +72,11 @@ export function useData<T>(load: () => Promise<T>, deps: DependencyList, options
   loadRef.current = load;
   const relevantRef = useRef(options.relevant);
   relevantRef.current = options.relevant;
+  const keepRef = useRef(options.keep);
+  keepRef.current = options.keep;
 
   useEffect(() => {
+    if (keepRef.current) return;
     setData(undefined);
     setError(null);
   }, deps);
@@ -96,25 +121,27 @@ export function useData<T>(load: () => Promise<T>, deps: DependencyList, options
   return useMemo(() => ({ data, error, reload }), [data, error, reload]);
 }
 
+export type Outcome<T> = { ok: true; value: T } | { ok: false };
+
 export interface Action {
   busy: boolean;
   error: string | null;
-  /** Runs a hub call, keeping its error for display. Resolves to null when it failed. */
-  run<T>(fn: () => Promise<T>): Promise<T | null>;
+  /** Runs a hub call and keeps its error for display. */
+  run<T>(fn: () => Promise<T>): Promise<Outcome<T>>;
   clearError(): void;
 }
 
 export function useAction(): Action {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const run = useCallback(async <T>(fn: () => Promise<T>): Promise<T | null> => {
+  const run = useCallback(async <T>(fn: () => Promise<T>): Promise<Outcome<T>> => {
     setBusy(true);
     setError(null);
     try {
-      return await fn();
+      return { ok: true, value: await fn() };
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
-      return null;
+      return { ok: false };
     } finally {
       setBusy(false);
     }

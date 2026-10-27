@@ -34,6 +34,19 @@ describe('api client', () => {
     ]);
   });
 
+  test('each task action posts to its own route', async () => {
+    const hub = fakeHub(200, { task: { id: 'T-1' } });
+    const api = createApi(hub.fetchFn);
+    await api.taskAction('T-1', 'release', { reason: 'stuck' });
+    await api.taskAction('T-1', 'merged', {});
+    await api.taskAction('T-1', 'unblock', {});
+    expect(hub.calls.map((call) => call.url)).toEqual([
+      '/api/tasks/T-1/release-claim',
+      '/api/tasks/T-1/merged',
+      '/api/tasks/T-1/unblock',
+    ]);
+  });
+
   test('builds query strings and skips empty values', async () => {
     const hub = fakeHub(200, { events: [] });
     const api = createApi(hub.fetchFn);

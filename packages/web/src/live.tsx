@@ -54,13 +54,22 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       };
     };
 
-    api
-      .events({ latest: true, limit: 1 })
-      .then((events) => {
-        lastId = events[0]?.id ?? 0;
-      })
-      .catch(() => {})
-      .finally(open);
+    // Find the newest stored event first, so the stream replays nothing. If that fails, try again
+    // later rather than streaming from the beginning.
+    const start = () => {
+      if (stopped) return;
+      api.events({ latest: true, limit: 1 }).then(
+        (events) => {
+          lastId = events[0]?.id ?? 0;
+          open();
+        },
+        () => {
+          setConnection('reconnecting');
+          retry = setTimeout(start, RECONNECT_MS);
+        },
+      );
+    };
+    start();
 
     return () => {
       stopped = true;

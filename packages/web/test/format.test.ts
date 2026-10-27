@@ -101,6 +101,11 @@ describe('task actions', () => {
     );
     expect(actionHint(task({ status: 'accepted' }))).toBe('Accepted. Merge its branch, then mark it merged.');
     expect(actionHint(task({ status: 'ready' }))).toBe('');
+    const submission = { summary: 's', evidence: [], branch: null, headSha: null, submittedAt: 0, by: 'A-4' };
+    expect(actionHint(task({ status: 'submitted', submission }))).toBe(
+      'A-4 submitted this for review. Accept it, or reject it with feedback.',
+    );
+    expect(actionHint(task({ status: 'blocked' }))).toBe('Unblock it once the problem is solved, or cancel it.');
   });
 
   test('bodies carry the text in the right field, and required text is enforced', () => {
@@ -108,6 +113,7 @@ describe('task actions', () => {
     expect(actionBody('reject', '   ')).toBeNull();
     expect(actionBody('accept', '')).toEqual({});
     expect(actionBody('merged', 'abc1234')).toEqual({ sha: 'abc1234' });
+    expect(actionBody('merged', ' ABC1234 ')).toEqual({ sha: 'abc1234' });
     expect(actionBody('release', 'went home')).toEqual({ reason: 'went home' });
   });
 });
@@ -252,6 +258,7 @@ describe('links and the new-task form', () => {
       'https://github.com/acme/demo/tree/agflow/T-1-x',
     );
     expect(repoLink('https://gitlab.com/acme/demo', 'commit', 'abc1234')).toBe('https://gitlab.com/acme/demo/-/commit/abc1234');
+    expect(repoLink('https://github.com/acme/demo.git/', 'branch', 'main')).toBe('https://github.com/acme/demo/tree/main');
     expect(repoLink('git@github.com:acme/demo.git', 'branch', 'main')).toBeNull();
     expect(repoLink('https://example.com/acme/demo', 'branch', 'main')).toBeNull();
   });

@@ -63,7 +63,7 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         <nav className="rail" aria-label="Main">
           <a className="brand" href={routeHref({ view: 'board' })}>
             <span className="wordmark">agflow</span>
-            <span className="brand-project">{project?.name ?? ' '}</span>
+            <span className="brand-project">{project?.name ?? '\u00a0'}</span>
           </a>
           <ul className="nav">
             {NAV.map((item) => (

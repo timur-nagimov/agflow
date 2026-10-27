@@ -145,9 +145,13 @@ export function ConfirmButton({
 }) {
   const [asking, setAsking] = useState(false);
   const action = useAction();
+  const ask = (value: boolean) => {
+    action.clearError();
+    setAsking(value);
+  };
   if (!asking) {
     return (
-      <button className={danger ? 'danger' : undefined} onClick={() => setAsking(true)}>
+      <button className={danger ? 'danger' : undefined} onClick={() => ask(true)}>
         {label}
       </button>
     );
@@ -158,12 +162,12 @@ export function ConfirmButton({
         className={danger ? 'danger solid' : 'primary'}
         disabled={action.busy}
         onClick={async () => {
-          if ((await action.run(onConfirm)) !== null) setAsking(false);
+          if ((await action.run(onConfirm)).ok) setAsking(false);
         }}
       >
         {confirm}
       </button>
-      <button onClick={() => setAsking(false)}>Keep</button>
+      <button onClick={() => ask(false)}>Keep</button>
       {action.error ? <span className="error">{action.error}</span> : null}
     </span>
   );
@@ -250,7 +254,7 @@ export function Composer({
     event?.preventDefault();
     if (!text || action.busy) return;
     const sent = await action.run(() => api.sendMessage({ to, body: text, standingRule: allowRule && rule ? true : undefined }));
-    if (sent) {
+    if (sent.ok) {
       setBody('');
       setRule(false);
     }

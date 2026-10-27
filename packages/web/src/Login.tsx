@@ -34,7 +34,7 @@ export function Login() {
         <p className="wordmark big">
           agflow <span className="lamp tone-done pulse" />
         </p>
-        <p className="login-project">{config ? config.project : ' '}</p>
+        <p className="login-project">{config ? config.project : '\u00a0'}</p>
         {config?.mode === 'github' ? (
           <button className="primary wide" onClick={() => go('/auth/github?returnTo=/')}>
             Sign in with GitHub
