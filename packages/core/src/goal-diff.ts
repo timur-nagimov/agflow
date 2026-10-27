@@ -60,24 +60,46 @@ function clipLine(text: string): string {
   return `${text.slice(0, end)}…`;
 }
 
+/** The last line of a rendering that left changes out, with the added and the removed lines counted apart. */
+function footer(added: number, removed: number): string {
+  const parts: string[] = [];
+  if (added > 0) parts.push(`${added} more added`);
+  if (removed > 0) parts.push(`${removed} more removed`);
+  return `… ${parts.join(' and ')} lines`;
+}
+
 /**
- * Renders the changed lines of a diff for a message. The result has at most `maxLines` lines, each
- * clipped to 300 characters, and at most `maxChars` characters in all, so a large goal edit cannot
- * push the text that follows it out of an agent's context. What does not fit is counted at the end.
+ * Renders the changed lines of a diff for a message. The result has at most `maxLines` changed lines,
+ * each clipped to 300 characters, and at most `maxChars` characters in all, so a large goal edit cannot
+ * push the text that follows it out of an agent's context.
+ *
+ * When not everything fits, added lines are picked first and removed lines get what is left. A diff
+ * lists a removed block before the added block that replaces it, so filling the budget in diff order
+ * would spend all of it on text that is going away and hide the new text. The picked lines are still
+ * shown in diff order, and a last line counts the added and the removed lines left out.
  */
 export function formatChanges(lines: DiffLine[], maxLines = 200, maxChars = 4000): string {
   const changed = lines.filter((line) => line.op !== ' ');
   if (changed.length === 0) return '(no line changes)';
-  const footer = (hidden: number) => `… ${hidden} more changed lines`;
-  const room = maxChars - footer(changed.length).length - 1;
-  const shown: string[] = [];
-  let used = 0;
-  for (const line of changed.slice(0, maxLines)) {
-    const text = clipLine(`${line.op} ${line.text}`);
-    if (used + text.length + 1 > room) break;
-    shown.push(text);
-    used += text.length + 1;
+  const rendered = changed.map((line) => clipLine(`${line.op} ${line.text}`));
+  const indexesOf = (op: DiffLine['op']) => changed.flatMap((line, i) => (line.op === op ? [i] : []));
+  const added = indexesOf('+');
+  const removed = indexesOf('-');
+  // The footer for leaving everything out is the longest one there can be, so reserve its room up front.
+  let room = maxChars - footer(added.length, removed.length).length;
+  const picked = new Set<number>();
+  for (const group of [added, removed]) {
+    for (const i of group) {
+      const cost = rendered[i].length + 1; // the line and the newline after it
+      // Each kind keeps its first lines and stops at the first one that does not fit.
+      if (picked.size >= maxLines || cost > room) break;
+      picked.add(i);
+      room -= cost;
+    }
   }
-  if (shown.length < changed.length) shown.push(footer(changed.length - shown.length));
+  const shown = rendered.filter((_, i) => picked.has(i));
+  const hiddenAdded = added.filter((i) => !picked.has(i)).length;
+  const hiddenRemoved = removed.filter((i) => !picked.has(i)).length;
+  if (hiddenAdded + hiddenRemoved > 0) shown.push(footer(hiddenAdded, hiddenRemoved));
   return shown.join('\n');
 }

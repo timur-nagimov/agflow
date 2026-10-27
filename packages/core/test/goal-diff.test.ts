@@ -106,7 +106,7 @@ describe('formatChanges', () => {
   test('truncates long change lists', () => {
     const before = Array.from({ length: 5 }, (_, i) => `line ${i}`).join('\n');
     const text = formatChanges(diffGoal(before, ''), 2);
-    expect(text).toBe('- line 0\n- line 1\n… 3 more changed lines');
+    expect(text).toBe('- line 0\n- line 1\n… 3 more removed lines');
   });
 
   test('says so when nothing changed', () => {
@@ -133,7 +133,7 @@ describe('formatChanges', () => {
     const shown = text.split('\n').length - 1;
     expect(shown).toBeGreaterThan(5);
     expect(shown).toBeLessThan(100);
-    expect(text.endsWith(`… ${100 - shown} more changed lines`)).toBe(true);
+    expect(text.endsWith(`… ${100 - shown} more added lines`)).toBe(true);
   });
 
   test('keeps a large edit under the default budget', () => {
@@ -141,11 +141,97 @@ describe('formatChanges', () => {
     const after = Array.from({ length: 200 }, (_, i) => `Requirement ${i}: ${'new wording '.repeat(8)}`).join('\n');
     const text = formatChanges(diffGoal(before, after));
     expect(text.length).toBeLessThanOrEqual(4000);
-    expect(text).toMatch(/\n… \d+ more changed lines$/);
+    expect(text).toMatch(/\n… \d+ more added and \d+ more removed lines$/);
   });
 
   test('does not add a footer when everything fits', () => {
     const text = formatChanges(diffGoal('a\nb\nc', 'a\nB\nc'), 200, 100);
     expect(text).toBe('- b\n+ B');
+  });
+
+  // A diff lists a removed block before the added block that replaces it, so a budget spent in diff
+  // order shows what is going away and none of what is new.
+  describe('when the changes do not fit', () => {
+    const prefixed = (op: '+' | '-', texts: string[]) => texts.map((text) => `${op} ${text}`);
+
+    test('replacing a long paragraph with a short one shows every added line', () => {
+      const sentences = (tag: string, count: number) =>
+        Array.from({ length: count }, (_, i) => `${tag} sentence ${i}: ${'detail '.repeat(10)}`.trimEnd());
+      const before = ['# Goal', ...sentences('old', 60), 'Last line'].join('\n');
+      const after = ['# Goal', ...sentences('new', 5), 'Last line'].join('\n');
+      const text = formatChanges(diffGoal(before, after));
+      const shown = text.split('\n');
+      const shownRemoved = shown.filter((line) => line.startsWith('- ')).length;
+      expect(text.length).toBeLessThanOrEqual(4000);
+      expect(shownRemoved).toBeGreaterThan(0);
+      expect(shownRemoved).toBeLessThan(60);
+      // The removed lines that fit come first, as in the diff, then all five new ones, then the count.
+      expect(shown).toEqual([
+        ...prefixed('-', sentences('old', shownRemoved)),
+        ...prefixed('+', sentences('new', 5)),
+        `… ${60 - shownRemoved} more removed lines`,
+      ]);
+    });
+
+    test('a rewrite spends the budget on the new text and counts both kinds it leaves out', () => {
+      const goal = (tag: string) =>
+        Array.from({ length: 80 }, (_, i) => `${tag} requirement ${i}: ${'x'.repeat(50)}`);
+      const text = formatChanges(diffGoal(goal('old').join('\n'), goal('new').join('\n')));
+      const shown = text.split('\n');
+      const shownAdded = shown.length - 1;
+      expect(text.length).toBeLessThanOrEqual(4000);
+      expect(shownAdded).toBeGreaterThan(40);
+      expect(shownAdded).toBeLessThan(80);
+      expect(shown).toEqual([
+        ...prefixed('+', goal('new').slice(0, shownAdded)),
+        `… ${80 - shownAdded} more added and 80 more removed lines`,
+      ]);
+    });
+
+    test('shows the new lines of a rewrite too big to diff exactly', () => {
+      const goal = (tag: string) => Array.from({ length: 600 }, (_, i) => `${tag} ${i} ${'z'.repeat(20)}`);
+      const text = formatChanges(diffGoal(goal('old').join('\n'), goal('new').join('\n')));
+      const shown = text.split('\n');
+      expect(text.length).toBeLessThanOrEqual(4000);
+      expect(shown[0]).toBe(`+ new 0 ${'z'.repeat(20)}`);
+      expect(shown.some((line) => line.startsWith('- '))).toBe(false);
+      expect(shown.at(-1)).toBe(`… ${600 - (shown.length - 1)} more added and 600 more removed lines`);
+    });
+
+    test('the line cap also keeps added lines first and shows what it keeps in diff order', () => {
+      // The diff reads: - b, + B, - d, + D. Both new lines and the first removed line fit in three.
+      expect(formatChanges(diffGoal('a\nb\nc\nd', 'a\nB\nc\nD'), 3)).toBe('- b\n+ B\n+ D\n… 1 more removed lines');
+      expect(formatChanges(diffGoal('a\nb\nc', 'x\ny\nz'), 2)).toBe(
+        '+ x\n+ y\n… 1 more added and 3 more removed lines',
+      );
+    });
+
+    test('never goes over the budget, and shown plus counted lines add up to every changed line', () => {
+      const before = [
+        ...Array.from({ length: 30 }, (_, i) => (i % 3 ? `keep ${i}` : `old ${i} ${'o'.repeat(i * 3)}`)),
+        'gone 1',
+        'gone 2',
+      ];
+      const after = [
+        ...Array.from({ length: 30 }, (_, i) => (i % 3 ? `keep ${i}` : `new ${i} ${'n'.repeat(i)}`)),
+        'extra 1',
+        'extra 2',
+        'extra 3',
+      ];
+      const lines = diffGoal(before.join('\n'), after.join('\n'));
+      const totalAdded = lines.filter((line) => line.op === '+').length;
+      const totalRemoved = lines.filter((line) => line.op === '-').length;
+      expect([totalAdded, totalRemoved]).toEqual([13, 12]);
+      for (let maxChars = 50; maxChars <= 1500; maxChars += 7) {
+        const text = formatChanges(lines, 200, maxChars);
+        const shown = text.split('\n');
+        const footer = shown.at(-1) as string;
+        const hiddenAdded = Number(footer.match(/(\d+) more added/)?.[1] ?? 0);
+        const hiddenRemoved = Number(footer.match(/(\d+) more removed/)?.[1] ?? 0);
+        expect(text.length).toBeLessThanOrEqual(maxChars);
+        expect(shown.filter((line) => line.startsWith('+ ')).length + hiddenAdded).toBe(totalAdded);
+        expect(shown.filter((line) => line.startsWith('- ')).length + hiddenRemoved).toBe(totalRemoved);
+      }
+    });
   });
 });
