@@ -370,3 +370,152 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
     return cancelled;
   });
 }
+
+// ---------------------------------------------------------------------------
+// Working on tasks
+// ---------------------------------------------------------------------------
+
+function heldTaskOf(ctx: HubContext, agentId: string): Task | null {
+  const row = ctx.db
+    .query("SELECT * FROM tasks WHERE assignee = $agentId AND status IN ('claimed', 'working') LIMIT 1")
+    .get({ agentId }) as TaskRow | null;
+  return row ? rowToTask(row) : null;
+}
+
+function overlappingHeldTask(ctx: HubContext, task: Task): Task | null {
+  if (task.ownedPaths.length === 0) return null;
+  return (
+    listTasks(ctx, { status: ['claimed', 'working'] }).find(
+      (other) => other.id !== task.id && pathsOverlap(task.ownedPaths, other.ownedPaths),
+    ) ?? null
+  );
+}
+
+function requireHolder(task: Task, agent: Agent): void {
+  if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
+}
+
+export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: string): Task {
+  return tx(ctx, (emit) => {
+    if (getProject(ctx).paused) throw conflict('the project is paused, so no new work can start');
+    const held = heldTaskOf(ctx, agent.id);
+    if (held) throw conflict(`you already hold ${held.id}; submit, release or hand it off first`);
+    const task = getTask(ctx, id);
+    if (task.status !== 'ready') throw conflict(`${id} is ${task.status}, not ready`);
+    const clash = overlappingHeldTask(ctx, task);
+    if (clash) throw conflict(`${id} owns paths that overlap ${clash.id}, which ${clash.assignee} is working on`);
+    const claimed = move(ctx, emit, task, 'claimed', `agent:${agent.id}`, {
+      changes: { assignee: agent.id, branch: branch ?? task.branch, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
+    });
+    setAgentTask(ctx, agent.id, id);
+    return claimed;
+  });
+}
+
+export function resumeClaim(ctx: HubContext, id: string, agent: Agent): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    if (!isHeld(task.status) || !task.assignee) throw conflict(`${id} is not held by anyone`);
+    if (task.assignee === agent.id) return task;
+    const previous = ctx.db.query('SELECT login FROM agents WHERE id = $id').get({ id: task.assignee }) as {
+      login: string;
+    } | null;
+    if (!previous || previous.login !== agent.user) throw forbidden(`${id} is held by someone else's agent`);
+    const held = heldTaskOf(ctx, agent.id);
+    if (held) throw conflict(`you already hold ${held.id}`);
+    writeTask(ctx, id, { assignee: agent.id, leaseExpiresAt: ctx.now() + ctx.config.leaseMs });
+    setAgentTask(ctx, task.assignee, null);
+    setAgentTask(ctx, agent.id, id);
+    emit({
+      type: 'task.claim_transferred',
+      actor: `agent:${agent.id}`,
+      subject: id,
+      data: { from: task.assignee, to: agent.id },
+    });
+    return getTask(ctx, id);
+  });
+}
+
+export function reportProgress(ctx: HubContext, id: string, agent: Agent, note: string): Task {
+  return tx(ctx, (emit) => {
+    let task = getTask(ctx, id);
+    requireHolder(task, agent);
+    addNote(ctx, id, 'progress', note, `agent:${agent.id}`);
+    if (task.status === 'claimed') task = move(ctx, emit, task, 'working', `agent:${agent.id}`);
+    writeTask(ctx, id, { leaseExpiresAt: ctx.now() + ctx.config.leaseMs });
+    emit({ type: 'task.progress', actor: `agent:${agent.id}`, subject: id, data: { note: clip(note, 500) } });
+    return getTask(ctx, id);
+  });
+}
+
+export function writeHandoff(ctx: HubContext, id: string, agent: Agent, note: string): void {
+  tx(ctx, (emit) => {
+    requireHolder(getTask(ctx, id), agent);
+    addNote(ctx, id, 'handoff', note, `agent:${agent.id}`);
+    emit({ type: 'task.handoff_written', actor: `agent:${agent.id}`, subject: id });
+  });
+}
+
+export function releaseTask(ctx: HubContext, id: string, agent: Agent, reason: string): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    requireHolder(task, agent);
+    addNote(ctx, id, 'release', reason, `agent:${agent.id}`);
+    const released = move(ctx, emit, task, 'ready', `agent:${agent.id}`, {
+      changes: { assignee: null, leaseExpiresAt: null },
+      event: 'task.released',
+      data: { reason, forced: false },
+    });
+    setAgentTask(ctx, agent.id, null);
+    return released;
+  });
+}
+
+export function forceRelease(ctx: HubContext, id: string, actor: string, reason: string): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    if (!isHeld(task.status) || !task.assignee) throw conflict(`${id} is not claimed`);
+    const holder = task.assignee;
+    addNote(ctx, id, 'release', reason, actor);
+    const released = move(ctx, emit, task, 'ready', actor, {
+      changes: { assignee: null, leaseExpiresAt: null },
+      event: 'task.released',
+      data: { reason, forced: true, holder },
+    });
+    setAgentTask(ctx, holder, null);
+    insertMessage(ctx, emit, {
+      from: actor,
+      to: `agent:${holder}`,
+      taskId: id,
+      body: `Your claim on ${id} was released by ${actor}: ${reason}\nStop working on it. Commit and push anything worth keeping to ${task.branch ?? 'its branch'}.`,
+    });
+    return released;
+  });
+}
+
+/** Returns tasks whose lease expired to the pool. Called periodically by the server. */
+export function sweepLeases(ctx: HubContext): string[] {
+  return tx(ctx, (emit) => {
+    const rows = ctx.db
+      .query(
+        "SELECT * FROM tasks WHERE status IN ('claimed', 'working') AND lease_expires_at IS NOT NULL AND lease_expires_at <= $now",
+      )
+      .all({ now: ctx.now() }) as TaskRow[];
+    for (const row of rows) {
+      const task = rowToTask(row);
+      const stale = move(ctx, emit, task, 'stale', 'system', {
+        changes: { leaseExpiresAt: null },
+        data: { holder: task.assignee },
+      });
+      move(ctx, emit, stale, 'ready', 'system', { changes: { assignee: null } });
+      if (task.assignee) setAgentTask(ctx, task.assignee, null);
+      insertMessage(ctx, emit, {
+        from: 'system',
+        to: 'lead',
+        taskId: task.id,
+        body: `${task.id} ("${clip(task.title, 120)}") went stale: its holder ${task.assignee ?? 'unknown'} stopped responding. It is ready again.`,
+      });
+    }
+    return rows.map((row) => row.id);
+  });
+}
