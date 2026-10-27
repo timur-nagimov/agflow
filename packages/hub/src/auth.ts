@@ -1,5 +1,5 @@
-import type { HubContext } from './context';
-import { forbidden } from './errors';
+import { type HubContext, tx } from './context';
+import { conflict, forbidden } from './errors';
 
 export type SessionKind = 'web' | 'cli';
 
@@ -65,11 +65,15 @@ export function deleteSession(ctx: HubContext, token: string): void {
   ctx.db.query('DELETE FROM sessions WHERE token_hash = $hash').run({ hash: hashToken(token) });
 }
 
+/** Stores only the approval; pollCliLogin starts the session when the CLI collects it, so no raw token is stored. */
 export function approveCliLogin(ctx: HubContext, code: string, user: string, label?: string): void {
-  const token = createSession(ctx, user, 'cli', label);
-  ctx.db
-    .query('INSERT OR REPLACE INTO cli_logins (code, created_at, login, token, label) VALUES ($code, $now, $login, $token, $label)')
-    .run({ code, now: ctx.now(), login: user.toLowerCase(), token, label: label ?? null });
+  if (!isAllowed(ctx, user)) throw forbidden(`${user} is not on this hub's allowlist`);
+  const result = ctx.db
+    .query(
+      'INSERT INTO cli_logins (code, created_at, login, label) VALUES ($code, $now, $login, $label) ON CONFLICT (code) DO NOTHING',
+    )
+    .run({ code, now: ctx.now(), login: user.toLowerCase(), label: label ?? null });
+  if (result.changes === 0) throw conflict('this sign-in is already approved');
 }
 
 export type CliLoginPoll =
@@ -78,15 +82,19 @@ export type CliLoginPoll =
   | { status: 'approved'; token: string; user: string };
 
 export function pollCliLogin(ctx: HubContext, code: string): CliLoginPoll {
-  const row = ctx.db.query('SELECT created_at, login, token FROM cli_logins WHERE code = $code').get({ code }) as {
-    created_at: number;
-    login: string;
-    token: string;
-  } | null;
-  if (!row) return { status: 'pending' };
-  ctx.db.query('DELETE FROM cli_logins WHERE code = $code').run({ code });
-  if (row.created_at + CLI_LOGIN_TTL <= ctx.now()) return { status: 'expired' };
-  return { status: 'approved', token: row.token, user: row.login };
+  return tx(ctx, (): CliLoginPoll => {
+    const row = ctx.db.query('SELECT created_at, login, label FROM cli_logins WHERE code = $code').get({ code }) as {
+      created_at: number;
+      login: string;
+      label: string | null;
+    } | null;
+    if (!row) return { status: 'pending' };
+    // Expired approvals stay until sweepAuth removes them, so a CLI that polls late still hears 'expired'.
+    if (row.created_at + CLI_LOGIN_TTL <= ctx.now()) return { status: 'expired' };
+    ctx.db.query('DELETE FROM cli_logins WHERE code = $code').run({ code });
+    // createSession re-checks the allowlist; if it refuses, the transaction keeps the approval unconsumed.
+    return { status: 'approved', token: createSession(ctx, row.login, 'cli', row.label ?? undefined), user: row.login };
+  });
 }
 
 export function createOAuthState(ctx: HubContext, returnTo: string): string {
@@ -111,6 +119,7 @@ export function consumeOAuthState(ctx: HubContext, state: string): { returnTo: s
 export function sweepAuth(ctx: HubContext): void {
   const now = ctx.now();
   ctx.db.query('DELETE FROM sessions WHERE expires_at <= $now').run({ now });
-  ctx.db.query('DELETE FROM cli_logins WHERE created_at <= $cutoff').run({ cutoff: now - CLI_LOGIN_TTL });
+  // Expired CLI approvals stay one more TTL: a CLI that resumes polling after a laptop sleeps still hears 'expired'.
+  ctx.db.query('DELETE FROM cli_logins WHERE created_at <= $cutoff').run({ cutoff: now - 2 * CLI_LOGIN_TTL });
   ctx.db.query('DELETE FROM oauth_states WHERE created_at <= $cutoff').run({ cutoff: now - OAUTH_STATE_TTL });
 }
