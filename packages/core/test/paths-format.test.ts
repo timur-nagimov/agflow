@@ -13,9 +13,19 @@ const UNSUPPORTED = [
   'src/\\auth/**',
   'src/@(auth|billing)/**',
   'src/+(auth|billing)/**',
-  'src/!(auth)/**',
   'src/(auth|billing)/**',
   'src/auth|docs/**',
+];
+
+/** Folder names in parentheses: route groups and extglob-looking names. Engines disagree on them. */
+const WITH_PARENS = [
+  'app/(tabs)/**',
+  'app/(tabs)/index.tsx',
+  'src/routes/(app)/**',
+  'app/feed/(..)photo/**',
+  'src/@(auth)/**',
+  'src/!(auth)/**',
+  'src/+(auth)/**',
 ];
 
 describe('patternPrefix', () => {
@@ -52,6 +62,17 @@ describe('patternPrefix', () => {
     expect(patternPrefix('src/a./{1..3}')).toBe('src/a');
     expect(patternPrefix('src/a b/x.ts')).toBe('src/a');
   });
+
+  test('ends before a parenthesis or an extglob sigil in front of one', () => {
+    expect(patternPrefix('app/(tabs)/**')).toBe('app/');
+    expect(patternPrefix('app/(tabs)/index.tsx')).toBe('app/');
+    expect(patternPrefix('src/routes/(app)/**')).toBe('src/routes/');
+    expect(patternPrefix('app/feed/(..)photo/**')).toBe('app/feed/');
+    expect(patternPrefix('src/a(b)/x.ts')).toBe('src/a');
+    expect(patternPrefix('src/@(auth)/**')).toBe('src/');
+    expect(patternPrefix('src/!(auth)/**')).toBe('src/');
+    expect(patternPrefix('src/+(auth)/**')).toBe('src/');
+  });
 });
 
 describe('isSupportedPattern', () => {
@@ -70,7 +91,11 @@ describe('isSupportedPattern', () => {
     for (const pattern of supported) expect(isSupportedPattern(pattern)).toBe(true);
   });
 
-  test('rejects absolute paths, negation, "..", escapes, parentheses and "|"', () => {
+  test('accepts folders in parentheses, such as route groups', () => {
+    for (const pattern of WITH_PARENS) expect(isSupportedPattern(pattern)).toBe(true);
+  });
+
+  test('rejects absolute paths, negation, "..", escapes and "|"', () => {
     for (const pattern of UNSUPPORTED) expect(isSupportedPattern(pattern)).toBe(false);
   });
 });
@@ -110,6 +135,24 @@ describe('pathsOverlap', () => {
     expect(pathsOverlap(['src//auth/**'], ['src/billing/**'])).toBe(false);
   });
 
+  test('a parenthesis ends the literal prefix, however an engine reads it', () => {
+    expect(pathsOverlap(['app/(tabs)/**'], ['docs/**'])).toBe(false);
+    // Read literally, as Bun.Glob does: the folder is named "(tabs)".
+    expect(pathsOverlap(['app/(tabs)/**'], ['app/(tabs)/index.tsx'])).toBe(true);
+    expect(pathsOverlap(['app/(tabs)/**'], ['app/**'])).toBe(true);
+    // Read as a group or an extglob, as picomatch does: "(tabs)" is "tabs", "@(auth)" is "auth".
+    expect(pathsOverlap(['app/(tabs)/**'], ['app/tabs/index.tsx'])).toBe(true);
+    expect(pathsOverlap(['src/@(auth)/**'], ['src/auth/login.ts'])).toBe(true);
+    expect(pathsOverlap(['src/!(auth)/**'], ['src/billing/invoice.ts'])).toBe(true);
+  });
+
+  test('Bun.Glob, which runs the scope check, reads parentheses literally', () => {
+    expect(new Bun.Glob('app/(tabs)/**').match('app/(tabs)/index.tsx')).toBe(true);
+    expect(new Bun.Glob('app/(tabs)/**').match('app/tabs/index.tsx')).toBe(false);
+    expect(new Bun.Glob('src/@(auth)/**').match('src/@(auth)/login.ts')).toBe(true);
+    expect(new Bun.Glob('src/@(auth)/**').match('src/auth/login.ts')).toBe(false);
+  });
+
   test('never misses a path that two patterns both match (Bun.Glob is the oracle)', () => {
     const patterns = [
       'src/**',
@@ -126,6 +169,8 @@ describe('pathsOverlap', () => {
       '*.md',
       '.github/**',
       'packages/@acme/**',
+      'app/**',
+      ...WITH_PARENS,
       '!docs/**',
       '!src/auth/**',
       'src/\\auth/**',
@@ -142,6 +187,13 @@ describe('pathsOverlap', () => {
       'README.md',
       '.github/workflows/ci.yml',
       'packages/@acme/core/index.ts',
+      'app/index.tsx',
+      'app/(tabs)/index.tsx',
+      'app/feed/(..)photo/page.tsx',
+      'src/routes/(app)/page.svelte',
+      'src/@(auth)/login.ts',
+      'src/!(auth)/login.ts',
+      'src/+(auth)/login.ts',
     ];
     const missed: string[] = [];
     for (const a of patterns) {

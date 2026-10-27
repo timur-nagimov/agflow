@@ -183,9 +183,17 @@ describe('ownedPaths', () => {
       'README.md',
       'src/{auth,billing}/**',
       'packages/@acme/core/**',
+      // Route-group folders: Next.js app/(marketing), Expo Router app/(tabs), SvelteKit routes/(app).
+      'app/(marketing)/**',
+      'app/(tabs)/**',
+      'app/(tabs)/index.tsx',
+      'src/routes/(app)/**',
+      'src/@(auth)/**',
+      'src/!(auth)/**',
     ];
     for (const path of supported) {
       expect(NewTaskSchema.safeParse({ ...task, ownedPaths: [path] }).success).toBe(true);
+      expect(TaskPatchSchema.safeParse({ ownedPaths: [path] }).success).toBe(true);
     }
   });
 
@@ -198,11 +206,18 @@ describe('ownedPaths', () => {
       './!docs/**',
       'src\\auth\\**',
       'src/@(auth|billing)/**',
+      'src/(auth|billing)/**',
       'src/auth|docs/**',
     ];
     for (const path of unsupported) {
       expect(NewTaskSchema.safeParse({ ...task, ownedPaths: [path] }).success).toBe(false);
       expect(TaskPatchSchema.safeParse({ ownedPaths: [path] }).success).toBe(false);
     }
+  });
+
+  test('the error says how to write alternatives', () => {
+    const result = NewTaskSchema.safeParse({ ...task, ownedPaths: ['src/(auth|billing)/**'] });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(prettifyError(result.error)).toContain('write alternatives as {a,b}');
   });
 });

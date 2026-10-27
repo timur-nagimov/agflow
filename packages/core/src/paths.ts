@@ -8,16 +8,21 @@ function normalizePattern(pattern: string): string {
 
 /**
  * Owned-path patterns are repo-relative globs. Glob engines read a leading "/" or "!", a ".."
- * segment, "\", "(" and "|" in different ways (absolute path, negation, parent directory, escape,
- * extglob, group or alternation), so they are outside the supported syntax and are rejected
- * rather than guessed.
+ * segment, "\" and "|" in different ways (absolute path, negation, parent directory, escape,
+ * alternation), so they are outside the supported syntax and are rejected rather than guessed.
+ *
+ * "(" is allowed, because route-group folders such as app/(tabs)/** are common. Engines read it
+ * differently (Bun.Glob, which runs the scope check, takes it literally; extglob engines take a
+ * group), but the literal prefix ends before it and, with "|" and "\" excluded, nothing after it can
+ * make the text before it optional. So the overlap test holds under either reading, at the cost of
+ * treating sibling groups (app/(tabs)/** and app/(shop)/**) as overlapping.
  */
 export function isSupportedPattern(pattern: string): boolean {
   const normalized = normalizePattern(pattern);
   return !(
     normalized.startsWith('/') ||
     normalized.startsWith('!') ||
-    /[\\(|]/.test(normalized) ||
+    /[\\|]/.test(normalized) ||
     normalized.split('/').includes('..')
   );
 }

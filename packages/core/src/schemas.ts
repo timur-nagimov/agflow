@@ -40,7 +40,7 @@ const OwnedPathSchema = z
   .max(300)
   .refine(
     isSupportedPattern,
-    'expected a repo-relative glob without a leading "/" or "!", a ".." segment, or any of \\ ( |',
+    'expected a repo-relative glob without a leading "/" or "!", a ".." segment, "\\" or "|" (write alternatives as {a,b})',
   );
 
 const contractFields = {
