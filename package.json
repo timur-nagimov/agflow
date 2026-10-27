@@ -9,7 +9,8 @@
     "hub": "bun packages/hub/src/main.ts",
     "smoke:hub": "bun scripts/smoke-hub.ts",
     "smoke:cli": "bun packages/cli/scripts/smoke.ts",
-    "build:cli": "bun build --compile packages/cli/src/main.ts --outfile dist/agflow"
+    "build:cli": "bun build --compile packages/cli/src/main.ts --outfile dist/agflow",
+    "verify:real-clis": "bun packages/cli/scripts/verify-real-clis.ts"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",
