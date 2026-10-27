@@ -7,6 +7,11 @@ import { findTask, lastRemindedAt, markReminded } from './tasks';
 import { clip } from './text';
 
 export const LIVE_INBOX_CHAR_LIMIT = 6000;
+/**
+ * The most one message may take, formatted, to be delivered through a hook. Claude Code cuts hook
+ * context at 10,000 characters, and the hook adds its own lines around the messages.
+ */
+export const LIVE_INBOX_HARD_LIMIT = 9000;
 
 function sessionAgent(ctx: HubContext, user: string, vendor: Vendor, sessionId: string): Agent | null {
   const agent = findAgentBySession(ctx, vendor, sessionId);
@@ -27,6 +32,9 @@ export function liveInbox(ctx: HubContext, user: string, vendor: Vendor, session
       // Bodies are quoted line by line when formatted, so count the formatted text.
       const cost = formatMessage(message).length + 2;
       if (picked.length > 0 && size + cost > LIVE_INBOX_CHAR_LIMIT) break;
+      // Even the first message must fit in hook context. One that does not stays unread: `more` counts it,
+      // and check_inbox returns it whole.
+      if (cost > LIVE_INBOX_HARD_LIMIT) break;
       picked.push(message);
       size += cost;
     }

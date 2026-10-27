@@ -8,6 +8,10 @@ import { findTask, listTasks } from './tasks';
 import { clip } from './text';
 
 export const BRIEF_LIMIT = 8000;
+/** The most a worker's task section may take. The full contract is a `get_task` call away. */
+export const BRIEF_TASK_LIMIT = 3500;
+const RULES_LIMIT = 1500;
+const OWNED_PATHS_SHOWN = 20;
 
 export interface BriefOptions {
   helloCode?: string | undefined;
@@ -51,13 +55,42 @@ export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions 
   if (project.paused) parts.push('THE PROJECT IS PAUSED. Do not start new work. Finish or hand off what you hold.');
   parts.push(agent.role === 'lead' ? LEAD_GUIDE : WORKER_GUIDE);
   parts.push(`## Goal${goal ? ` (v${goal.version})` : ''}\n${goal ? clip(goal.text, 2500) : 'No goal has been set yet.'}`);
-  const rules = listStandingRules(ctx).slice(0, 15);
-  const ruleLines = rules.length > 0 ? rules.map((rule) => `- #${rule.id}: ${clip(rule.body, 300)}`).join('\n') : 'None.';
-  parts.push(clip(`## Standing rules from people\n${ruleLines}`, 1500));
-  parts.push(agent.role === 'lead' ? situationReport(ctx) : yourTask(ctx, agent));
+  parts.push(standingRules(ctx));
   const unread = unreadFor(ctx, agent).length;
-  parts.push(`## Messages\n${unread} unread.${unread > 0 ? ' Call `check_inbox` to read them.' : ''}`);
-  return clip(parts.join('\n\n'), BRIEF_LIMIT);
+  // The messages section closes the brief outside the clip, so no amount of other text can push it out.
+  const messages = `## Messages\n${unread} unread.${unread > 0 ? ' Call `check_inbox` to read them.' : ''}`;
+  const room = BRIEF_LIMIT - messages.length - 2;
+  const head = parts.join('\n\n');
+  const section =
+    agent.role === 'lead' ? situationReport(ctx) : yourTask(ctx, agent, Math.min(BRIEF_TASK_LIMIT, room - head.length - 2));
+  return `${clip(`${head}\n\n${section}`, room)}\n\n${messages}`;
+}
+
+const RULES_HEADING = '## Standing rules from people';
+const leftOut = (count: number): string => `${count} older standing rule(s) did not fit in this brief. Ask a person for them.`;
+
+/**
+ * People's standing rules, newest first: a newer rule may refine an older one, and an agent that joins
+ * after a rule was sent never gets it as a message. The older rules that do not fit are counted, not
+ * dropped silently.
+ */
+function standingRules(ctx: HubContext): string {
+  const rules = listStandingRules(ctx).reverse();
+  if (rules.length === 0) return `${RULES_HEADING}\nNone.`;
+  const lines = [RULES_HEADING];
+  const countRoom = leftOut(rules.length).length + 1;
+  let size = RULES_HEADING.length;
+  for (const [index, rule] of rules.entries()) {
+    const line = `- #${rule.id}: ${clip(rule.body, 300)}`;
+    // Unless this is the last rule, keep room for the line that counts the ones left out.
+    const reserve = index === rules.length - 1 ? 0 : countRoom;
+    if (size + 1 + line.length + reserve > RULES_LIMIT) break;
+    lines.push(line);
+    size += 1 + line.length;
+  }
+  const left = rules.length - (lines.length - 1);
+  if (left > 0) lines.push(leftOut(left));
+  return lines.join('\n');
 }
 
 /**
@@ -67,19 +100,34 @@ export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions 
  */
 const quoted = (text: string, max: number): string => quoteLines(clip(text, max));
 
-function yourTask(ctx: HubContext, agent: Agent): string {
+/**
+ * The task the worker holds, in at most `budget` characters. When any of it is cut, the section ends
+ * by sending the agent to `get_task` for the full contract.
+ */
+function yourTask(ctx: HubContext, agent: Agent, budget: number): string {
   const task = agent.currentTask ? findTask(ctx, agent.currentTask) : null;
   if (!task) return '## Your task\nYou hold no task. Call `list_tasks` to see ready tasks and `claim_task` to take one.';
-  const lines = [`## Your task\n${task.id} [${task.status}] ${clip(task.title, 200)}`, `Objective:\n${quoted(task.objective, 1200)}`];
-  if (task.why) lines.push(`Why:\n${quoted(task.why, 400)}`);
+  const paths = task.ownedPaths.slice(0, OWNED_PATHS_SHOWN);
+  const morePaths = task.ownedPaths.length - paths.length;
+  let cut = task.acceptance.length > 15 || morePaths > 0;
+  // Quotes a field cut to max characters and remembers whether anything was cut.
+  const field = (text: string, max: number): string => {
+    cut ||= text.length > max;
+    return quoted(text, max);
+  };
+  const lines = [`## Your task\n${task.id} [${task.status}] ${clip(task.title, 200)}`, `Objective:\n${field(task.objective, 1200)}`];
+  if (task.why) lines.push(`Why:\n${field(task.why, 400)}`);
   lines.push(
     'Acceptance criteria:',
-    ...task.acceptance.slice(0, 15).map((criterion) => `- ${criterion.id}:\n${quoted(criterion.assertion, 300)}`),
+    ...task.acceptance.slice(0, 15).map((criterion) => `- ${criterion.id}:\n${field(criterion.assertion, 300)}`),
   );
-  if (task.ownedPaths.length > 0) lines.push(`Owned paths: ${task.ownedPaths.join(', ')}`);
+  if (paths.length > 0) lines.push(`Owned paths: ${paths.join(', ')}${morePaths > 0 ? ` and ${morePaths} more` : ''}`);
   if (task.branch) lines.push(`Branch: ${task.branch}`);
-  if (task.feedback) lines.push(`Latest review feedback:\n${quoted(task.feedback, 800)}`);
-  return lines.join('\n');
+  if (task.feedback) lines.push(`Latest review feedback:\n${field(task.feedback, 800)}`);
+  const text = lines.join('\n');
+  if (!cut && text.length <= budget) return text;
+  const pointer = `This task was shortened to fit the brief. Call \`get_task\` with id "${task.id}" for the full contract.`;
+  return `${clip(text, budget - pointer.length - 1)}\n${pointer}`;
 }
 
 export function situationReport(ctx: HubContext): string {
