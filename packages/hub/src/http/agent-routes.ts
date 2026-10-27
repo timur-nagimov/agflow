@@ -2,7 +2,7 @@ import { HelloInputSchema, LiveSessionQuerySchema, SessionStartInputSchema, Stop
 import { helloAgent, listAgents, startLiveSession } from '../agents';
 import { buildBrief } from '../brief';
 import type { HubContext } from '../context';
-import { liveInbox, stopCheck } from '../live';
+import { liveInbox, peekInbox, stopCheck } from '../live';
 import type { App } from './app';
 import { principal, readBody, readQuery } from './util';
 
@@ -30,6 +30,12 @@ export function mountAgentRoutes(app: App, ctx: HubContext): void {
     const p = principal(c);
     const query = readQuery(c, LiveSessionQuerySchema);
     return c.json(liveInbox(ctx, p.user, query.vendor, query.sessionId));
+  });
+
+  app.get('/api/live/peek', (c) => {
+    const p = principal(c);
+    const query = readQuery(c, LiveSessionQuerySchema);
+    return c.json(peekInbox(ctx, p.user, query.vendor, query.sessionId));
   });
 
   app.post('/api/live/stop-check', async (c) => {

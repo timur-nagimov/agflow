@@ -186,3 +186,8 @@ export interface HubStatus {
   activeAgents: number;
   humansInbox: MessageView[];
 }
+
+export interface LivePeek {
+  unread: number;
+  first: { from: string } | null;
+}

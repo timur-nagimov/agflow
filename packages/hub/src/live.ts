@@ -1,4 +1,4 @@
-import { type Agent, type LiveInbox, type Message, type StopCheckResult, type Vendor, formatMessage, isHeld } from '@agflow/core';
+import { type Agent, type LiveInbox, type LivePeek, type Message, type StopCheckResult, type Vendor, formatMessage, isHeld } from '@agflow/core';
 import { findAgentBySession, getAgent, touchAgent } from './agents';
 import { type HubContext, tx } from './context';
 import { forbidden } from './errors';
@@ -64,4 +64,18 @@ export function stopCheck(ctx: HubContext, user: string, input: StopCheckInput):
     }
   }
   return { action: 'allow' };
+}
+
+/**
+ * What a waiting hook needs to know: the unread count and the first sender. Bodies stay out of hook
+ * notices; agents read them through check_inbox, where every body line is quoted. Does not deliver or
+ * count as activity.
+ */
+export function peekInbox(ctx: HubContext, user: string, vendor: Vendor, sessionId: string): LivePeek {
+  const agent = findAgentBySession(ctx, vendor, sessionId);
+  if (!agent) return { unread: 0, first: null };
+  if (agent.user !== user) throw forbidden('this session belongs to another user');
+  const unread = unreadFor(ctx, agent);
+  const first = unread[0];
+  return { unread: unread.length, first: first ? { from: first.from } : null };
 }
