@@ -5,6 +5,7 @@ import { listEvents } from '../src/events';
 import { listMessages } from '../src/messages';
 import { setPaused } from '../src/project';
 import {
+  acceptTask,
   cancelTask,
   claimTask,
   createTasks,
@@ -15,7 +16,9 @@ import {
   releaseTask,
   reportProgress,
   resumeClaim,
+  submitTask,
   sweepLeases,
+  updateTask,
 } from '../src/tasks';
 import { addAgent, createTestContext, newTask } from './helpers';
 
@@ -60,6 +63,30 @@ describe('claiming', () => {
     claimTask(ctx, a.id, first);
     expect(() => claimTask(ctx, b.id, second)).toThrow(`overlap ${a.id}`);
     expect(claimTask(ctx, c.id, second).status).toBe('claimed');
+  });
+
+  test('a task with unmet dependencies is moved to blocked instead of being claimed', () => {
+    const { ctx } = createTestContext();
+    const first = addAgent(ctx);
+    const second = addAgent(ctx, 'bob');
+    const [a, b] = createTasks(ctx, [newTask({ title: 'A' }), newTask({ title: 'B' })], 'user:alice');
+    claimTask(ctx, b.id, first);
+    // A dependency added while the task is held leaves it held, so it comes back to the pool ready.
+    updateTask(ctx, b.id, { dependsOn: [a.id] }, 'user:alice');
+    releaseTask(ctx, b.id, first, 'A has to come first');
+    expect(getTask(ctx, b.id).status).toBe('ready');
+    expect(() => claimTask(ctx, b.id, second)).toThrow(`${b.id} cannot be claimed: it is waiting on ${a.id}`);
+    expect(getTask(ctx, b.id)).toMatchObject({
+      status: 'blocked',
+      blockedKind: 'deps',
+      blockedReason: `waiting on ${a.id}`,
+      assignee: null,
+    });
+    expect(getAgent(ctx, second.id).currentTask).toBeNull();
+    claimTask(ctx, a.id, second);
+    submitTask(ctx, a.id, second, { summary: 'Done.', evidence: [] });
+    acceptTask(ctx, a.id, 'user:alice');
+    expect(claimTask(ctx, b.id, first).status).toBe('claimed');
   });
 });
 
