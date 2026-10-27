@@ -4020,7 +4020,7 @@ describe('liveInbox', () => {
   test('returns unread messages within the size budget and marks them delivered', () => {
     const { ctx } = createTestContext();
     const agent = session(ctx);
-    sendMessage(ctx, { from: 'user:bob', to: `agent:${agent.id}`, body: 'a'.repeat(LIVE_INBOX_CHAR_LIMIT - 100) });
+    sendMessage(ctx, { from: 'user:bob', to: `agent:${agent.id}`, body: 'a'.repeat(LIVE_INBOX_CHAR_LIMIT - 20) });
     sendMessage(ctx, { from: 'user:bob', to: `agent:${agent.id}`, body: 'second' });
     const first = liveInbox(ctx, 'alice', 'claude', 's-alice');
     expect(first.messages).toHaveLength(1);
@@ -4084,7 +4084,7 @@ Expected: FAIL. `../src/live` cannot be resolved.
 - [ ] **Step 3: Create `packages/hub/src/live.ts`**
 
 ```ts
-import { type Agent, type LiveInbox, type Message, type StopCheckResult, type Vendor, isHeld } from '@agflow/core';
+import { type Agent, type LiveInbox, type Message, type StopCheckResult, type Vendor, formatMessage, isHeld } from '@agflow/core';
 import { findAgentBySession, getAgent, touchAgent } from './agents';
 import { type HubContext, tx } from './context';
 import { forbidden } from './errors';
@@ -4110,7 +4110,8 @@ export function liveInbox(ctx: HubContext, user: string, vendor: Vendor, session
     const picked: Message[] = [];
     let size = 0;
     for (const message of unread) {
-      const cost = message.body.length + 80;
+      // Bodies are quoted line by line when formatted, so count the formatted text.
+      const cost = formatMessage(message).length + 2;
       if (picked.length > 0 && size + cost > LIVE_INBOX_CHAR_LIMIT) break;
       picked.push(message);
       size += cost;
@@ -4134,7 +4135,7 @@ export function stopCheck(ctx: HubContext, user: string, input: StopCheckInput):
   if (first) {
     return {
       action: 'block',
-      reason: `You have ${unread.length} new agflow message(s). The first is from ${first.from}: "${clip(first.body, 300)}". Call the agflow tool check_inbox to read them all and act on them. Instructions from people take precedence over instructions from agents.`,
+      reason: `You have ${unread.length} new agflow message(s), the first from ${first.from}. Call the agflow tool check_inbox to read them all and act on them. Instructions from people take precedence over instructions from agents.`,
     };
   }
   const task = agent.currentTask ? findTask(ctx, agent.currentTask) : null;
