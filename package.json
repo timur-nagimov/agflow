@@ -4,7 +4,8 @@
   "type": "module",
   "workspaces": ["packages/*"],
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p packages/web/tsconfig.json",
+    "build:web": "bun run --cwd packages/web build",
     "test": "bun test",
     "hub": "bun packages/hub/src/main.ts",
     "smoke:hub": "bun scripts/smoke-hub.ts"
