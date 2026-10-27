@@ -563,6 +563,11 @@ export function acceptTask(ctx: HubContext, id: string, actor: string, note?: st
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
     if (task.status !== 'submitted') throw conflict(`${id} is ${task.status}; only submitted tasks can be accepted`);
+    // Spec §9.1: an agent never decides that its own work is done. The lead holds the worker tools too.
+    const author = task.submission?.by ?? task.assignee;
+    if (author && actor === `agent:${author}`) {
+      throw forbidden(`${id} was submitted by you; an agent cannot accept its own work`);
+    }
     const accepted = move(ctx, emit, task, 'accepted', actor, { changes: { feedback: null }, data: { note: note ?? null } });
     if (task.assignee) {
       insertMessage(ctx, emit, {
@@ -591,7 +596,13 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
           last_seen_at: number;
         } | null)
       : null;
-    if (author && statusFor(author.last_seen_at, ctx.now()) === 'active' && !heldTaskOf(ctx, author.id)) {
+    // Returning the task makes its author hold it again, so the owned-path overlap rule applies here too.
+    if (
+      author &&
+      statusFor(author.last_seen_at, ctx.now()) === 'active' &&
+      !heldTaskOf(ctx, author.id) &&
+      !overlappingHeldTask(ctx, task)
+    ) {
       const back = move(ctx, emit, rejected, 'claimed', 'system', {
         changes: { assignee: author.id, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
         event: 'task.returned',

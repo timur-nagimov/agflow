@@ -10,8 +10,10 @@ import {
   createTasks,
   declareImpossible,
   getTask,
+  listTasks,
   markMerged,
   rejectTask,
+  releaseTask,
   submitTask,
   unblockTask,
 } from '../src/tasks';
@@ -57,6 +59,28 @@ describe('reviewing', () => {
     expect(listMessages(ctx, { target: `agent:${agent.id}` })[0]?.body).toBe(`${a.id} was accepted. Nice.`);
   });
 
+  test('an agent cannot accept its own submission, but a person can', () => {
+    const { ctx } = createTestContext();
+    const lead = addAgent(ctx, 'alice', 'lead');
+    const [task] = createTasks(ctx, [newTask()], 'user:alice');
+    claimTask(ctx, task.id, lead);
+    submitTask(ctx, task.id, lead, { summary: 'Done.', evidence: [] });
+    expect(() => acceptTask(ctx, task.id, `agent:${lead.id}`)).toThrow(HubError);
+    expect(() => acceptTask(ctx, task.id, `agent:${lead.id}`)).toThrow('cannot accept its own work');
+    expect(getTask(ctx, task.id).status).toBe('submitted');
+    expect(acceptTask(ctx, task.id, 'user:alice').status).toBe('accepted');
+  });
+
+  test('the lead can accept the work of another agent', () => {
+    const { ctx } = createTestContext();
+    const lead = addAgent(ctx, 'alice', 'lead');
+    const worker = addAgent(ctx, 'bob');
+    const [task] = createTasks(ctx, [newTask()], 'user:alice');
+    claimTask(ctx, task.id, worker);
+    submitTask(ctx, task.id, worker, { summary: 'Done.', evidence: [] });
+    expect(acceptTask(ctx, task.id, `agent:${lead.id}`).status).toBe('accepted');
+  });
+
   test('rejected work goes back to its author while the author is active', () => {
     const { ctx } = createTestContext();
     const { agent, task } = submitted(ctx);
@@ -71,6 +95,38 @@ describe('reviewing', () => {
     const { task } = submitted(ctx);
     clock.advance(ACTIVE_MS + 1);
     expect(rejectTask(ctx, task.id, 'user:alice', 'Redo.')).toMatchObject({ status: 'ready', assignee: null, feedback: 'Redo.' });
+  });
+
+  test('rejected work returns to the pool when sending it back would overlap a held task', () => {
+    const { ctx } = createTestContext();
+    const author = addAgent(ctx);
+    const other = addAgent(ctx, 'bob');
+    const [a, b] = createTasks(
+      ctx,
+      [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['src/auth/login.ts'] })],
+      'user:alice',
+    );
+    claimTask(ctx, a.id, author);
+    submitTask(ctx, a.id, author, { summary: 'Done.', evidence: [] });
+    claimTask(ctx, b.id, other);
+    expect(rejectTask(ctx, a.id, 'user:alice', 'Redo.')).toMatchObject({ status: 'ready', assignee: null, feedback: 'Redo.' });
+    expect(getAgent(ctx, author.id).currentTask).toBeNull();
+    expect(listTasks(ctx, { status: ['claimed', 'working'] }).map((task) => task.id)).toEqual([b.id]);
+    expect(() => claimTask(ctx, a.id, author)).toThrow(`overlap ${b.id}`);
+    releaseTask(ctx, b.id, other, 'switching tasks');
+    expect(claimTask(ctx, a.id, author).status).toBe('claimed');
+  });
+
+  test('rejected work still goes back to its author when held tasks own other paths', () => {
+    const { ctx } = createTestContext();
+    const author = addAgent(ctx);
+    const other = addAgent(ctx, 'bob');
+    const [a, b] = createTasks(ctx, [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['docs/**'] })], 'user:alice');
+    claimTask(ctx, a.id, author);
+    submitTask(ctx, a.id, author, { summary: 'Done.', evidence: [] });
+    claimTask(ctx, b.id, other);
+    expect(rejectTask(ctx, a.id, 'user:alice', 'Redo.')).toMatchObject({ status: 'claimed', assignee: author.id });
+    expect(getAgent(ctx, author.id).currentTask).toBe(a.id);
   });
 
   test('only submitted tasks can be accepted or rejected', () => {
