@@ -69,9 +69,35 @@ export function acquireWaiterLock(dir: string, vendor: Vendor, sessionId: string
   };
 }
 
-export async function waitInboxCommand(vendor: Vendor, io: Io): Promise<number> {
-  const dir = configDir();
-  const input = parseHookInput(await Bun.stdin.text());
+/**
+ * Whether this process may sit and wait. Claude Code backgrounds an asyncRewake hook only in an interactive session
+ * (or one driven through streaming input). In print mode (`claude -p`) it runs the hook in the foreground and waits
+ * for it, so a waiter would hold up SessionStart and Stop for hours. Claude Code sets CLAUDE_CODE_ENTRYPOINT in the
+ * hook's environment: `cli` for an interactive terminal session, `sdk-cli` for print mode and other values for the
+ * SDKs, editors and desktop apps. Only `cli` is known to be backgrounded, so any other value returns at once; those
+ * chats still get their messages from the stop and prompt hooks. Without the variable (someone running the command
+ * by hand) the waiter may wait. The variable says nothing about other vendors.
+ */
+export function safeToWait(vendor: Vendor, env: Record<string, string | undefined> = process.env): boolean {
+  if (vendor !== 'claude') return true;
+  const entrypoint = env.CLAUDE_CODE_ENTRYPOINT;
+  return !entrypoint || entrypoint === 'cli';
+}
+
+export interface WaitInboxDeps {
+  env: Record<string, string | undefined>;
+  readStdin: () => Promise<string>;
+}
+
+export async function waitInboxCommand(
+  vendor: Vendor,
+  io: Io,
+  deps: WaitInboxDeps = { env: process.env, readStdin: () => Bun.stdin.text() },
+): Promise<number> {
+  // First, before reading input or asking the hub anything: a hook that Claude Code runs in the foreground must not wait.
+  if (!safeToWait(vendor, deps.env)) return 0;
+  const dir = configDir(deps.env);
+  const input = parseHookInput(await deps.readStdin());
   const sessionId = typeof input.session_id === 'string' ? input.session_id : '';
   const credentials = loadCredentials(dir);
   if (!sessionId || !credentials) return 0;
