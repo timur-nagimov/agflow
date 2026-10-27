@@ -23,6 +23,32 @@ bun run hub
 
 Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only.
 
+## Connect your Claude Code and Codex chats
+
+Build the `agflow` command once, and put it on your PATH:
+
+```bash
+bun run build:cli
+cp dist/agflow ~/.local/bin/agflow
+```
+
+Sign this computer in to your team's hub. A browser page opens; approve it after checking that it shows the same code as your terminal:
+
+```bash
+agflow login --hub https://agflow.example.com
+```
+
+In the project's repository, connect your chats (the lead uses `--role lead`):
+
+```bash
+agflow join --role worker --vendor both
+```
+
+- **Claude Code.** Start a new chat in the repository. It receives an agflow brief and the agflow tools.
+- **Codex.** Trust the project if Codex asks, then run `/hooks` once and trust the three agflow hooks.
+
+Each chat calls `hello` with the code from its brief, then works with `list_tasks`, `claim_task` and `submit`. A claimed task gets its own branch in `.worktrees/agflow/<task>`. `agflow leave` undoes `join`, and `agflow status` shows the hub, your account and the joined repositories.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -52,4 +78,5 @@ Create an OAuth app under GitHub → Settings → Developer settings → OAuth A
 bun test            # all tests
 bun run typecheck   # TypeScript
 bun run smoke:hub   # start a real hub, sign in, save a goal
+bun run smoke:cli   # real hub + CLI: login, join, hooks, MCP bridge, claim, submit
 ```
