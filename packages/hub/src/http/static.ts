@@ -1,9 +1,10 @@
-import { extname, join, normalize, sep } from 'node:path';
+import { extname, join, normalize, resolve, sep } from 'node:path';
 import type { App } from './app';
 
 /** Serves the built web UI and falls back to index.html for client-side routes. */
 export function mountStatic(app: App, root: string): void {
-  const base = normalize(root);
+  // Absolute and without a trailing slash, so the containment check below also holds for "dist/" and ".".
+  const base = resolve(root);
   app.get('*', async (c, next) => {
     const path = c.req.path;
     if (path.startsWith('/api/') || path.startsWith('/auth/')) return next();

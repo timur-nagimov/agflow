@@ -7,6 +7,8 @@ import type { App } from './app';
 import { intParam, principal } from './util';
 
 export const SSE_PING_MS = 15_000;
+/** Events read per replay query. listEvents returns at most this many, so a shorter page is the last one. */
+const REPLAY_PAGE = 1000;
 
 export function mountEventRoutes(app: App, ctx: HubContext): void {
   app.get('/api/events', (c) => {
@@ -47,7 +49,13 @@ export function mountEventRoutes(app: App, ctx: HubContext): void {
         await stream.writeSSE({ event: 'hub', id: String(event.id), data: JSON.stringify(event) });
         lastId = event.id;
       };
-      for (const event of listEvents(ctx.db, { after, limit: 1000 })) await send(event);
+      // Page through everything stored after lastId, so a long disconnect leaves no hole before the live events.
+      // send() skips ids at or below lastId, so events that were queued meanwhile are not sent twice.
+      for (;;) {
+        const page = listEvents(ctx.db, { after: lastId, limit: REPLAY_PAGE });
+        for (const event of page) await send(event);
+        if (page.length < REPLAY_PAGE || closed) break;
+      }
       while (!closed) {
         while (queue.length > 0) await send(queue.shift() as HubEvent);
         if (closed) break;
