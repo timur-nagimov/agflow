@@ -2,8 +2,18 @@ import { describe, expect, test } from 'bun:test';
 import { listEvents } from '../src/events';
 import { updateGoal } from '../src/goal';
 import { listMessages } from '../src/messages';
-import { cancelTask, createTasks, getTask, listTasks, updateTask } from '../src/tasks';
-import { createTestContext, newTask } from './helpers';
+import {
+  acceptTask,
+  cancelTask,
+  claimTask,
+  createTasks,
+  getTask,
+  listTasks,
+  submitTask,
+  unblockTask,
+  updateTask,
+} from '../src/tasks';
+import { addAgent, createTestContext, newTask } from './helpers';
 
 describe('creating tasks', () => {
   test('a task without dependencies is ready and records the goal version', () => {
@@ -74,5 +84,78 @@ describe('updating and cancelling', () => {
     expect(listEvents(ctx.db, { subject: task.id }).at(-1)?.data).toMatchObject({ reason: 'not needed' });
     expect(() => updateTask(ctx, task.id, { title: 'x' }, 'user:alice')).toThrow('can no longer change');
     expect(getTask(ctx, task.id).status).toBe('cancelled');
+  });
+
+  test('cancelling a blocked task clears why it was blocked', () => {
+    const { ctx } = createTestContext();
+    const [, b] = createTasks(ctx, [newTask({ title: 'A' }), newTask({ title: 'B', dependsOn: ['#1'] })], 'user:alice');
+    expect(cancelTask(ctx, b.id, 'not needed', 'user:alice')).toMatchObject({
+      status: 'cancelled',
+      blockedKind: null,
+      blockedReason: null,
+    });
+  });
+
+  test('cancelling a task asks the lead to decide on the open tasks that depend on it', () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [a, b, c, d] = createTasks(
+      ctx,
+      [
+        newTask({ title: 'API' }),
+        newTask({ title: 'Client', dependsOn: ['#1'] }),
+        newTask({ title: 'Docs' }),
+        newTask({ title: 'Old client', dependsOn: ['#1'] }),
+      ],
+      'user:alice',
+    );
+    claimTask(ctx, c.id, agent);
+    updateTask(ctx, c.id, { dependsOn: [a.id] }, 'user:alice');
+    // Nothing depends on d, and once cancelled d is not open, so neither cancel below lists it.
+    cancelTask(ctx, d.id, 'Superseded.', 'user:alice');
+    expect(listMessages(ctx, { target: 'lead' })).toEqual([]);
+    cancelTask(ctx, a.id, 'Replaced by the vendor SDK.', 'user:alice');
+    expect(getTask(ctx, b.id)).toMatchObject({
+      status: 'blocked',
+      blockedKind: 'deps',
+      blockedReason: `${a.id} was cancelled; amend or cancel this task`,
+    });
+    expect(getTask(ctx, c.id)).toMatchObject({ status: 'claimed', blockedReason: null });
+    const notices = listMessages(ctx, { target: 'lead' });
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ from: 'system', taskId: a.id });
+    expect(notices[0]?.body).toBe(
+      [
+        `${a.id} ("API") was cancelled by user:alice.`,
+        'user:alice wrote:',
+        '> Replaced by the vendor SDK.',
+        'These open tasks depend on it:',
+        `- ${b.id} ("Client") [blocked]`,
+        `- ${c.id} ("Docs") [claimed]`,
+        'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
+      ].join('\n'),
+    );
+  });
+
+  test('a task whose dependency was cancelled stays blocked until it is amended', () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [a, b, c] = createTasks(
+      ctx,
+      [newTask({ title: 'A' }), newTask({ title: 'B' }), newTask({ title: 'C', dependsOn: ['#1', '#2'] })],
+      'user:alice',
+    );
+    cancelTask(ctx, a.id, 'Not needed.', 'user:alice');
+    const reason = `${a.id} was cancelled; amend or cancel this task`;
+    expect(getTask(ctx, c.id).blockedReason).toBe(reason);
+    // Neither accepting the other dependency nor unblocking hides the reason, and new dependents get it too.
+    claimTask(ctx, b.id, agent);
+    submitTask(ctx, b.id, agent, { summary: 'Done.', evidence: [] });
+    acceptTask(ctx, b.id, 'user:alice');
+    expect(getTask(ctx, c.id)).toMatchObject({ status: 'blocked', blockedReason: reason });
+    expect(unblockTask(ctx, c.id, 'user:alice')).toMatchObject({ status: 'blocked', blockedReason: reason });
+    const [late] = createTasks(ctx, [newTask({ title: 'Late', dependsOn: [a.id] })], 'user:alice');
+    expect(late.blockedReason).toBe(reason);
+    expect(updateTask(ctx, c.id, { dependsOn: [b.id] }, 'user:alice').status).toBe('ready');
   });
 });
