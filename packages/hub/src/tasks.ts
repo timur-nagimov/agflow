@@ -519,3 +519,172 @@ export function sweepLeases(ctx: HubContext): string[] {
     return rows.map((row) => row.id);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Submitting, reviewing, blocking and merging
+// ---------------------------------------------------------------------------
+
+export interface SubmitInput {
+  summary: string;
+  evidence: string[];
+  branch?: string | undefined;
+  headSha?: string | undefined;
+}
+
+export function submitTask(ctx: HubContext, id: string, agent: Agent, input: SubmitInput): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    requireHolder(task, agent);
+    const branch = input.branch ?? task.branch;
+    const submission = {
+      summary: input.summary,
+      evidence: input.evidence,
+      branch,
+      headSha: input.headSha ?? null,
+      submittedAt: ctx.now(),
+      by: agent.id,
+    };
+    const result = move(ctx, emit, task, 'submitted', `agent:${agent.id}`, {
+      changes: { submission, branch, leaseExpiresAt: null },
+      data: { branch, headSha: input.headSha ?? null },
+    });
+    setAgentTask(ctx, agent.id, null);
+    insertMessage(ctx, emit, {
+      from: 'system',
+      to: 'lead',
+      taskId: id,
+      body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\nSummary: ${clip(input.summary, 1500)}\nReview it with accept_task or reject_task.`,
+    });
+    return result;
+  });
+}
+
+export function acceptTask(ctx: HubContext, id: string, actor: string, note?: string): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    if (task.status !== 'submitted') throw conflict(`${id} is ${task.status}; only submitted tasks can be accepted`);
+    const accepted = move(ctx, emit, task, 'accepted', actor, { changes: { feedback: null }, data: { note: note ?? null } });
+    if (task.assignee) {
+      insertMessage(ctx, emit, {
+        from: actor,
+        to: `agent:${task.assignee}`,
+        taskId: id,
+        body: `${id} was accepted.${note ? ` ${note}` : ''}`,
+      });
+    }
+    refreshDependents(ctx, emit);
+    return accepted;
+  });
+}
+
+export function rejectTask(ctx: HubContext, id: string, actor: string, feedback: string): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    if (task.status !== 'submitted') throw conflict(`${id} is ${task.status}; only submitted tasks can be rejected`);
+    const rejected = move(ctx, emit, task, 'rejected', actor, {
+      changes: { feedback },
+      data: { feedback: clip(feedback, 500) },
+    });
+    const author = task.assignee
+      ? (ctx.db.query('SELECT id, last_seen_at FROM agents WHERE id = $id').get({ id: task.assignee }) as {
+          id: string;
+          last_seen_at: number;
+        } | null)
+      : null;
+    if (author && statusFor(author.last_seen_at, ctx.now()) === 'active' && !heldTaskOf(ctx, author.id)) {
+      const back = move(ctx, emit, rejected, 'claimed', 'system', {
+        changes: { assignee: author.id, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
+        event: 'task.returned',
+        data: { to: author.id },
+      });
+      setAgentTask(ctx, author.id, id);
+      insertMessage(ctx, emit, {
+        from: actor,
+        to: `agent:${author.id}`,
+        taskId: id,
+        body: `${id} was rejected and is back with you.\nFeedback:\n${feedback}`,
+      });
+      return back;
+    }
+    return move(ctx, emit, rejected, 'ready', 'system', { changes: { assignee: null, leaseExpiresAt: null } });
+  });
+}
+
+export function blockTask(
+  ctx: HubContext,
+  id: string,
+  agent: Agent,
+  reason: string,
+  kind: 'agent' | 'impossible' = 'agent',
+): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    requireHolder(task, agent);
+    const blocked = move(ctx, emit, task, 'blocked', `agent:${agent.id}`, {
+      changes: { assignee: null, leaseExpiresAt: null, blockedKind: kind, blockedReason: reason },
+      event: kind === 'impossible' ? 'task.impossible' : 'task.blocked',
+      data: { reason: clip(reason, 500) },
+    });
+    setAgentTask(ctx, agent.id, null);
+    const body =
+      kind === 'impossible'
+        ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified:\n${reason}\nDecide: amend it with update_task and then unblock_task, split it, or cancel it.`
+        : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}:\n${reason}\nUnblock it with unblock_task once this is resolved.`;
+    insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: id, body });
+    return blocked;
+  });
+}
+
+export function declareImpossible(ctx: HubContext, id: string, agent: Agent, evidence: string): Task {
+  return blockTask(ctx, id, agent, evidence, 'impossible');
+}
+
+export function unblockTask(ctx: HubContext, id: string, actor: string, note?: string): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    if (task.status !== 'blocked') throw conflict(`${id} is not blocked`);
+    const waiting = unmetDependencies(ctx, task.dependsOn);
+    if (waiting.length > 0) {
+      writeTask(ctx, id, { blockedKind: 'deps', blockedReason: waitingReason(waiting) });
+      emit({ type: 'task.updated', actor, subject: id, data: { fields: ['blocked'] } });
+      return getTask(ctx, id);
+    }
+    return move(ctx, emit, task, 'ready', actor, {
+      changes: { blockedKind: null, blockedReason: null },
+      event: 'task.unblocked',
+      data: { note: note ?? null },
+    });
+  });
+}
+
+export function markMerged(ctx: HubContext, id: string, actor: string, sha?: string): Task {
+  return tx(ctx, (emit) => {
+    const task = getTask(ctx, id);
+    if (task.status !== 'accepted') throw conflict(`${id} is ${task.status}; only accepted tasks can be marked merged`);
+    return move(ctx, emit, task, 'merged', actor, { changes: { mergedSha: sha ?? null }, data: { sha: sha ?? null } });
+  });
+}
+
+function refreshDependents(ctx: HubContext, emit: Emit): void {
+  const rows = ctx.db.query("SELECT * FROM tasks WHERE status = 'blocked' AND blocked_kind = 'deps'").all() as TaskRow[];
+  for (const row of rows) {
+    const task = rowToTask(row);
+    const waiting = unmetDependencies(ctx, task.dependsOn);
+    if (waiting.length === 0) {
+      move(ctx, emit, task, 'ready', 'system', { changes: { blockedKind: null, blockedReason: null } });
+    } else if (task.blockedReason !== waitingReason(waiting)) {
+      writeTask(ctx, task.id, { blockedReason: waitingReason(waiting) });
+    }
+  }
+}
+
+export function lastRemindedAt(ctx: HubContext, id: string): number | null {
+  const row = ctx.db.query('SELECT last_reminded_at FROM tasks WHERE id = $id').get({ id }) as {
+    last_reminded_at: number | null;
+  } | null;
+  return row?.last_reminded_at ?? null;
+}
+
+export function markReminded(ctx: HubContext, id: string): void {
+  writeTask(ctx, id, { lastRemindedAt: ctx.now() });
+}
