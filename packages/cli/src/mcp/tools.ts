@@ -8,12 +8,21 @@ import {
   TaskIdSchema,
   TaskPatchSchema,
   formatMessages,
+  isHeld,
   quoteLines,
 } from '@agflow/core';
 import { z } from 'zod';
 import { repoRoot } from '../git';
 import type { HubClient } from '../hub-client';
-import { isTaskBranch, prepareTaskWorktree, pushTaskBranch, removeTaskWorktree, taskBranchName, taskWorktreePath } from './task-git';
+import {
+  assertTaskBranch,
+  isTaskBranch,
+  prepareTaskWorktree,
+  pushTaskBranch,
+  removeTaskWorktree,
+  taskBranchName,
+  taskWorktreePath,
+} from './task-git';
 
 export interface ToolState {
   agentId: string | null;
@@ -91,6 +100,9 @@ export function taskLine(task: Task): string {
 }
 
 export const lines = (parts: Array<string | false | null | undefined | 0>) => parts.filter(Boolean).join('\n');
+
+/** Where a chat that holds a task works. claim_task and resume_claim both end with it. */
+const workInside = (path: string, branch: string) => `Work only inside ${path} (branch ${branch}). Commit there; submit pushes the branch.`;
 
 export const sharedTools: ToolDef[] = [
   defineTool(
@@ -192,10 +204,31 @@ export const sharedTools: ToolDef[] = [
 ];
 
 export const workerTools: ToolDef[] = [
-  defineTool('resume_claim', 'Take over a task that one of your own earlier chats holds.', { id: TaskIdSchema }, async ({ id }, ctx) => {
-    const { task } = await asAgent(ctx).resumeClaim(id);
-    return `You now hold ${task.id}${task.branch ? ` (branch ${task.branch})` : ''}.`;
-  }),
+  defineTool(
+    'resume_claim',
+    'Take over a task that one of your own earlier chats holds. For a task on an agflow branch this also gives you its worktree in this repository; do all work for the task there.',
+    { id: TaskIdSchema },
+    async ({ id }, ctx) => {
+      const client = asAgent(ctx);
+      const { branch } = (await client.task(id)).task;
+      if (!isTaskBranch(id, branch)) {
+        const { task } = await client.resumeClaim(id);
+        return `You now hold ${task.id}${task.branch ? ` (branch ${task.branch})` : ''}.`;
+      }
+      // As in claim_task, the worktree comes first, so that a refusal by the hub leaves nothing behind.
+      const root = repoRoot(ctx.cwd);
+      if (!root) throw new ToolError(`${ctx.cwd} is not inside a git repository, so agflow cannot create the worktree for ${id}.`);
+      const worktree = prepareTaskWorktree(root, id, branch);
+      let task: Task;
+      try {
+        task = (await client.resumeClaim(id)).task;
+      } catch (error) {
+        removeTaskWorktree(root, worktree, branch);
+        throw error;
+      }
+      return lines([`You now hold ${task.id} (branch ${branch}).`, workInside(worktree.path, branch)]);
+    },
+  ),
   defineTool(
     'report_progress',
     'Record progress on the task you hold. This also keeps your claim alive.',
@@ -267,7 +300,7 @@ export const gitTools: ToolDef[] = [
       }
       return lines([
         `You hold ${claimed.id}: ${claimed.title}`,
-        `Work only inside ${worktree.path} (branch ${branch}). Commit there; submit pushes the branch.`,
+        workInside(worktree.path, branch),
         labelled('Objective:', claimed.objective),
         `Acceptance criteria:\n${acceptanceLines(claimed)}`,
         claimed.ownedPaths.length > 0 && `Change only: ${claimed.ownedPaths.join(', ')}`,
@@ -286,9 +319,38 @@ export const gitTools: ToolDef[] = [
     async ({ task_id, summary, evidence }, ctx) => {
       const client = asAgent(ctx);
       const { task } = await client.task(task_id);
-      const root = repoRoot(ctx.cwd);
-      const worktree = root ? taskWorktreePath(root, task_id) : null;
-      const headSha = worktree && task.branch && existsSync(worktree) ? pushTaskBranch(worktree, task.id, task.branch) : undefined;
+      // The hub refuses a submission from anyone but the holder, but only after the push below. A chat whose
+      // claim has ended (the lease ran out, it released the task, someone took it over) must not push at all:
+      // its commits would land on the branch that the task's new holder works on, and that holder's own
+      // push would then be rejected.
+      if (task.assignee !== ctx.state.agentId || !isHeld(task.status)) {
+        const heldBy = isHeld(task.status) && task.assignee ? ` (held by ${task.assignee})` : '';
+        throw new ToolError(
+          `You do not hold ${task.id}: it is ${task.status}${heldBy}. Nothing was pushed or submitted, and its branch is no longer yours to push to. ` +
+            'If you have work worth keeping, tell the lead with send_message. Then pick another task with list_tasks and claim_task.',
+        );
+      }
+      let headSha: string | undefined;
+      if (task.branch) {
+        // A task on a branch goes to review only with that branch pushed, or the lead would be sent to a branch
+        // that is not on the remote. The branch name comes first: resume_claim cannot give a task a new one.
+        assertTaskBranch(task.id, task.branch);
+        const root = repoRoot(ctx.cwd);
+        if (!root) {
+          throw new ToolError(
+            `${ctx.cwd} is not inside a git repository, so the worktree of ${task.id} cannot be found, and nothing was pushed or submitted. ` +
+              `Ask the person to start this chat inside the repository, call resume_claim for ${task.id} there, commit in the worktree it names, and submit again.`,
+          );
+        }
+        const worktree = taskWorktreePath(root, task.id);
+        if (!existsSync(worktree)) {
+          throw new ToolError(
+            `There is no worktree for ${task.id} in ${root}, so nothing was pushed or submitted. ` +
+              `Call resume_claim for ${task.id} here, which creates the worktree. Commit your work there, then submit again.`,
+          );
+        }
+        headSha = pushTaskBranch(worktree, task.id, task.branch);
+      }
       const submitted = (await client.submit(task_id, { summary, evidence: evidence ?? [], branch: task.branch ?? undefined, headSha })).task;
       const where = headSha ? ` at ${headSha.slice(0, 7)} on ${task.branch}` : '';
       return `${submitted.id} is ${submitted.status}${where}. The lead will review it; you may claim another task.`;

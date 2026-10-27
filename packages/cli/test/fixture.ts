@@ -108,3 +108,32 @@ export function tempRepo(): { dir: string; origin: string; root: string } {
   run(['git', 'push', '--quiet', '-u', 'origin', 'main'], root);
   return { dir, origin, root };
 }
+
+/**
+ * A repository made with `git init` on `branch` and pushed to a bare "origin" that was added by hand, which
+ * is how many repositories come to have a remote. Unlike a clone, it has no `origin/HEAD`.
+ */
+export function pushedRepo(branch: string): { dir: string; origin: string; root: string } {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-git-')));
+  const origin = join(dir, 'origin.git');
+  const root = join(dir, 'work');
+  run(['git', 'init', '--quiet', '--bare', '-b', branch, origin], dir);
+  run(['git', 'init', '--quiet', '-b', branch, root], dir);
+  run(['git', 'config', 'user.email', 'dev@example.com'], root);
+  run(['git', 'config', 'user.name', 'Dev'], root);
+  run(['git', 'remote', 'add', 'origin', origin], root);
+  writeFileSync(join(root, 'README.md'), '# demo\n');
+  run(['git', 'add', 'README.md'], root);
+  run(['git', 'commit', '--quiet', '-m', 'init'], root);
+  run(['git', 'push', '--quiet', '-u', 'origin', branch], root);
+  return { dir, origin, root };
+}
+
+/** Another clone of the repository's origin, as on another computer. */
+export function cloneOf(repo: { dir: string; origin: string }, name: string): string {
+  const path = join(repo.dir, name);
+  run(['git', 'clone', '--quiet', repo.origin, path], repo.dir);
+  run(['git', 'config', 'user.email', 'dev@example.com'], path);
+  run(['git', 'config', 'user.name', 'Dev'], path);
+  return path;
+}

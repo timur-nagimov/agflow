@@ -19,6 +19,15 @@ export function isTaskBranch(taskId: string, branch: string | null | undefined):
   return typeof branch === 'string' && branch.startsWith(`agflow/${taskId}-`);
 }
 
+export function assertTaskBranch(taskId: string, branch: string): void {
+  if (!isTaskBranch(taskId, branch)) {
+    throw new Error(
+      `${branch} is not an agflow task branch (agflow/${taskId}-<name>), so submit will not push to it. ` +
+        `Release ${taskId} and claim it again with claim_task to get a proper branch.`,
+    );
+  }
+}
+
 export interface TaskWorktree {
   path: string;
   created: boolean;
@@ -57,12 +66,7 @@ export function removeTaskWorktree(root: string, worktree: TaskWorktree, branch:
  * anything but the task's own branch from a worktree that has it checked out.
  */
 export function pushTaskBranch(path: string, taskId: string, branch: string): string {
-  if (!isTaskBranch(taskId, branch)) {
-    throw new Error(
-      `${branch} is not an agflow task branch (agflow/${taskId}-<name>), so submit will not push to it. ` +
-        `Release ${taskId} and claim it again with claim_task to get a proper branch.`,
-    );
-  }
+  assertTaskBranch(taskId, branch);
   const checkedOut = gitOk(path, ['branch', '--show-current']);
   if (checkedOut !== branch) {
     throw new Error(

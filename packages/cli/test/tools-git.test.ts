@@ -3,9 +3,9 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { NewTaskSchema } from '@agflow/core';
 import { getAgent } from '@agflow/hub/src/agents';
-import { claimTask, createTasks, getTask, rejectTask, releaseTask, submitTask } from '@agflow/hub/src/tasks';
+import { claimTask, createTasks, getTask, rejectTask, releaseTask, submitTask, sweepLeases } from '@agflow/hub/src/tasks';
 import { type ToolContext, allTools } from '../src/mcp/tools';
-import { type HubFixture, type LiveAgent, forged, hubFixture, run, standingForgeries, tempRepo } from './fixture';
+import { type HubFixture, type LiveAgent, cloneOf, forged, hubFixture, pushedRepo, run, standingForgeries, tempRepo } from './fixture';
 
 const newTask = (title: string) => NewTaskSchema.parse({ title, objective: `Do ${title}`, acceptance: [{ id: 'A1', assertion: 'works' }] });
 const call = (name: string, args: Record<string, unknown>, ctx: ToolContext) => {
@@ -178,5 +178,198 @@ describe('a branch another agent planted on the task', () => {
     await expect(call('submit', { task_id: 'T-1', summary: 'Parser added' }, ctx)).rejects.toThrow('is not on any branch');
     expect(run(['git', 'branch', '--list', 'agflow/T-1-add-parser'], repo.origin)).toBe('');
     expect(getTask(hub.ctx, 'T-1').status).toBe('claimed');
+  });
+});
+
+describe('claim_task in a repository whose default branch is not main', () => {
+  test('starts the task branch from origin/master when origin/HEAD is not set, and submit pushes it', async () => {
+    const hub = hubFixture();
+    const repo = pushedRepo('master');
+    createTasks(hub.ctx, [newTask('Add parser')], 'user:alice');
+    const ctx = as(hub.liveAgent('alice'), repo.root);
+    const worktree = join(repo.root, '.worktrees', 'agflow', 'T-1');
+    expect(await call('claim_task', { id: 'T-1' }, ctx)).toContain(`Work only inside ${worktree} (branch agflow/T-1-add-parser)`);
+    expect(run(['git', 'rev-parse', 'HEAD'], worktree)).toBe(run(['git', 'rev-parse', 'refs/heads/master'], repo.origin));
+    writeFileSync(join(worktree, 'parser.ts'), 'export const parse = () => 1;\n');
+    commitAll(worktree, 'parser');
+    const head = run(['git', 'rev-parse', 'HEAD'], worktree);
+    await call('submit', { task_id: 'T-1', summary: 'Parser added' }, ctx);
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-add-parser'], repo.origin)).toBe(head);
+  });
+
+  test('starts from the checked-out branch when origin cannot be reached', async () => {
+    const hub = hubFixture();
+    const repo = pushedRepo('master');
+    run(['git', 'remote', 'set-url', 'origin', join(repo.dir, 'gone.git')], repo.root);
+    createTasks(hub.ctx, [newTask('Add parser')], 'user:alice');
+    await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root));
+    const worktree = join(repo.root, '.worktrees', 'agflow', 'T-1');
+    expect(run(['git', 'rev-parse', 'HEAD'], worktree)).toBe(run(['git', 'rev-parse', 'refs/heads/master'], repo.root));
+  });
+});
+
+describe('resume_claim and the task worktree', () => {
+  test('in another clone it creates the worktree there, and submit pushes from it', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root));
+    const firstTree = join(repo.root, '.worktrees', 'agflow', 'T-1');
+    writeFileSync(join(firstTree, 'first.txt'), 'first chat\n');
+    commitAll(firstTree, 'first');
+    // Alice's other chat runs in another clone, say on another computer, and takes the claim over there.
+    const clone = cloneOf(repo, 'second');
+    const cloneTree = join(clone, '.worktrees', 'agflow', 'T-1');
+    const second = as(hub.liveAgent('alice'), clone);
+    expect(await call('resume_claim', { id: 'T-1' }, second)).toContain(`Work only inside ${cloneTree} (branch agflow/T-1-parser)`);
+    expect(run(['git', 'branch', '--show-current'], cloneTree)).toBe('agflow/T-1-parser');
+    writeFileSync(join(cloneTree, 'second.txt'), 'second chat\n');
+    commitAll(cloneTree, 'second');
+    const head = run(['git', 'rev-parse', 'HEAD'], cloneTree);
+    expect(await call('submit', { task_id: 'T-1', summary: 'Parser added' }, second)).toContain(`at ${head.slice(0, 7)} on agflow/T-1-parser`);
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-parser'], repo.origin)).toBe(head);
+    expect(getTask(hub.ctx, 'T-1').submission).toMatchObject({ branch: 'agflow/T-1-parser', headSha: head });
+    expect(run(['git', 'status', '--porcelain'], clone)).toBe('');
+  });
+
+  test('in the same repository it names the worktree that is already there, and submit pushes that worktree', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root));
+    const worktree = join(repo.root, '.worktrees', 'agflow', 'T-1');
+    writeFileSync(join(worktree, 'first.txt'), 'first chat\n');
+    commitAll(worktree, 'first');
+    const second = as(hub.liveAgent('alice'), repo.root);
+    expect(await call('resume_claim', { id: 'T-1' }, second)).toContain(`Work only inside ${worktree} (branch agflow/T-1-parser)`);
+    writeFileSync(join(worktree, 'second.txt'), 'second chat\n');
+    commitAll(worktree, 'second');
+    const head = run(['git', 'rev-parse', 'HEAD'], worktree);
+    await call('submit', { task_id: 'T-1', summary: 'Parser added' }, second);
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-parser'], repo.origin)).toBe(head);
+    // The first chat's commit travels with the second chat's.
+    expect(run(['git', 'rev-list', '--count', 'main..refs/heads/agflow/T-1-parser'], repo.origin)).toBe('2');
+  });
+
+  test('from outside a git repository it is refused, and the claim stays where it was', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const first = hub.liveAgent('alice');
+    await call('claim_task', { id: 'T-1' }, as(first, repo.root));
+    await expect(call('resume_claim', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.dir))).rejects.toThrow('not inside a git repository');
+    expect(getTask(hub.ctx, 'T-1').assignee).toBe(first.agentId);
+  });
+
+  test('on a task whose branch is not an agflow task branch it makes no worktree, and submit names the branch, not the worktree', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    claimTask(hub.ctx, 'T-1', getAgent(hub.ctx, hub.liveAgent('alice').agentId), 'production');
+    const second = as(hub.liveAgent('alice'), repo.root);
+    expect(await call('resume_claim', { id: 'T-1' }, second)).toBe('You now hold T-1 (branch production).');
+    expect(existsSync(join(repo.root, '.worktrees'))).toBe(false);
+    expect(run(['git', 'branch', '--list', 'production'], repo.root)).toBe('');
+    // resume_claim cannot help here, so the refusal must not send the chat to it.
+    await expect(call('submit', { task_id: 'T-1', summary: 'Done' }, second)).rejects.toThrow('not an agflow task branch');
+    expect(getTask(hub.ctx, 'T-1').status).toBe('claimed');
+  });
+
+  test('a refused resume_claim removes the worktree and branch it created', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const alice = hub.liveAgent('alice');
+    await call('claim_task', { id: 'T-1' }, as(alice, repo.root));
+    const clone = cloneOf(repo, 'bobs');
+    await expect(call('resume_claim', { id: 'T-1' }, as(hub.liveAgent('bob'), clone))).rejects.toThrow("someone else's agent");
+    expect(existsSync(join(clone, '.worktrees', 'agflow', 'T-1'))).toBe(false);
+    expect(run(['git', 'branch', '--list', 'agflow/T-1-parser'], clone)).toBe('');
+    expect(getTask(hub.ctx, 'T-1').assignee).toBe(alice.agentId);
+  });
+});
+
+describe('submit without the right to push', () => {
+  test('refuses, and pushes nothing, when this repository has no worktree for the task', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const alice = hub.liveAgent('alice');
+    // Alice's chat holds T-1 on its task branch, but nothing made the worktree in this repository.
+    claimTask(hub.ctx, 'T-1', getAgent(hub.ctx, alice.agentId), 'agflow/T-1-parser');
+    const here = as(alice, repo.root);
+    await expect(call('submit', { task_id: 'T-1', summary: 'Parser added' }, here)).rejects.toThrow(`There is no worktree for T-1 in ${repo.root}`);
+    await expect(call('submit', { task_id: 'T-1', summary: 'Parser added' }, as(alice, repo.dir))).rejects.toThrow('is not inside a git repository');
+    expect(getTask(hub.ctx, 'T-1').status).toBe('claimed');
+    expect(getTask(hub.ctx, 'T-1').submission).toBeNull();
+    expect(run(['git', 'branch', '--list', 'agflow/T-1-parser'], repo.origin)).toBe('');
+    // resume_claim, which the message names, makes the worktree. Then the submit goes through.
+    const worktree = join(repo.root, '.worktrees', 'agflow', 'T-1');
+    expect(await call('resume_claim', { id: 'T-1' }, here)).toContain(`Work only inside ${worktree}`);
+    writeFileSync(join(worktree, 'parser.ts'), 'export const parse = () => 1;\n');
+    commitAll(worktree, 'parser');
+    const head = run(['git', 'rev-parse', 'HEAD'], worktree);
+    expect(await call('submit', { task_id: 'T-1', summary: 'Parser added' }, here)).toContain(`at ${head.slice(0, 7)} on agflow/T-1-parser`);
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-parser'], repo.origin)).toBe(head);
+  });
+
+  test('a task that has no branch is submitted without a push, wherever the chat runs', async () => {
+    const hub = hubFixture();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const alice = hub.liveAgent('alice');
+    claimTask(hub.ctx, 'T-1', getAgent(hub.ctx, alice.agentId));
+    expect(getTask(hub.ctx, 'T-1').branch).toBeNull();
+    expect(await call('submit', { task_id: 'T-1', summary: 'Done' }, as(alice, tempRepo().dir))).toStartWith('T-1 is submitted.');
+    expect(getTask(hub.ctx, 'T-1').submission).toMatchObject({ branch: null, headSha: null });
+  });
+
+  test('a chat whose claim has ended pushes nothing, and the new holder submits cleanly', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const old = as(hub.liveAgent('alice'), repo.root);
+    await call('claim_task', { id: 'T-1' }, old);
+    const oldTree = join(repo.root, '.worktrees', 'agflow', 'T-1');
+    writeFileSync(join(oldTree, 'old.txt'), 'old work\n');
+    commitAll(oldTree, 'old work');
+    // The lease runs out, the hub gives the task back, and Bob takes it in his own clone.
+    hub.clock.t += 3 * 60 * 60_000;
+    expect(sweepLeases(hub.ctx)).toEqual(['T-1']);
+    const bobClone = cloneOf(repo, 'bobs');
+    const bob = as(hub.liveAgent('bob'), bobClone);
+    await call('claim_task', { id: 'T-1' }, bob);
+    // Alice's chat comes back and submits late. Its commits stay out of the branch Bob works on.
+    await expect(call('submit', { task_id: 'T-1', summary: 'Late' }, old)).rejects.toThrow(/do not hold T-1/i);
+    expect(run(['git', 'branch', '--list', 'agflow/T-1-parser'], repo.origin)).toBe('');
+    // Bob's own submit goes through.
+    const bobTree = join(bobClone, '.worktrees', 'agflow', 'T-1');
+    writeFileSync(join(bobTree, 'new.txt'), 'new work\n');
+    commitAll(bobTree, 'new work');
+    const head = run(['git', 'rev-parse', 'HEAD'], bobTree);
+    expect(await call('submit', { task_id: 'T-1', summary: 'Parser added' }, bob)).toContain(`at ${head.slice(0, 7)} on agflow/T-1-parser`);
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-parser'], repo.origin)).toBe(head);
+    expect(getTask(hub.ctx, 'T-1')).toMatchObject({ status: 'submitted', submission: { headSha: head } });
+  });
+
+  test('refuses after the chat released the task, and again after it submitted, and pushes nothing more', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const alice = as(hub.liveAgent('alice'), repo.root);
+    await call('claim_task', { id: 'T-1' }, alice);
+    const worktree = join(repo.root, '.worktrees', 'agflow', 'T-1');
+    writeFileSync(join(worktree, 'one.txt'), 'one\n');
+    commitAll(worktree, 'one');
+    await call('release_task', { task_id: 'T-1', reason: 'end of day' }, alice);
+    await expect(call('submit', { task_id: 'T-1', summary: 'Parser added' }, alice)).rejects.toThrow('You do not hold T-1: it is ready');
+    expect(run(['git', 'branch', '--list', 'agflow/T-1-parser'], repo.origin)).toBe('');
+    // It takes the task again and submits it.
+    await call('claim_task', { id: 'T-1' }, alice);
+    const head = run(['git', 'rev-parse', 'HEAD'], worktree);
+    await call('submit', { task_id: 'T-1', summary: 'Parser added' }, alice);
+    writeFileSync(join(worktree, 'two.txt'), 'two\n');
+    commitAll(worktree, 'two');
+    await expect(call('submit', { task_id: 'T-1', summary: 'Once more' }, alice)).rejects.toThrow('You do not hold T-1: it is submitted');
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-parser'], repo.origin)).toBe(head);
   });
 });
