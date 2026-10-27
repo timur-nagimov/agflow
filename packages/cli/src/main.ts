@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { AGFLOW_VERSION } from '@agflow/core';
 import { type ParsedArgs, UsageError, parseArgs } from './args';
+import { hookCommand } from './hooks';
 import { type Io, stdio } from './io';
 import { joinCommand, leaveCommand } from './join';
 import { loginCommand, logoutCommand, statusCommand } from './login';
@@ -28,6 +29,7 @@ const commands: Record<string, Command> = {
   status: statusCommand,
   join: joinCommand,
   leave: leaveCommand,
+  hook: hookCommand,
 };
 
 export async function main(argv: string[], io: Io = stdio): Promise<number> {
