@@ -35,6 +35,27 @@ describe('sign-in and principals', () => {
     expect((await hub.call('GET', '/auth/dev?user=alice&returnTo=//evil.example')).headers.get('location')).toBe('/');
   });
 
+  test('dev sign-in redirects only to same-site paths', async () => {
+    const hub = createTestHub();
+    const redirectFor = async (returnTo: string) =>
+      (await hub.call('GET', `/auth/dev?user=alice&returnTo=${returnTo}`)).headers.get('location');
+    for (const path of ['/board', '/tasks/T-1?tab=notes#x', '/cli-login?code=abc']) {
+      expect(await redirectFor(encodeURIComponent(path))).toBe(path);
+    }
+    // Browsers read a backslash as a slash and drop tabs and line breaks from URLs.
+    for (const hostile of [
+      '/%5Cevil.example',
+      '/%09/evil.example',
+      '/%0A/evil.example',
+      '/%0D/evil.example',
+      '/%00/evil.example',
+      'https://evil.example',
+      'evil.example',
+    ]) {
+      expect(await redirectFor(hostile)).toBe('/');
+    }
+  });
+
   test('dev sign-in is disabled in GitHub mode', async () => {
     const hub = createTestHub({ auth: 'github' });
     expect((await hub.call('GET', '/auth/dev?user=alice')).status).toBe(404);

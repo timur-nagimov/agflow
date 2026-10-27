@@ -15,8 +15,8 @@ function fakeGithub(login: string | null): FetchFn {
   };
 }
 
-async function startSignIn(hub: ReturnType<typeof createTestHub>): Promise<string> {
-  const start = await hub.call('GET', '/auth/github?returnTo=/board');
+async function startSignIn(hub: ReturnType<typeof createTestHub>, returnTo = '/board'): Promise<string> {
+  const start = await hub.call('GET', `/auth/github?returnTo=${returnTo}`);
   expect(start.status).toBe(302);
   const location = new URL(start.headers.get('location') ?? '');
   expect(location.origin + location.pathname).toBe('https://github.com/login/oauth/authorize');
@@ -32,6 +32,15 @@ describe('GitHub sign-in', () => {
     const callback = await hub.call('GET', `/auth/github/callback?code=abc&state=${state}`);
     expect(callback.status).toBe(302);
     expect(callback.headers.get('location')).toBe('/board');
+    expect(callback.headers.get('set-cookie')).toContain('agflow_session=');
+  });
+
+  test('a returnTo that would leave the site is replaced before the round trip to GitHub', async () => {
+    const hub = createTestHub(githubConfig, fakeGithub('alice'));
+    const state = await startSignIn(hub, '/%5Cevil.example/phish');
+    const callback = await hub.call('GET', `/auth/github/callback?code=abc&state=${state}`);
+    expect(callback.status).toBe(302);
+    expect(callback.headers.get('location')).toBe('/');
     expect(callback.headers.get('set-cookie')).toContain('agflow_session=');
   });
 

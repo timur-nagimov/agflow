@@ -13,6 +13,20 @@ describe('search', () => {
     expect(search(ctx, 't-2').tasks.map((task) => task.id)).toEqual(['T-2']);
   });
 
+  test('a search by task id lists that task first, even when newer tasks mention it', () => {
+    const { ctx } = createTestContext();
+    createTasks(ctx, [newTask({ title: 'First' }), newTask({ title: 'Second' })], 'user:alice');
+    // More tasks than one page of results, all newer than T-2 and all naming it in their contract.
+    const followUps = Array.from({ length: 21 }, (_, index) =>
+      newTask({ title: `Follow-up ${index + 1}`, dependsOn: ['T-2'] }),
+    );
+    createTasks(ctx, followUps, 'user:alice');
+    const { tasks } = search(ctx, 't-2');
+    expect(tasks).toHaveLength(20);
+    expect(tasks[0]?.id).toBe('T-2');
+    expect(tasks[1]?.id).toBe('T-23');
+  });
+
   test('finds messages and a goal snippet', () => {
     const { ctx } = createTestContext();
     updateGoal(ctx, { text: 'Build a CLI that syncs calendars.', baseVersion: 0 }, 'user:alice');

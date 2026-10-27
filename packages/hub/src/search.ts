@@ -8,9 +8,13 @@ export function search(ctx: HubContext, query: string): SearchResult {
   const needle = query.trim();
   if (!needle) return { tasks: [], messages: [], goal: null };
   const like = `%${needle.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+  // The task whose id was typed comes first; otherwise newer tasks that merely mention it could push it off the page.
   const tasks = (
     ctx.db
-      .query("SELECT * FROM tasks WHERE id = $exact OR contract LIKE $like ESCAPE '\\' ORDER BY seq DESC LIMIT 20")
+      .query(
+        `SELECT * FROM tasks WHERE id = $exact OR contract LIKE $like ESCAPE '\\'
+         ORDER BY id = $exact DESC, seq DESC LIMIT 20`,
+      )
       .all({ exact: needle.toUpperCase(), like }) as TaskRow[]
   ).map(rowToTask);
   const messages = (

@@ -7,9 +7,14 @@ import { getProject } from '../project';
 import { type App, SESSION_COOKIE } from './app';
 import { type Ctx, human, principal, readBody } from './util';
 
-/** Only same-site paths are allowed as post-login redirects. */
+/**
+ * Only same-site paths are allowed as post-login redirects. Browsers read a backslash as a slash and drop tabs and
+ * line breaks from URLs, so "/\evil.example" and "/<tab>/evil.example" would leave the site; any control character is
+ * refused, which also keeps the Location header valid.
+ */
 export function safeReturnTo(value: string | undefined): string {
-  return value?.startsWith('/') && !value.startsWith('//') ? value : '/';
+  if (!value || !value.startsWith('/') || value.startsWith('//') || /[\\\p{Cc}]/u.test(value)) return '/';
+  return value;
 }
 
 export function startWebSession(c: Ctx, ctx: HubContext, user: string, returnTo: string): Response {
