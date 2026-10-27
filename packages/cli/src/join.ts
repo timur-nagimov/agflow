@@ -11,11 +11,21 @@ import { type SelfCommand, selfCommand, shellCommand } from './self';
 /** Every hook handler agflow writes carries this statusMessage, so it can be found again. */
 export const HOOK_MARK = 'agflow';
 
+/** Runs a program and reports how it ended. It must not throw, so callers can treat any failure the same way. */
 export type Runner = (cmd: string[], cwd: string) => { code: number; output: string };
 
+/**
+ * A program that cannot be started (for example `claude` when Claude Code is not installed) is a failed run with
+ * code 127, the shell's "command not found", and the reason as its output. `leave` depends on this on a machine
+ * that only has Codex.
+ */
 export const defaultRunner: Runner = (cmd, cwd) => {
-  const result = Bun.spawnSync(cmd, { cwd, stdout: 'pipe', stderr: 'pipe' });
-  return { code: result.exitCode, output: `${result.stdout.toString()}${result.stderr.toString()}`.trim() };
+  try {
+    const result = Bun.spawnSync(cmd, { cwd, stdout: 'pipe', stderr: 'pipe' });
+    return { code: result.exitCode, output: `${result.stdout.toString()}${result.stderr.toString()}`.trim() };
+  } catch (error) {
+    return { code: 127, output: error instanceof Error ? error.message : String(error) };
+  }
 };
 
 export type HookHandler = Record<string, unknown>;
@@ -79,7 +89,9 @@ export function claudeHooks(self: SelfCommand, role: AgentRole): HooksConfig {
     statusMessage: HOOK_MARK,
     ...extra,
   });
-  const waiter = handler('wait-inbox', { asyncRewake: true });
+  // Claude Code still enforces `timeout` on an asyncRewake hook (600 s by default). The waiter polls for up to
+  // 8 hours (WAIT_MAX_MS in wait-inbox.ts), so its timeout is that plus 5 minutes. Change both together.
+  const waiter = handler('wait-inbox', { asyncRewake: true, timeout: 8 * 60 * 60 + 5 * 60 });
   return {
     SessionStart: [{ hooks: [handler('session-start', { timeout: 20 }), waiter] }],
     UserPromptSubmit: [{ hooks: [handler('user-prompt-submit', { timeout: 15 })] }],

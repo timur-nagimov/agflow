@@ -3,7 +3,17 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveCredentials } from '../src/credentials';
-import { CODEX_CONFIG, CODEX_HOOKS, type Runner, joinCodex, joinRepository, leaveCodex, leaveRepository, loadJoined } from '../src/join';
+import {
+  CODEX_CONFIG,
+  CODEX_HOOKS,
+  type Runner,
+  defaultRunner,
+  joinCodex,
+  joinRepository,
+  leaveCodex,
+  leaveRepository,
+  loadJoined,
+} from '../src/join';
 import { run, tempRepo } from './fixture';
 
 const self = { command: '/Apps/My Tools/agflow', args: [] };
@@ -76,5 +86,20 @@ describe('joinRepository', () => {
     leaveRepository({ cwd: repo.root, dir, run: noClaude });
     expect(loadJoined(dir)).toEqual([]);
     expect(existsSync(join(repo.root, CODEX_CONFIG))).toBe(false);
+  });
+
+  test('leave still removes a Codex-only setup on a machine without Claude Code', () => {
+    const repo = tempRepo();
+    const dir = mkdtempSync(join(tmpdir(), 'agflow-cfg-'));
+    saveCredentials({ hubUrl: 'http://hub.test', token: 't', user: 'alice' }, dir);
+    joinRepository({ cwd: repo.root, dir, role: 'worker', vendors: ['codex'], self, run: noClaude });
+    expect(existsSync(join(repo.root, CODEX_CONFIG))).toBe(true);
+    expect(existsSync(join(repo.root, CODEX_HOOKS))).toBe(true);
+    // The real runner with a made-up program name stands in for a machine without `claude`; the real claude is never run.
+    const missingClaude: Runner = (cmd, cwd) => defaultRunner(['agflow-no-such-binary', ...cmd.slice(1)], cwd);
+    expect(leaveRepository({ cwd: repo.root, dir, run: missingClaude })).toBe(`Removed agflow from ${repo.root}.`);
+    expect(existsSync(join(repo.root, CODEX_CONFIG))).toBe(false);
+    expect(existsSync(join(repo.root, CODEX_HOOKS))).toBe(false);
+    expect(loadJoined(dir)).toEqual([]);
   });
 });
