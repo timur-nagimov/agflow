@@ -3850,6 +3850,8 @@ try {
 }
 ```
 
+> **Deviation from the snippet above (found in the review of batch 6):** its Codex line does not work with codex-cli 0.159.2. Codex splits the `-c` key on dots and keeps the quote characters in it, so `projects."<work>".trust_level="trusted"` leaves the repository untrusted, and Codex then ignores its `.codex/config.toml` and `.codex/hooks.json`. The script passes the inline-table form instead, `-c 'projects={"<work>"={trust_level="trusted"}}'`, built by `codexTrustOverride()` in `packages/cli/scripts/codex-trust.ts` and tested in `packages/cli/test/codex-trust.test.ts`. It replaces the `projects` table for that one run only.
+
 - [ ] **Step 2: Add the script to the root `package.json`**
 
 Add to `"scripts"`:

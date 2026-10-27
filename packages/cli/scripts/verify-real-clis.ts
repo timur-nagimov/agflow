@@ -2,6 +2,7 @@ import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveCredentials } from '../src/credentials';
+import { codexTrustOverride } from './codex-trust';
 
 const base = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-real-')));
 const port = 8796;
@@ -79,7 +80,7 @@ try {
   results.push(`claude: exit ${claude.code}; answered T-1: ${claude.out.includes('T-1')}`);
 
   const codex = sh(
-    ['codex', 'exec', '--json', '--dangerously-bypass-hook-trust', '-c', `projects."${work}".trust_level="trusted"`, PROMPT],
+    ['codex', 'exec', '--json', '--dangerously-bypass-hook-trust', '-c', codexTrustOverride(work), PROMPT],
     work,
     300_000,
   );
