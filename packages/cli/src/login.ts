@@ -4,6 +4,7 @@ import { type ParsedArgs, UsageError, stringFlag } from './args';
 import { type Credentials, deleteCredentials, loadCredentials, saveCredentials } from './credentials';
 import { type FetchFn, HubClient } from './hub-client';
 import type { Io } from './io';
+import { loadJoined } from './join';
 import { configDir } from './paths';
 
 export interface LoginDeps {
@@ -63,7 +64,10 @@ export async function statusReport(dir: string, fetchFn?: FetchFn): Promise<stri
   const [me, status] = await Promise.all([client.me(), client.status()]);
   const project = `${status.project.name} (${status.project.repo})${status.project.paused ? ' [paused]' : ''}`;
   const lead = status.lead ? `${status.lead.id} (${status.lead.user})` : 'none';
-  return `Hub: ${credentials.hubUrl}\nSigned in as: ${me.user}\nProject: ${project}\nGoal version: v${status.goalVersion}\nLead: ${lead}\n`;
+  const joined = loadJoined(dir);
+  const repos =
+    joined.length > 0 ? joined.map((repo) => `  ${repo.root} (${repo.role}; ${repo.vendors.join(', ')})`).join('\n') : '  none';
+  return `Hub: ${credentials.hubUrl}\nSigned in as: ${me.user}\nProject: ${project}\nGoal version: v${status.goalVersion}\nLead: ${lead}\nJoined repositories:\n${repos}\n`;
 }
 
 export async function loginCommand(args: ParsedArgs, io: Io): Promise<number> {

@@ -2,6 +2,7 @@
 import { AGFLOW_VERSION } from '@agflow/core';
 import { type ParsedArgs, UsageError, parseArgs } from './args';
 import { type Io, stdio } from './io';
+import { joinCommand, leaveCommand } from './join';
 import { loginCommand, logoutCommand, statusCommand } from './login';
 
 export const HELP = `agflow ${AGFLOW_VERSION}
@@ -25,6 +26,8 @@ const commands: Record<string, Command> = {
   login: loginCommand,
   logout: logoutCommand,
   status: statusCommand,
+  join: joinCommand,
+  leave: leaveCommand,
 };
 
 export async function main(argv: string[], io: Io = stdio): Promise<number> {
