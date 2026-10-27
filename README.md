@@ -6,7 +6,7 @@ The design is in [docs/superpowers/specs/2026-10-26-agflow-design.md](docs/super
 
 ## Status
 
-Milestone M1 is in progress. This repository currently contains the hub: shared state, the REST API and the live event stream. The `agflow` CLI (plan M1b) and the web UI (plan M1c) come next.
+Milestone M1 ("project brain") is built: the hub (shared state, the REST API and the live event stream), the web UI, and the `agflow` CLI with its hooks and MCP bridge for Claude Code and Codex chats. Next is M1's end-to-end check with real chats, then M2 (runners that start agents on teammates' laptops).
 
 ## Run the hub locally
 
@@ -21,7 +21,32 @@ AGFLOW_PROJECT_REPO=https://github.com/you/demo \
 bun run hub
 ```
 
-Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only.
+Then sign in at `http://localhost:8787/auth/dev?user=your-github-login`. Dev sign-in skips GitHub and is for local use only, so with `AGFLOW_AUTH=dev` the hub listens on loopback (`127.0.0.1`) and other machines cannot reach it. It also answers only requests addressed to `localhost`, `127.0.0.1`, `[::1]` or the host in `AGFLOW_PUBLIC_URL`, so a web page cannot reach it through your browser by pointing a domain of its own at `127.0.0.1`. Do not point `AGFLOW_HOST` at a network address in dev mode: anyone who can reach the hub could sign in as any allowed user.
+
+## Web UI
+
+The hub serves the web UI when `AGFLOW_WEB_DIST` points at the build:
+
+```bash
+bun run build:web
+AGFLOW_WEB_DIST=packages/web/dist AGFLOW_AUTH=dev AGFLOW_ALLOWED_USERS=your-github-login \
+AGFLOW_PROJECT_NAME=demo AGFLOW_PROJECT_REPO=https://github.com/you/demo bun run hub
+```
+
+Open `http://localhost:8787` and sign in. Its pages:
+- **Board.** Tasks by status, and a form for new tasks.
+- **Task page.** A task's contract, submission, notes, thread and history, plus the actions people can take: accept, reject, mark merged, unblock, release a claim and cancel.
+- **Goal.** Edit the goal with a preview of the changes, see the lead's notes, read the messages agents sent to people, and pause or resume all work.
+- **Agents.** Who is connected and what each agent works on.
+- **Messages.** Steer the lead and the agents; mark a message as a standing rule.
+- **Timeline.** Everything that happened, live.
+- **Knowledge.** Standing rules, and search across tasks, messages and the goal.
+
+To try the UI without agents, run the demo hub. It keeps a made-up project in memory, and one of its agents reports progress every few seconds:
+
+```bash
+bun run build:web && bun run demo   # http://localhost:8790, sign in as "demo"
+```
 
 ## Connect your Claude Code and Codex chats
 
@@ -57,10 +82,11 @@ Each chat calls `hello` with the code from its brief, then works with `list_task
 | `AGFLOW_ALLOWED_USERS` | (required) | Comma-separated GitHub logins allowed to sign in |
 | `AGFLOW_PROJECT_NAME` | (required) | Project name shown to people and agents |
 | `AGFLOW_PROJECT_REPO` | (required) | URL of the project's git repository |
-| `AGFLOW_PUBLIC_URL` | `http://localhost:<port>` | Address people and laptops use to reach the hub |
-| `AGFLOW_PORT` | `8787` | Listening port |
+| `AGFLOW_PUBLIC_URL` | `http://localhost:<port>` | Address people and laptops use to reach the hub, an `http://` or `https://` URL; `https://` makes session cookies secure |
+| `AGFLOW_HOST` | `127.0.0.1` with `AGFLOW_AUTH=dev`, otherwise `0.0.0.0` | Listening address; `::` accepts IPv6 as well as IPv4 |
+| `AGFLOW_PORT` | `8787` | Listening port, 1 to 65535 |
 | `AGFLOW_DB` | `data/agflow.db` | SQLite database file |
-| `AGFLOW_BACKUP_DIR` | `data/backups` | Daily snapshots; the newest 7 are kept |
+| `AGFLOW_BACKUP_DIR` | `data/backups` | Database snapshots: one a day (the newest 7 are kept) and one at every start (the newest 3 are kept) |
 | `AGFLOW_WEB_DIST` | (unset) | Folder with the built web UI |
 | `AGFLOW_LEASE_MINUTES` | `120` | How long a claim survives without agent activity |
 | `AGFLOW_REMINDER_MINUTES` | `30` | Minimum time between "you hold a task" reminders |
@@ -68,15 +94,20 @@ Each chat calls `hello` with the code from its brief, then works with `list_task
 | `AGFLOW_MAX_TASKS_PER_HOUR` | `60` | Guard: refuse new tasks beyond this hourly rate |
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | (unset) | OAuth app credentials, required when `AGFLOW_AUTH=github` |
 
+Behind a proxy, set `AGFLOW_PUBLIC_URL` to the address people open in the browser, with `https://` if the proxy terminates TLS. A signed-in browser can change things only from the hub's own pages, which the hub recognises by this address or by the request's Host header.
+
 ### GitHub sign-in
 
-Create an OAuth app under GitHub → Settings → Developer settings → OAuth Apps. Set the callback URL to `<AGFLOW_PUBLIC_URL>/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The hub reads only the person's GitHub login and keeps no GitHub token.
+Create an OAuth app under GitHub → Settings → Developer settings → OAuth Apps. Set the callback URL to `<AGFLOW_PUBLIC_URL>/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The hub asks GitHub for no scopes, reads only the person's GitHub login and keeps no GitHub token. Open the hub at `AGFLOW_PUBLIC_URL` to sign in: a short-lived cookie for that address ties each sign-in to the browser that started it.
 
 ## Development
 
 ```bash
 bun test            # all tests
 bun run typecheck   # TypeScript
-bun run smoke:hub   # start a real hub, sign in, save a goal
+bun run smoke:hub   # start a real hub, check it is off the network, sign in, save a goal
 bun run smoke:cli   # real hub + CLI: login, join, hooks, MCP bridge, claim, submit
+bun run build:web   # build the web UI into packages/web/dist
+bun run demo        # a hub with a made-up project and the UI, on port 8790
+bun run check:ui    # drive the UI in headless Chromium against the demo hub
 ```

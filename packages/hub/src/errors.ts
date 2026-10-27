@@ -1,4 +1,4 @@
-export type HubErrorStatus = 400 | 401 | 403 | 404 | 409;
+export type HubErrorStatus = 400 | 401 | 403 | 404 | 409 | 415;
 
 export class HubError extends Error {
   constructor(
@@ -16,3 +16,4 @@ export const unauthorized = (message = 'sign in first') => new HubError(401, 'un
 export const forbidden = (message: string) => new HubError(403, 'forbidden', message);
 export const notFound = (what: string) => new HubError(404, 'not_found', `${what} not found`);
 export const conflict = (message: string) => new HubError(409, 'conflict', message);
+export const unsupportedMediaType = (message: string) => new HubError(415, 'unsupported_media_type', message);

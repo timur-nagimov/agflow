@@ -121,7 +121,6 @@ CREATE TABLE cli_logins (
   code TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL,
   login TEXT NOT NULL,
-  token TEXT NOT NULL,
   label TEXT
 );
 
@@ -146,7 +145,14 @@ export function openDb(path: string): Database {
 export function migrate(db: Database): void {
   db.run('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)');
   const row = db.query('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number | null };
-  for (let index = row.v ?? 0; index < MIGRATIONS.length; index++) {
+  const version = row.v ?? 0;
+  // Older code on a newer schema (after a rollback, or a restore of a newer backup) would misread the data.
+  if (version > MIGRATIONS.length) {
+    throw new Error(
+      `database schema version ${version} is newer than this hub supports (${MIGRATIONS.length}); run a newer hub or restore an older backup`,
+    );
+  }
+  for (let index = version; index < MIGRATIONS.length; index++) {
     const sql = MIGRATIONS[index] as string;
     db.transaction(() => {
       db.run(sql);
