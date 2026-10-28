@@ -2,6 +2,7 @@ import {
   type Agent,
   type BlockedKind,
   type NewTask,
+  type Submission,
   type Task,
   type TaskContract,
   type TaskDetail,
@@ -45,6 +46,9 @@ export interface TaskRow {
   last_reminded_at: number | null;
 }
 
+/** Submissions recorded before M2 carry no attempt or submission id. */
+type StoredSubmission = Omit<Submission, 'attemptId' | 'submissionId'> & Partial<Submission>;
+
 export function rowToTask(row: TaskRow): Task {
   const contract = JSON.parse(row.contract) as TaskContract;
   return {
@@ -57,12 +61,20 @@ export function rowToTask(row: TaskRow): Task {
     leaseExpiresAt: row.lease_expires_at,
     blockedKind: row.blocked_kind,
     blockedReason: row.blocked_reason,
-    submission: row.submission ? (JSON.parse(row.submission) as Task['submission']) : null,
+    submission: row.submission
+      ? { attemptId: null, submissionId: null, ...(JSON.parse(row.submission) as StoredSubmission) }
+      : null,
     feedback: row.feedback,
     mergedSha: row.merged_sha,
     createdBy: row.created_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // Schema version 1 has no attempts, so these hold their empty values.
+    currentAttempt: null,
+    attemptCount: 0,
+    workRef: null,
+    workSha: null,
+    nextDispatchAt: null,
   };
 }
 
@@ -123,6 +135,7 @@ export function listTaskNotes(ctx: HubContext, taskId: string): TaskNote[] {
     body: row.body,
     author: row.author,
     createdAt: row.created_at,
+    attemptId: null,
   }));
 }
 
@@ -134,6 +147,8 @@ export function getTaskDetail(ctx: HubContext, id: string): TaskDetail {
     // The newest 500, oldest first: a long task drops its oldest history, never its latest changes.
     events: listEvents(ctx.db, { subject: id, latest: true, limit: 500 }).reverse(),
     messages: listMessages(ctx, { taskId: id }),
+    attempts: [],
+    submissions: [],
   };
 }
 
@@ -620,13 +635,15 @@ export function submitTask(ctx: HubContext, id: string, agent: Agent, input: Sub
     const task = getTask(ctx, id);
     requireHolder(task, agent);
     const branch = input.branch ?? task.branch;
-    const submission = {
+    const submission: Submission = {
       summary: input.summary,
       evidence: input.evidence,
       branch,
       headSha: input.headSha ?? null,
       submittedAt: ctx.now(),
       by: agent.id,
+      attemptId: null,
+      submissionId: null,
     };
     const result = move(ctx, emit, task, 'submitted', `agent:${agent.id}`, {
       changes: { submission, branch, leaseExpiresAt: null },

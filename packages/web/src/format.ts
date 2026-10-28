@@ -518,6 +518,8 @@ export const NOTE_LABELS: Record<TaskNote['kind'], string> = {
   progress: 'Progress',
   handoff: 'Handoff',
   release: 'Released',
+  restatement: 'Restatement',
+  late_work: 'Late work',
 };
 
 export function evidenceText(evidence: Evidence): string {

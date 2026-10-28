@@ -15,9 +15,40 @@ const ALL: TaskStatus[] = [
   'accepted', 'merging', 'merged', 'rejected', 'stale', 'blocked', 'cancelled', 'failed',
 ];
 
+/** The table as M1 left it, before M2's additions. */
+const M1_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+  draft: ['ready', 'blocked', 'cancelled'],
+  ready: ['claimed', 'blocked', 'cancelled'],
+  claimed: ['working', 'submitted', 'ready', 'stale', 'blocked', 'cancelled'],
+  working: ['submitted', 'ready', 'stale', 'blocked', 'cancelled'],
+  submitted: ['checking', 'accepted', 'rejected', 'cancelled'],
+  checking: ['reviewing', 'rejected', 'cancelled'],
+  reviewing: ['accepted', 'rejected', 'cancelled'],
+  accepted: ['merging', 'merged'],
+  merging: ['merged', 'rejected'],
+  merged: [],
+  rejected: ['ready', 'claimed', 'cancelled', 'failed'],
+  stale: ['ready', 'cancelled'],
+  blocked: ['ready', 'cancelled'],
+  cancelled: [],
+  failed: [],
+};
+
 describe('task state machine', () => {
   test('defines transitions for every status', () => {
     expect(Object.keys(TASK_TRANSITIONS).sort()).toEqual([...ALL].sort());
+  });
+
+  test('M2 adds rejected → blocked, ready → failed and blocked → failed, and keeps every M1 move', () => {
+    const added: [TaskStatus, TaskStatus][] = [
+      ['rejected', 'blocked'],
+      ['ready', 'failed'],
+      ['blocked', 'failed'],
+    ];
+    for (const from of ALL) {
+      const expected = [...M1_TRANSITIONS[from], ...added.filter(([source]) => source === from).map(([, to]) => to)];
+      expect([from, [...TASK_TRANSITIONS[from]].sort()]).toEqual([from, expected.sort()]);
+    }
   });
 
   test('allows the M1 happy path', () => {

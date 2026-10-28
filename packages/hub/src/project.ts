@@ -7,7 +7,8 @@ export function getProject(ctx: HubContext): Project {
     repo: string;
     paused: number;
   };
-  return { name: row.name, repo: row.repo, paused: row.paused === 1 };
+  // Runner leads are on unless people turn them off, which schema version 1 cannot record.
+  return { name: row.name, repo: row.repo, paused: row.paused === 1, runnerLeads: true };
 }
 
 export function setPaused(ctx: HubContext, paused: boolean, actor: string): Project {

@@ -1,8 +1,10 @@
 import type { TaskStatus } from './types';
 
+// M2's retry ladder blocks a task for a re-plan from rejected or ready (step 4), and fails it from ready,
+// blocked or rejected when a re-plan did not help (step 5).
 export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   draft: ['ready', 'blocked', 'cancelled'],
-  ready: ['claimed', 'blocked', 'cancelled'],
+  ready: ['claimed', 'blocked', 'cancelled', 'failed'],
   claimed: ['working', 'submitted', 'ready', 'stale', 'blocked', 'cancelled'],
   working: ['submitted', 'ready', 'stale', 'blocked', 'cancelled'],
   submitted: ['checking', 'accepted', 'rejected', 'cancelled'],
@@ -11,9 +13,9 @@ export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]
   accepted: ['merging', 'merged'],
   merging: ['merged', 'rejected'],
   merged: [],
-  rejected: ['ready', 'claimed', 'cancelled', 'failed'],
+  rejected: ['ready', 'claimed', 'blocked', 'cancelled', 'failed'],
   stale: ['ready', 'cancelled'],
-  blocked: ['ready', 'cancelled'],
+  blocked: ['ready', 'cancelled', 'failed'],
   cancelled: [],
   failed: [],
 };

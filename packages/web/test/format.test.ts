@@ -53,6 +53,11 @@ function task(overrides: Partial<Task> = {}): Task {
     createdBy: 'agent:A-1',
     createdAt: 0,
     updatedAt: 0,
+    currentAttempt: null,
+    attemptCount: 0,
+    workRef: null,
+    workSha: null,
+    nextDispatchAt: null,
     ...overrides,
   };
 }
@@ -103,7 +108,16 @@ describe('task actions', () => {
     );
     expect(actionHint(task({ status: 'accepted' }))).toBe('Accepted. Merge its branch, then mark it merged.');
     expect(actionHint(task({ status: 'ready' }))).toBe('');
-    const submission = { summary: 's', evidence: [], branch: null, headSha: null, submittedAt: 0, by: 'A-4' };
+    const submission = {
+      summary: 's',
+      evidence: [],
+      branch: null,
+      headSha: null,
+      submittedAt: 0,
+      by: 'A-4',
+      attemptId: null,
+      submissionId: null,
+    };
     expect(actionHint(task({ status: 'submitted', submission }))).toBe(
       'A-4 submitted this for review. Accept it, or reject it with feedback.',
     );
@@ -174,6 +188,8 @@ function agent(overrides: Partial<Agent> = {}): Agent {
     status: 'active',
     lastSeenAt: 0,
     createdAt: 0,
+    runnerId: null,
+    attemptId: null,
     ...overrides,
   };
 }

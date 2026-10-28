@@ -23,6 +23,8 @@ describe('live-session routes', () => {
     expect((await hub.call('POST', '/api/live/hello', { user: 'bob', body: { code } })).status).toBe(404);
     const agents = await hub.call('GET', '/api/agents', { user: 'alice', via: 'web' });
     expect(agents.json.agents.map((a: { id: string; status: string }) => `${a.id} ${a.status}`)).toEqual(['A-1 active']);
+    // A live chat runs on no runner and, until it claims a task, in no attempt.
+    expect(agents.json.agents[0]).toMatchObject({ origin: 'live', runnerId: null, attemptId: null });
   });
 
   test('a lead session gets the lead brief', async () => {

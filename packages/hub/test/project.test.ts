@@ -4,9 +4,9 @@ import { getProject, setPaused } from '../src/project';
 import { createTestContext } from './helpers';
 
 describe('project', () => {
-  test('starts unpaused with the configured name and repo', () => {
+  test('starts unpaused, with runner leads on and the configured name and repo', () => {
     const { ctx } = createTestContext();
-    expect(getProject(ctx)).toEqual({ name: 'demo', repo: 'https://github.com/acme/demo', paused: false });
+    expect(getProject(ctx)).toEqual({ name: 'demo', repo: 'https://github.com/acme/demo', paused: false, runnerLeads: true });
   });
 
   test('pausing and resuming record events; repeating is a no-op', () => {

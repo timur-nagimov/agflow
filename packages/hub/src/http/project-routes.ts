@@ -40,10 +40,24 @@ export function mountProjectRoutes(app: App, ctx: HubContext): void {
     principal(c);
     const counts: Record<string, number> = {};
     for (const task of listTasks(ctx)) counts[task.status] = (counts[task.status] ?? 0) + 1;
+    const project = getProject(ctx);
+    const lead = currentLead(ctx);
     const status: HubStatus = {
-      project: getProject(ctx),
+      project,
       goalVersion: currentGoalVersion(ctx),
-      lead: currentLead(ctx),
+      lead,
+      // Only live chats lead so far, and nothing records when one took the seat.
+      leadSeat: {
+        kind: lead ? 'live' : 'none',
+        agentId: lead?.id ?? null,
+        attemptId: null,
+        runnerId: null,
+        since: null,
+        wakeups: 0,
+        runnerLeads: project.runnerLeads,
+      },
+      // A hub starts at epoch 1; only a restore raises it.
+      epoch: 1,
       counts,
       activeAgents: listAgents(ctx).filter((agent) => agent.status === 'active').length,
       humansInbox: listMessages(ctx, { target: 'humans', limit: 20 }),

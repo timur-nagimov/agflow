@@ -42,6 +42,9 @@ function toAgent(ctx: HubContext, row: AgentRow): Agent {
     status: statusFor(row.last_seen_at, ctx.now()),
     lastSeenAt: row.last_seen_at,
     createdAt: row.created_at,
+    // Schema version 1 has no runners or attempts.
+    runnerId: null,
+    attemptId: null,
   };
 }
 
