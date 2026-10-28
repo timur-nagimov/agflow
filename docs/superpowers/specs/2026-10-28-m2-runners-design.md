@@ -1,6 +1,6 @@
 # agflow M2 design — runners
 
-- **Date:** 2026-10-28, revision 3 (after the design review and a re-check of revision 2)
+- **Date:** 2026-10-28, revision 4 (after the design review, a re-check of revision 2, and the cross-plan questions of the seven plan outlines)
 - **Status:** design for the M2 implementation plans
 - **Extends:** [the agflow design spec](2026-10-26-agflow-design.md), sections 6, 9.5, 9.7 and 11–14, and the open items of section 18
 - **Evidence:**
@@ -180,11 +180,12 @@ export interface Attempt {
   resumable: boolean;         // false once its clone or session is known to be gone
   reviewRounds: number;       // ladder step 1 resumes
   wakeups: number;            // deliveries to a lead attempt
-  activeMs: number;           // time running, excluding holding, quota_wait, waiting_approval and sleep
+  activeMs: number;           // time in the phases starting and turn; never idle, waits or sleep (section 6.8)
   phase: AttemptPhase | null;
   facts: AttemptFacts | null;
   stopRequested: { cause: StopCause; reason: string; by: string; handoff: boolean; deferred: boolean; at: number } | null;
-  takeover: { local: string | null; anywhere: string; error: string | null } | null;   // commands shown to the person
+  takeover: { local: string | null; anywhere: string; ref: string; error: string | null } | null;
+                              // commands shown to the person; ref: the take-over ref they push to (section 6.12)
   leaseExpiresAt: number | null;
   quotaResetsAt: number | null;
   startedAt: number;
@@ -221,6 +222,7 @@ export interface Runner {
   git: { ready: boolean; problem: string | null; lastPushAt: number | null };
   power: { source: 'ac' | 'battery' | 'unknown'; batteryPercent: number | null; lowPowerMode: boolean } | null;
   disk: { freeBytes: number; agflowBytes: number } | null;
+  acceptingUntil: number | null;   // epoch ms, from the last heartbeat: no placement before it (wake, battery, disk)
   activeAttempts: number;
   lastSeenAt: number;
   createdAt: number;
@@ -242,7 +244,7 @@ export interface RunnerVendor {
 }
 export interface VendorQuota {
   state: 'ok' | 'exhausted' | 'unknown';
-  resetsAt: number | null;    // epoch milliseconds
+  resetsAt: number | null;    // epoch milliseconds; the reset of the limiting window (one per account)
   windows: { fiveHour: number | null; weekly: number | null };   // utilization 0..1
   paidUsage: 'disabled' | 'enabled' | 'in_use' | 'unknown';
   updatedAt: number;
@@ -300,6 +302,25 @@ export interface LeadSeat {
   wakeups: number;
   runnerLeads: boolean;       // project setting: may the scheduler start leads on runners
 }
+
+export interface LeadNote {   // a row of lead_notes; GET /api/lead/notes
+  id: number;
+  attemptId: string | null;
+  kind: 'handoff' | 'restatement';
+  body: string;               // agent text, always shown quoted
+  author: string;
+  createdAt: number;
+}
+
+export interface PrepareRequest {   // GET /api/prepare/:id; stored as its prepare_dependencies command
+  id: string;                 // the command id
+  attemptId: string;
+  status: 'pending' | 'ok' | 'failed';
+  error: string | null;
+  logTail: string | null;
+  requestedAt: number;
+  finishedAt: number | null;
+}
 ```
 
 **Changes to existing types:**
@@ -308,7 +329,7 @@ export interface LeadSeat {
   - `quota_wait` and `holding` → `idle`;
   - `ended` → `gone`.
 - `TaskContract` gains optional `vendorHint: 'claude' | 'codex' | null`.
-- `Task` gains `currentAttempt`, `attemptCount`, `workRef`, `workSha` and `nextDispatchAt`.
+- `Task` gains `currentAttempt`, `attemptCount` (every attempt of the task, live ones included), `workRef`, `workSha` and `nextDispatchAt`.
 - `TaskDetail` gains `attempts: Attempt[]` and `submissions: SubmissionRecord[]`.
 - `BlockedKind` gains:
   - `'takeover'`: a person holds the task;
@@ -316,10 +337,10 @@ export interface LeadSeat {
   - `'paused'`: a person stopped and held the work;
   - `'branch_moved'`: the task branch moved outside agflow;
   - `'policy'`: the vendor refused the work on policy grounds.
-- `TaskNote['kind']` gains `'restatement'` and `'late_work'`.
+- `TaskNote['kind']` gains `'restatement'` and `'late_work'`. `TaskNote` gains `attemptId: string | null`: the attempt a handoff, restatement or late-work note belongs to, so the task page pairs notes with attempts.
 - The task's `Submission` gains `attemptId` and `submissionId`.
 - `Project` gains `runnerLeads`.
-- `HubStatus` gains `leadSeat: LeadSeat`.
+- `HubStatus` gains `leadSeat: LeadSeat` and `epoch: number` (the hub epoch, section 6.14). `HubStatus.lead` stays: the seat holder's agent, or null.
 - `Principal.via` gains `'agent'`.
 
 ### 6.2 Schema version 2
@@ -341,6 +362,7 @@ ALTER TABLE tasks ADD COLUMN work_sha TEXT;
 ALTER TABLE tasks ADD COLUMN branch_head TEXT;                  -- task branch head the hub last recorded
 ALTER TABLE tasks ADD COLUMN next_dispatch_at INTEGER;          -- infra backoff
 ALTER TABLE tasks ADD COLUMN dispatch_hold_until INTEGER;       -- waiting for late work or a final push
+ALTER TABLE task_notes ADD COLUMN attempt_id TEXT;               -- TaskNote.attemptId
 INSERT INTO counters (name, value) VALUES ('runner', 0), ('fence', 0), ('lead_attempt', 0), ('submission', 0);
 
 CREATE TABLE hub_state (
@@ -420,7 +442,7 @@ CREATE TABLE attempts (
   facts TEXT,                        -- JSON AttemptFacts
   facts_at INTEGER,                  -- when the hub received them
   stop_requested TEXT,               -- JSON {cause, reason, by, handoff, deferred, at}
-  takeover TEXT,                     -- JSON {local, anywhere, error}
+  takeover TEXT,                     -- JSON {local, anywhere, ref, error}
   final_sha TEXT,                    -- the harvested head reported at exit, even when its push failed
   compaction_summary TEXT,
   transcript_tail TEXT,
@@ -562,11 +584,12 @@ All messages are JSON objects with a `t` field, validated by zod schemas in `pac
 export type RunnerMessage =
   | { t: 'hello'; protocol: number; runnerKey: string; machineId: string; name: string;
       agflowVersion: string; platform: string;
-      settings: RunnerSettings;
+      settings: RunnerSettings;        // the last hub-confirmed snapshot, never local edits
       vendors: RunnerVendor[]; quota: AccountQuotaReport[]; profile: ProfileSummary; git: Runner['git'];
       state: 'ok' | 'crash_loop' | 'disk_low'; stateDetail: string | null;
       outboxEpoch: string;           // new whenever runner.db is new
       firstSeq: number;              // lowest event seq the runner still keeps (acknowledged ones are kept 48 h)
+      lastSeq: number;               // highest event seq the runner holds; firstSeq − 1 when the outbox is empty
       lastHubEpoch: number | null;
       attempts: LiveAttempt[] }      // every attempt whose start or resume the runner has recorded
   | { t: 'heartbeat'; at: number; attempts: AttemptFacts[]; power: Runner['power']; disk: Runner['disk'];
@@ -574,7 +597,7 @@ export type RunnerMessage =
   | { t: 'events'; outboxEpoch: string; events: RunnerEvent[] }
   | { t: 'result'; commandId: string; ok: boolean; data?: unknown; error?: string };
 
-export interface RunnerSettings {     // runner.json is the source; only the hub assigns versions
+export interface RunnerSettings {     // runner.json is the source; only the hub assigns versions; see "Settings sync"
   capacity: number;
   keepAwake: 'off' | 'ac' | 'always';
   draining: boolean;
@@ -587,16 +610,21 @@ export interface LiveAttempt {
   attemptId: string;
   fence: Fence;
   state: 'starting' | 'running' | 'idle' | 'stopped' | 'suspended';
+                                     // starting: before attempt.spawned; running: the process is alive (a worker,
+                                     // or a lead in a turn); idle: a lead's process waits between wake-ups;
+                                     // stopped: no process; suspended: stopped by a suspend
   sessionRef: string | null;
   clone: boolean;                    // the clone still exists
 }
 export interface AccountQuotaReport { vendor: Vendor; accountId: string; quota: VendorQuota }
+                                     // runners omit reports for a vendor whose account id is unknown
 
 // Hub → runner
 export type HubMessage =
   | { t: 'welcome'; runnerId: string; hubEpoch: number; hubTime: number; ackedSeq: number;
       wipRefPrefix: string; stop: { attemptId: string; reason: string }[];
-      timings: { heartbeatMs: number; deadLinkMs: number; handoffMs: number } }   // override runner.json
+      timings: { heartbeatMs: number; deadLinkMs: number; handoffMs: number;   // override runner.json
+                 wipGraceMs: number } }   // runnerLeaseMs / 3: WIP pushes during a link outage (section 7.3)
   | { t: 'ack'; outboxEpoch: string; seq: number }       // cumulative
   | { t: 'heartbeat_ack'; at: number; hubTime: number }
   | { t: 'command'; id: string; seq: number; command: RunnerCommand };
@@ -604,7 +632,7 @@ export type HubMessage =
 
 **Identity.**
 - **Unknown key.** A `hello` with an unknown `runnerKey` registers a new runner, owned by the session's user and bound to `machineId`. The owner never changes.
-- **Known key.** A `hello` with a known key from another user, or from another machine, is refused with close code 4403: "this runner belongs to <owner> on another machine; run agflow runner setup".
+- **Known key.** A `hello` with a known key from another user, or from another machine, is refused with close code 4403: "this runner belongs to <owner> on another machine; run agflow runner setup". A `hello` from a retired runner is refused with 4403 too: "this runner was retired; run agflow runner setup".
 - **Second connection.** A second connection with the same key and machine replaces the first, which is closed with 4409.
 - **Protocol range.** A `hello` with a protocol outside the hub's supported range is refused with 4426, naming the minimum version. The runner row records it as `incompatible`. Upgrades go hub first, then runners: a hub accepts [`minProtocol`, current], and `minProtocol` rises only in a release after the one that introduced the newer protocol.
 - **State.** The hub derives each runner's state:
@@ -615,6 +643,17 @@ export type HubMessage =
   - otherwise `online`.
 
   `draining` is a separate flag. `RunnerVendor.degraded` and the hub's not-ready marks come from `runners.vendor_holds` and are never taken from runner messages. A vendor report whose `preflightAt` is later than the mark's `notReadySince` clears it.
+
+**Settings sync.** `runner.json` holds the settings and a snapshot of the last ones the hub confirmed, with their version.
+- `hello.settings` carries that snapshot and never a local edit.
+- On `hello`, the hub compares versions:
+  - a new runner: the hub stores the reported values at version 1 and echoes them with `update_settings`;
+  - an equal version: nothing;
+  - an older version (the owner changed settings in the browser meanwhile): the hub sends its settings with `update_settings`;
+  - a newer version (a restored hub): the hub adopts the reported values and version.
+- Local edits (`drain`, `undrain`, a hand edit, the crash-loop self-drain) travel only as `runner.settings`, after `welcome`. After each `welcome` the runner sends every field where `runner.json` differs from the snapshot.
+- An `update_settings` echo replaces the snapshot. It also updates `runner.json`, except pending local edits (fields that differed from the old snapshot and differ from the echo): they keep their value and are sent again.
+- So a drain made while offline and a capacity change made in the browser meanwhile both survive.
 
 **Link behaviour:**
 - The runner sends a heartbeat every 15 s. The hub answers each one with `heartbeat_ack`.
@@ -629,7 +668,7 @@ export type HubMessage =
 - **Shape and order.** Each event is `{ seq, at, type, attemptId?, fence?, data }`. The runner stores them in a bun:sqlite outbox with an `AUTOINCREMENT` seq and sends them in order.
 - **Retention.** Acknowledged events are kept for 48 hours, so a restored hub can catch up.
 - **Applying.** The hub applies each event in its own savepoint. The cumulative acknowledgement always advances: an event is never refused by withholding the ack, so one bad event cannot block a runner's outbox.
-- **Acknowledged position.** On `hello` the hub sets `acked_seq = max(acked_seq, firstSeq − 1)`, creating the row if needed, and returns it as `welcome.ackedSeq`. The runner then sends every event after it that it still has.
+- **Acknowledged position.** On `hello` the hub sets `acked_seq = max(acked_seq, firstSeq − 1)`, creating the row if needed, and returns it as `welcome.ackedSeq`. The runner then sends every event after it that it still has. The replay is complete once `acked_seq` reaches `hello.lastSeq`.
 - **Stale events.** An event about an attempt takes effect only if the attempt is not ended and the event's fence equals the attempt's current fence. Otherwise it is logged (`attempt_log` kind `rejected`), with these exceptions:
   - `attempt.wip` and `attempt.late_work` of an ended attempt, or of an attempt the hub does not know, are recorded as late work (section 6.4);
   - `attempt.exited` of an ended attempt records the exit and voids its approvals, and a `finalWip` that differs from the recorded `wip_sha` is recorded as late work;
@@ -637,21 +676,22 @@ export type HubMessage =
   - `attempt.taken_over` of an attempt that ended `taken_over` stores its commands;
   - `attempt.handed_back` completes the hand-back (section 6.12); `hand_back` carries no fence, so none is compared;
   - `attempt.violation` of an ended attempt is still reported to people and the lead.
+  - During the replay after a restore (`hello.lastHubEpoch` below the hub's epoch), an event whose fence is newer than the attempt's recorded fence counts as current: it was sent after the backup.
 - **Effects on tasks** apply only if `tasks.current_attempt` is this attempt and the task is in the state the effect expects.
 - **Invalid, unknown or throwing events** are acknowledged, stored in `runner_event_rejects`, and emitted as `runner.event_rejected`.
 
 | Event type | Data | Hub effect |
 |---|---|---|
 | `attempt.spawned` | sessionRef, pid, model, cliVersion, permissionMode, startSha (null on a resume) | `starting` → `running`, for a new session and for a resumed one; agent session id set; the unread backlog is delivered (section 6.7) |
-| `attempt.failed_to_start` | error, refused (draining, disk_low, vendor_not_ready, …) or null | ends `failed_to_start`. Infra, with backoff and a failure signature, unless `refused` is set: then the class is null (no backoff, no signature, not counted toward the two-failed-starts rule) and the runner's state is updated. The task goes back to `ready` under section 6.4's conditional moves. |
-| `attempt.activity` | kind (`tool`, `turn`, `text`, `compaction`, `vendor_error`, `note`), summary | `attempt_log` (newest 500 kept); `last_activity_at`; a compaction also sets `compaction_summary` |
+| `attempt.failed_to_start` | error, refused (one of `START_REFUSALS`: `draining`, `at_capacity`, `vendor_not_ready`, `disk_low`, `battery_low`, `waking`, `needs_login`) or null | ends `failed_to_start`. Infra, with backoff and a failure signature, unless `refused` is set: then the class is null (no backoff, no signature, not counted toward the two-failed-starts rule), the refusal shows on the runner's card, and nothing more is placed on that runner until its next heartbeat. The task goes back to `ready` under section 6.4's conditional moves. |
+| `attempt.activity` | kind (`tool`, `turn`, `text`, `compaction`, `vendor_error`, `note`; adapter warnings are sent as `note`), summary | `attempt_log` (newest 500 kept); `last_activity_at`; a compaction also sets `compaction_summary` |
 | `attempt.first_output` | text | quoted `restatement` note on the task (successors) or in `lead_notes` (leads) |
-| `attempt.delivered`, `attempt.acknowledged` | messageIds | delivery rows (section 6.7) |
-| `attempt.quota` | vendor, accountId, quota | `running` ⇄ `quota_wait`; account quota updated |
-| `attempt.prepared` | requestId, ok, error, log tail | dependency preparation result (section 7.7) |
-| `attempt.wip` | ref, sha, stripped, skipped, embedded, logStat | `wip_sha`, task `work_ref`/`work_sha`; event `attempt.wip` |
-| `attempt.wip_failed` | error, failures | runner `git.ready` false after 3 consecutive failures |
-| `attempt.violation` | phase (`start`, `wip`, `submit`, `takeover`), paths | event; message to people and the lead |
+| `attempt.delivered`, `attempt.acknowledged` | messageIds (an id 0 is ignored) | delivery rows (section 6.7) |
+| `attempt.quota` | vendor, accountId (null when unknown), quota | quota `exhausted` → `quota_wait`; `ok` → `running` again (section 6.10); the account's quota is updated only with an accountId |
+| `attempt.prepared` | requestId (null for a preparation the runner ran before a start or resume), ok, error, log tail | dependency preparation result (section 7.7) |
+| `attempt.wip` | ref, sha, stripped, skipped, embedded, logStat (at most 4,000 characters) | `wip_sha`, task `work_ref`/`work_sha`; event `attempt.wip` |
+| `attempt.wip_failed` | error, failures (the runner's consecutive failed WIP pushes, over all its attempts) | runner `git.ready` false at 3; a later `attempt.wip`, or a `hello` with `git.ready`, sets it back |
+| `attempt.violation` | phase (`start`, `wip`, `submit`, `takeover`; a hand-back from the clone reports `wip`), paths | event; message to people and the lead |
 | `attempt.submitted` | submissionId, ok, headSha, remoteHead, error (null, `dirty`, `protected_paths`, `needs_merge`, `branch_moved`, `remote`, `interrupted`), detail | the submission outcome (section 6.13); `dirty`, `protected_paths` and `needs_merge` are fixable by the agent |
 | `attempt.taken_over` | commands { local, anywhere }, wipSha, error | take-over completes (section 6.12) |
 | `attempt.handed_back` | ref, sha | hand-back completes |
@@ -663,6 +703,8 @@ export type HubMessage =
 | `runner.state` | state, detail | `crash_loop`, `disk_low`, or back to `ok` |
 | `approval.requested` | approvalId, kind, summary, detail | `approvals` row; event; owner notified (section 6.10) |
 | `approval.voided` | approvalId | approval `void` |
+
+The code lists in this table are closed and live in `packages/core/src/runner-protocol.ts`: the activity kinds, `START_REFUSALS`, `SUBMIT_ERRORS`, `VIOLATION_PHASES`, `VENDOR_OUTCOME_KINDS`, `EXIT_CAUSES` (`suspend`, `runner_stop`) and `STOPPED_BY` (`interrupt`, `close`, `sigterm`, `sigkill`, `none`). Senders import them instead of writing literals; any other value makes the event a reject.
 
 **Commands.**
 - **Delivery.** Commands carry an id, a per-runner seq (unique within the hub epoch), and, for an attempt, its fence. Command ids are `<hubEpoch>-<runnerId>-<seq>`, so they never repeat across restores. The hub stores them in `runner_commands` and sends the pending ones after every `welcome`, in seq order.
@@ -680,7 +722,7 @@ export type HubMessage =
   - `deliver`, `interrupt` and `decide_approval` act on the live session at once, so an approval raised during a handoff turn does not wait behind `stop_attempt`.
   - Different attempts run concurrently. Updates to one vault's refs are serialized.
 - **Cancellation.** In the transaction that ends an attempt or gives it a new fence, the hub cancels every pending command of the old fence. `cleanup_attempt`, `upload_transcript` and `hand_back` are kept. Cancelled commands are never resent. A new fence enqueues its `resume_attempt` and re-targets pending deliveries in the same transaction.
-- **Unsupported commands.** Each command kind names the minimum protocol that understands it and is never sent to an older runner. An unknown or invalid command is answered `{ ok: false, error: 'unsupported' }`.
+- **Unsupported commands.** Protocol 1 has 17 command kinds, the members of `RunnerCommand` below. `COMMAND_MIN_PROTOCOL` in core names, for each kind, the minimum protocol that understands it (1 for all 17), and a command is never sent to an older runner. An unknown or invalid command is answered `{ ok: false, error: 'unsupported' }`.
 - **Tokens.** Agent tokens are never stored in `runner_commands.payload`. A resent `start_attempt` or `resume_attempt` carries a freshly minted token for the same attempt and fence. Earlier tokens of that attempt and fence stay valid. All of them are revoked together when the attempt ends, gets a new fence, or the epoch changes.
 - **Resume on a live process.** A `resume_attempt` for an attempt whose process is still alive first stops it, with the stop ladder, the final push and no handoff turn. It then resumes the session with the new token, because a bridge's token cannot change in place. This happens after a restore, and for a step-1 resume whose hold never reached the runner. When the hub re-fences an attempt whose `resume_attempt` is still pending, the new command carries that command's prompt and messages.
 
@@ -692,7 +734,8 @@ export type RunnerCommand =
                                    // or "the runner restarted; continue from your last step" (reconciliation, restore)
       messages: InjectedMessage[];
       taskPack: string | null; restore: AttemptSpec['restore']; acceptanceIds: string[] }   // recomputed by the hub
-  | { kind: 'deliver'; attemptId: string; fence: Fence; messages: InjectedMessage[]; more: number }
+  | { kind: 'deliver'; attemptId: string; fence: Fence; messages: InjectedMessage[];
+      more: number }               // messages that did not fit; the runner adds one line about them (section 6.7)
   | { kind: 'interrupt'; attemptId: string; fence: Fence }      // the Agents view's Interrupt action
   | { kind: 'stop_attempt'; attemptId: string; fence: Fence; cause: StopCause; reason: string;
       handoff: boolean;            // ask for a handoff note first (section 6.8)
@@ -703,6 +746,8 @@ export type RunnerCommand =
       expectedBranchSha: string | null; adoptable: string[] }   // shas the hub accepts as the remote head (section 6.13)
   | { kind: 'prepare_takeover'; attemptId: string; fence: Fence; person: string }
   | { kind: 'hand_back'; attemptId: string; source: { kind: 'clone' } | { kind: 'ref'; ref: string; sha: string } }
+                                   // protocol-1 hubs send only the clone source; a runner given a ref source
+                                   // fetches the ref into its vault and answers ok, with no event
   | { kind: 'cleanup_attempt'; attemptId: string }
   | { kind: 'decide_approval'; attemptId: string; fence: Fence; approvalId: string; decision: 'approve' | 'decline';
       reason: string | null }
@@ -714,7 +759,8 @@ export type RunnerCommand =
   | { kind: 'update_settings'; settings: Partial<Omit<RunnerSettings, 'version'>>; version: number };
 
 export interface InjectedMessage {
-  messageId: number;
+  messageId: number;               // 0: hub text with no message row (the lead's situation report);
+                                   // runners never report it as delivered or acknowledged
   authority: 'person' | 'agent' | 'system';
   text: string;                    // formatted and quoted by the hub
 }
@@ -732,7 +778,10 @@ export interface AttemptSpec {
   start: { ref: string; sha: string | null };   // the task's work position, or main
   branch: string | null;           // 'agflow/T-42-<slug>'; from epoch 2 'agflow/T-42-e2-<slug>'; null for leads
   wipRef: string | null;
-  restore: { paths: string[]; base: string | null };   // resolved by the hub (section 7.3); base = merge-base source
+  restore: { paths: string[]; base: string | null };
+                                   // paths: protected-class patterns with this task's exemptions applied, matched
+                                   // only with core's matchesProtectedPattern; base: 'refs/heads/<mainBranch>',
+                                   // which the runner resolves in its vault (section 7.3); null: the start commit
   acceptanceIds: string[];         // for continuation prompts
   toolCaps: {                      // computed by the hub; the runner reports the cap it applied in AttemptFacts.tool.capMs
     defaultMs: number;             // toolCapMs
@@ -746,7 +795,9 @@ export interface AttemptSpec {
 }
 ```
 
-**Reconciliation on `hello`.** The hub decides it in the `hello` transaction, for every attempt it believes is not ended on this runner, from the reported state. The first matching row applies.
+**Reconciliation on `hello`.** The hub decides it in the `hello` transaction, for every attempt it believes is not ended on this runner, from the reported state. The first matching row applies. Two rows wait:
+- the two "after a restore" rows apply once the replay is complete (`acked_seq` reaches `hello.lastSeq`); if the link drops first, the next `hello` decides again;
+- when `hello.state` is not `ok`, the rows that resume a `stopped` or `suspended` attempt wait for `runner.state` `ok`, and the leases keep running meanwhile.
 
 | Reported | Hub status | Action |
 |---|---|---|
@@ -776,7 +827,7 @@ The runner applies `welcome.stop` before any command, and answers later commands
 - **Resume.** Every `resume_attempt` sets the attempt to `starting` in the transaction that issues it. This applies to ladder step 1, a lead's wake-up, reconciliation and restores. A `starting` attempt holds a runner lease, counts toward capacity, and receives no deliveries. The runner reports `attempt.spawned` again when the resumed session is live, which moves the attempt to `running`. A failed resume reports `attempt.failed_to_start` (section 7.4).
 - **Runner lease.** Attempts in `starting`, `running` or `quota_wait` hold a runner lease, renewed by every heartbeat that lists them. Default 15 minutes. It measures whether the laptop is there, not whether the agent works (stalls are section 6.8). `holding` and `ended` attempts hold none.
 - **Lease expiry.** The attempt ends `lost` (infra) and its token is revoked. If the task is held, it goes `stale` → `ready` with an assembled handoff note.
-  - If the runner comes back, `welcome.stop` names the attempt. The runner stops it, pushes its late work to a late-work ref, reports `attempt.late_work`, and then gets `upload_transcript`.
+  - If the runner comes back, `welcome.stop` names the attempt. The runner stops it without a handoff turn, pushes its late work to a late-work ref, reports `attempt.late_work` (and `attempt.exited` with `finalWip` null when a process was still alive), and then gets `upload_transcript`.
   - If such a runner reconnects while the task is still `ready`, dispatch waits `dispatchHoldMs` (2 minutes, `dispatch_hold_until`) for that late work.
 - **Work position.** `tasks.work_ref` and `work_sha` say where the next attempt starts, whether it runs on a runner or in a live chat. They are updated by:
   - `attempt.wip` and `attempt.exited.finalWip` of the current attempt;
@@ -815,7 +866,8 @@ The runner applies `welcome.stop` before any command, and answers later commands
 | submit finds the branch moved (section 6.13) | `stop_attempt` (handoff) | on exit | `stopped` | none | → `blocked` (`branch_moved`) at once | if none written |
 | take-over | `prepare_takeover` | on `attempt.taken_over`, or at lease expiry or the stop timeout | `taken_over` | none | → `blocked` (`takeover`) at once | — |
 | lead rotation | `stop_attempt` (handoff) | on exit | `rotated` | none | — | lead note |
-| the runner's own stop (`agflow runner stop`, `uninstall`, disk guard, low battery: `cause: 'runner_stop'`) | — | on exit | `stopped` | infra, with no backoff and no failure signature | → `ready` on exit | if none written |
+| stop or replace of a runner lead by a person (hold is refused for leads; the lead's own tools act on workers only) | `stop_attempt` (handoff: a lead handoff) | on exit | `stopped` or `replaced` | none | — (the seat empties) | lead note |
+| the runner's own stop (`cause: 'runner_stop'`): `agflow runner stop` and `uninstall` with a handoff turn; the disk and battery guards without one | — | on exit | `stopped` | infra, with no backoff and no failure signature | → `ready` on exit | if none written |
 | a runner suspend (SIGTERM: launchd restart, logout, upgrade; `cause: 'suspend'`) | — | no; it keeps its status, and its lease runs without renewal until the runner says `hello` again | — | — | — | — |
 | unrequested exit of a worker | — | on exit | `crashed` | infra | → `ready` with backoff | if none written |
 | unrequested exit of a lead, idle or during a turn | `resume_attempt` (new fence) on the next delivery if it was idle, at once with its unacknowledged deliveries if it was in a turn | no; it is `holding` until resumed | — | — | — | — |
@@ -826,11 +878,18 @@ The runner applies `welcome.stop` before any command, and answers later commands
 | reconciled away after a restore | (listed in `welcome.stop`) | at once | `superseded` | none | — | — |
 
 **Task moves are conditional.**
-- A row's task move applies only while the task is `claimed` or `working` and `tasks.current_attempt` names this attempt. The move to `submitted` applies from `claimed` or `working`, and the moves on acceptance and rejection apply from `submitted`. This holds whether a runner event, a request or the tick triggered it.
+- A row's task move applies only while the task is `claimed` or `working` and `tasks.current_attempt` names this attempt. The move to `submitted` applies from `claimed` or `working`, and the moves on acceptance and rejection apply from `submitted`. This holds whether a runner event, a stop request or the tick triggered it.
+- The M1 operations of people and the lead (cancel, accept, reject, unblock) keep their M1 preconditions on the task. For example, cancelling a `submitted` task cancels it, and its `holding` attempt ends `cancelled` at once.
 - Otherwise the attempt still ends as the row says, and the task keeps its status. An attempt that ends while a take-over is in flight leaves the task `blocked` (`takeover`).
 - The ladder and the failure-signature rule run only when a move to `ready` actually happens.
 
 **No process.** A cause whose command is `stop_attempt` or `hold_attempt` may apply to an attempt with no live process: a `holding` attempt, or a lead that exited while idle. Then the attempt ends at once with that cause's end reason and class; the task moves and the note is assembled as the row says.
+
+**A second stop request** on an attempt that already has one:
+- a cause that moves the task at request time (cancel, `blocked`, `impossible`, `policy`, `branch_moved`, stop and hold) replaces a recorded stop, replace or stall cause, and makes its move;
+- a recorded `takeover` cause is never replaced, and a take-over is refused (409 `not_running`) while any stop is recorded;
+- otherwise the first cause stands;
+- a newer request replaces a deferred one (section 6.13).
 
 **Invariants:**
 - **(a) Exit before end.** An attempt with a live process ends when the runner reports the process gone, or when its lease expires; never at request time. `stop_requested` records the cause.
@@ -885,7 +944,8 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 - **Valid tokens.** A valid token gives `{ user: runner owner, via: 'agent', agent }`. Valid means: not revoked, the attempt not ended, the fence current, and the epoch current.
 - **Invalid tokens.**
   - An `agt_` bearer whose only fault is an older epoch, while its attempt is being re-fenced after a restore, gets **401 `attempt_refenced`**. The bridge then answers: "agflow is restarting your session; stop and wait."
-  - Every other invalid `agt_` bearer (unknown, revoked, an ended attempt, an older fence) gets **401 `attempt_ended`**. The answer tells the agent to stop.
+  - So does an unknown `agt_` bearer within `runnerLeaseMs` after a restore (`hub_state.restored_at`): tokens minted after the backup are unknown to the restored hub, and their attempts are about to be re-fenced.
+  - Every other invalid `agt_` bearer (unknown, revoked, an ended attempt, an older fence) gets **401 `attempt_ended`**, with the end reason in the body (`{ error: 'attempt_ended', reason }`, reason null when unknown). The answer tells the agent to stop.
 - With an agent token, `X-Agflow-Agent` is refused.
 - The M1 path (CLI token plus `X-Agflow-Agent`) is refused for agents whose origin is `runner`.
 - **Holder.** For an agent token, the holder test is: the token's attempt is `tasks.current_attempt`, the attempt is not ended, and the fence is current, in any task status.
@@ -922,8 +982,9 @@ A tick runs every `tickMs` (15 s), and also right after events that free a slot 
    - stall decisions, from fresh facts only (section 6.8);
    - stop timeouts (invariant d) and submission timeouts (section 6.13);
    - `holding` runner leads that cannot be resumed (section 6.11);
-   - the lead's periodic review;
-   - scheduled remote-ref cleanup and retention (section 6.18).
+   - the lead's periodic review.
+
+   Retention and remote-ref cleanup are not in the tick: they run on a daily timer (section 6.18).
 2. **Lead seat** (section 6.11). Skipped while the project is paused.
 3. **Ready set**, skipped while paused or while the churn guard holds dispatch. Tasks qualify when they:
    - are in `ready` with their dependencies done;
@@ -940,12 +1001,14 @@ A tick runs every `tickMs` (15 s), and also right after events that free a slot 
 5. **Placement** for each ready task, in order.
    - **Candidate runners** must be:
      - in state `online`, not draining, and with `git.ready`;
-     - without `acceptingUntil` in their last heartbeat (set for a while after waking from sleep, on low battery and on low disk);
+     - without `acceptingUntil` in their last heartbeat (set for a while after waking from sleep, on low battery and on low disk), and without a refused start since that heartbeat;
      - with capacity left: `capacity` minus their `starting`, `running` and `quota_wait` attempts, with a lead counting.
    - **The vendor on that runner** must be:
      - `ready`, with no not-ready mark and not `degraded` in `vendor_holds`;
      - on an account that is not exhausted, uses no paid usage unless the runner allows it, and is not `ownerAway` (section 6.10);
-     - below the candidate runner's own ceilings, compared with the shared account utilization.
+     - below the candidate runner's own ceilings, compared with the shared account utilization (unknown utilization counts as 0, so a ceiling of 0 keeps the vendor off that runner).
+
+     A vendor that reports no account id is usable when ready, with no account rules. Only tests can produce one; test mode reports a fixed account id (section 15.1).
    - **Vendor preference:**
      1. the ladder's requirement (section 6.9); once the task has been ready for `vendorRequirementMs` (10 min) since its last attempt ended, any vendor;
      2. `vendorHint`;
@@ -971,7 +1034,8 @@ Pure placement and ordering functions live in `packages/core/src/scheduling.ts` 
 - **In flight.** A message with a `pending_deliveries` row is excluded from that agent's `unreadFor` and `check_inbox`, so it is never injected and taken twice. The row goes when `attempt.delivered` arrives, when the command is cancelled, or when the attempt ends.
 - **Backlog.** When an attempt enters `running` (spawned, resumed or re-fenced), the hub delivers its whole unread backlog and re-targets pending deliveries to the new fence. Messages carried in `resume_attempt.messages` get `pending_deliveries` rows with the resume command's id, so the backlog excludes them.
 - **Authority.** Messages from people are `person`; from the hub (`system`), `system`; from agents, `agent`. The hub formats every message with M1's quoting rules.
-- **Batching.** Deliveries to one attempt are batched over 2 s, at most 6000 characters per command. A backlog that does not fit is announced in the batch: "N more messages: call check_inbox".
+- **Batching.** Deliveries to one attempt are batched over 2 s, at most 6000 characters per command. A backlog that does not fit is counted in `deliver.more`, and the runner adds one system line to the batch: "N more agflow messages are waiting: call check_inbox". That line is not a hub message and is never reported back.
+- **Hub text.** The situation report that starts each delivery to the lead (section 6.11) is an `InjectedMessage` with `messageId` 0 and authority `system`. It has no message row and is never reported back.
 - **Delivered and acknowledged.** The runner reports `attempt.delivered` when the vendor accepts the input: for Claude, the message's command lifecycle reaches `started`; for Codex, the steer or turn request succeeds. It reports `attempt.acknowledged` when the turn that consumed it ends: Claude's `result.user_message_uuids`, or Codex's `turn/completed`.
 - **Endings:**
   - When a worker attempt ends, its agent's unacknowledged messages are copied to the task's thread (`task:T-42`), so the successor reads them.
@@ -996,7 +1060,7 @@ export interface AttemptFacts {
   repeatedCalls: number;         // identical consecutive tool calls (name and arguments)
   continuations: number;
   vendorErrorMs: number;         // continuous time in vendor_error
-  activeMs: number;
+  activeMs: number;              // time in the phases starting and turn only (idle, waits and sleep excluded)
   contextUsed: number | null;    // 0..1 of the model's window
 }
 ```
@@ -1013,7 +1077,7 @@ export interface AttemptFacts {
 | loop | identical consecutive tool calls | 3 |
 | budget | continuations sent, or `activeMs` of the attempt, or a vendor outcome `denials` or `session_budget` | `maxContinuations` 25; `activeBudgetMs` 4 h |
 
-Each rule maps to a stop cause: `stall_silent`, `stall_hung_tool`, `stall_no_progress`, `stall_loop`, `stall_budget`. The phases `waiting_approval`, `quota_wait`, `vendor_error`, `preparing` and `stopping` never count as stalls, and their time is excluded from `activeMs`. The runner sets `tool.capMs` from `AttemptSpec.toolCaps`: a command matching a task check gets that check's cap, and one matching `longPatterns` (build and test commands, kept in `packages/core/src/stall.ts`) gets the long cap. The hub's rule uses the reported `capMs`. `fsAgeMs`, `commitAgeMs` and `turns` appear on the attempt page; no rule uses them.
+Each rule maps to a stop cause: `stall_silent`, `stall_hung_tool`, `stall_no_progress`, `stall_loop`, `stall_budget`. The phases `waiting_approval`, `quota_wait`, `vendor_error`, `preparing` and `stopping` never count as stalls, and `activeMs` counts only the phases `starting` and `turn`. The runner sets `tool.capMs` with core's `capForCommand(spec.toolCaps, command)`: a command matches a task check when its whitespace-normalised text contains the check's whitespace-normalised `cmd`, and gets that check's cap; one whose segments start with a `longPatterns` entry (build and test commands, kept in `packages/core/src/stall.ts`) gets the long cap. The hub's rule uses the reported `capMs`. `fsAgeMs`, `commitAgeMs` and `turns` appear on the attempt page; no rule uses them.
 
 **Vendor errors.** A turn that fails with a vendor, network or API error is not a stall:
 - the attempt's phase becomes `vendor_error`;
@@ -1029,7 +1093,7 @@ After `vendorErrorReplaceMs` (60 minutes) of continuous vendor errors, the hub r
 
 Further rules:
 - No continuation follows a failed or interrupted turn.
-- None is sent while the link is down, or after a tool answered "hub unreachable". When the link returns, the runner sends one "the agflow hub is reachable again; retry the tool that failed".
+- None is sent while the link is down, or after a tool answered "hub unreachable". When the link returns, the runner sends one "the agflow hub is reachable again; retry the tool that failed" to each attempt whose turn ended because of the outage: a tool answered "hub unreachable", or the runner interrupted the turn in `needs_login` (section 7.1). That is the only nudge after an outage.
 - Leads get no continuation.
 
 **Replacement.** A stall decision, or a person's or the lead's stop or replace, runs:
@@ -1046,7 +1110,7 @@ Further rules:
    - a successor elsewhere starts from the last pushed position, and its handoff note names `finalSha` as unpushed work on that runner.
 5. The scheduler starts the successor.
 
-**Crashes.** An unrequested exit of a worker follows the same path from step 3. The runner always harvests and pushes before reporting the exit, so uncommitted work survives.
+**Crashes.** An unrequested exit of a worker follows the same path from step 3. The runner first kills the agent's remaining tool processes and sweeps the clone (section 7.4), then harvests and pushes before reporting the exit, so uncommitted work survives and no orphan writes during the harvest.
 
 **Assembled handoff note** (`packages/hub/src/handoff.ts`), at most 12,000 characters, author `system`. Only the hub's own framing is unquoted. Every agent-produced part is quoted under a header naming its source attempt and agent. It contains:
 - the task id, title and objective;
@@ -1103,14 +1167,14 @@ It closes with: "No handoff note was written; the next step is unknown. Read the
   - Claude: overage in use, `rateLimitType: 'overage'`, or a usage-transition notice;
   - Codex: a window at 100% while credits are consumed.
 
-  `allowPaidUsage` (default false per vendor) changes that, and only the owner can set it. Preflight reports whether extra usage is enabled.
+  `allowPaidUsage` (default false per vendor) changes that, and only the owner can set it. Preflight reports whether extra usage is enabled (Claude: section 8.1; Codex: the credits in `account/rateLimits/read`).
 
-  Paid usage stops running work too. While `allowPaidUsage` is false, the runner treats paid usage in use as a limit hit. It interrupts the turn, sends no continuation, and reports `attempt.quota`; the attempt moves to `quota_wait` until `resetsAt`.
-- **Unknown reset times.** When `resetsAt` is unknown, the vendor is retried after `AGFLOW_QUOTA_UNKNOWN_MINUTES` (30) with one cheap probe: Codex `account/rateLimits/read`; for Claude, the next start.
+  Paid usage stops running work too. Adapters only report quota facts; the runner's attempt controller applies `allowPaidUsage`, the same way for both vendors. While it is false, the runner treats paid usage in use as a limit hit. It interrupts the turn, sends no continuation, and reports `attempt.quota`; the attempt moves to `quota_wait` until `resetsAt`.
+- **Unknown reset times.** When `resetsAt` is unknown, the vendor is retried after `AGFLOW_QUOTA_UNKNOWN_MINUTES` (30) with one cheap probe. For Codex, the hub sends `preflight { vendor: 'codex' }` to one online runner of that owner on that account; preflight calls `account/rateLimits/read`, and the `runner.vendors` answer lifts the exhaustion. For Claude, the probe is the next start.
 
 **`quota_wait`.**
 - A running attempt that hits a limit moves to `quota_wait`. Its stall timers and budget freeze; its runner lease keeps running and is renewed like any other.
-- At the reset time, the runner resumes the turn.
+- At the reset time, the runner resumes the turn and reports `attempt.quota` with state `ok`, which moves the attempt back to `running`. Fresh facts with phase `turn` do the same, in case that event is lost.
 - If the reset is more than `quotaWaitMaxMs` (45 minutes) away, or unknown, the hub replaces the attempt (class `infra`, no handoff turn) — but only if a placement with quota exists right now. Otherwise the attempt stays in `quota_wait`, and with an unknown reset the runner retries its turn every `quotaUnknownMs`.
 
 **Approvals.** Only Codex raises approval requests in M2. Claude agents run with `permissionPrompts: 'none'`, so anything that would prompt is denied at once and the turn continues.
@@ -1127,8 +1191,8 @@ It closes with: "No handoff note was written; the next step is unknown. Read the
 
   `approve` maps only to Codex's `accept`, never to session-wide or policy-amending answers. A file-change request with a non-null `grantRoot` shows that root with the warning "approving may let the agent write anywhere under this root for the rest of the session". Its default action, like expiry, is decline.
 - **Expiry.** A request not answered within `AGFLOW_APPROVAL_MINUTES` (15) of the hub receiving it is declined. The agent sees the reason: "the owner did not answer; continue without it or declare_blocked". Time in `waiting_approval` counts toward neither budgets nor stall timers.
-- **Owner away.** After a timeout, the owner's account for that vendor becomes `ownerAway` until the owner answers any approval or acts in the UI. While it is set, the scheduler places no new attempts of that vendor on the owner's runners. The lead gets one notice when ready work cannot be placed because of it, not one per request.
-- **Notifications.** The runner posts a macOS notification for each relayed request, with the summary and a link to Approvals.
+- **Owner away.** After a timeout, the owner's account for that vendor becomes `ownerAway` until the owner acts: any approval decision, or a change to one of their runners (`PATCH /api/runners/:id`). While it is set, the scheduler places no new attempts of that vendor on the owner's runners. The lead gets one notice when ready work cannot be placed because of it, not one per request.
+- **Notifications.** The runner posts a macOS notification for each relayed request, with the summary and the Approvals address, `<hub>` followed by core's `APPROVALS_ROUTE` (`#/approvals`), in its text: a notification cannot open a link. The attempt controller relays the request and calls the runner's notifier; nothing is posted in test mode.
 - **Who may answer.** Only the owner, in a browser session. Every decision is an event.
 
 **Managed devices.** `managedPolicy` is detected at preflight (section 9.1) and shown on the Runners card. Because the runner never answers approvals, it changes no behaviour. It explains why so much needs the owner on such a device.
@@ -1158,7 +1222,7 @@ M1's `currentLead()` is removed, and nothing reads `agents.role` for authority.
 **Lifecycle.**
 - **Idle between wake-ups.** The lead's process stays alive and idle while its runner is online, and idle is not a stall.
 - **Its clone.** A lead attempt gets a clone checked out detached at `main`. It has no task branch, pushes no WIP and is never harvested (section 7.3).
-- **Process exits.** An unrequested exit moves the attempt to `holding` and resumes it: on the next delivery if it was idle, at once (with its unacknowledged deliveries) if it was in a turn. The third unrequested exit within `leadExitWindowMs` (an hour) ends it `crashed`, and the seat empties.
+- **Process exits.** An unrequested exit moves the attempt to `holding` and resumes it: on the next delivery if it was idle, at once (with its unacknowledged deliveries) if it was in a turn. It was in a turn if its last reported phase was `turn`, or a message delivered to it is still unacknowledged. The third unrequested exit within `leadExitWindowMs` (an hour) ends it `crashed`, and the seat empties.
 - **Liveness.** A runner lead's agent `last_seen_at` is renewed with its runner lease.
 
 **Wake-ups are deliveries.** Everything that should wake the lead already produces a message to `lead`:
@@ -1187,10 +1251,10 @@ Messages that the ended lead received but never acknowledged become unread again
 ### 6.12 Take-over and hand-back
 
 **Take over** (a person, in the browser, `POST /api/tasks/:id/takeover`).
-- **When it is allowed.** Only when the task's current attempt is `running` or `quota_wait` on an online runner. Otherwise the hub answers 409:
+- **When it is allowed.** Only when the task's current attempt is `running` or `quota_wait` on an online runner, with no stop recorded. Otherwise the hub answers 409:
   - `submission_pending` while a submission is pending;
   - `runner_offline`;
-  - `not_running`.
+  - `not_running`, also while a stop is recorded.
 
   It then offers "Stop and hold" instead: the task becomes `blocked` (kind `paused`) from its last WIP.
 - **Recording.** In one transaction the hub records `stop_requested` (cause `takeover`), moves the task to `blocked` (kind `takeover`, "taken over by <login>"), and answers `202 { attemptId }`. The task counts as a path holder, and the lead cannot unblock it.
@@ -1206,19 +1270,19 @@ Messages that the ended lead received but never acknowledged become unread again
 
   During a take-over the runner reports no `attempt.exited`. If the take-over fails after the agent stopped, the runner still reports `attempt.taken_over`, with `commands.local` null and the error.
 - **Completion.** The attempt ends `taken_over` when `attempt.taken_over` arrives, or at lease expiry or the stop timeout. Without the event, the page shows only the "anywhere" command.
-- **The commands shown** use the runner's pinned binaries, because a resume must use the same CLI version that wrote the session:
-  - on the runner's laptop: `cd <clone> && CLAUDE_CONFIG_DIR=<runner claude home> ~/.agflow/runner/vendor/claude/<version>/claude --resume <session>`, or `cd <clone> && CODEX_HOME=<runner codex home> ~/.agflow/runner/vendor/codex/<version>/codex resume --no-daemon <thread>`;
-  - anywhere: `git fetch origin <work ref> && git switch -c agflow/T-42-<slug> FETCH_HEAD`, and when done, `git push origin HEAD:<wipRefPrefix>T-42/takeover-<login>`.
+- **The commands shown** use the runner's pinned binaries of the attempt's own CLI version, because a resume must use the same CLI version that wrote the session. The runner core builds them (not the adapters):
+  - on the runner's laptop: `cd <clone> && CLAUDE_CONFIG_DIR=<runner claude home> ~/.agflow/runner/vendor/claude/<version>/claude --resume <session>`, or `cd <clone> && CODEX_HOME=<runner codex home> ~/.agflow/runner/vendor/codex/<version>/bin/codex resume --no-daemon <thread>`;
+  - anywhere: `git fetch origin <work ref> && git switch -c agflow/T-42-<slug> FETCH_HEAD`, and when done, `git push origin HEAD:<wipRefPrefix>T-42/takeover-<login>`. The hub keeps that take-over ref in `Attempt.takeover.ref`, so the page can offer it for a hand-back.
 
-**Hand back** (the same person, or anyone if the runner is gone, `POST /api/tasks/:id/handback { source }`).
+**Hand back** (the same person, or anyone if the runner is gone, which means not `online`; `POST /api/tasks/:id/handback { source }`).
 - **Clone source** (`'clone'`, the runner's clone). The hub sends `hand_back` to the attempt's runner, which:
   - stops the runner-home Codex daemon (`CODEX_HOME=<runner codex home> <runner codex> app-server daemon stop`, errors ignored);
-  - refuses, and reports, if a process still runs in the clone;
+  - refuses if a process still runs in the clone: the command answers `{ ok: false, error: 'process_running' }`, naming the pids, and the runner logs an `attempt.activity` note. The hub keeps the task `blocked` (`takeover`), shows the error in `Attempt.takeover.error`, and stops the hand-back timer; the person may hand back again;
   - harvests the clone (the person's commits and uncommitted changes), and strips and checks it like a WIP;
   - pushes the result to a new late-work ref, reports `attempt.handed_back`, and then cleans the attempt up.
 
   The task stays `blocked` until `attempt.handed_back` arrives. Then the hub records the sha as the work position (not late work) and moves the task to `ready`. If the runner is offline, or nothing arrives within `handbackTimeoutMs` (10 minutes), the task becomes `ready` from the last recorded position, and a later push is late work.
-- **Ref source** (`{ ref, sha }`, for example the take-over ref). It needs no runner.
+- **Ref source** (`{ ref, sha }`, for example the take-over ref; `sha` is a full 40-hex sha, because the next runner may fetch it by SHA). It needs no runner.
   - In the request transaction, the hub records `{ ref, sha }` as the work position (not late work), moves the task to `ready`, queues `cleanup_attempt` for the taken-over attempt, and sends nothing else.
   - The next attempt's runner fetches the ref with its `<wipRefPrefix><task>/*` refspec, or by SHA. Before starting, it restores and strips it like a WIP, and reports `attempt.violation` for stripped paths.
 - **Unblock.** Unblock on a `takeover` task answers 409, "hand it back instead".
@@ -1242,7 +1306,7 @@ Runner agents cannot push, so `submit` has two phases.
      1. if the submitted commit contains the remote head, or the remote head is in `adoptable`, it retries once with that head as the expected value;
      2. if the remote head descends from a sha in `adoptable` (someone added commits on top of agflow work), it refuses with `needs_merge`, fixable by the agent: `git fetch origin && git merge origin/<branch>`. The vault carries that ref;
      3. otherwise it refuses with `branch_moved`. The hub then blocks the task (kind `branch_moved`) for people, with both shas shown, and stops the attempt (section 6.4).
-   - **Remote failures** (network, 5xx, auth, timeout) are retried by the runner while the submission stays pending. Only the fixable refusals (`dirty`, `protected_paths`, `needs_merge`) go back to the agent.
+   - **Remote failures** (network, 5xx, auth, timeout) are retried by the runner with backoff while the submission stays pending: until a stop or hold for the attempt arrives (outcome `interrupted`), or for `submitRetry` (15 minutes; outcome `remote`). Only the fixable refusals (`dirty`, `protected_paths`, `needs_merge`) go back to the agent to fix.
    - **Outcome.** It arrives as the outbox event `attempt.submitted`. The command result repeats it.
 3. **Recording.** On success the hub, in one transaction:
    - records the submission (task `submitted`, `branch_head`, work position);
@@ -1250,7 +1314,9 @@ Runner agents cannot push, so `submit` has two phases.
    - tells the lead, as in M1.
 
    The hub records the branch head from every outcome, even one that arrives after the attempt ended. A late success, for an attempt that is no longer current or has a newer submission, records only the head; the hub tells the lead and the task's current holder that the branch moved.
-4. **The agent's answer.** The bridge polls `GET /api/submissions/:id` every `AGFLOW_BRIDGE_POLL_MS` (2 s) for up to `AGFLOW_BRIDGE_POLL_MAX_MS` (3 minutes). It returns "submitted at <sha>", or the refusal with what to fix. On timeout it answers: "submission pending; do not submit again; the result will arrive as a message". The hub sends that message when the outcome arrives.
+4. **The agent's answer.** The bridge polls `GET /api/submissions/:id` every `AGFLOW_BRIDGE_POLL_MS` (2 s) for up to `AGFLOW_BRIDGE_POLL_MAX_MS` (3 minutes). It returns "submitted at <sha>", or the refusal with what to fix. On timeout it answers: "submission pending; do not submit again; the result will arrive as a message".
+   - The hub sends every failed outcome, and every outcome for a submission that already failed, to the agent as a message, because it cannot know whether the poll returned it. A repeat of what the tool answered is harmless.
+   - `remote` and `interrupted` outcomes fail the submission the way the timeout does (below).
 
 **Ordering.**
 - **While a submission is pending:**
@@ -1286,11 +1352,11 @@ Runner agents cannot push, so `submit` has two phases.
   - The hub detects a restore from `hello.lastHubEpoch` being lower than its epoch. It first applies the events the runner replays (so WIP pushed after the backup still updates work positions). Then every attempt that the runner reports, and that the restored hub knows and has not ended, gets a new fence through `resume_attempt` (class `infra`; section 6.3). If its task no longer names it, it ends `superseded`.
   - Attempts the hub does not know go to `welcome.stop`. Their late work becomes a note on the task if the task exists, and goes to people otherwise.
   - Recorded branch heads are treated as unknown; the first `push_submission` of each task adopts the remote head under section 6.13's rule.
-- **Backups.** An `hourly` kind (kept 24 hours) joins `daily` (7) and `start` (3). `VACUUM INTO` runs outside the tick, and its duration is logged.
+- **Backups.** An `hourly` kind (kept 24 hours) joins `daily` (7) and `start` (3). The first hourly snapshot comes an hour after start, so a start still writes only `start` (and a missing `daily`). `VACUUM INTO` runs outside the tick, and its duration is logged.
 
 ### 6.15 Guards
 
-- **Churn budget.** `create_tasks`, `update_task` and `cancel_task` calls from agents count toward a churn budget: default 60 per hour (`AGFLOW_MAX_PLAN_CHANGES_PER_HOUR`). The M1 creation limits stay. Hitting the budget sets `hub_state.dispatch_paused_until` to the end of the hour, which pauses worker dispatch but not the lead seat, and tells people.
+- **Churn budget.** `create_tasks`, `update_task` and `cancel_task` calls from agents count toward a churn budget: default 60 per sliding hour (`AGFLOW_MAX_PLAN_CHANGES_PER_HOUR`). Each call counts once, however many tasks it touches, and is recorded as a `guard.plan_change` event. The M1 creation limits stay. Hitting the budget sets `hub_state.dispatch_paused_until` to the time the oldest counted call leaves the hour, which pauses worker dispatch but not the lead seat, and tells people (a message and a `guard.dispatch_paused` event).
 - **Attempt limit.** Reaching the attempt limit of one task triggers ladder step 4 for that task; it never pauses the project.
 
 ### 6.16 HTTP API additions
@@ -1303,31 +1369,35 @@ All request and response bodies have zod schemas in `packages/core/src/api-schem
 | `GET /api/runner/whoami` | CLI token | → `{ user }` |
 | `POST /api/runner/attempts/:id/transcript` | CLI token of the runner's owner | `{ tail }` (≤ 64 KB) → `{ ok }` |
 | `GET /api/runners` | signed in | → `{ runners: Runner[], accounts: AccountQuota[] }` |
-| `PATCH /api/runners/:id` | owner, browser | `{ capacity?, keepAwake?, draining?, ceilings?, allowPaidUsage? }` → `{ runner }` |
+| `PATCH /api/runners/:id` | owner, browser | `{ capacity?, keepAwake?, draining?, ceilings?, allowPaidUsage? }` → `{ runner }`; capacity is an integer 1..16, ceilings 0..1 (0: no new attempts of that vendor there); core's `RunnerPatchInputSchema` holds the bounds |
 | `DELETE /api/runners/:id` | owner, browser | retire: its open attempts end `lost` (held tasks go `stale` → `ready`; `submitted` tasks keep their status); the card goes → `{ ok }` |
 | `POST /api/runner/retire` | CLI token of the runner's owner | `{ runnerKey }` → `{ ok }`; the same, for `agflow runner uninstall` |
-| `GET /api/attempts` | signed in | `?task=&role=&status=&runner=` → `{ attempts: Attempt[] }`, newest first |
+| `GET /api/attempts` | signed in | `?task=&role=&status=&runner=&limit=` (status takes a comma list; limit 200 by default, at most 1000) → `{ attempts: Attempt[] }`, newest first |
 | `GET /api/attempts/:id` | signed in | → `{ attempt, log: AttemptLogEntry[] }` |
-| `POST /api/agents/:id/stop` | person (browser), or the lead for runner agents | `{ reason, hold?: boolean }` → `{ attempt }`; 409 for live chats (use Release) |
-| `POST /api/agents/:id/replace` | person (browser), or the lead for runner agents | `{ reason }` → `{ attempt }`; 409 for live chats |
+| `POST /api/agents/:id/stop` | person (browser), or the lead for runner workers | `{ reason, hold?: boolean }` → `{ attempt }`; 409 for live chats (use Release), and for `hold` on a lead |
+| `POST /api/agents/:id/replace` | person (browser), or the lead for runner workers | `{ reason }` → `{ attempt }`; 409 for live chats |
 | `POST /api/tasks/:id/takeover` | person (browser) | → `202 { attemptId }`; 409 `runner_offline`, `not_running` or `submission_pending` |
-| `POST /api/tasks/:id/handback` | person (browser) | `{ source: 'clone' \| { ref, sha } }` → `202 { attemptId }` |
-| `GET /api/approvals` | signed in | `?status=` → the caller's approvals |
+| `POST /api/tasks/:id/handback` | person (browser) | `{ source: 'clone' \| { ref, sha } }` (sha: 40 hex) → `202 { attemptId }` |
+| `GET /api/approvals` | signed in | `?status=` (a comma list) → `{ approvals: Approval[] }`, the caller's own |
 | `POST /api/approvals/:id` | owner, browser | `{ decision: 'approve' \| 'decline' }` → `{ approval }` |
 | `POST /api/staffing` | seat holder or person | `{ count, vendor?, reason }` → `{ running, target }` |
 | `POST /api/tasks/:id/submit` | agent token (runner agent) | `{ summary, evidence }` only (a `branch` or `headSha` is a 400) → `202 { submission }` (live chats keep M1's `200 { task }`) |
 | `POST /api/agents/:id/interrupt` | person (browser) | → `{ ok }`; sends `interrupt` to a runner agent |
 | `GET /api/submissions/:id` | the submitting agent, or people | → `{ submission: SubmissionRecord }` |
-| `POST /api/prepare`, `GET /api/prepare/:id` | agent token | → `202 { request }` / `{ request: { id, status, error, logTail } }` |
+| `POST /api/prepare`, `GET /api/prepare/:id` | agent token | → `202 { request: PrepareRequest }` / `{ request: PrepareRequest }` |
 | `POST /api/lead/handoff` | seat holder | `{ note }` → `{ ok }` |
-| `GET /api/lead/notes` | seat holder or people | → `{ notes }` |
+| `GET /api/lead/notes` | seat holder or people | → `{ notes: LeadNote[] }` |
 | `PATCH /api/project` (new) | person (browser) | `{ runnerLeads: boolean }` → `Project` |
-| `GET /api/status` | as before | adds `leadSeat` |
+| `GET /api/status` | as before | adds `leadSeat` and `epoch`; `lead` stays, derived from the seat |
 | `GET /api/tasks/:id` | as before | adds `attempts` and `submissions` |
 
 ### 6.17 Events
 
-New event types, alongside the spec's §11.3:
+New event types, alongside the spec's §11.3. Core's `HUB_EVENT_TYPES` records each type's subject and data keys.
+- **Subjects.** `attempt.*`, `submission.*`, `agent.*`, `approval.*` and `task.*` events of a task attempt use the task id; those of a lead attempt use the attempt id. `runner.*` use the runner id, `account.*` the owner, and `lead.*`, `guard.*` and `system.*` have none.
+- **Data** always carries `attemptId`, `runnerId`, `agentId`, `taskId`, `approvalId` and `submissionId` where they apply. A page that follows one task attempt reads the task's events and filters on `data.attemptId` (core's `parseAttemptId` gives the task).
+
+The types:
 - **runners:** `runner.online`, `runner.offline`, `runner.updated`, `runner.retired`, `runner.event_rejected`;
 - **accounts:** `account.quota_changed`, `account.owner_away`;
 - **attempts:** `attempt.started`, `attempt.running`, `attempt.quota_wait`, `attempt.holding`, `attempt.resumed`, `attempt.ended`, `attempt.wip`, `attempt.violation`, `attempt.late_work`, `attempt.prepared`;
@@ -1335,7 +1405,8 @@ New event types, alongside the spec's §11.3:
 - **approvals:** `approval.requested`, `approval.decided`, `approval.expired`, `approval.voided`;
 - **lead:** `lead.seat_changed`, `lead.rotated`;
 - **submissions:** `submission.pending`, `submission.recorded`, `submission.failed`;
-- **tasks:** `task.taken_over`, `task.handed_back`;
+- **tasks:** `task.taken_over`, `task.handed_back`, `task.refs_deleted`;
+- **guards:** `guard.plan_change`, `guard.dispatch_paused`;
 - **hub:** `system.recovery_started`, `system.recovery_ended`, `system.restored`.
 
 ### 6.18 Hub retention
@@ -1349,7 +1420,7 @@ Each removal runs on a daily timer outside the tick:
 | decided approvals | deleted after 90 days |
 | `runner_event_rejects` | deleted after 30 days |
 | `attempt_log` | at most 500 rows per attempt |
-| remote refs | 7 days after a task is merged, cancelled or failed, an online runner of the task's last attempt (or any runner) gets `delete_refs` for `<wipRefPrefix><task>/*`, with fenced deletes |
+| remote refs | 7 days after a task is merged, cancelled or failed, an online runner of the task's last attempt (or any runner) gets `delete_refs` for the refs under `<wipRefPrefix><task>/` whose sha the hub recorded (WIP, late work, hand-back), with fenced deletes. A successful result records `task.refs_deleted`; until then the daily run retries. Refs with no recorded sha (a take-over ref never handed back) stay. |
 
 ## 7. Runner
 
@@ -1370,6 +1441,8 @@ Each removal runs on a daily timer outside the tick:
 3. **Vendor binaries.** The runner installs its own pinned vendor binaries into `~/.agflow/runner/vendor/<vendor>/<version>/` and checks `--version`. The owner's own installs are never used or changed.
    - **Claude:** the `claude` file of `@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.285`. Its sha256 must equal the SDK's `manifest.json` `platforms.darwin-arm64.checksum`.
    - **Codex:** there is no separate platform package. The runner downloads `@openai/codex@0.159.2-darwin-arm64` and copies its whole `vendor/aarch64-apple-darwin/` directory to `~/.agflow/runner/vendor/codex/0.159.2/`. The binary needs that layout: its bundled `rg` (`codex-path/`) and the code-mode host (`bin/codex-code-mode-host`).
+   - **Pins.** `VENDOR_PINS` in `packages/runner/src/vendor/pins.ts` is the one place for each vendor's version, package and integrity: the tarball's sha512 and, for Claude, the binary's sha256 copied from the SDK's `manifest.json` (a test checks that they still match). `vendorBinary(vendor, version)` gives `vendor/claude/<version>/claude` and `vendor/codex/<version>/bin/codex`. M2 pins darwin-arm64; on other platforms preflight reports "unsupported platform".
+   - `setup` and `install` install missing pins, which is also the upgrade path. `start` never downloads: a missing pinned binary makes preflight report "binary missing".
 4. **Claude login.** Runs `CLAUDE_CONFIG_DIR=<path> <runner claude> auth login --claudeai` from an empty temporary directory, then requires `auth status --json` to show a subscription.
 5. **Codex login.** Runs `CODEX_HOME=<path> HOME=<codex-user home> <runner codex> login` the same way.
 6. **Service and checks.** Installs the service (below). Then, inside the running service, over `runner.sock`, it runs and prints every check:
@@ -1386,11 +1459,11 @@ Each removal runs on a daily timer outside the tick:
 |---|---|
 | `agflow runner start` | Runs in the foreground, logging to the terminal and to `logs/runner.log`. |
 | `agflow runner install` | Writes `~/Library/LaunchAgents/dev.agflow.runner.plist` and bootstraps it. Refused in test mode. |
-| `agflow runner status` | Asks the running runner over `runner.sock`. Without a socket it reports, labelled best effort: whether the plist is installed, `launchctl print-disabled` for the label, the last exit reason the runner wrote, and the last 20 log lines. |
-| `agflow runner drain` / `undrain` | Changes `runner.json` and tells the hub (`runner.settings`). |
+| `agflow runner status` | Asks the running runner over `runner.sock`. Without a socket it reports, labelled best effort: whether the plist is installed, `launchctl print-disabled` for the label, the last exit reason the runner wrote, and the last 20 log lines. `--json` prints the report as JSON, including each attempt's pid, pgid and `lstart` (tests use it to find agent processes). |
+| `agflow runner drain` / `undrain` | Changes `runner.json` and tells the hub (`runner.settings`; section 6.3's settings sync). When the runner is not running, only `runner.json` changes, and the runner sends the edit after its next `welcome`. `undrain` also clears `crash_loop`. |
 | `agflow runner restart` | The suspend path (below), then `launchctl kickstart -k`. |
-| `agflow runner stop` | Drains and waits for the hub to acknowledge. Stops every agent with a handoff and a WIP push, reporting `attempt.exited` with `cause: 'runner_stop'`, so the hub ends them `stopped` (infra, no backoff) and dispatches elsewhere. Then runs `launchctl bootout`, so the runner stays stopped until `install` or `start`. |
-| `agflow runner uninstall` | `stop`, then logs out of both runner homes (`claude auth logout`, `codex logout`), then retires the runner on the hub (`POST /api/runner/retire`). `--purge` also deletes `~/.agflow/runner`, `~/.agflow/vaults` and `~/.agflow/work`, after checking that no WIP is unpushed. |
+| `agflow runner stop` | Drains and waits up to 60 s for the hub to acknowledge (with the link down it warns and goes on). Stops every agent with a handoff and a WIP push, reporting `attempt.exited` with `cause: 'runner_stop'`, so the hub ends them `stopped` (infra, no backoff) and dispatches elsewhere, and waits a bounded time for those events to be acknowledged. Then runs `launchctl bootout` and `launchctl disable`, so the runner stays stopped, even across a login, until `install` or `start`. |
+| `agflow runner uninstall` | `stop` (when the runner is not running: kill its registered agent groups whose identity still matches), then logs out of both runner homes (`claude auth logout`, `codex logout`), then retires the runner on the hub (`POST /api/runner/retire`), then removes the plist. `--purge` also deletes `~/.agflow/runner`, `~/.agflow/vaults` and `~/.agflow/work`, after checking that no WIP is unpushed. |
 
 **The LaunchAgent** runs in `gui/<uid>` with `LimitLoadToSessionType Aqua`, because the login keychain is unlocked there. It sets:
 - absolute `ProgramArguments`: the compiled `agflow` binary, then `runner start --service`;
@@ -1407,7 +1480,8 @@ Install runs `launchctl bootout` (errors ignored), then `enable`, then `bootstra
   - A second `runner start` in the foreground exits with "the runner is already running (pid N); use agflow runner status".
   - Under launchd (`--service`), it waits for the lock instead, so KeepAlive does not loop.
   - On a `machineId` mismatch with `runner.json` (a copied home folder), the runner refuses to start until `setup` creates a new key.
-- **SIGTERM means suspend:**
+- **Refusals that need a person.** On 4403 (the key belongs elsewhere, or the runner was retired), 4426 (incompatible protocol) or a `machineId` mismatch, the runner records the reason as its last exit and exits 0 under launchd, so `KeepAlive` does not loop and `runner status` says why; in the foreground it exits 1.
+- **SIGTERM means suspend** (and so does SIGINT in the foreground):
   - the runner stops taking commands;
   - it interrupts its agents and sends SIGTERM to their groups;
   - it harvests and pushes WIP without a handoff turn, oldest unpushed work first;
@@ -1417,12 +1491,12 @@ Install runs `launchctl bootout` (errors ignored), then `enable`, then `bootstra
   The hub keeps suspended attempts open (section 6.4). On the next `hello` it resumes them (section 6.3), or their lease expiry ends them `lost`. This covers launchd restarts, logout and upgrades.
 - **`needs_login`.** When the hub refuses the CLI token, the runner keeps running in `needs_login` (the hub shows the same state, derived from the expired session; section 6.3):
   - it takes no new work;
-  - it interrupts its agents and pushes their WIP, without a handoff turn;
+  - it interrupts its agents and pushes their WIP, without a handoff turn, when section 7.3's `canPushWip` allows; otherwise the harvest waits in the vault for the next `welcome`;
   - it posts a macOS notification;
-  - it re-reads `credentials.json` and probes `whoami` every 60 s, and reconnects by itself after `agflow login`.
+  - it re-reads `credentials.json` (parsed with core's `CredentialsSchema`, which the CLI uses too) and probes `whoami` every 60 s, and reconnects by itself after `agflow login`. The interrupted agents get the one reconnect message of section 6.8.
 
   `runner status` and the log say why.
-- **Crash loops.** After 3 unclean exits within 10 minutes, the runner drains itself and reports `crash_loop` with the last error.
+- **Crash loops.** After 3 unclean exits within 10 minutes, the runner drains itself and reports `crash_loop` with the last error. It stays drained, and reports `crash_loop` on every `hello`, until `agflow runner undrain`, which forgets the earlier unclean exits and reports `runner.state` `ok`.
 
 ### 7.2 Layout
 
@@ -1443,6 +1517,7 @@ Install runs `launchctl bootout` (errors ignored), then `enable`, then `bootstra
     .agflow/run/                       runner-owned, untracked, never committed:
       task.md  brief.md  gitconfig  bin/ (gh and glab shims)  home/ (Codex tool HOME)
       cache/ (per-attempt package caches)  tmp/ (Codex TMPDIR)
+      config/ (AGFLOW_CONFIG_DIR for the bridge and the brief hook: no credentials, only hook.log)
 /tmp/agf/<6-char id>/                  CLAUDE_CODE_TMPDIR for one Claude attempt (0700)
 ```
 
@@ -1504,7 +1579,13 @@ A plan test plants every program-valued key in the clone's config: directly, thr
 Lead attempts have no WIP refs.
 
 **Pushes** run in the vault with the remote environment, always `--atomic --porcelain --no-verify` with `--force-with-lease=<ref>:<exact sha the hub gave>`. Never a bare `--force-with-lease`, never `--force`, never a `+` refspec. A repeated successful push reports `=` and counts as success.
-- **WIP.** Every 10 minutes while the clone changed, and before any stop: the attempt's WIP ref, leased on the attempt's previous WIP sha (empty to create it). A WIP ref is never pushed once the runner knows the attempt is fenced or ended. That includes once the runner has emitted the attempt's `attempt.exited`: from then on a retried final push goes to a late-work ref. After a clock gap or a reconnect, no WIP is pushed until `welcome` confirms the attempt is not in `stop`.
+- **WIP.** Every 10 minutes while the clone changed, and before any stop: the attempt's WIP ref, leased on the attempt's previous WIP sha (empty to create it). A WIP ref is never pushed once the runner knows the attempt is fenced or ended. That includes once the runner has emitted the attempt's `attempt.exited`: from then on a retried final push goes to a late-work ref.
+- **`canPushWip`.** One predicate in the runner decides every push to a WIP ref. It holds when all of these do:
+  - the runner has had a `welcome` since its last clock gap (so after a sleep or freeze, nothing is pushed until `welcome` confirms the attempt is not in `stop`);
+  - the attempt is not known to be fenced, ended or exited;
+  - the last `heartbeat_ack` (or `welcome`) arrived less than `welcome.timings.wipGraceMs` ago: `runnerLeaseMs / 3`, 5 minutes by default, well inside the runner lease and the stop timeout, so the hub cannot have ended the attempt meanwhile.
+
+  So pushes go on through a short link outage, such as a hub restart. When the predicate fails, the harvest waits in the vault (`refs/agflow-local/<attempt>/head`) and is pushed after the next `welcome`. A final push it forbids goes to a late-work ref instead, and `attempt.exited` carries `pushError`. Pushes to late-work refs are never gated: they create new refs.
 - **Submit.** The task branch and the WIP ref together (section 6.13).
 - **Late work.** Once an attempt has ended, its WIP ref is never rewritten. Late work and hand-backs go to new refs, `<wipRefPrefix><task>/<attempt>-late-<n>`, created with an empty lease. The hub records late work under section 6.4's rule, and a hand-back as the work position (section 6.12). A late-work message to the current holder names the ref to merge: `git fetch origin <ref> && git merge FETCH_HEAD`. The hub sends `refresh_vault` to the holder's runner first, so the vault has the ref.
 - **Starting point.** A successor starts from the tip of the fetched work-position ref and reports the commit it actually used (`attempt.spawned.startSha`). A tip that differs from the recorded sha is pre-fence work the hub had not heard of. The hub logs it and does not fail the attempt.
@@ -1517,7 +1598,8 @@ Lead attempts have no WIP refs.
 | people only | `.github/workflows/**`, `.gitlab-ci.yml`, `.gitlab/**`, `.env*`, `*.pem`, `*.key`, `.gitmodules`, `.gitattributes` | The same, except in tasks a person created whose owned paths include them. |
 | curators only | `AGENTS.md` and `CLAUDE.md` at any depth | The same, except in tasks of kind `curation`. |
 
-- **The restore set** is resolved by the hub for each attempt (`AttemptSpec.restore`). Its base is `merge-base(main, the attempt's start commit)`, which is what the branch should contain. When `main` has newer versions of these files, a refusal tells the agent to merge `main` rather than revert.
+- **The restore set** is resolved by the hub for each attempt (`AttemptSpec.restore`): protected-class patterns with the task's exemptions applied, matched only with core's `matchesProtectedPattern`. The hub has no git, so `restore.base` names a ref, `refs/heads/<main>`. The runner's `resolveRestoreBase(vault, spec)` resolves it in the vault after the pre-start fetch and returns `merge-base(that commit, the attempt's start commit)`, which is what the branch should contain. Restore, detection, stripping and the dependency-preparation config all use that one base. When `main` has newer versions of these files, a refusal tells the agent to merge `main` rather than revert.
+- **At a start or resume**, protected changes between the base and the start commit (a hand-back ref, say) are restored in the clone, stripped from what is pushed, and reported as `attempt.violation` with phase `start`.
 - **Detection** uses `diff --raw -z -M <base>..<head>`, which also catches symlinks, mode changes and renames out of a protected directory, plus the snapshot's tree.
 - **Restore.** Checks out the restore set from the base into the clone, with the local environment and `--work-tree`, and removes files that the branch added inside protected directories. The Claude CLI's untracked staging directory `.claude/.cc-writes/` is never a violation; the runner deletes it before each start.
 - **Strip.** Builds a new tree with a temporary index (`read-tree`, `update-index --cacheinfo` or `--force-remove`, `write-tree`, `commit-tree`), with no checkout and no hooks, and reports `attempt.violation`.
@@ -1541,7 +1623,9 @@ Lead attempts have no WIP refs.
 
   Before any group kill, the runner checks that the group leader's pid and `lstart` still match, because macOS PIDs wrap at 99,999.
 - **Exit.** The runner uses `await proc.exited` with `exitCode` and `signalCode`. A SIGTERMed claude exits 143, not by signal, and exit code 0 does not mean a clean finish, so `stoppedBy` decides whether an exit was requested. Waiting for the agent's pipes to close is always bounded, because an escaped process that inherited them must not block a stop.
+- **Unrequested exits.** When an agent exits without a request (a worker or a lead), the runner first runs ladder steps 3 and 4: SIGKILL every recorded group that passes the identity check, then the clone sweep. Only then does the final work start, so an orphaned tool cannot write during or after the harvest.
 - **Final work before `attempt.exited`.** For every exit, requested or not, the runner first finishes the final harvest, strip and push, with retries for up to `finalPush` (60 s). Only then does it emit `attempt.exited`, with `finalSha` and `finalWip`, or `pushError`. After `prepare_takeover`, `attempt.taken_over` takes its place (section 6.12). After reporting a `pushError`, the runner keeps retrying that push with backoff to a late-work ref, and reports `attempt.late_work` when it lands.
+- **CLI version.** The runner records the CLI version each attempt started with. Every resume of the attempt runs that version's binary (`AgentLaunch.cliVersion`), and so do its take-over commands; new attempts use the current pin.
 - **Resume failures.**
   - A session or thread that never ran a turn cannot be resumed ("No conversation found", "no rollout found"). The adapter then starts a fresh session in the same clone with the attempt's brief and first prompt, and reports the new `sessionRef`.
   - Any other resume failure is harvested and pushed, then reported as `attempt.failed_to_start` (infra).
@@ -1579,7 +1663,7 @@ export interface PermissionProfile {
   - `proxy.golang.org`, `sum.golang.org`;
   - `crates.io`, `static.crates.io`, `index.crates.io`.
 
-  The `auto` profile is opt-in per runner, used only when the account offers auto mode, which is checked from `system/init.permissionMode`.
+  The `auto` profile is opt-in per runner, used only when the account offers auto mode, which is checked from `system/init.permissionMode`. Otherwise the runner falls back to `standard`, and `hello.profile.name` reports `standard`.
 
 **Denied reads.**
 - **Claude's sandbox `filesystem.denyRead`** (Bash commands):
@@ -1619,7 +1703,7 @@ export interface PermissionProfile {
 - **`PATH`:** `<clone>/.agflow/run/bin`, where `gh` and `glab` shims refuse, followed by the captured `PATH`.
 - **Vendor homes:** `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, the runner's own canonical paths. Then `DISABLE_AUTOUPDATER=1`, and for Claude also `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`.
 - **Git:** the agent git variables (section 7.3).
-- **Bridge:** `AGFLOW_AGENT_TOKEN`, `AGFLOW_HUB_URL`, `AGFLOW_ATTEMPT_ID`, `AGFLOW_ROLE`, `AGFLOW_CLONE`, `AGFLOW_BRIDGE_POLL_MS` and `AGFLOW_BRIDGE_POLL_MAX_MS`. Also `AGFLOW_CONFIG_DIR`, an empty per-attempt directory, so the bridge never reads the owner's CLI credentials.
+- **Bridge:** `AGFLOW_AGENT_TOKEN`, `AGFLOW_HUB_URL`, `AGFLOW_ATTEMPT_ID`, `AGFLOW_ROLE`, `AGFLOW_CLONE`, `AGFLOW_BRIDGE_POLL_MS` and `AGFLOW_BRIDGE_POLL_MAX_MS`. Also `AGFLOW_CONFIG_DIR`, `<clone>/.agflow/run/config/`, an empty per-attempt directory, so the bridge never reads the owner's CLI credentials. The bridge's own environment (`AgentLaunch.bridge.env`) holds these plus `NODE_USE_SYSTEM_CA` and the connectivity variables; Codex forwards every one of its names (section 9.2).
 
 Left out: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_*` and `CODEX_*` from the runner's own environment, and everything else. Test mode adds its own variables after the allowlist (section 15.1).
 
@@ -1634,9 +1718,9 @@ Agents need dependencies, but Codex agents have no network, and Claude's sandbox
                         "when": ["package.json", "bun.lock"] } ] }
   ```
 
-  Without the file, nothing is prepared.
+  Without the file, nothing is prepared. The runner reads it from the vault at the restore base (section 7.3), never from the clone's working tree. An entry whose command runs lifecycle scripts says so with `"scripts": true`.
 - **When:**
-  - before an attempt starts or resumes, when a `when` file changed since the last preparation;
+  - before a worker attempt starts or resumes, when a `when` file changed since the last preparation (leads get none);
   - when an agent calls the bridge tool `prepare_dependencies`, which goes through the hub as `prepare_dependencies` and is polled like a submit.
 - **How:** inside an OS sandbox, which `agflow runner setup` checks: Anthropic's sandbox runtime (`@anthropic-ai/sandbox-runtime`, pinned to 0.0.81; the library behind Claude Code's sandbox, verified to run `bun install` here with write and domain allowlists).
   - The runner calls `SandboxManager.initialize` once and `wrapWithSandboxArgv` per command, and always spawns asynchronously: the runtime's proxies run on the runner's event loop, so `spawnSync` deadlocks.
@@ -1644,10 +1728,13 @@ Agents need dependencies, but Codex agents have no network, and Claude's sandbox
   - Writes are allowed only into the clone and a runner-owned cache (`~/.agflow/runner/prep/<project>/`).
   - Network goes only to the profile's registries.
   - Reads of the credential paths are denied.
-  - Preparation runs with the agent environment of section 7.6: the allowlist and the agent git environment, with no SSH agent. It never uses the runner's own environment, or the local or remote git environment.
-  - Lifecycle scripts are off by default, and run later inside the agent's own sandbox. A configured command that turns them on runs with a per-attempt cache under the clone, never the shared cache, because the scripts come from manifests the agent can edit.
+  - Preparation runs with the agent environment of section 7.6: the allowlist and the agent git environment, with no SSH agent. It never uses the runner's own environment, or the local or remote git environment. Its `HOME` is `<clone>/.agflow/run/home` for both vendors, so the owner's `~/.npmrc` never steers it; private registries are out of M2.
+  - Lifecycle scripts are off by default (`npm_config_ignore_scripts=true`), and run later inside the agent's own sandbox. An entry with `"scripts": true` runs with a per-attempt cache under the clone, never the shared cache, because the scripts come from manifests the agent can edit. Go and Cargo always use the per-attempt caches, because agents read them at build time.
   - Packages are materialised into the clone by copy or clonefile, never by hard links. Agents never get write access to the shared cache.
 - **Reporting.** The runner reports `attempt.prepared`; a failure is class `infra`. Agent-config paths are restored before every preparation, so the agent's edits to `.npmrc` or `bunfig.toml` never steer it.
+  - For an agent's request, `requestId` is the `prepare_dependencies` command id, which the hub also returns as the request's id (`PrepareRequest`, kept with the command).
+  - A preparation before a start or resume reports `requestId` null. If it fails, the runner then reports `attempt.failed_to_start` (infra), so repeated failures reach people through the failure-signature rule.
+  - Each preparation times out after `prep` (15 minutes).
 - **If the sandbox runtime does not work on a laptop,** `ProfileSummary.dependencyPrep` is false. Claude agents then install inside their own sandbox, with their per-attempt caches, and Codex agents need owner-approved escalations.
 
 ### 7.8 Retention and disk
@@ -1663,13 +1750,13 @@ Agents need dependencies, but Codex agents have no network, and Claude's sandbox
 
 **Disk guard.** Heartbeats carry free space and agflow's own usage.
 - Below `minFreeGb` (default 10), the runner takes no new attempts (`acceptingUntil`) and reports `disk_low`.
-- Below half of that, it stops its agents as a runner's own stop (`cause: 'runner_stop'`), with WIP pushes, so their tasks move to other runners.
+- Below half of that, it stops its agents as a runner's own stop (`cause: 'runner_stop'`), once per crossing, with WIP pushes and without a handoff turn, so their tasks move to other runners.
 
 ### 7.9 Power and keep-awake
 
 - **Modes.** `keepAwake` is `off`, `ac` or `always`, default `ac`. With `ac`, the runner holds one `caffeinate -i -w <runner pid>` only on AC power, and only while an attempt is `starting`, `running` or `quota_wait`. An idle lead holds it only on AC.
 - **The assertion.** It is ref-counted and spawned in the runner's own group. After spawning, the runner checks that caffeinate is alive, because a bad pid makes it exit 0 silently, and restarts it if something kills it.
-- **Battery.** Heartbeats carry `power`. Below `batteryDrainPercent` (default 20), the runner takes no new attempts (`acceptingUntil`). Below 8, it stops its agents as a runner's own stop (`cause: 'runner_stop'`), with WIP pushes.
+- **Battery.** Heartbeats carry `power`. Below `batteryDrainPercent` (default 20), the runner takes no new attempts (`acceptingUntil`). Below 8, it stops its agents as a runner's own stop (`cause: 'runner_stop'`), once per crossing, with WIP pushes and without a handoff turn.
 - **Waking.** After a detected wake gap, the runner sets `acceptingUntil` for `wakeHold` (2 minutes).
 - **Lid close** still sleeps the Mac; runner leases handle that.
 
@@ -1678,14 +1765,16 @@ Agents need dependencies, but Codex agents have no network, and Claude's sandbox
 ### 8.1 Pin and preflight
 
 - **Pin.** `@anthropic-ai/claude-agent-sdk` 0.3.285 is pinned together with Claude Code 2.1.285; the SDK's `claudeCodeVersion` names the matching CLI. The SDK's optional bundled binary is not installed (`bun install --omit optional`). `pathToClaudeCodeExecutable` is the runner's own copy, `~/.agflow/runner/vendor/claude/2.1.285/claude`.
-- **Preflight.** Before every start, the runner runs `<bin> --version`. Before the first dispatch and every 6 hours, it runs a zero-model handshake: a query whose only input is the local `/clear` command, with the full session options. It must find:
+- **Preflight.** Before every start, the runner runs `<bin> --version` on the binary of the attempt's CLI version (section 7.4), which must report that version. Before the first dispatch and every 6 hours, it runs a zero-model handshake: a query whose only input is the local `/clear` command, with the full session options. It must find:
   - `initializationResult().account.subscriptionType` set, and no `apiKeySource`;
   - in `system/init`: `apiKeySource: 'none'`, the expected `claude_code_version` and `permissionMode`, `tools` equal to the requested built-ins plus `mcp__agflow__*`, `mcp_servers` only `agflow`, and `plugins` only built-in entries;
   - in `getSettings().effective` (untyped in `sdk.d.ts`, like `cancelQueued`; the adapter casts it): `sandbox.enabled` true and `sandbox.failIfUnavailable` true.
 
   Any mismatch marks the vendor not ready, with the reason. `apiKeySource: 'ANTHROPIC_API_KEY'` reads "an API key would replace the subscription".
-- **The account** gives `accountId` (a hash of the account email) and `plan`.
-- **First turn.** The first turn of every session checks `system/init` again.
+- **Quota and extra usage.** On the same query, preflight calls the SDK's experimental `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()`, which the pin fixes. Its `rate_limits` give the 5-hour and weekly utilization (percent / 100) and reset times; `extra_usage.is_enabled` gives `paidUsage` `enabled` or `disabled`. If the call fails or its shape differs, `paidUsage` is `unknown` and the quota stays unknown until the first `rate_limit_event`.
+- **The account** gives `accountId` (a hash of the account email) and `plan`. `managedPolicy` is always false for Claude.
+- **Weakened items.** Preflight's `weakened` list names what cannot be enforced: the `auto` profile, and the shared `/tmp/claude` if the local sandbox checks (section 15) find its `denyWrite` unenforced on the pin. The list is fixed per pin from those checks; nothing is probed at run time.
+- **First turn.** The first turn of every session checks `system/init` again, expecting the attempt's CLI version. A mismatch fails the start (`attempt.failed_to_start`, infra); the hub's two-failed-starts rule then marks the vendor not ready.
 
 ### 8.2 Session options
 
@@ -1706,11 +1795,13 @@ query({
     permissionPrompts: 'none',                                // no canUseTool: denials are immediate
     sandbox: { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
                network: { allowedDomains, strictAllowlist: true },
-               filesystem: { denyRead, allowRead: [clone], allowWrite: [tmpDir], denyWrite: ['/tmp/claude', '/private/tmp/claude'] } },
+               filesystem: { denyRead, allowRead: [clone], allowWrite: [tmpDir],
+                             denyWrite: ['/tmp/claude', '/private/tmp/claude', '~/.npm/_logs'] } },
     settings: {
       permissions: { allow: ['mcp__agflow'],                  // + WebFetch/WebSearch if profile.webTools
                      deny: denyRules },                       // section 7.6 reads and writes, push commands
       hooks: { SessionStart: [{ hooks: [{ type: 'command', command: '<agflow> hook brief --runner' }] }] },
+                                                              // <agflow>: the agflow command the adapter factory gets (section 13)
       autoMemoryEnabled: false, crossSessionInbound: 'refuse', cleanupPeriodDays: 30,
       syncClaudeAiSkills: false, syncClaudeAiPlugins: false,
     },
@@ -1724,8 +1815,10 @@ query({
 - **Brief.** The brief arrives through the `SessionStart` command hook. That hook runs with `pwd` set to the base checkout, so `agflow hook brief --runner` identifies the attempt from `AGFLOW_AGENT_TOKEN`.
 - **The guard,** a `PreToolUse` callback in both profiles, refuses:
   - Bash commands that run `git push` (including `git -C … push`), `git credential`, `git config --global`, `gh`, `glab` or `security`, or that write into `.git/hooks` or `.git/config`;
-  - `Edit`, `Write` and `NotebookEdit` whose real path is outside the clone and its temporary directory;
-  - `Read`, `Glob` and `Grep` whose real path is in another attempt's clone (section 7.6).
+  - `Edit`, `Write` and `NotebookEdit` whose real path is outside the clone and its temporary directory, or is `<clone>/.git/config` or under `<clone>/.git/hooks/`;
+  - `Read`, `Glob` and `Grep` whose real path is in another attempt's clone, or under `<CLAUDE_CONFIG_DIR>/projects/` outside the attempt's own project directory (section 7.6).
+
+  A command the guard cannot parse is refused.
 - **Tools.** The explicit built-in tools list removes `SendMessage`, `ListAgents`, cron and wake-up tools, `RemoteTrigger`, `Workflow`, `EnterWorktree` and `ToolSearch`.
 - **Shell snapshot.** Claude Code sources the owner's shell profile outside the sandbox once per process (section 5). The snapshot is written to the runner's Claude home, which sandboxed commands cannot read. The owner's functions therefore do not reach agent commands, and the agent's `PATH` comes from its environment.
 
@@ -1776,9 +1869,11 @@ query({
 - **Preflight** (zero-model):
   - `initialize`;
   - `account/read` must return a `chatgpt` account, which gives `accountId` and `plan`;
-  - `configRequirements/read` and `config/read { includeLayers: true }`.
+  - `configRequirements/read` and `config/read { includeLayers: true }`;
+  - `mcpServerStatus/list` must be empty (the bridge is added per thread, and `codex_apps` must be absent), and `skills/list` must show no user or plugin skills;
+  - `account/rateLimits/read` gives the quota and the credits (a scripted provider answers -32600; the quota is then unknown).
 
-  `managedPolicy` is true when requirements are non-null, or when any config layer is MDM-managed, enterprise-managed or legacy-managed. If either call fails, the vendor counts as managed. The vendor is not ready when `workspace-write` is missing from the allowed sandbox modes or `on-request` from the allowed approval policies. A unit test covers the classifier with a managed output recorded on this Mac and a synthesized unmanaged one (`requirements: null`, and no `mdm`, `enterpriseManaged` or `legacyManaged*` layer). An empty home on this Mac is still managed.
+  `managedPolicy` is true when requirements are non-null, or when any config layer is MDM-managed, enterprise-managed or legacy-managed. If either call fails, the vendor counts as managed. The vendor is not ready when `workspace-write` is missing from the allowed sandbox modes, `on-request` from the allowed approval policies, or `user` from the allowed approvals reviewers. A unit test covers the classifier with a managed output recorded on this Mac and a synthesized unmanaged one (`requirements: null`, and no `mdm`, `enterpriseManaged` or `legacyManaged*` layer). An empty home on this Mac is still managed.
 
 ### 9.2 Threads and turns
 
@@ -1787,23 +1882,25 @@ query({
 ```ts
 {
   cwd: realpath(clone), model, sandbox: 'workspace-write', approvalPolicy: 'on-request',
-  developerInstructions: spec.brief,
+  approvalsReviewer: 'user',                                 // never a model; a different answer fails the start
+  developerInstructions: launch.brief,                       // spec.brief plus the working-directory line (section 10)
   config: {
-    projects: { [realpath(clone)]: { trust_level: 'trusted' } },   // only when .codex/ equals the base's; nested, never dotted
+    projects: { [realpath(clone)]: { trust_level: launch.projectConfigVerified ? 'trusted' : 'untrusted' } },
+                                                             // always explicit; nested, never dotted
     sandbox_workspace_write: { writable_roots: [`${clone}/.git`], network_access: false,
                                exclude_slash_tmp: true, exclude_tmpdir_env_var: true },
     shell_environment_policy: { inherit: 'all', exclude: ['AGFLOW_*'],
                                 set: { HOME: `${clone}/.agflow/run/home`, TMPDIR: `${clone}/.agflow/run/tmp` } },
     mcp_servers: { agflow: { command, args: ['mcp', '--vendor', 'codex', '--runner'],
-                             env_vars: ['AGFLOW_AGENT_TOKEN', 'AGFLOW_HUB_URL', 'AGFLOW_ATTEMPT_ID', 'AGFLOW_ROLE',
-                                        'AGFLOW_CLONE', 'AGFLOW_CONFIG_DIR', 'NODE_USE_SYSTEM_CA', ...connectivity],
+                             env_vars: Object.keys(launch.bridge.env),   // every bridge variable of section 7.6:
+                                       // the AGFLOW_* ones, the poll settings, NODE_USE_SYSTEM_CA, connectivity
                              default_tools_approval_mode: 'approve', required: true } },
     web_search: profile.webTools ? 'cached' : 'disabled',   // values: disabled | cached | indexed | live; MDM may restrict them
   },
 }
 ```
 
-- **Trust.** Before `thread/start` and `thread/resume`, the runner checks that the clone's `.codex/` equals the base commit's; agent-config paths are always restored before a start. Without the override, Codex would trust the clone automatically and write a trust entry, which now lands in the runner's own Codex home.
+- **Trust.** Before `thread/start` and `thread/resume`, the runner checks that the clone's `.codex/` equals the restore base's, through the vault, after restoring the agent-config paths. It passes the answer as `AgentLaunch.projectConfigVerified`. The trust entry is always explicit: without one, Codex would trust the clone automatically and write a trust entry, which now lands in the runner's own Codex home. When the check fails, the thread runs `untrusted`, without the project's `.codex/` layer, and the runner logs a note.
 - **Checks after every `thread/start`.**
   - `mcpServerStatus/list` must list only `agflow`.
   - `skills/list` must list no user or plugin skills.
@@ -1821,12 +1918,12 @@ query({
   |---|---|
   | `usageLimitExceeded`, or `rateLimits.rateLimitReachedType` set | `quota_wait`; the reset time from `account/rateLimits/read` |
   | credits consumed at 100% while `allowPaidUsage` is false | `quota_wait` |
-  | `unauthorized` | `attempt.vendor_outcome` `auth`: the vendor is not ready ("login expired"), and the attempt ends as in section 6.4 |
-  | `contextWindowExceeded` | one `thread/compact/start`; if it happens again, `attempt.vendor_outcome` `context` (replacement with a handoff) |
+  | `unauthorized`, or an HTTP 401 from the model provider (`httpConnectionFailed` with status 401) | `attempt.vendor_outcome` `auth`: the vendor is not ready ("login expired"), and the attempt ends as in section 6.4 |
+  | `contextWindowExceeded` | the adapter itself runs one `thread/compact/start` and a continuation turn, and reports no `turn_ended` for the failed turn; if it happens again, `turn_ended` with `errorKind` `context`, and the runner reports `attempt.vendor_outcome` `context` (replacement with a handoff) |
   | `cyberPolicy`, `misalignmentPolicyViolation` | `attempt.vendor_outcome` `policy`: the task is blocked (kind `policy`) and people are told |
   | `tooManyDenials`, `sessionBudgetExceeded` | `attempt.vendor_outcome` `denials` or `session_budget`: the stall rule `budget` |
   | `rateLimitExceeded`, `serverOverloaded`, `sandboxError`, and anything else (Codex has already retried) | `vendor_error` (section 6.8) |
-- **Quota.** `account/rateLimits/updated` gives `usedPercent`, `windowDurationMins` and `resetsAt`. A window at 100% while credits are consumed is paid usage.
+- **Quota.** `account/rateLimits/updated` gives `usedPercent`, `windowDurationMins` and `resetsAt` (epoch seconds). A window at 100% while the account has credits (`credits.hasCredits` or unlimited) is paid usage in use; the adapter reports it, and the runner's controller applies `allowPaidUsage` (section 6.10).
 - **Collaboration tools.** Codex's built-in multi-agent tools cannot be removed; approvals still apply to every nested call.
 
 ### 9.3 Approvals
@@ -1835,16 +1932,17 @@ query({
   - A file-change request carries no diff; the adapter takes it from the preceding `item/started` file-change item.
   - `approve` maps only to `accept`.
   - `writeStdin` approvals are shown to the owner as stdin input.
-- **Withdrawn requests.** `serverRequest/resolved` (which also arrives after an interrupt) voids a pending request.
+  - Codex decisions carry no reason. A decline with a reason (an expiry, say) is followed by one system note with that reason, steered into the thread's active turn.
+- **Withdrawn requests.** `serverRequest/resolved` (which also arrives after an interrupt) voids a request that is still unanswered. It also follows the runner's own answers, which it must not void.
 - **Waiting.** `thread/status/changed` with `activeFlags` containing `waitingOnApproval` sets the phase to `waiting_approval`.
 - **User input.** `item/tool/requestUserInput` is answered at once with empty answers ("no person is available; decide yourself or use declare_blocked") and is not relayed.
-- **Everything else.** `item/permissions/requestApproval` and `mcpServer/elicitation/request` are relayed as `other`. When they cannot be parsed, they are declined. Server requests of any other kind get an immediate JSON-RPC error (-32601). Every server request gets an answer.
+- **Everything else.** `item/permissions/requestApproval` is relayed as `other`; approving grants exactly the requested profile, for that turn only. `mcpServer/elicitation/request` is always declined, because the agflow bridge never elicits. Requests that cannot be parsed are declined. Server requests of any other kind get an immediate JSON-RPC error (-32601). Every server request gets an answer.
 
 ### 9.4 Stop, resume and take-over
 
 - **Stop:** `turn/interrupt`, then stdin EOF (app-server exits and kills its commands, including background ones that outlived their turn), then SIGTERM and SIGKILL of the recorded groups.
 - **Crash recovery** needs no cleanup: after a SIGKILL, a new process resumes the thread at once, even though the writer-lock file stays. Resume failures follow section 7.4.
-- **Take-over:** the app-server must exit, because `thread/unsubscribe` keeps the single-writer lock. The person then runs `codex resume --no-daemon <thread>` in the clone with the runner's `CODEX_HOME`. Hand-back stops any daemon in that home first.
+- **Take-over:** the app-server must exit, because `thread/unsubscribe` keeps the single-writer lock. The person then runs `codex resume --no-daemon <thread>` in the clone with the runner's `CODEX_HOME`. Hand-back stops any daemon in that home first; the runner core does that and builds the commands, so the adapter needs no take-over hooks.
 
 ## 10. Bridge and hooks
 
@@ -1865,14 +1963,17 @@ query({
   - **401 `attempt_ended`:** every tool answers "Your agflow attempt has ended (<reason>). Stop working; do not commit further."
   - **401 `attempt_refenced`:** "agflow is restarting your session; stop and wait."
   - **Hub unreachable** (in every mode): "The agflow hub is unreachable; keep working on your task and try again in a few minutes."
+- **One source for the texts.** They are `BRIDGE_ANSWERS` in core, next to `BRIDGE_HEADER` (`X-Agflow-Bridge`) and `BRIDGE_VERSION` (2). The bridge and both adapters import them; `<reason>` is the `reason` of the hub's 401 body.
+- **Error results.** Every refusal (the three answers above, and a refused submit) is an MCP error result. Success and "submission pending" are normal results. Adapters count a terminal tool (`tool_ended.terminal`) only on a normal result, and set `tool_ended.hubUnreachable` when the answer is the hub-unreachable text.
+- The new lead tools are for runner mode only; the live bridge keeps M1's tools.
 
-**Live-chat claims** (M1 mode) now start from the task's work position. The claim answer names a ref or SHA, and the bridge fetches it with the person's own credentials (fetch-by-SHA works on GitHub), creates the task branch there, and says so. The hub refuses a live claim on a task whose work position is a WIP ref when the bridge does not declare support (an `X-Agflow-Bridge: 2` header).
+**Live-chat claims** (M1 mode) now start from the task's work position. The claim answer's task names it (`workRef`, `workSha`), and the bridge fetches it with the person's own credentials (fetch-by-SHA works on GitHub), creates the task branch there, and says so. The hub refuses a live claim on a task whose work position is a WIP ref when the bridge does not declare support (an `X-Agflow-Bridge: 2` header). From epoch 2 on, the bridge names the branch with the hub's epoch (`HubStatus.epoch`), and reuses the task's recorded branch only when it carries the current epoch.
 
-**`agflow hook brief --runner`** is the `SessionStart` command hook for Claude runner agents. It reads the token from its environment, fetches `GET /api/brief`, and prints `{ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": <brief> } }`.
+**`agflow hook brief --runner`** is the `SessionStart` command hook for Claude runner agents. It reads the token from its environment, fetches `GET /api/brief`, appends the line "Your working directory: <AGFLOW_CLONE>", and prints `{ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": <brief> } }`. On any failure it prints a short explanation as the context, logs to `AGFLOW_CONFIG_DIR/hook.log` and exits 0, so the session still starts.
 
 **Runner brief.** `buildBrief` gains a runner variant:
 - no hello code;
-- the clone path and the branch, with "commit on this branch; the runner pushes for you; you cannot push";
+- the branch, with "commit on this branch; the runner pushes for you; you cannot push". The hub does not know the clone's path, so the runner adds "Your working directory: <clone>": to `AgentLaunch.brief` (Codex's `developerInstructions` and `.agflow/run/brief.md`), and through the brief hook for Claude;
 - the task pack at `.agflow/run/task.md`;
 - "finish with `submit`, or `declare_blocked` or `declare_impossible`";
 - for successors, the newest handoff note (up to 3000 characters), quoted, with a pointer to `get_task`;
@@ -1882,7 +1983,7 @@ query({
 
 | View | Change |
 |---|---|
-| **Runners** (new) | One card per runner: owner, state with a one-line "why" for every non-online state, free slots and capacity, power and battery, disk, keep-awake, git readiness and last push. For each vendor: readiness and its reason, the runner's binary version (and the owner's), plan, managed policy, both quota windows with ceilings and reset times, paid usage, owner away. The profile with any weakened items. **Owner only:** capacity, keep-awake, draining, ceilings, paid usage, retire. |
+| **Runners** (new) | One card per runner: owner, state with a one-line "why" for every non-online state, free slots and capacity, power and battery, disk, keep-awake, git readiness and last push, and "takes no new work until <time>" while `acceptingUntil` is set. For each vendor: readiness and its reason, the runner's binary version (and the owner's), plan, managed policy, both quota windows with ceilings, the account's one reset time, paid usage, owner away. The profile with any weakened items. **Owner only:** capacity, keep-awake, draining, ceilings, paid usage, retire. |
 | **Agents** | Columns for runner, attempt and phase (starting, preparing, working, waiting for approval, waiting for quota, vendor error, holding). **Actions:** interrupt, stop, "stop and hold", replace, take over. On runner-held tasks, M1's Release becomes Stop. The lead's row shows whether it is a live chat or on a runner, and its wake-ups since rotation. |
 | **Task** | An attempts table: number, agent, vendor and model, runner, status, end reason, class, WIP ref and short sha, start and end times. The attempt log. Handoff, restatement and late-work notes side by side. Submissions with their outcome. Take over and hand back (from the runner's clone, or from a pushed ref), with the commands to run. Unblock is not offered for `takeover`, which uses hand back. Tasks that only live chats may do are marked "live chat only". |
 | **Approvals** (new, with a badge in the shell) | The signed-in person's pending approvals: agent, task, the full command and cwd, the reason, the "outside the sandbox" warning, the manifest diff when there is one, and time left. Approve and decline. |
@@ -1892,6 +1993,8 @@ query({
 ## 12. Configuration
 
 Every duration is a named setting in milliseconds. Environment variables are the production overrides, and values below the production minimums are accepted only in test mode.
+
+**Hub test mode and minimums.** `AGFLOW_TEST=1` turns on the hub's test mode. Then `AGFLOW_TEST_CONFIG`, a JSON object of `HubConfig` millisecond fields, overrides any setting, so a real hub process can run with short timings. Outside test mode the minimums are: `tickMs` 5 s, `recoveryMs` 30 s, `runnerLeaseMs` 5 min, `stallMs` 5 min, `approvalMs` 5 min and `submitTimeoutMs` 5 min. Code that builds a `HubConfig` directly (tests, the demo) spreads `HUB_RUNNER_DEFAULTS`.
 
 **Hub** (`HubConfig` fields; environment variables with defaults):
 
@@ -1913,6 +2016,7 @@ Every duration is a named setting in milliseconds. Environment variables are the
 | `heartbeatMs` | — | 15 s (sent to runners in `welcome.timings`) |
 | `deadLinkMs` | — | 45 s (sent to runners) |
 | `handoffMs` | — | 3 min (sent to runners) |
+| `wipGraceMs` | — | `runnerLeaseMs` / 3 (sent to runners; section 7.3) |
 | `activeBudgetMs` | `AGFLOW_ACTIVE_BUDGET_MINUTES` | 4 h |
 | `maxContinuations` | — | 25 |
 | `vendorErrorReplaceMs` | — | 60 min |
@@ -1940,7 +2044,8 @@ Every duration is a named setting in milliseconds. Environment variables are the
   - Codex: both roles `gpt-6.1-sol`;
 - `ceilings` (0.85 and 0.85) and `allowPaidUsage` (false), per vendor;
 - `minFreeGb` (10), `batteryDrainPercent` (20);
-- vendor pins and binary paths, the vendor homes, the captured `PATH` and connectivity variables, the commit identity;
+- the vendor homes, the captured `PATH` and connectivity variables, the commit identity (vendor pins live in code, section 7.1);
+- the snapshot of the last hub-confirmed settings, with their version (section 6.3);
 - `timings`:
 
   | Timing | Default |
@@ -1964,50 +2069,84 @@ Every duration is a named setting in milliseconds. Environment variables are the
   | `loginProbe` | 60 s |
   | `stopInterrupt` / `stopClose` / `stopKill` | 5 s / 2 s / 5 s |
   | `vendorErrorBackoff` | 30 s, doubling to 10 min |
+  | `quotaUnknown` (turn retries in `quota_wait` with an unknown reset) | 30 min |
+  | `lateRetry` (late-work pushes after a `pushError`) | 30 s, doubling to 10 min |
+  | `submitRetry` (remote failures of a submission push) | 15 min |
+  | `prep` (one dependency preparation) | 15 min |
   | `preflightEvery` | 6 h |
   | `eventRetention` | 48 h |
+
+  Outside test mode these defaults are also the minimums; with `AGFLOW_TEST=1` and `test.allowShortTimings`, any positive value is accepted.
 - `test` (section 15.1).
 
 ## 13. Packages and interfaces
 
 ```
-packages/core/src/runner-protocol.ts   zod schemas and types shared by hub and runner (protocol 1)
-packages/core/src/api-schemas.ts       request and response schemas of the new HTTP routes
+packages/core/src/runner-protocol.ts   zod schemas and types shared by hub and runner (protocol 1), the closed code
+                                       lists, COMMAND_MIN_PROTOCOL, TEST_ACCOUNT_ID
+packages/core/src/api-schemas.ts       request and response schemas of the new HTTP routes, HUB_EVENT_TYPES,
+                                       BRIDGE_HEADER, BRIDGE_VERSION, BRIDGE_ANSWERS, APPROVALS_ROUTE
+packages/core/src/naming.ts            attempt ids; WIP, late-work, take-over and local pin refs; task branch names
+packages/core/src/credentials.ts       CredentialsSchema: the CLI's credentials.json (no file access), for CLI and runner
 packages/core/src/fence.ts             Fence, compareFence, formatting
 packages/core/src/scheduling.ts        placement and ordering (pure)
-packages/core/src/stall.ts             stall rules (pure)
+packages/core/src/stall.ts             stall rules and capForCommand (pure)
 packages/core/src/ladder.ts            STOP_CAUSES, classes and steps (pure)
-packages/core/src/protected-paths.ts   path classes, restore-set resolution, classification (pure)
+packages/core/src/protected-paths.ts   path classes, restore-set resolution, classification, liveChatOnly (pure)
 packages/hub/src/{runners,gateway,commands,events-in,attempts,submissions,delivery,scheduler,supervisor,
                   handoff,lead,takeover,approvals,quota,recovery,retention}.ts
+packages/hub/src/server.ts             startHub: the app, the gateway and the scheduler on one port
 packages/hub/src/restore.ts            the restore command
 packages/runner/                       the runner (section 7) and adapters (sections 8, 9)
+packages/runner/src/vendor/pins.ts     VENDOR_PINS and vendorBinary (section 7.1)
 packages/runner/src/adapters/types.ts  the adapter interface (below)
-packages/testkit/                      scripted model servers, recorded-stream fake CLI, fake adapter, multi-runner harness
+packages/runner/src/adapters/index.ts  createAdapters, with one entry file per vendor
+packages/testkit/                      git fixtures, the refusing proxy, scripted model servers, recorded-stream fake
+                                       CLI, fake adapter, multi-runner harness
 packages/cli/src/runner-command.ts     agflow runner …
 ```
+
+- **Package direction.** `packages/cli` depends on `packages/runner`, never the reverse: the CLI passes the runner the agflow command (`{ command, args }`, as M1's `selfCommand` gives it) and starts it. `packages/testkit` imports runner types only, except its multi-runner harness, which has its own entry point.
+- **`startHub(ctx, { port, hostname, scheduler: 'auto' | 'manual' | false, dbLock, timers })`** returns `{ url, gateway, scheduler, stop }`. `main.ts` uses it with the lock and the automatic scheduler. Tests and the demo pass their own context (a fake clock, `:memory:`), take no lock, and start or tick the scheduler themselves. The runner's tests share one in-process hub fixture built on it.
 
 **Adapter interface.** The Claude and Codex adapters implement it, and so does the fake adapter used in runner tests.
 
 ```ts
 export interface VendorAdapter {
   readonly vendor: Vendor;
-  preflight(): Promise<{ vendor: RunnerVendor; quota: VendorQuota | null }>;
+  preflight(): Promise<PreflightResult>;
   start(launch: AgentLaunch): Promise<AgentSession>;
   readTranscriptTail(input: { sessionRef: string; clone: string; maxChars: number }): Promise<string | null>;
+  deleteTranscript(input: { sessionRef: string; clone: string }): Promise<void>;   // cleanup_attempt and retention
+  enrichApproval?(input: { clone: string; vault: string; startSha: string;        // the default changes nothing;
+                           request: { kind: Approval['kind']; summary: string; detail: Approval['detail'] } })
+    : Promise<Approval['detail']>;                                                 // Codex adds manifest diffs
 }
+
+export interface PreflightResult {
+  facts: Pick<RunnerVendor, 'vendor' | 'cliVersion' | 'ownerCliVersion' | 'ready' | 'problem' | 'accountId' | 'plan'
+                          | 'managedPolicy'>;   // the runner adds models, ceilings, allowPaidUsage and preflightAt
+  quota: VendorQuota | null;
+  weakened: string[];            // merged with the runner's own items into hello.profile.weakened
+}
+
+// One per vendor, in packages/runner/src/adapters/<vendor>/entry.ts; null until that vendor's plan fills it.
+export type AdapterFactory = (input: { config: RunnerConfig; paths: RunnerPaths;
+                                       agflow: { command: string; args: string[] } }) => VendorAdapter | null;
 
 export interface AgentLaunch {
   attemptId: string;
   role: AgentRole;
   model: string;                 // resolved by the runner
+  cliVersion: string;            // the pin at start; the attempt's recorded version on every resume (section 7.4)
   clone: string;                 // real path; the agent's cwd
-  baseCheckout: string | null;   // Claude's project config root
+  baseCheckout: string | null;   // Claude's project config root; null for Codex
+  projectConfigVerified: boolean;  // the clone's .codex/ equals the restore base's (section 9.2)
   tmpDir: string;                // CLAUDE_CODE_TMPDIR or the Codex TMPDIR
   env: Record<string, string>;   // the agent environment (section 7.6)
   bridge: { command: string; args: string[]; env: Record<string, string> };
   profile: PermissionProfile;
-  brief: string;
+  brief: string;                 // spec.brief plus "Your working directory: <clone>" (section 10)
   firstPrompt: string;
   resume: { sessionRef: string } | null;
   logFile: string;
@@ -2031,7 +2170,8 @@ export type AgentEvent =
   | { type: 'turn_ended'; outcome: 'completed' | 'interrupted' | 'failed'; toolCalls: number; error: string | null;
       errorKind: 'quota' | 'vendor' | 'auth' | 'context' | 'policy' | 'denials' | 'session_budget' | null }
   | { type: 'tool_started'; toolId: string; name: string; input: string; command: string | null }
-  | { type: 'tool_ended'; toolId: string; ok: boolean; denied: boolean; terminal: 'submit' | 'blocked' | 'impossible' | 'released' | 'handoff' | null }
+  | { type: 'tool_ended'; toolId: string; ok: boolean; denied: boolean; terminal: 'submit' | 'blocked' | 'impossible' | 'released' | 'handoff' | null;
+      hubUnreachable: boolean }  // the bridge answered the hub-unreachable text (section 10)
   | { type: 'text'; text: string }
   | { type: 'delivered'; id: string }
   | { type: 'acknowledged'; id: string }
@@ -2041,26 +2181,35 @@ export type AgentEvent =
   | { type: 'waiting_approval'; waiting: boolean }
   | { type: 'compacted'; summary: string | null }
   | { type: 'context'; used: number }
-  | { type: 'warning'; text: string };
+  | { type: 'warning'; text: string };   // reported as an attempt.activity note
 
 export interface ExitInfo { code: number | null; signal: string | null }
 ```
 
-The runner's `AttemptController` owns everything that is not vendor-specific: git, dependency preparation, the stop ladder, continuation, facts, deliveries, approvals relay, WIP timers, the final push and reporting. The stop ladder calls `interrupt`, then `close`, then signals the recorded groups. Usage accounting in tokens or money is out of M2; quota windows are reported.
+The runner's `AttemptController` owns everything that is not vendor-specific: git, dependency preparation, the stop ladder, continuation, facts, deliveries, the approvals relay and its owner notifications, paid-usage handling, WIP timers, the final push, the take-over commands and the hand-back daemon stop, and reporting. The stop ladder calls `interrupt`, then `close`, then signals the recorded groups. Usage accounting in tokens or money is out of M2; quota windows are reported.
+
+**Registry.** `createAdapters(config, paths, { agflow })` in `packages/runner/src/adapters/index.ts` returns every adapter whose entry file returns one. The runner core creates both entry files returning null; the Claude and Codex plans each fill their own. `agflow runner start` calls it; tests inject adapters instead.
 
 ## 14. Plans
 
 | Plan | Contents | Depends on |
 |---|---|---|
 | **M2a — hub** | Sections 6 and 13 (hub and core). The shared contracts come first: core types, fence, runner protocol and API schemas. Then: schema v2, gateway, commands and events, attempts and the trigger table, agent tokens and the route allowlist, M1 operation mapping, work positions, submissions, delivery, scheduler, quota and accounts, stall and ladder policy, handoff assembly, lead seat, take-over, approvals, recovery and restore, backups and retention, churn guard, HTTP API, events, the hub's refusal of older bridges | M1 |
-| **M2b — runner core and bridge** | Sections 7.2–7.6 and 13: runner config, test mode and timings; `runner.db` (journal, outbox, registry); the link client; git (vault, clones, harvest, snapshot, protected paths, pushes, late refs); processes; facts; the adapter interface and fake adapter; `AttemptController` and the command executor; the agent environment; the bridge's runner mode; `agflow hook brief --runner`; live-chat claims from the work position (`task-git.ts`, `X-Agflow-Bridge: 2`) | M2a contracts |
+| **M2b — runner core and bridge** | Sections 7.2–7.6 and 13: runner config, test mode and timings; `runner.db` (journal, outbox, registry); the link client; git (vault, clones, harvest, snapshot, protected paths, pushes, late refs); processes; facts; the adapter interface and fake adapter; `AttemptController` and the command executor; the agent environment; the bridge's runner mode; `agflow hook brief --runner`; live-chat claims from the work position (`task-git.ts`, `X-Agflow-Bridge: 2`) | M2a contracts; its in-process-hub, bridge and live-claim tasks also need M2a's hub |
 | **M2c — runner service and operations** | Sections 7.1, 7.7, 7.8 and 7.9: `agflow runner setup/start/install/status/drain/restart/stop/uninstall`, vendor binaries, logins, service checks, the LaunchAgent, single instance, suspend, `needs_login`, crash loops, notifications, dependency preparation, retention and the disk guard, power and keep-awake | M2b |
 | **M2d — Claude adapter** | Section 8, the scripted Anthropic Messages API server and the recorded-stream fake CLI in testkit, and the Claude smoke suite | M2b |
 | **M2e — Codex adapter** | Section 9 and the runner side of approvals, generated protocol types, the scripted Responses API provider in testkit, and the Codex smoke suite | M2b |
 | **M2f — web UI** | Section 11 | M2a |
-| **M2g — end-to-end** | The multi-runner harness, the three exit scenarios with fault injection plus runner restart, hub restart and mid-turn delivery, the live run with real subscriptions, and README and spec updates | all |
+| **M2g — end-to-end** | The multi-runner harness, the three exit scenarios with fault injection plus runner restart, hub restart, hub restore, mid-turn delivery and take-over with hand-back, the live run with real subscriptions, and README and spec updates | all |
 
-Execution order: M2a, then M2b, then M2c, M2d and M2e, then M2f, then M2g. The contracts (the first tasks of M2a) are what the hub and runner plans share.
+**Execution order.** The contracts (the first tasks of M2a) are what all plans share, so they come first and then freeze: a later change needs a recorded decision and updates every importer in the same change. After that the plans overlap, with gates:
+1. **Contracts:** M2a's core tasks: types, names, the runner protocol, API schemas and events, protected paths, stall rules, the ladder, and the placement helpers.
+2. **In parallel:** the rest of M2a; M2b's runner core (everything before its in-process-hub tasks); M2f's DOM-free models.
+3. **Once the runner core is done, in parallel:** M2c's tasks that need no hub (machine facts, pins, logins, the lock, logs); M2d and M2e up to their real-CLI suites. M2b's in-process-hub, bridge and live-claim tasks start once M2a has the gateway, scheduler, submissions, preparation, lead routes and live claims.
+4. **Once M2b is done, in parallel:** the rest of M2c; M2d's and M2e's real-CLI suites. Once M2a is done: M2f's demo and views. M2g's harness pieces start as their providers land.
+5. **Last:** M2g's scenarios once M2c, M2d and M2e are done; its live run and docs once M2f is done too.
+
+Parallel plans avoid editing the same files: the runner core pre-declares the shared dependencies, the root scripts of M2c, M2d and M2e, and every runner timing; each vendor plan fills only its own registry entry; the README is M2g's alone.
 
 ## 15. Testing
 
@@ -2080,12 +2229,12 @@ Execution order: M2a, then M2b, then M2c, M2d and M2e, then M2f, then M2g. The c
   - approval identity and voiding;
   - a gateway batch with a stale-fence event and a throwing event in the middle: the whole batch is acknowledged, and the later events take effect;
   - every task move the trigger table can make, replayed against the state machine from every status.
-- **Adapter tests** (local, skipped without the CLIs), with zero quota use:
+- **Adapter tests** (local: they run with `AGFLOW_SMOKE=1`, and are skipped without it or without the pinned CLIs), with zero quota use:
   - **Claude:** the real `claude` against a scripted Anthropic Messages API server (section 15.1). Subscription quota signals cannot come from an API-key server, so they are tested with a recorded-stream fake CLI fed the stream of a real limit hit; the real CLI covers the 429 path with retries off.
   - **Codex:** the real `codex app-server` against a scripted Responses API model provider in a scratch `CODEX_HOME`.
   - **Both cover:** start, deliver, interrupt, resume (including a session that never ran a turn), stop, quota and vendor errors, approvals (Codex), the bridge, and the only-agflow checks.
   - The scripted Responses provider cannot exercise web search; `web_search: 'disabled'` is checked only through the absence of a `configWarning`.
-- **Sandbox checks (local):**
+- **Sandbox checks** (local, with `AGFLOW_SANDBOX_CHECKS=1`, because they use the network and a throwaway keychain item, which they always remove):
   - sandboxed commands cannot reach the hub URL or the git host, cannot read a throwaway keychain item (which succeeds outside), and cannot write outside the clone and its temporary directory, nor into another attempt's temporary directory or `/tmp/claude`;
   - an allowed registry is reachable;
   - the commands' `TMPDIR` is under `/tmp/agf/<id>/`, and writes to `/tmp/claude` and `~/.npm/_logs` are refused;
@@ -2095,7 +2244,8 @@ Execution order: M2a, then M2b, then M2c, M2d and M2e, then M2f, then M2g. The c
   - a fixture `bun install` and `pip install` succeed from an empty cache through dependency preparation;
   - in both profiles, these succeed: Read, Edit and Write of a clone file; a Bash write and a git commit in the clone; a Read of a persisted oversized Bash output. If the last fails under the `~/.agflow/runner` read deny, the runner's files are denied one by one instead, and the runner's Claude home is left to the sandbox's `denyRead`;
   - a marker `~/.zshrc` (and `~/.bashrc` with `SHELL=/bin/bash`) runs once per Claude process outside the sandbox, and its functions do not reach agent commands.
-- **End-to-end (local).** M2g's harness: one hub, three runners with separate `AGFLOW_HOME`s, a local bare origin, scripted model servers, and short timings in test mode. It runs the three exit scenarios plus a runner restart, a hub restart and a delivery to a mid-turn agent.
+- **End-to-end (local).** M2g's harness: one hub, three runners with separate `AGFLOW_HOME`s, a local bare origin, scripted model servers, and short timings in test mode. It runs the three exit scenarios plus a runner restart, a hub restart, a hub restore, a delivery to a mid-turn agent, and a take-over with hand-back. It runs with `AGFLOW_E2E=1`, and then fails, instead of skipping, when a prerequisite is missing.
+- **Pinned binaries in tests.** `findClaudeBinary` (testkit) and `findCodexBinary` (`packages/runner`) look at `AGFLOW_CLAUDE_BIN` and `AGFLOW_CODEX_BIN`, then at the runner's vendor directory under `~/.agflow`; `bun run vendor:install` puts the pins there without a full setup. A test runner home links the located version directory into its own `vendor/`. A test runner without one vendor just lacks its binary, and preflight reports "binary missing".
 - **Live run (manual).** The exit scenarios with real subscriptions on a toy repository, like M1's, plus a TTY check of both take-over commands on the runner's laptop.
 
 ### 15.1 Test mode
@@ -2103,15 +2253,17 @@ Execution order: M2a, then M2b, then M2c, M2d and M2e, then M2f, then M2g. The c
 Owned by M2b.
 - `runner.json` gains `test: { claudeEnv, codexConfig, skipAuthChecks, allowShortTimings }`. It is honoured only with `AGFLOW_TEST=1`, and `agflow runner install` refuses it.
 - `claudeEnv` is added after the allowlist: `ANTHROPIC_BASE_URL`, a test key, `CLAUDE_CODE_MAX_RETRIES=0`, and the switches that stop non-essential traffic.
-- With `skipAuthChecks`, preflight reports the vendor ready, with the problem "test mode".
+- With `skipAuthChecks`, preflight reports the vendor ready, with the problem "test mode", `plan` "test mode", and `accountId` core's `TEST_ACCOUNT_ID`: `337c8a0a2e66c1e6`, the first 16 hex of sha256("agflow-test"). The fake adapter and both real adapters do this, so per-account quota and owner away work in tests.
 - Codex tests put the mock provider into the scratch `CODEX_HOME`'s `config.toml`.
 - The adapter tests use the same switches through their constructors.
+- Test mode posts no macOS notifications.
 
 **Scripted servers:**
 - They answer from request content (the session or thread id, the last tool_use id, markers from the brief), never from request order.
 - They accept `system` entries in the message list (Claude folds mid-turn messages in that way) and extra user messages after tool results.
-- Codex tests use the pinned model slug and record its tool surface.
-- Both CLIs run behind a refusing `HTTPS_PROXY`, and the tests assert that no external connection succeeded.
+- Both expose one shape, `{ url, requests, setHandler(fn) }`, with parsed requests and reply builders: `startScriptedAnthropic` and `claudeTestEnv` (M2d), `startResponsesServer` and `codexTestConfig` (M2e). Auxiliary requests (token counts, titles, summaries) get a harmless default answer.
+- Codex tests use the pinned model slug and record its tool surface. That slug runs Code Mode, so Codex tool replies are `exec` calls built by M2e's builders.
+- Both CLIs run behind a refusing `HTTPS_PROXY` (testkit's `startRefusingProxy`, which M2b creates with the testkit), and the tests assert that no external connection succeeded.
 
 ## 16. Out of scope and deferred
 
@@ -2203,3 +2355,14 @@ Revision 2 applies the review's upheld findings. The main changes:
 - **Deny rules** no longer cover the agent's own clone.
 - **No lost work.** Late work respects the work-position lineage, and a failed final push no longer loses work.
 - **Settings.** Every duration is configurable, and the hub sends the timings that both sides must share.
+
+**Revision 4** settles the cross-plan questions of the seven plan outlines. These are its contract clarifications:
+- **Runner link.** `hello.lastSeq`; restore reconciliation waits for the replay, and replayed events with a newer fence count as current. `welcome.timings.wipGraceMs`. Settings sync: `hello` carries the hub-confirmed snapshot, and local edits travel only as `runner.settings`. A retired runner gets 4403. The `LiveAttempt` states are defined.
+- **Commands and events.** 17 command kinds, each in `COMMAND_MIN_PROTOCOL`. Closed code lists in core, including `START_REFUSALS`; a refusal stops placement on that runner until its next heartbeat. `attempt.prepared.requestId` and `attempt.quota.accountId` may be null. `messageId` 0 marks hub text, and the runner writes the "more messages" line. `attempt.quota` with state `ok` ends `quota_wait`. `attempt.wip_failed.failures` counts over the whole runner.
+- **Types and API.** `Attempt.takeover.ref`, `TaskNote.attemptId`, `Runner.acceptingUntil`, `LeadNote`, `PrepareRequest`, and `HubStatus.epoch` (with `HubStatus.lead` kept). Response keys, limits and the runner PATCH bounds. Event subjects and data, plus `task.refs_deleted` and the `guard.*` events. `APPROVALS_ROUTE`, `CredentialsSchema` and `TEST_ACCOUNT_ID` in core.
+- **Runner.** `canPushWip` with its grace period. `resolveRestoreBase`: the hub sends a ref. The orphan kill and sweep on an unrequested exit. Resumes use the attempt's CLI version. One reconnect nudge. The `hand_back` error `process_running`. Submission retries capped by `submitRetry`. New runner timings and minimums. `agflow runner status --json`. The exit policy for refusals that need a person, and how `crash_loop` clears.
+- **Adapters.** `PreflightResult` (with `weakened`), `deleteTranscript`, the optional `enrichApproval`, `AgentLaunch.cliVersion` and `projectConfigVerified`, `tool_ended.hubUnreachable`, the agflow command passed to adapter factories, and `createAdapters` with one entry file per vendor. The runner core builds the take-over commands. Claude's preflight reads the experimental usage call. Codex sends `approvalsReviewer: 'user'` and runs an unverified clone `untrusted`.
+- **Hub.** Unknown agent tokens after a restore get `attempt_refenced`, and the 401 body names the end reason. M1 operations keep their M1 preconditions. A rule for a second stop request, and a row for stopping a runner lead. `startHub` options. Hub test mode (`AGFLOW_TEST_CONFIG`) and minimums. Retention runs outside the tick, and the first hourly backup an hour after start.
+- **Plans.** A staged, parallel execution order (section 14).
+
+Later contract changes are recorded here the same way.
