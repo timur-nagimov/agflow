@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { addExclude, defaultBranch, git, gitOk, isTracked, removeExclude, repoRoot, slugify } from '../src/git';
+import { addExclude, defaultBranch, git, gitOk, isTracked, removeExclude, repoRoot } from '../src/git';
 import { selfCommand, shellCommand, shellQuote } from '../src/self';
 import { cloneOf, pushedRepo, run, tempRepo } from './fixture';
 
@@ -59,12 +59,6 @@ describe('git helpers', () => {
     expect(git(repo.root, ['rev-parse', '--verify', '--quiet', 'refs/heads/nope']).code).not.toBe(0);
     expect(() => gitOk(repo.root, ['checkout', 'nope'])).toThrow('git checkout nope failed');
     expect(gitOk(repo.root, ['rev-parse', 'HEAD'])).toBe(run(['git', 'rev-parse', 'HEAD'], repo.root));
-  });
-
-  test('slugify makes short branch-safe names', () => {
-    expect(slugify('Add OAuth 2.0 login (GitHub)!')).toBe('add-oauth-2-0-login-github');
-    expect(slugify('***')).toBe('task');
-    expect(slugify('x'.repeat(80))).toHaveLength(40);
   });
 });
 

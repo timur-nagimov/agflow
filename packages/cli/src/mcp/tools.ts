@@ -9,20 +9,14 @@ import {
   TaskPatchSchema,
   formatMessages,
   isHeld,
+  isTaskBranch,
   quoteLines,
+  taskBranchName,
 } from '@agflow/core';
 import { z } from 'zod';
 import { repoRoot } from '../git';
 import type { HubClient } from '../hub-client';
-import {
-  assertTaskBranch,
-  isTaskBranch,
-  prepareTaskWorktree,
-  pushTaskBranch,
-  removeTaskWorktree,
-  taskBranchName,
-  taskWorktreePath,
-} from './task-git';
+import { assertTaskBranch, prepareTaskWorktree, pushTaskBranch, removeTaskWorktree, taskWorktreePath } from './task-git';
 
 export interface ToolState {
   agentId: string | null;
@@ -288,8 +282,8 @@ export const gitTools: ToolDef[] = [
       const { task } = await client.task(id);
       // The hub keeps the branch name a claim last gave it, and any agent can give it any valid name (say
       // "production"). Only a name inside this task's own namespace is used; any other is replaced, and the
-      // claim below stores the replacement on the hub.
-      const branch = isTaskBranch(task.id, task.branch) ? task.branch : taskBranchName(task.id, task.title);
+      // claim below stores the replacement on the hub. Live chats name branches as M1 did, without an epoch.
+      const branch = isTaskBranch(task.id, task.branch) ? task.branch : taskBranchName(task.id, task.title, 1);
       const worktree = prepareTaskWorktree(root, task.id, branch);
       let claimed: Task;
       try {

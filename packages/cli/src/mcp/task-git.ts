@@ -1,24 +1,13 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { addExclude, defaultBranch, git, gitOk, slugify } from '../git';
+import { isTaskBranch } from '@agflow/core';
+import { addExclude, defaultBranch, git, gitOk } from '../git';
 
 export function taskWorktreePath(root: string, taskId: string): string {
   return join(root, '.worktrees', 'agflow', taskId);
 }
 
-export function taskBranchName(taskId: string, title: string): string {
-  return `agflow/${taskId}-${slugify(title)}`;
-}
-
-/**
- * True for a branch inside the task's own namespace, `agflow/T-<id>-<slug>`. The hub keeps whatever branch
- * name a claim last gave it, and any agent may give it any valid name, so a name from the hub is trusted
- * only when it is one of these: a push goes there with the person's own git login.
- */
-export function isTaskBranch(taskId: string, branch: string | null | undefined): branch is string {
-  return typeof branch === 'string' && branch.startsWith(`agflow/${taskId}-`);
-}
-
+/** A push to the task branch goes there with the person's own git login, so only the task's own namespace will do. */
 export function assertTaskBranch(taskId: string, branch: string): void {
   if (!isTaskBranch(taskId, branch)) {
     throw new Error(
