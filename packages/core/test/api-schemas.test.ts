@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, test } from 'bun:test';
 import type { z } from 'zod';
 import {
   AGENT_ERRORS,
+  APPROVALS_ROUTE,
   AccountQuotaSchema,
   AgentReplaceInputSchema,
   AgentStopInputSchema,
@@ -16,7 +17,14 @@ import {
   AttemptSchema,
   AttemptsQuerySchema,
   AttemptsResponseSchema,
+  BRIDGE_ANSWERS,
+  BRIDGE_HEADER,
+  BRIDGE_VERSION,
+  HUB_EVENT_TYPES,
   HandbackInputSchema,
+  type HubEventCategory,
+  type HubEventSubject,
+  type HubEventType,
   LeadHandoffInputSchema,
   LeadNoteSchema,
   LeadNotesResponseSchema,
@@ -585,5 +593,162 @@ describe('error codes', () => {
   test("AGENT_ERRORS are design 6.5's refusals of agent tokens, TAKEOVER_REFUSALS design 6.12's 409 codes", () => {
     expect([...AGENT_ERRORS]).toEqual(['attempt_ended', 'attempt_refenced', 'agent_not_allowed']);
     expect([...TAKEOVER_REFUSALS]).toEqual(['runner_offline', 'not_running', 'submission_pending']);
+  });
+});
+
+describe('the event catalogue', () => {
+  const types = Object.keys(HUB_EVENT_TYPES) as HubEventType[];
+  const prefixOf = (type: string) => type.slice(0, type.indexOf('.'));
+
+  test('HUB_EVENT_TYPES lists every type of design 6.17 once, in its order', () => {
+    expect(types).toEqual([
+      'runner.online',
+      'runner.offline',
+      'runner.updated',
+      'runner.retired',
+      'runner.event_rejected',
+      'account.quota_changed',
+      'account.owner_away',
+      'attempt.started',
+      'attempt.running',
+      'attempt.quota_wait',
+      'attempt.holding',
+      'attempt.resumed',
+      'attempt.ended',
+      'attempt.wip',
+      'attempt.violation',
+      'attempt.late_work',
+      'attempt.prepared',
+      'agent.stalled',
+      'agent.stopped',
+      'agent.replaced',
+      'approval.requested',
+      'approval.decided',
+      'approval.expired',
+      'approval.voided',
+      'lead.seat_changed',
+      'lead.rotated',
+      'submission.pending',
+      'submission.recorded',
+      'submission.failed',
+      'task.taken_over',
+      'task.handed_back',
+      'task.refs_deleted',
+      'guard.plan_change',
+      'guard.dispatch_paused',
+      'system.recovery_started',
+      'system.recovery_ended',
+      'system.restored',
+    ]);
+    expectTypeOf<'task.refs_deleted' | 'guard.plan_change' | 'guard.dispatch_paused'>().toMatchTypeOf<HubEventType>();
+    // M1's types keep their own sentences; the catalogue holds only what M2 adds.
+    expectTypeOf<'task.created'>().not.toMatchTypeOf<HubEventType>();
+  });
+
+  test('subjects: attempt, submission, agent, approval and task events take the task id (a lead attempt its id), runner events the runner id, account events the owner, and lead, guard and system events none', () => {
+    const subjects: Record<string, HubEventSubject | null> = {
+      attempt: 'task',
+      submission: 'task',
+      agent: 'task',
+      approval: 'task',
+      task: 'task',
+      runner: 'runner',
+      account: 'owner',
+      lead: null,
+      guard: null,
+      system: null,
+    };
+    for (const type of types) {
+      expect([type, HUB_EVENT_TYPES[type].subject]).toEqual([type, subjects[prefixOf(type)]]);
+    }
+  });
+
+  test("categories are design 6.17's groups", () => {
+    const categories: Record<string, HubEventCategory> = {
+      runner: 'runners',
+      account: 'accounts',
+      attempt: 'attempts',
+      agent: 'agents',
+      approval: 'approvals',
+      lead: 'lead',
+      submission: 'submissions',
+      task: 'tasks',
+      guard: 'guards',
+      system: 'hub',
+    };
+    for (const type of types) {
+      expect([type, HUB_EVENT_TYPES[type].category]).toEqual([type, categories[prefixOf(type)]]);
+    }
+  });
+
+  test('data carries attemptId, runnerId, agentId, taskId, approvalId and submissionId where they apply', () => {
+    const idsOf: Record<string, string[]> = {
+      runner: ['runnerId'],
+      account: [],
+      attempt: ['attemptId', 'taskId', 'agentId', 'runnerId'],
+      agent: ['attemptId', 'taskId', 'agentId', 'runnerId'],
+      approval: ['approvalId', 'attemptId', 'taskId', 'agentId', 'runnerId'],
+      lead: ['agentId', 'attemptId', 'runnerId'],
+      submission: ['submissionId', 'attemptId', 'taskId', 'agentId', 'runnerId'],
+      task: ['taskId', 'runnerId'],
+      guard: [],
+      system: [],
+    };
+    for (const type of types) {
+      const keys: readonly string[] = HUB_EVENT_TYPES[type].data;
+      expect([type, new Set(keys).size]).toEqual([type, keys.length]);
+      for (const id of idsOf[prefixOf(type)] ?? []) expect([type, id, keys.includes(id)]).toEqual([type, id, true]);
+    }
+  });
+
+  test('each type records the data its sentence and its readers need', () => {
+    const data = (type: HubEventType) => [...HUB_EVENT_TYPES[type].data];
+    expect(data('attempt.ended')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'endReason', 'failureClass']);
+    // Handoff assembly quotes the newest WIP's log stat (design 6.8), and ref cleanup reads recorded refs.
+    expect(data('attempt.wip')).toEqual([
+      'attemptId',
+      'taskId',
+      'agentId',
+      'runnerId',
+      'ref',
+      'sha',
+      'stripped',
+      'skipped',
+      'embedded',
+      'logStat',
+    ]);
+    expect(data('attempt.late_work')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'ref', 'sha']);
+    expect(data('task.handed_back')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'source', 'ref', 'sha']);
+    expect(data('task.refs_deleted')).toEqual(['taskId', 'runnerId', 'refs']);
+    expect(data('agent.stalled')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'cause', 'reason']);
+    expect(data('approval.decided')).toEqual(['approvalId', 'attemptId', 'taskId', 'agentId', 'runnerId', 'summary', 'decision']);
+    expect(data('guard.plan_change')).toEqual(['agentId', 'call', 'taskIds', 'count']);
+    expect(data('system.recovery_ended')).toEqual([]);
+  });
+});
+
+describe('the bridge and the approvals route', () => {
+  test('the bridge declares itself with X-Agflow-Bridge: 2', () => {
+    expect(BRIDGE_HEADER).toBe('X-Agflow-Bridge');
+    expect(BRIDGE_VERSION).toBe(2);
+  });
+
+  test("BRIDGE_ANSWERS are design 10's texts", () => {
+    expect(BRIDGE_ANSWERS.attemptEnded('stalled')).toBe(
+      'Your agflow attempt has ended (stalled). Stop working; do not commit further.',
+    );
+    expect(BRIDGE_ANSWERS.attemptRefenced).toBe('agflow is restarting your session; stop and wait.');
+    expect(BRIDGE_ANSWERS.hubUnreachable).toBe(
+      'The agflow hub is unreachable; keep working on your task and try again in a few minutes.',
+    );
+  });
+
+  test('without a reason from the hub, the attempt-ended answer leaves it out', () => {
+    expect(BRIDGE_ANSWERS.attemptEnded(null)).toBe('Your agflow attempt has ended. Stop working; do not commit further.');
+    expect(BRIDGE_ANSWERS.attemptEnded('')).toBe(BRIDGE_ANSWERS.attemptEnded(null));
+  });
+
+  test("APPROVALS_ROUTE is the web UI's '#/approvals'", () => {
+    expect(APPROVALS_ROUTE).toBe('#/approvals');
   });
 });

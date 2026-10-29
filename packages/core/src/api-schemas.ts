@@ -2,7 +2,10 @@
 // approvals, agent actions, take-over and hand-back, runner submissions, dependency preparation and the lead, and the
 // error codes their callers tell apart. Request bodies are strict, like M1's; queries stay loose, because proxies and
 // caches add parameters. Each value schema is pinned to its core type, so the hub's answers and their readers cannot
-// drift apart.
+// drift apart. The module also holds the event catalogue (6.17), the bridge's constants and answers (10) and the
+// approvals route (6.10).
+//
+// The web UI imports only types from this module: one value import would put zod into its bundle (decision X-48).
 import { z } from 'zod';
 import { parseAttemptId } from './naming';
 import {
@@ -477,3 +480,139 @@ export const WhoamiResponseSchema = z.strictObject({ user: Name });
 
 /** Retiring a runner, a transcript, an interrupt and a lead handoff answer only that they were done. */
 export const OkResponseSchema = z.strictObject({ ok: z.literal(true) });
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/**
+ * What a hub event's subject names (design 6.17). task: the task id, or the attempt id for a lead attempt, which has no
+ * task; runner: the runner id; owner: the account owner's login. Events without a subject have null.
+ */
+export type HubEventSubject = 'task' | 'runner' | 'owner';
+
+/** The groups of design 6.17's list of event types. */
+export type HubEventCategory =
+  | 'runners'
+  | 'accounts'
+  | 'attempts'
+  | 'agents'
+  | 'approvals'
+  | 'lead'
+  | 'submissions'
+  | 'tasks'
+  | 'guards'
+  | 'hub';
+
+interface HubEventSpec {
+  category: HubEventCategory;
+  subject: HubEventSubject | null;
+  /** Every key of the event's data; an id that does not apply to one event is null there. */
+  data: readonly string[];
+}
+
+// Data carries attemptId, runnerId, agentId, taskId, approvalId and submissionId wherever they apply, so a page that
+// follows one attempt reads its task's events and filters on data.attemptId (design 6.17). Every event about one
+// attempt carries its four ids; a lead attempt's taskId is null.
+const OF_ATTEMPT = ['attemptId', 'taskId', 'agentId', 'runnerId'] as const;
+const OF_APPROVAL = ['approvalId', ...OF_ATTEMPT, 'summary'] as const;
+const OF_SUBMISSION = ['submissionId', ...OF_ATTEMPT] as const;
+
+/**
+ * Every event type M2 adds: its group, what its subject names and the keys of its data. The hub fills every key it
+ * lists, and pages describe the events from these keys only.
+ */
+export const HUB_EVENT_TYPES = {
+  'runner.online': { category: 'runners', subject: 'runner', data: ['runnerId', 'name'] },
+  // state: offline, or needs_login when the link's session no longer verifies.
+  'runner.offline': { category: 'runners', subject: 'runner', data: ['runnerId', 'name', 'state'] },
+  // fields: the settings that changed.
+  'runner.updated': { category: 'runners', subject: 'runner', data: ['runnerId', 'name', 'fields'] },
+  'runner.retired': { category: 'runners', subject: 'runner', data: ['runnerId', 'name'] },
+  // The rejected event's seq and type, and why the hub could not apply it.
+  'runner.event_rejected': { category: 'runners', subject: 'runner', data: ['runnerId', 'seq', 'type', 'error'] },
+  // quota: the account's VendorQuota.
+  'account.quota_changed': { category: 'accounts', subject: 'owner', data: ['vendor', 'accountId', 'quota'] },
+  // approvalId: the approval whose expiry marked the owner away.
+  'account.owner_away': { category: 'accounts', subject: 'owner', data: ['vendor', 'accountId', 'approvalId'] },
+  'attempt.started': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'vendor', 'role'] },
+  'attempt.running': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT] },
+  'attempt.quota_wait': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'resetsAt'] },
+  // submissionId: the submission the attempt holds for; null for a lead whose process exited.
+  'attempt.holding': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'submissionId'] },
+  // fence: the new one; reason: what the resume is for.
+  'attempt.resumed': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'fence', 'reason'] },
+  'attempt.ended': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'endReason', 'failureClass'] },
+  'attempt.wip': {
+    category: 'attempts',
+    subject: 'task',
+    data: [...OF_ATTEMPT, 'ref', 'sha', 'stripped', 'skipped', 'embedded', 'logStat'],
+  },
+  'attempt.violation': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'phase', 'paths'] },
+  'attempt.late_work': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'ref', 'sha'] },
+  // requestId: the prepare_dependencies command the agent asked for.
+  'attempt.prepared': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'requestId', 'ok', 'error'] },
+  // cause: the StopCause; reason: the text the agent was given.
+  'agent.stalled': { category: 'agents', subject: 'task', data: [...OF_ATTEMPT, 'cause', 'reason'] },
+  'agent.stopped': { category: 'agents', subject: 'task', data: [...OF_ATTEMPT, 'cause', 'reason'] },
+  'agent.replaced': { category: 'agents', subject: 'task', data: [...OF_ATTEMPT, 'cause', 'reason'] },
+  'approval.requested': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL, 'kind'] },
+  'approval.decided': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL, 'decision'] },
+  'approval.expired': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL] },
+  'approval.voided': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL] },
+  // The seat after the change; kind none leaves the ids null.
+  'lead.seat_changed': { category: 'lead', subject: null, data: ['kind', 'agentId', 'attemptId', 'runnerId'] },
+  // reason: wake-ups, context or runner leads turned off.
+  'lead.rotated': { category: 'lead', subject: null, data: ['attemptId', 'agentId', 'runnerId', 'reason'] },
+  'submission.pending': { category: 'submissions', subject: 'task', data: [...OF_SUBMISSION] },
+  'submission.recorded': { category: 'submissions', subject: 'task', data: [...OF_SUBMISSION, 'headSha', 'branch'] },
+  'submission.failed': { category: 'submissions', subject: 'task', data: [...OF_SUBMISSION, 'error'] },
+  // person: who took the task over; ref: the take-over ref they push to.
+  'task.taken_over': { category: 'tasks', subject: 'task', data: [...OF_ATTEMPT, 'person', 'ref'] },
+  // source: clone or ref; ref and sha: the new work position.
+  'task.handed_back': { category: 'tasks', subject: 'task', data: [...OF_ATTEMPT, 'source', 'ref', 'sha'] },
+  // refs: the remote refs the runner deleted.
+  'task.refs_deleted': { category: 'tasks', subject: 'task', data: ['taskId', 'runnerId', 'refs'] },
+  // call: create_tasks, update_task or cancel_task; count: the calls counted in the sliding hour, this one included.
+  'guard.plan_change': { category: 'guards', subject: null, data: ['agentId', 'call', 'taskIds', 'count'] },
+  // until: when worker dispatch resumes; agentId: the agent whose call reached the budget.
+  'guard.dispatch_paused': { category: 'guards', subject: null, data: ['agentId', 'until', 'count'] },
+  // gapMs: the downtime found; until: the end of the recovery window.
+  'system.recovery_started': { category: 'hub', subject: null, data: ['gapMs', 'until'] },
+  'system.recovery_ended': { category: 'hub', subject: null, data: [] },
+  // epoch: the hub epoch after the restore.
+  'system.restored': { category: 'hub', subject: null, data: ['epoch'] },
+} as const satisfies Record<string, HubEventSpec>;
+
+export type HubEventType = keyof typeof HUB_EVENT_TYPES;
+
+// ---------------------------------------------------------------------------
+// The bridge and the approvals route
+// ---------------------------------------------------------------------------
+
+/** The agflow MCP bridge sends it on every hub request, with BRIDGE_VERSION. */
+export const BRIDGE_HEADER = 'X-Agflow-Bridge';
+
+/**
+ * A bridge at version 2 can start a live claim from a WIP ref, so the hub refuses such a claim unless the request
+ * carries BRIDGE_HEADER with this version (design 10).
+ */
+export const BRIDGE_VERSION = 2;
+
+/**
+ * What every bridge tool answers when the hub refuses the agent or cannot be reached (design 10). The bridge and both
+ * adapters import these texts: the bridge answers them as MCP error results, and the adapters recognise
+ * hubUnreachable by its text.
+ */
+export const BRIDGE_ANSWERS = {
+  /** 401 attempt_ended; reason is the end reason of the hub's body, left out when the hub gave none. */
+  attemptEnded: (reason: string | null): string =>
+    `Your agflow attempt has ended${reason ? ` (${reason})` : ''}. Stop working; do not commit further.`,
+  /** 401 attempt_refenced, while a restore gives the attempt a new fence. */
+  attemptRefenced: 'agflow is restarting your session; stop and wait.',
+  /** In every mode, when the hub does not answer. */
+  hubUnreachable: 'The agflow hub is unreachable; keep working on your task and try again in a few minutes.',
+} as const;
+
+/** The web UI's Approvals page. A notification cannot open a link, so runners print the hub's URL followed by this. */
+export const APPROVALS_ROUTE = '#/approvals';

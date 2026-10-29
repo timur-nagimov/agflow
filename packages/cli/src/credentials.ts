@@ -1,14 +1,11 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { CREDENTIALS_FILE, type Credentials, CredentialsSchema } from '@agflow/core';
 
-export interface Credentials {
-  hubUrl: string;
-  token: string;
-  user: string;
-}
+export type { Credentials };
 
 export function credentialsPath(dir: string): string {
-  return join(dir, 'credentials.json');
+  return join(dir, CREDENTIALS_FILE);
 }
 
 export function saveCredentials(credentials: Credentials, dir: string): void {
@@ -21,9 +18,9 @@ export function saveCredentials(credentials: Credentials, dir: string): void {
 export function loadCredentials(dir: string): Credentials | null {
   const path = credentialsPath(dir);
   if (!existsSync(path)) return null;
-  const data = JSON.parse(readFileSync(path, 'utf8')) as Partial<Credentials>;
-  if (!data.hubUrl || !data.token || !data.user) return null;
-  return { hubUrl: data.hubUrl, token: data.token, user: data.user };
+  // Core's schema, which the runner reads the file with too: a missing or empty field means signed out.
+  const parsed = CredentialsSchema.safeParse(JSON.parse(readFileSync(path, 'utf8')));
+  return parsed.success ? parsed.data : null;
 }
 
 export function deleteCredentials(dir: string): void {
