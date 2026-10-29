@@ -353,14 +353,14 @@ CREATE TABLE lead_notes (
 );
 `;
 
-/**
- * The hub_state row starts with the migration. M1's lead seat was the lead chat seen within the last 15 minutes
- * (currentLead in agents.ts), so a lead that is live now keeps the seat.
- */
+/** M1's lead seat: the lead chat seen within the last 15 minutes. Only the migration to schema version 2 reads it. */
+export const M1_LEAD_STALE_MS = 15 * 60_000;
+
+/** The hub_state row starts with the migration, and M1's lead, if it is live now, keeps the seat. */
 function seedHubState(db: Database, now: number): void {
   const lead = db
     .query("SELECT id FROM agents WHERE role = 'lead' AND last_seen_at > $cutoff ORDER BY last_seen_at DESC LIMIT 1")
-    .get({ cutoff: now - 15 * 60_000 }) as { id: string } | null;
+    .get({ cutoff: now - M1_LEAD_STALE_MS }) as { id: string } | null;
   db.query(
     `INSERT INTO hub_state (id, last_alive_at, lead_agent_id, lead_kind, lead_since)
      VALUES (1, $now, $leadId, $kind, $since)`,

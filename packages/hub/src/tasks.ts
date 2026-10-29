@@ -7,9 +7,11 @@ import {
   type TaskDetail,
   type TaskPatch,
   type TaskStatus,
+  PROTECTED_CLASSES,
   isClosed,
   isHeld,
   quoteLines,
+  restoreSet,
 } from '@agflow/core';
 import { statusFor } from './agents';
 import { findAttempt, listAttempts } from './attempt-store';
@@ -204,6 +206,15 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
       if (reaches(ctx, dependency, id)) throw badRequest(`depending on ${dependency} would create a dependency cycle`);
     }
     const contract: TaskContract = { ...contractOf(task), ...patch };
+    // A person's task exempts the people-only paths its owned paths include (design 7.3), so giving it more of them
+    // is a person's decision: an agent, even the lead, would widen what runner agents may change.
+    if (actor.startsWith('agent:')) {
+      const after = restoreSet({ ...task, ownedPaths: contract.ownedPaths, kind: contract.kind });
+      const widened = restoreSet(task).some(
+        (pattern) => PROTECTED_CLASSES.people_only.includes(pattern) && !after.includes(pattern),
+      );
+      if (widened) throw forbidden('only a person can give a task people-only paths');
+    }
     if (isHeld(task.status)) {
       // Decision 8 also covers paths a held task gains. Only the added ones are checked, so an overlap
       // that is already there does not block an unrelated change.

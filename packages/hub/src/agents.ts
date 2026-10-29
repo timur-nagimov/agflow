@@ -1,11 +1,11 @@
 import type { Agent, AgentOrigin, AgentRole, AgentStatus, AttemptStatus, Vendor } from '@agflow/core';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
-import { forbidden, notFound } from './errors';
+import { conflict, forbidden, notFound } from './errors';
+import { emptySeat, getHubState, seatHolderId, takeSeat } from './hub-state';
 
 export const ACTIVE_MS = 10 * 60_000;
 export const IDLE_MS = 2 * 60 * 60_000;
-export const LEAD_STALE_MS = 15 * 60_000;
 
 interface AgentRow {
   id: string;
@@ -88,16 +88,6 @@ export function listAgents(ctx: HubContext): Agent[] {
   return (ctx.db.query(`${AGENT_SELECT} ORDER BY agents.seq`).all() as AgentRow[]).map((row) => toAgent(ctx, row));
 }
 
-export function currentLead(ctx: HubContext): Agent | null {
-  const row = ctx.db
-    .query(
-      `${AGENT_SELECT} WHERE agents.role = 'lead' AND agents.last_seen_at > $cutoff
-       ORDER BY agents.last_seen_at DESC LIMIT 1`,
-    )
-    .get({ cutoff: ctx.now() - LEAD_STALE_MS }) as AgentRow | null;
-  return row ? toAgent(ctx, row) : null;
-}
-
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 export function randomHelloCode(): string {
@@ -122,9 +112,13 @@ export function startLiveSession(ctx: HubContext, user: string, input: SessionSt
   return tx(ctx, (emit) => {
     const now = ctx.now();
     const existing = findAgentBySession(ctx, input.vendor, input.sessionId);
+    // A chat must not take over a runner agent's identity, nor demote a runner lead through it.
+    if (existing?.origin === 'runner') throw conflict('this session belongs to a runner agent');
     if (existing && existing.user !== user) throw forbidden('this session belongs to another user');
-    const lead = currentLead(ctx);
-    const leadSeatTakenBy = input.role === 'lead' && lead !== null && lead.id !== existing?.id ? lead : null;
+    // The seat, never the role column, decides who leads (design 6.11). A runner lead is never demoted here.
+    const holder = seatHolderId(ctx);
+    const seated = holder !== null && holder === existing?.id;
+    const leadSeatTakenBy = input.role === 'lead' && holder !== null && !seated ? getAgent(ctx, holder) : null;
     const role: AgentRole = input.role === 'lead' && leadSeatTakenBy === null ? 'lead' : 'worker';
     const helloCode = randomHelloCode();
     let id: string;
@@ -153,14 +147,9 @@ export function startLiveSession(ctx: HubContext, user: string, input: SessionSt
           now,
         });
     }
-    if (role === 'lead') {
-      const demoted = ctx.db
-        .query("UPDATE agents SET role = 'worker' WHERE role = 'lead' AND id != $id RETURNING id")
-        .all({ id }) as { id: string }[];
-      if (existing?.role !== 'lead') {
-        emit({ type: 'agent.lead_changed', actor: `user:${user}`, subject: id, data: { previous: demoted.map((row) => row.id) } });
-      }
-    }
+    if (role === 'lead' && !seated) takeSeat(ctx, emit, id, 'live', `user:${user}`);
+    // The holder starting again as a worker gives the seat up.
+    if (role === 'worker' && getHubState(ctx).leadAgentId === id) emptySeat(ctx, emit, `user:${user}`, id);
     emit({
       type: 'agent.session_started',
       actor: `user:${user}`,

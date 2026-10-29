@@ -6,7 +6,7 @@ import {
   UpdateGoalInputSchema,
   diffGoal,
 } from '@agflow/core';
-import { currentLead, listAgents } from '../agents';
+import { getAgent, listAgents } from '../agents';
 import type { HubContext } from '../context';
 import { notFound } from '../errors';
 import {
@@ -18,11 +18,12 @@ import {
   listGoalVersions,
   updateGoal,
 } from '../goal';
+import { hubEpoch, leadSeat } from '../hub-state';
 import { listMessages } from '../messages';
 import { getProject, setPaused } from '../project';
 import { listTasks } from '../task-store';
 import type { App } from './app';
-import { actor, human, leadOrHuman, principal, readBody, readQuery } from './util';
+import { actor, human, leadBody, principal, readBody, readQuery } from './util';
 
 export function mountProjectRoutes(app: App, ctx: HubContext): void {
   app.get('/api/project', (c) => {
@@ -41,23 +42,14 @@ export function mountProjectRoutes(app: App, ctx: HubContext): void {
     const counts: Record<string, number> = {};
     for (const task of listTasks(ctx)) counts[task.status] = (counts[task.status] ?? 0) + 1;
     const project = getProject(ctx);
-    const lead = currentLead(ctx);
+    const seat = leadSeat(ctx);
     const status: HubStatus = {
       project,
       goalVersion: currentGoalVersion(ctx),
-      lead,
-      // Only live chats lead so far, and nothing records when one took the seat.
-      leadSeat: {
-        kind: lead ? 'live' : 'none',
-        agentId: lead?.id ?? null,
-        attemptId: null,
-        runnerId: null,
-        since: null,
-        wakeups: 0,
-        runnerLeads: project.runnerLeads,
-      },
-      // A hub starts at epoch 1; only a restore raises it.
-      epoch: 1,
+      // The seat holder's agent, for the readers that predate leadSeat (the CLI's status, M1 pages).
+      lead: seat.agentId ? getAgent(ctx, seat.agentId) : null,
+      leadSeat: seat,
+      epoch: hubEpoch(ctx),
       counts,
       activeAgents: listAgents(ctx).filter((agent) => agent.status === 'active').length,
       humansInbox: listMessages(ctx, { target: 'humans', limit: 20 }),
@@ -92,8 +84,7 @@ export function mountProjectRoutes(app: App, ctx: HubContext): void {
   });
 
   app.post('/api/goal/notes', async (c) => {
-    const p = leadOrHuman(c);
-    const { text } = await readBody(c, GoalNoteInputSchema);
-    return c.json(addGoalNote(ctx, text, actor(p)), 201);
+    const { lead, body: { text } } = await leadBody(c, ctx, GoalNoteInputSchema);
+    return c.json(addGoalNote(ctx, text, actor(lead)), 201);
   });
 }

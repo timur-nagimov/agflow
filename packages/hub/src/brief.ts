@@ -2,6 +2,7 @@ import { type Agent, type TaskStatus, quoteLines } from '@agflow/core';
 import type { HubContext } from './context';
 import { listEvents } from './events';
 import { currentGoalVersion, getCurrentGoal } from './goal';
+import { holdsSeat } from './hub-state';
 import { listStandingRules, unreadFor } from './messages';
 import { getProject } from './project';
 import { findTask, listTasks } from './task-store';
@@ -39,7 +40,9 @@ const OPEN_STATUSES = new Set<TaskStatus>([
 export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions = {}): string {
   const project = getProject(ctx);
   const goal = getCurrentGoal(ctx);
-  const role = agent.role === 'lead' ? 'the lead manager' : 'a worker';
+  // The brief briefs a lead only while the agent holds the seat, whatever its role column says.
+  const lead = holdsSeat(ctx, agent.id);
+  const role = lead ? 'the lead manager' : 'a worker';
   const parts: string[] = [
     `# agflow brief for ${agent.id}`,
     `You are agflow agent ${agent.id}, ${role}, running on ${agent.vendor}, in project "${project.name}" (${project.repo}).`,
@@ -53,7 +56,7 @@ export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions 
     );
   }
   if (project.paused) parts.push('THE PROJECT IS PAUSED. Do not start new work. Finish or hand off what you hold.');
-  parts.push(agent.role === 'lead' ? LEAD_GUIDE : WORKER_GUIDE);
+  parts.push(lead ? LEAD_GUIDE : WORKER_GUIDE);
   parts.push(`## Goal${goal ? ` (v${goal.version})` : ''}\n${goal ? clip(goal.text, 2500) : 'No goal has been set yet.'}`);
   parts.push(standingRules(ctx));
   const unread = unreadFor(ctx, agent).length;
@@ -62,7 +65,7 @@ export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions 
   const room = BRIEF_LIMIT - messages.length - 2;
   const head = parts.join('\n\n');
   const section =
-    agent.role === 'lead' ? situationReport(ctx) : yourTask(ctx, agent, Math.min(BRIEF_TASK_LIMIT, room - head.length - 2));
+    lead ? situationReport(ctx) : yourTask(ctx, agent, Math.min(BRIEF_TASK_LIMIT, room - head.length - 2));
   return `${clip(`${head}\n\n${section}`, room)}\n\n${messages}`;
 }
 

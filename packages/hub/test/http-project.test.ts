@@ -79,7 +79,7 @@ describe('project and status routes', () => {
     const lead = addAgent(hub.ctx, 'alice', 'lead');
     const after = await hub.call('GET', '/api/status', { user: 'bob', via: 'web' });
     expect(after.json.lead).toMatchObject({ id: lead.id, role: 'lead' });
-    expect(after.json.leadSeat).toEqual({ kind: 'live', agentId: lead.id, ...seat });
+    expect(after.json.leadSeat).toEqual({ kind: 'live', agentId: lead.id, ...seat, since: hub.ctx.now() });
     expect(after.json.epoch).toBe(1);
   });
 });

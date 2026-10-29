@@ -34,7 +34,7 @@ import {
 } from '../tasks';
 import { listTasks } from '../task-store';
 import type { App } from './app';
-import { actor, agentOf, holderOf, human, leadOrHuman, principal, readBody } from './util';
+import { actor, agentOf, holderOf, human, leadBody, principal, readBody } from './util';
 
 export function mountTaskRoutes(app: App, ctx: HubContext): void {
   app.get('/api/tasks', (c) => {
@@ -55,45 +55,38 @@ export function mountTaskRoutes(app: App, ctx: HubContext): void {
 
   // The lead or a person.
   app.post('/api/tasks', async (c) => {
-    const p = leadOrHuman(c);
-    const { tasks } = await readBody(c, CreateTasksInputSchema);
-    return c.json({ tasks: createTasks(ctx, tasks, actor(p)) }, 201);
+    const { lead, body: { tasks } } = await leadBody(c, ctx, CreateTasksInputSchema);
+    return c.json({ tasks: createTasks(ctx, tasks, actor(lead)) }, 201);
   });
 
   app.patch('/api/tasks/:id', async (c) => {
-    const p = leadOrHuman(c);
-    const patch = await readBody(c, TaskPatchSchema);
-    return c.json({ task: updateTask(ctx, c.req.param('id'), patch, actor(p)) });
+    const { lead, body: patch } = await leadBody(c, ctx, TaskPatchSchema);
+    return c.json({ task: updateTask(ctx, c.req.param('id'), patch, actor(lead)) });
   });
 
   app.post('/api/tasks/:id/cancel', async (c) => {
-    const p = leadOrHuman(c);
-    const { reason } = await readBody(c, ReasonInputSchema);
-    return c.json({ task: cancelTask(ctx, c.req.param('id'), reason, actor(p)) });
+    const { lead, body: { reason } } = await leadBody(c, ctx, ReasonInputSchema);
+    return c.json({ task: cancelTask(ctx, c.req.param('id'), reason, actor(lead)) });
   });
 
   app.post('/api/tasks/:id/accept', async (c) => {
-    const p = leadOrHuman(c);
-    const { note } = await readBody(c, NoteInputSchema);
-    return c.json({ task: acceptTask(ctx, c.req.param('id'), actor(p), note) });
+    const { lead, body: { note } } = await leadBody(c, ctx, NoteInputSchema);
+    return c.json({ task: acceptTask(ctx, c.req.param('id'), actor(lead), note) });
   });
 
   app.post('/api/tasks/:id/reject', async (c) => {
-    const p = leadOrHuman(c);
-    const { feedback } = await readBody(c, FeedbackInputSchema);
-    return c.json({ task: rejectTask(ctx, c.req.param('id'), actor(p), feedback) });
+    const { lead, body: { feedback } } = await leadBody(c, ctx, FeedbackInputSchema);
+    return c.json({ task: rejectTask(ctx, c.req.param('id'), actor(lead), feedback) });
   });
 
   app.post('/api/tasks/:id/unblock', async (c) => {
-    const p = leadOrHuman(c);
-    const { note } = await readBody(c, NoteInputSchema);
-    return c.json({ task: unblockTask(ctx, c.req.param('id'), actor(p), note) });
+    const { lead, body: { note } } = await leadBody(c, ctx, NoteInputSchema);
+    return c.json({ task: unblockTask(ctx, c.req.param('id'), actor(lead), note) });
   });
 
   app.post('/api/tasks/:id/merged', async (c) => {
-    const p = leadOrHuman(c);
-    const { sha } = await readBody(c, MarkMergedInputSchema);
-    return c.json({ task: markMerged(ctx, c.req.param('id'), actor(p), sha) });
+    const { lead, body: { sha } } = await leadBody(c, ctx, MarkMergedInputSchema);
+    return c.json({ task: markMerged(ctx, c.req.param('id'), actor(lead), sha) });
   });
 
   // People only.

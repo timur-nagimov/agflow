@@ -3,9 +3,9 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LEAD_STALE_MS, getAgent } from '../src/agents';
+import { getAgent } from '../src/agents';
 import { createContext } from '../src/context';
-import { SCHEMA_V1, migrate, nextId, openDb } from '../src/db';
+import { M1_LEAD_STALE_MS, SCHEMA_V1, migrate, nextId, openDb } from '../src/db';
 import { type HubStateRow, getHubState, hubEpoch, updateHubState } from '../src/hub-state';
 import { getProject } from '../src/project';
 import { getTask, listTaskNotes } from '../src/tasks';
@@ -211,7 +211,7 @@ describe('hub_state', () => {
 
   test("M1's live lead keeps the seat when it was seen within 15 minutes", () => {
     const path = tempDbPath();
-    v1Database(path, NOW - LEAD_STALE_MS + 1);
+    v1Database(path, NOW - M1_LEAD_STALE_MS + 1);
     const db = openDb(path, NOW);
     expect(db.query('SELECT last_alive_at, lead_agent_id, lead_kind, lead_since FROM hub_state').get()).toEqual({
       last_alive_at: NOW,
@@ -224,7 +224,7 @@ describe('hub_state', () => {
 
   test('a lead unseen for 15 minutes leaves the seat empty', () => {
     const path = tempDbPath();
-    v1Database(path, NOW - LEAD_STALE_MS);
+    v1Database(path, NOW - M1_LEAD_STALE_MS);
     const db = openDb(path, NOW);
     expect(db.query('SELECT lead_agent_id, lead_kind, lead_since FROM hub_state').get()).toEqual({
       lead_agent_id: null,

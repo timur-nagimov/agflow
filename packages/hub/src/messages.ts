@@ -2,6 +2,7 @@ import { type Agent, type Message, type MessageView, parseTarget } from '@agflow
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
 import { badRequest, notFound } from './errors';
+import { holdsSeat } from './hub-state';
 
 export interface MessageRow {
   id: number;
@@ -94,7 +95,8 @@ export function unreadFor(ctx: HubContext, agent: Agent): Message[] {
   const rows = ctx.db.query(UNREAD_SQL).all({
     self: `agent:${agent.id}`,
     id: agent.id,
-    isLead: agent.role === 'lead' ? 1 : 0,
+    // Lead messages are for the seat holder alone, whatever an agent's role column says.
+    isLead: holdsSeat(ctx, agent.id) ? 1 : 0,
     taskTarget: agent.currentTask ? `task:${agent.currentTask}` : null,
     createdAt: agent.createdAt,
   }) as MessageRow[];
