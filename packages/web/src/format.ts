@@ -3,6 +3,7 @@ import {
   type BlockedKind,
   type Evidence,
   type HubEvent,
+  type HubEventType,
   type Message,
   type MessageView,
   type NewTaskInput,
@@ -407,12 +408,121 @@ const count = (value: unknown, noun: string): string => {
   const n = Array.isArray(value) ? value.length : 0;
   return `${n} ${noun}${n === 1 ? '' : 's'}`;
 };
+const list = (value: unknown): string => (Array.isArray(value) ? value.map(String).join(', ') : '');
+/** Codes such as failed_to_start, in words. */
+const words = (value: unknown): string => text(value).replaceAll('_', ' ');
+const sha7 = (value: unknown): string => shortSha(text(value));
+const vendorName = (value: unknown): string => (value === 'claude' || value === 'codex' ? VENDOR_NAMES[value] : text(value));
+/** How long after the event a time in its data is ('2 h'), or '' without one. */
+const later = (event: HubEvent, value: unknown): string =>
+  typeof value === 'number' && value > event.ts ? duration(value - event.ts) : '';
+
+function quotaSentence(owner: string, vendor: string, quota: unknown, event: HubEvent): string {
+  const q = (quota ?? {}) as { state?: unknown; resetsAt?: unknown; windows?: { fiveHour?: unknown; weekly?: unknown } };
+  const of = `${owner}'s ${vendor} quota`;
+  if (q.state === 'exhausted') {
+    const reset = later(event, q.resetsAt);
+    return reset ? `${of} ran out; it resets ${reset} later` : `${of} ran out`;
+  }
+  const windows = [
+    typeof q.windows?.fiveHour === 'number' ? `${percent(q.windows.fiveHour)} of the 5-hour window` : '',
+    typeof q.windows?.weekly === 'number' ? `${percent(q.windows.weekly)} of the week` : '',
+  ].filter(Boolean);
+  return q.state === 'ok' && windows.length > 0 ? `${of}: ${windows.join(', ')}` : `${of} is unknown`;
+}
+
+type Sentence = (d: Record<string, unknown>, by: string, on: string, event: HubEvent) => string;
+
+/**
+ * The sentences of the event types M2 adds (design 6.17), keyed by core's HubEventType, so a type core adds and this
+ * table misses fails the typecheck. Each reads only the data keys core's HUB_EVENT_TYPES records for its type, which
+ * the unit test checks. Attempt events name the attempt from data.attemptId; their subject is the task (or, for a
+ * lead attempt, the attempt itself).
+ */
+const M2_SENTENCES: Record<HubEventType, Sentence> = {
+  'runner.online': (d, _by, on) => `${text(d.runnerId) || on} came online`,
+  'runner.offline': (d, _by, on) =>
+    d.state === 'needs_login'
+      ? `${text(d.runnerId) || on} went offline: its login no longer verifies, so it needs agflow login`
+      : `${text(d.runnerId) || on} went offline`,
+  'runner.updated': (d, by, on) =>
+    `${by} changed ${text(d.runnerId) || on}'s settings${Array.isArray(d.fields) ? ` (${list(d.fields)})` : ''}`,
+  'runner.retired': (d, by, on) => `${by} retired ${text(d.runnerId) || on}`,
+  'runner.event_rejected': (d, _by, on) =>
+    `The hub refused ${text(d.type)} #${String(d.seq)} from ${text(d.runnerId) || on}: ${text(d.error)}`,
+  'account.quota_changed': (d, _by, on, event) => quotaSentence(on, vendorName(d.vendor), d.quota, event),
+  'account.owner_away': (d, _by, on) =>
+    `${on} seems away: an approval timed out, so their ${vendorName(d.vendor)} account takes no new work until they act`,
+  'attempt.started': (d) =>
+    `${text(d.attemptId)} started: ${text(d.agentId)}, a ${vendorName(d.vendor)} ${text(d.role)}${
+      d.runnerId ? ` on ${text(d.runnerId)}` : ' in a live chat'
+    }`,
+  'attempt.running': (d) => `${text(d.attemptId)} is running`,
+  'attempt.quota_wait': (d, _by, _on, event) => {
+    const reset = later(event, d.resetsAt);
+    return `${text(d.attemptId)} is waiting for quota${reset ? `; it resets ${reset} later` : ''}`;
+  },
+  // A task attempt holds while its submission is reviewed; a lead's holds once its process exits, until a delivery.
+  'attempt.holding': (d) =>
+    d.submissionId
+      ? `${text(d.attemptId)} is holding while ${text(d.submissionId)} is reviewed`
+      : `${text(d.attemptId)} is holding until its next message`,
+  'attempt.resumed': (d) => `${text(d.attemptId)} resumed${d.reason ? `: ${text(d.reason)}` : ''}`,
+  'attempt.ended': (d) => `${text(d.attemptId)} ended: ${words(d.endReason)}`,
+  'attempt.wip': (d) =>
+    `${text(d.attemptId)} pushed work in progress at ${sha7(d.sha)}${
+      Array.isArray(d.stripped) && d.stripped.length > 0 ? `, without ${count(d.stripped, 'protected path')}` : ''
+    }`,
+  'attempt.violation': (d) => `${text(d.attemptId)} changed protected paths (${text(d.phase)}): ${list(d.paths)}`,
+  'attempt.late_work': (d) => `${text(d.attemptId)} pushed late work at ${sha7(d.sha)}`,
+  'attempt.prepared': (d) =>
+    d.ok
+      ? `Dependencies are ready for ${text(d.attemptId)}`
+      : `Preparing dependencies for ${text(d.attemptId)} failed: ${text(d.error)}`,
+  'agent.stalled': (d) => `${text(d.agentId)} stalled on ${text(d.attemptId)}: ${text(d.reason)}`,
+  'agent.stopped': (d, by) =>
+    `${by} ${d.cause === 'stop_hold' ? 'stopped and held' : 'stopped'} ${text(d.agentId)} on ${text(d.attemptId)}: ${text(d.reason)}`,
+  'agent.replaced': (d, by) => `${by} replaced ${text(d.agentId)} on ${text(d.attemptId)}: ${text(d.reason)}`,
+  'approval.requested': (d) => `${text(d.agentId)} asked for approval on ${text(d.attemptId)}: ${text(d.summary)}`,
+  'approval.decided': (d, by) =>
+    `${by} ${d.decision === 'approve' ? 'approved' : 'declined'} ${text(d.agentId)}'s request: ${text(d.summary)}`,
+  'approval.expired': (d) => `${text(d.agentId)}'s request expired unanswered and was declined: ${text(d.summary)}`,
+  'approval.voided': (d) => `${text(d.agentId)}'s request no longer applies: ${text(d.summary)}`,
+  'lead.seat_changed': (d) => {
+    if (d.kind === 'none' || !d.agentId) return 'The lead seat is empty';
+    return `${text(d.agentId)} took the lead seat ${d.kind === 'runner' ? `on ${text(d.runnerId)}` : 'in a live chat'}`;
+  },
+  'lead.rotated': (d) => `The lead ${text(d.agentId)} rotated out: ${text(d.reason)}`,
+  'submission.pending': (d) => `${text(d.attemptId)} is submitting ${text(d.submissionId)}`,
+  'submission.recorded': (d) =>
+    `${text(d.attemptId)} submitted ${text(d.submissionId)} at ${sha7(d.headSha)}${d.branch ? ` on ${text(d.branch)}` : ''}`,
+  'submission.failed': (d) => `${text(d.submissionId)} from ${text(d.attemptId)} failed: ${text(d.error)}`,
+  'task.taken_over': (d, by, on) => `${who(text(d.person)) || by} took ${text(d.taskId) || on} over from ${text(d.attemptId)}`,
+  'task.handed_back': (d, by, on) =>
+    `${by} handed ${text(d.taskId) || on} back from ${d.source === 'clone' ? "the runner's clone" : text(d.ref)}${
+      d.sha ? ` at ${sha7(d.sha)}` : ''
+    }`,
+  'task.refs_deleted': (d, _by, on) => `${text(d.runnerId)} deleted ${count(d.refs, 'ref')} of ${text(d.taskId) || on}`,
+  'guard.plan_change': (d) =>
+    `${text(d.agentId)} called ${text(d.call)} on ${list(d.taskIds)}: ${String(d.count)} plan changes in the last hour`,
+  'guard.dispatch_paused': (d, _by, _on, event) => {
+    const pause = later(event, d.until);
+    return `Worker dispatch paused${pause ? ` for ${pause}` : ''} after ${String(d.count)} plan changes in an hour by ${text(d.agentId)}`;
+  },
+  'system.recovery_started': (d) =>
+    `The hub was down for ${duration(typeof d.gapMs === 'number' ? d.gapMs : 0)}; it recovers before it starts new work`,
+  'system.recovery_ended': () => 'The hub finished recovering',
+  'system.restored': (d) => `The hub was restored from a backup (epoch ${String(d.epoch)})`,
+};
+
+const isM2Type = (type: string): type is HubEventType => Object.hasOwn(M2_SENTENCES, type);
 
 /** One plain sentence per event, for the timeline and task histories. */
 export function describeEvent(event: HubEvent): string {
   const by = who(event.actor);
   const on = event.subject ?? '';
   const d = event.data;
+  if (isM2Type(event.type)) return M2_SENTENCES[event.type](d, by, on, event);
   switch (event.type) {
     case 'task.created':
       return `${by} created ${on} “${text(d.title)}”`;
@@ -433,7 +543,8 @@ export function describeEvent(event: HubEvent): string {
     case 'task.stale':
       return `${on} went stale: ${text(d.holder) || 'its agent'} stopped responding`;
     case 'task.ready':
-      return `${on} is ready`;
+      // Only the hub's hand-back fallback gives a reason: the runner had no link, or the clone's push timed out (X-49).
+      return d.reason ? `${on} is ready again without the clone's work: ${text(d.reason)}` : `${on} is ready`;
     case 'task.blocked':
       return d.reason ? `${by} reported ${on} blocked: ${text(d.reason)}` : `${on} is waiting on other tasks`;
     case 'task.impossible':
@@ -449,7 +560,7 @@ export function describeEvent(event: HubEvent): string {
     case 'task.returned':
       return `${on} went back to ${text(d.to)} for another try`;
     case 'task.merged':
-      return `${by} marked ${on} merged${d.sha ? ` at ${text(d.sha).slice(0, 7)}` : ''}`;
+      return `${by} marked ${on} merged${d.sha ? ` at ${sha7(d.sha)}` : ''}`;
     case 'task.cancelled':
       return `${by} cancelled ${on}: ${text(d.reason)}`;
     case 'goal.updated':
@@ -479,8 +590,31 @@ export function describeEvent(event: HubEvent): string {
   }
 }
 
-export function eventTone(type: string): Tone {
+/** Attempt endings that went wrong; the others are a person's or the ladder's decision. */
+const TROUBLED_ENDINGS = new Set(['crashed', 'lost', 'stalled']);
+
+/** The tone of an attempt.ended event. A refused start (failed_to_start with no failure class, X-3) only waits. */
+function endingTone(data: Record<string, unknown>): Tone {
+  if (data.endReason === 'accepted') return 'done';
+  if (data.endReason === 'failed_to_start') return data.failureClass === null ? 'wait' : 'trouble';
+  return TROUBLED_ENDINGS.has(text(data.endReason)) ? 'trouble' : 'closed';
+}
+
+/** The tone of an event; a few M2 types take theirs from the data (an attempt's end reason, a quota's state). */
+export function eventTone(type: string, data: Record<string, unknown> = {}): Tone {
   switch (type) {
+    case 'attempt.ended':
+      return endingTone(data);
+    case 'attempt.prepared':
+      return data.ok ? 'active' : 'trouble';
+    case 'approval.decided':
+      return data.decision === 'approve' ? 'done' : 'closed';
+    case 'account.quota_changed':
+      return (data.quota as { state?: unknown } | null)?.state === 'exhausted' ? 'trouble' : 'wait';
+    case 'lead.seat_changed':
+      return data.kind === 'none' ? 'wait' : 'active';
+    case 'task.handed_back':
+    case 'system.recovery_ended':
     case 'task.accepted':
     case 'task.merged':
     case 'project.resumed':
@@ -488,6 +622,9 @@ export function eventTone(type: string): Tone {
     case 'task.submitted':
     case 'goal.updated':
     case 'goal.note_added':
+    case 'submission.recorded':
+    case 'attempt.holding':
+    case 'approval.requested':
       return 'review';
     case 'task.claimed':
     case 'task.working':
@@ -495,6 +632,13 @@ export function eventTone(type: string): Tone {
     case 'task.handoff_written':
     case 'task.claim_transferred':
     case 'task.returned':
+    case 'runner.online':
+    case 'attempt.started':
+    case 'attempt.running':
+    case 'attempt.resumed':
+    case 'attempt.wip':
+    case 'submission.pending':
+    case 'task.taken_over':
       return 'active';
     case 'task.rejected':
     case 'task.blocked':
@@ -502,33 +646,60 @@ export function eventTone(type: string): Tone {
     case 'task.stale':
     case 'guard.tripped':
     case 'project.paused':
+    case 'runner.event_rejected':
+    case 'account.owner_away':
+    case 'attempt.violation':
+    case 'attempt.late_work':
+    case 'agent.stalled':
+    case 'approval.expired':
+    case 'submission.failed':
+    case 'guard.dispatch_paused':
       return 'trouble';
     case 'task.cancelled':
     case 'message.delivered':
     case 'message.acknowledged':
+    case 'runner.retired':
+    case 'agent.stopped':
+    case 'approval.voided':
+    case 'task.refs_deleted':
       return 'closed';
     default:
       return 'wait';
   }
 }
 
-export type EventCategory = 'goal' | 'tasks' | 'messages' | 'agents' | 'project';
+export type EventCategory = 'goal' | 'tasks' | 'attempts' | 'runners' | 'messages' | 'agents' | 'project';
 
 export const EVENT_CATEGORIES: { key: EventCategory; label: string }[] = [
   { key: 'goal', label: 'Goal' },
   { key: 'tasks', label: 'Tasks' },
+  { key: 'attempts', label: 'Attempts' },
+  { key: 'runners', label: 'Runners' },
   { key: 'messages', label: 'Messages' },
   { key: 'agents', label: 'Agents' },
   { key: 'project', label: 'Project' },
 ];
 
+/** The timeline filter an event type belongs to, by its prefix; system and guard events are the project's. */
 export function categoryOf(type: string): EventCategory {
   const prefix = type.slice(0, type.indexOf('.'));
   if (prefix === 'task') return 'tasks';
   if (prefix === 'goal') return 'goal';
+  if (prefix === 'attempt' || prefix === 'submission' || prefix === 'approval') return 'attempts';
+  if (prefix === 'runner' || prefix === 'account') return 'runners';
   if (prefix === 'message' || prefix === 'rule') return 'messages';
-  if (prefix === 'agent') return 'agents';
+  if (prefix === 'agent' || prefix === 'lead') return 'agents';
   return 'project';
+}
+
+/** An event about a task: its subject is the task, or its data names it (the events of the task's attempts). */
+export function concernsTask(event: Pick<HubEvent, 'subject' | 'data'>, taskId: string): boolean {
+  return event.subject === taskId || event.data.taskId === taskId;
+}
+
+/** An event about an attempt: its data names it, or it is a lead attempt's event, whose subject is the attempt. */
+export function concernsAttempt(event: Pick<HubEvent, 'subject' | 'data'>, attemptId: string): boolean {
+  return event.data.attemptId === attemptId || event.subject === attemptId;
 }
 
 /** Merges live and loaded events without duplicates, newest first. */
