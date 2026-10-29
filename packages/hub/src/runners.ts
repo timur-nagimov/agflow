@@ -12,6 +12,7 @@ import {
   type Vendor,
 } from '@agflow/core';
 import { verifySessionHash } from './auth';
+import { type CommandRow, type StoredCommand, cancelPendingSettings, enqueueCommand } from './commands';
 import { type HubContext, afterCommit, tx } from './context';
 import { nextId } from './db';
 import { notFound } from './errors';
@@ -376,4 +377,198 @@ export function markRetired(ctx: HubContext, emit: Emit, runnerId: string, actor
   emit({ type: 'runner.retired', actor, subject: runnerId, data: { runnerId, name: row.name } });
   afterCommit(ctx, () => ctx.link.closeRunner(runnerId, CLOSE_CODES.refused, RETIRED_REASON));
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Settings sync (design 6.3): runner.json is the source, and only the hub assigns versions. Ceilings and paid usage
+// are records per vendor, and each vendor's entry counts as its own field, as on the runner.
+// ---------------------------------------------------------------------------
+
+export type SettingsValues = Omit<RunnerSettings, 'version'>;
+export type SettingsChanges = Partial<SettingsValues>;
+
+/** The settings the hub confirmed last, with their version. */
+export function runnerSettings(row: RunnerRow): RunnerSettings {
+  const info = runnerInfo(row);
+  return {
+    capacity: row.capacity,
+    keepAwake: row.keep_awake,
+    draining: row.draining === 1,
+    ceilings: info.ceilings,
+    allowPaidUsage: info.allowPaidUsage,
+    version: row.settings_version,
+  };
+}
+
+/** Writes the given fields at the given version; per-vendor records merge vendor by vendor. */
+function writeSettings(ctx: HubContext, row: RunnerRow, changes: SettingsChanges, version: number): void {
+  const info = runnerInfo(row);
+  if (changes.ceilings) info.ceilings = { ...info.ceilings, ...changes.ceilings };
+  if (changes.allowPaidUsage) info.allowPaidUsage = { ...info.allowPaidUsage, ...changes.allowPaidUsage };
+  ctx.db
+    .query(
+      `UPDATE runners SET capacity = $capacity, keep_awake = $keepAwake, draining = $draining,
+         settings_version = $version, info = $info
+       WHERE id = $id`,
+    )
+    .run({
+      id: row.id,
+      capacity: changes.capacity ?? row.capacity,
+      keepAwake: changes.keepAwake ?? row.keep_awake,
+      draining: changes.draining === undefined ? row.draining : changes.draining ? 1 : 0,
+      version,
+      info: JSON.stringify(info),
+    });
+}
+
+function settingsCommand(settings: SettingsChanges, version: number): StoredCommand {
+  return { kind: 'update_settings', settings, version };
+}
+
+function existingRow(ctx: HubContext, runnerId: string): RunnerRow {
+  const row = findRunnerRow(ctx, runnerId);
+  if (!row) throw notFound(`runner ${runnerId}`);
+  return row;
+}
+
+/**
+ * Compares a hello's settings snapshot with the hub's (design 6.3, "Settings sync"), in the hello's transaction:
+ * - stored: a new runner (version 0 here) has its reported settings stored at version 1 and echoed;
+ * - unchanged: equal versions;
+ * - sent: the runner's version is older, as when its owner changed settings in the browser meanwhile, so the hub
+ *   sends all of its settings;
+ * - adopted: the runner's version is newer, which only a restored hub sees, so the hub takes its values and version
+ *   and cancels the older update_settings it still had queued.
+ */
+export function reconcileHelloSettings(
+  ctx: HubContext,
+  runnerId: string,
+  reported: RunnerSettings,
+): 'stored' | 'unchanged' | 'sent' | 'adopted' {
+  const row = existingRow(ctx, runnerId);
+  const { version, ...values } = reported;
+  if (row.settings_version === 0) {
+    writeSettings(ctx, row, values, 1);
+    enqueueCommand(ctx, runnerId, settingsCommand(values, 1));
+    return 'stored';
+  }
+  if (version === row.settings_version) return 'unchanged';
+  if (version > row.settings_version) {
+    writeSettings(ctx, row, values, version);
+    cancelPendingSettings(ctx, runnerId);
+    return 'adopted';
+  }
+  const { version: hubVersion, ...hubValues } = runnerSettings(row);
+  enqueueCommand(ctx, runnerId, settingsCommand(hubValues, hubVersion));
+  return 'sent';
+}
+
+/** Applies changes at the hub's version + 1, queues their update_settings echo, and emits runner.updated. */
+function changeSettings(
+  ctx: HubContext,
+  emit: Emit,
+  row: RunnerRow,
+  changes: SettingsChanges,
+  actor: string,
+): CommandRow {
+  const version = row.settings_version + 1;
+  writeSettings(ctx, row, changes, version);
+  emit({
+    type: 'runner.updated',
+    actor,
+    subject: row.id,
+    data: { runnerId: row.id, name: row.name, fields: Object.keys(changes) },
+  });
+  return enqueueCommand(ctx, row.id, settingsCommand(changes, version));
+}
+
+/**
+ * runner.settings: the runner's local edits (drain, undrain, a hand edit, the crash-loop self-drain). They apply
+ * whatever the event's baseVersion, because the runner sends again only edits that still differ from what the hub
+ * echoed. Returns the queued update_settings echo.
+ */
+export function applyRunnerSettings(ctx: HubContext, emit: Emit, runnerId: string, changes: SettingsChanges): CommandRow {
+  return changeSettings(ctx, emit, existingRow(ctx, runnerId), changes, `runner:${runnerId}`);
+}
+
+/** The owner's PATCH /api/runners/:id: a new version, sent to the runner with update_settings. */
+export function patchRunnerSettings(
+  ctx: HubContext,
+  emit: Emit,
+  runnerId: string,
+  patch: SettingsChanges,
+  actor: string,
+): Runner {
+  changeSettings(ctx, emit, existingRow(ctx, runnerId), patch, actor);
+  return getRunner(ctx, runnerId);
+}
+
+// ---------------------------------------------------------------------------
+// Vendor reports and the hub's vendor holds (design 6.3, 6.8, 6.9)
+// ---------------------------------------------------------------------------
+
+const NO_HOLD: VendorHold = { degradedUntil: null, failedStarts: 0, notReadySince: null };
+
+function changeHold(
+  ctx: HubContext,
+  runnerId: string,
+  vendor: Vendor,
+  change: (hold: VendorHold) => VendorHold,
+): VendorHold {
+  const holds = vendorHolds(existingRow(ctx, runnerId));
+  const next = change({ ...NO_HOLD, ...holds[vendor] });
+  holds[vendor] = next;
+  ctx.db
+    .query('UPDATE runners SET vendor_holds = $holds WHERE id = $id')
+    .run({ id: runnerId, holds: JSON.stringify(holds) });
+  return next;
+}
+
+/**
+ * Stores the vendors a hello or runner.vendors reports. Their degraded flags are ignored: the hub's holds decide. A
+ * report of a preflight run after a not-ready mark clears the mark.
+ */
+export function applyVendorReport(ctx: HubContext, runnerId: string, vendors: RunnerVendor[]): void {
+  const row = existingRow(ctx, runnerId);
+  const info = runnerInfo(row);
+  info.vendors = vendors;
+  const holds = vendorHolds(row);
+  for (const report of vendors) {
+    const hold = holds[report.vendor];
+    if (hold?.notReadySince != null && report.preflightAt !== null && report.preflightAt > hold.notReadySince) {
+      holds[report.vendor] = { ...hold, notReadySince: null };
+    }
+  }
+  ctx.db
+    .query('UPDATE runners SET info = $info, vendor_holds = $holds WHERE id = $id')
+    .run({ id: runnerId, info: JSON.stringify(info), holds: JSON.stringify(holds) });
+}
+
+/** Continuous vendor errors: no new attempts of the vendor on this runner for degradedMs (design 6.8). */
+export function setDegraded(ctx: HubContext, runnerId: string, vendor: Vendor): void {
+  const until = ctx.now() + ctx.config.degradedMs;
+  changeHold(ctx, runnerId, vendor, (hold) => ({ ...hold, degradedUntil: until }));
+}
+
+/**
+ * Marks the vendor not ready on this runner (two failed starts, an expired login) and asks the runner for a preflight,
+ * whose later report clears the mark. The failed-start count starts again. False when it was marked already.
+ */
+export function markVendorNotReady(ctx: HubContext, runnerId: string, vendor: Vendor): boolean {
+  const current = vendorHolds(existingRow(ctx, runnerId))[vendor];
+  if (current?.notReadySince != null) return false;
+  const now = ctx.now();
+  changeHold(ctx, runnerId, vendor, (hold) => ({ ...hold, notReadySince: now, failedStarts: 0 }));
+  enqueueCommand(ctx, runnerId, { kind: 'preflight', vendor });
+  return true;
+}
+
+/** Counts a failed start of the vendor on this runner (refusals are not counted); returns the consecutive count. */
+export function recordFailedStart(ctx: HubContext, runnerId: string, vendor: Vendor): number {
+  return changeHold(ctx, runnerId, vendor, (hold) => ({ ...hold, failedStarts: hold.failedStarts + 1 })).failedStarts;
+}
+
+/** A start that worked ends the run of failed ones. */
+export function resetFailedStarts(ctx: HubContext, runnerId: string, vendor: Vendor): void {
+  changeHold(ctx, runnerId, vendor, (hold) => ({ ...hold, failedStarts: 0 }));
 }

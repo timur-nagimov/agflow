@@ -233,6 +233,19 @@ export function cancelPendingCommands(ctx: HubContext, attemptId: string): Comma
   return rows.map(toRow).sort((a, b) => a.hubEpoch - b.hubEpoch || a.seq - b.seq);
 }
 
+/**
+ * Cancels the runner's pending update_settings, when the hub adopts a newer snapshot from its hello: every one of them
+ * carries an older version, which would undo the adopted settings on the runner. Returns how many.
+ */
+export function cancelPendingSettings(ctx: HubContext, runnerId: string): number {
+  return ctx.db
+    .query(
+      `UPDATE runner_commands SET status = 'cancelled', done_at = $now
+       WHERE runner_id = $runnerId AND kind = 'update_settings' AND status = 'pending'`,
+    )
+    .run({ runnerId, now: ctx.now() }).changes;
+}
+
 /** The attempt's pending resume_attempt, whose prompt and messages a re-fence carries over. */
 export function pendingResumeOf(ctx: HubContext, attemptId: string): CommandRow | null {
   const row = ctx.db

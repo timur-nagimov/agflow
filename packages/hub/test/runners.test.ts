@@ -4,25 +4,39 @@ import {
   PROTOCOL_VERSION,
   type RunnerMessage,
   RunnerSchema,
+  type RunnerSettings,
   type RunnerState,
   type RunnerVendor,
   TEST_ACCOUNT_ID,
 } from '@agflow/core';
 import { createSession, sessionHashOf } from '../src/auth';
+import { pendingCommands } from '../src/commands';
 import { tx } from '../src/context';
 import { listEvents } from '../src/events';
 import {
+  type RunnerRow,
+  applyRunnerSettings,
+  applyVendorReport,
   checkRunnerIdentity,
   deriveRunnerState,
   findRunner,
   findRunnerByKey,
+  findRunnerRow,
   getRunner,
   identifyRunner,
   listRunners,
   markLinked,
   markRetired,
   markUnlinked,
+  markVendorNotReady,
+  patchRunnerSettings,
+  reconcileHelloSettings,
+  recordFailedStart,
   refreshNeedsLogin,
+  resetFailedStarts,
+  runnerSettings,
+  setDegraded,
+  vendorHolds,
 } from '../src/runners';
 import { addRunnerAttempt, createTestContext } from './helpers';
 
@@ -361,5 +375,192 @@ describe('the runner view', () => {
     expect(closed).toEqual([]);
     tx(ctx, (emit) => markRetired(ctx, emit, 'R-1', 'user:alice'));
     expect(closed).toEqual([['R-1', CLOSE_CODES.refused, 'this runner was retired; run agflow runner setup']]);
+  });
+});
+
+describe('settings sync', () => {
+  const settings = (overrides: Partial<RunnerSettings> = {}): RunnerSettings => ({
+    capacity: 3,
+    keepAwake: 'always',
+    draining: false,
+    ceilings: {},
+    allowPaidUsage: {},
+    version: 0,
+    ...overrides,
+  });
+  const settingsCommands = (ctx: Ctx, runnerId = 'R-1') =>
+    pendingCommands(ctx, runnerId, PROTOCOL_VERSION)
+      .map((row) => row.command)
+      .filter((command) => command.kind === 'update_settings');
+
+  function registered(ctx: Ctx, reported = settings()) {
+    const result = identifyRunner(ctx, 'alice', hello({ settings: reported }));
+    if (!result.ok) throw new Error(result.reason);
+    return result.runner.id;
+  }
+
+  test('a new runner is stored at version 1 and echoed', () => {
+    const { ctx } = createTestContext();
+    const reported = settings({ ceilings: { codex: { fiveHour: 0.5, weekly: 0.9 } }, allowPaidUsage: { codex: true } });
+    const id = registered(ctx, reported);
+    expect(tx(ctx, () => reconcileHelloSettings(ctx, id, reported))).toBe('stored');
+    expect(runnerSettings(findRunnerRow(ctx, id) as RunnerRow)).toEqual({ ...reported, version: 1 });
+    const { version: _, ...values } = reported;
+    expect(settingsCommands(ctx)).toEqual([{ kind: 'update_settings', settings: values, version: 1 }]);
+  });
+
+  test('an equal version changes nothing; an older one gets the hub settings; a newer one is adopted', () => {
+    const { ctx } = createTestContext();
+    const id = registered(ctx);
+    tx(ctx, () => reconcileHelloSettings(ctx, id, settings()));
+    // Equal: the runner holds what the hub confirmed.
+    expect(tx(ctx, () => reconcileHelloSettings(ctx, id, settings({ version: 1 })))).toBe('unchanged');
+    expect(settingsCommands(ctx)).toHaveLength(1);
+    // Newer: a hub restored from a backup adopts what the runner was confirmed since.
+    const newer = settings({ capacity: 6, draining: true, allowPaidUsage: { claude: true }, version: 7 });
+    expect(tx(ctx, () => reconcileHelloSettings(ctx, id, newer))).toBe('adopted');
+    expect(runnerSettings(findRunnerRow(ctx, id) as RunnerRow)).toEqual(newer);
+    // The echo still queued carried an older version: it is cancelled rather than sent after the welcome.
+    expect(settingsCommands(ctx)).toEqual([]);
+    // Older: the hub's settings go back to the runner.
+    expect(tx(ctx, () => reconcileHelloSettings(ctx, id, settings({ version: 3 })))).toBe('sent');
+    expect(settingsCommands(ctx).at(-1)).toEqual({
+      kind: 'update_settings',
+      settings: { capacity: 6, keepAwake: 'always', draining: true, ceilings: {}, allowPaidUsage: { claude: true } },
+      version: 7,
+    });
+    expect(getRunner(ctx, id)).toMatchObject({ capacity: 6, draining: true, settingsVersion: 7 });
+  });
+
+  test("adopting a newer snapshot cancels the hub's queued echoes, so the runner keeps it", () => {
+    const { ctx } = createTestContext();
+    const id = registered(ctx);
+    tx(ctx, () => reconcileHelloSettings(ctx, id, settings()));
+    // A restored hub at version 1: the owner raises the capacity before the runner is back.
+    tx(ctx, (emit) => patchRunnerSettings(ctx, emit, id, { capacity: 5 }, 'user:alice'));
+    expect(settingsCommands(ctx).at(-1)).toMatchObject({ settings: { capacity: 5 }, version: 2 });
+    const newer = settings({ capacity: 2, draining: true, version: 7 });
+    expect(tx(ctx, () => reconcileHelloSettings(ctx, id, newer))).toBe('adopted');
+    expect(settingsCommands(ctx)).toEqual([]);
+    expect(getRunner(ctx, id)).toMatchObject({ capacity: 2, draining: true, settingsVersion: 7 });
+    // Other kinds stay queued.
+    tx(ctx, () => markVendorNotReady(ctx, id, 'claude'));
+    tx(ctx, () => reconcileHelloSettings(ctx, id, settings({ version: 9 })));
+    expect(pendingCommands(ctx, id, PROTOCOL_VERSION).map((row) => row.kind)).toEqual(['preflight']);
+  });
+
+  test('runner.settings applies the changed fields at the hub version + 1 and echoes them', () => {
+    const { ctx } = createTestContext();
+    const id = registered(ctx, settings({ ceilings: { claude: { fiveHour: 0.85, weekly: 0.85 } } }));
+    tx(ctx, () => reconcileHelloSettings(ctx, id, settings()));
+    const echo = tx(ctx, (emit) =>
+      applyRunnerSettings(ctx, emit, id, { draining: true, ceilings: { codex: { fiveHour: 0.4, weekly: 0.5 } } }),
+    );
+    expect(echo.command).toEqual({
+      kind: 'update_settings',
+      settings: { draining: true, ceilings: { codex: { fiveHour: 0.4, weekly: 0.5 } } },
+      version: 2,
+    });
+    // Each vendor's entry is its own field: a change for one vendor keeps the other's.
+    expect(runnerSettings(findRunnerRow(ctx, id) as RunnerRow)).toMatchObject({
+      draining: true,
+      ceilings: { claude: { fiveHour: 0.85, weekly: 0.85 }, codex: { fiveHour: 0.4, weekly: 0.5 } },
+      version: 2,
+    });
+    expect(eventsOf(ctx, 'runner.updated').map((event) => [event.actor, event.data])).toEqual([
+      [`runner:${id}`, { runnerId: id, name: 'alice-laptop', fields: ['draining', 'ceilings'] }],
+    ]);
+  });
+
+  test('patchRunnerSettings bumps the version and queues update_settings', () => {
+    const { ctx } = createTestContext();
+    const id = registered(ctx);
+    tx(ctx, () => reconcileHelloSettings(ctx, id, settings()));
+    const runner = tx(ctx, (emit) => patchRunnerSettings(ctx, emit, id, { capacity: 5, keepAwake: 'off' }, 'user:alice'));
+    expect(runner).toMatchObject({ capacity: 5, keepAwake: 'off', settingsVersion: 2 });
+    expect(settingsCommands(ctx).at(-1)).toEqual({
+      kind: 'update_settings',
+      settings: { capacity: 5, keepAwake: 'off' },
+      version: 2,
+    });
+    expect(eventsOf(ctx, 'runner.updated').at(-1)).toMatchObject({
+      actor: 'user:alice',
+      subject: id,
+      data: { runnerId: id, name: 'alice-laptop', fields: ['capacity', 'keepAwake'] },
+    });
+  });
+
+  test('a capacity change made in the browser and a drain made offline both survive', () => {
+    const { ctx } = createTestContext();
+    const id = registered(ctx);
+    tx(ctx, () => reconcileHelloSettings(ctx, id, settings()));
+    // The runner is away. Its owner raises the capacity in the browser; the runner drains itself meanwhile.
+    tx(ctx, (emit) => patchRunnerSettings(ctx, emit, id, { capacity: 5 }, 'user:alice'));
+    // Its next hello still carries the snapshot of version 1, never the local drain: the hub sends its settings.
+    expect(tx(ctx, () => reconcileHelloSettings(ctx, id, settings({ version: 1 })))).toBe('sent');
+    expect(settingsCommands(ctx).at(-1)).toMatchObject({ settings: { capacity: 5, draining: false }, version: 2 });
+    // The drain is a pending local edit the echo leaves alone, so the runner sends it after the echo.
+    const echo = tx(ctx, (emit) => applyRunnerSettings(ctx, emit, id, { draining: true }));
+    expect(echo.command).toEqual({ kind: 'update_settings', settings: { draining: true }, version: 3 });
+    expect(getRunner(ctx, id)).toMatchObject({ capacity: 5, draining: true, settingsVersion: 3 });
+  });
+});
+
+describe('vendor holds', () => {
+  const holdsOf = (ctx: Ctx, id = 'R-1') => vendorHolds(findRunnerRow(ctx, id) as RunnerRow);
+  const preflights = (ctx: Ctx) =>
+    pendingCommands(ctx, 'R-1', PROTOCOL_VERSION)
+      .map((row) => row.command)
+      .filter((command) => command.kind === 'preflight');
+
+  test('a degraded mark holds until its time, whatever the runner reports', () => {
+    const { ctx, clock } = createTestContext({ degradedMs: 60_000 });
+    linkedRunner(ctx);
+    tx(ctx, () => setDegraded(ctx, 'R-1', 'claude'));
+    expect(holdsOf(ctx).claude).toEqual({ degradedUntil: ctx.now() + 60_000, failedStarts: 0, notReadySince: null });
+    tx(ctx, () => applyVendorReport(ctx, 'R-1', [vendor({ degraded: false, preflightAt: ctx.now() + 1 })]));
+    expect(getRunner(ctx, 'R-1').vendors[0]?.degraded).toBe(true);
+    clock.advance(60_000);
+    expect(getRunner(ctx, 'R-1').vendors[0]?.degraded).toBe(false);
+  });
+
+  test('a not-ready mark asks for a preflight, and only a later preflight clears it', () => {
+    const { ctx, clock } = createTestContext();
+    linkedRunner(ctx);
+    const since = ctx.now();
+    expect(tx(ctx, () => markVendorNotReady(ctx, 'R-1', 'claude'))).toBe(true);
+    expect(holdsOf(ctx).claude?.notReadySince).toBe(since);
+    expect(preflights(ctx)).toEqual([{ kind: 'preflight', vendor: 'claude' }]);
+    // Marked already: no second preflight.
+    clock.advance(1_000);
+    expect(tx(ctx, () => markVendorNotReady(ctx, 'R-1', 'claude'))).toBe(false);
+    expect(preflights(ctx)).toHaveLength(1);
+    expect(getRunner(ctx, 'R-1').vendors[0]).toMatchObject({ ready: false });
+    // A report of a preflight from before the mark leaves it.
+    tx(ctx, () => applyVendorReport(ctx, 'R-1', [vendor({ preflightAt: since - 1 })]));
+    expect(holdsOf(ctx).claude?.notReadySince).toBe(since);
+    // Nor does one from the very moment of the mark: only a later preflight saw what the mark was about.
+    tx(ctx, () => applyVendorReport(ctx, 'R-1', [vendor({ preflightAt: since })]));
+    expect(holdsOf(ctx).claude?.notReadySince).toBe(since);
+    expect(getRunner(ctx, 'R-1').vendors[0]).toMatchObject({ ready: false });
+    tx(ctx, () => applyVendorReport(ctx, 'R-1', [vendor({ preflightAt: since + 1, plan: 'Claude Pro' })]));
+    expect(holdsOf(ctx).claude?.notReadySince).toBeNull();
+    expect(getRunner(ctx, 'R-1').vendors[0]).toMatchObject({ ready: true, plan: 'Claude Pro', preflightAt: since + 1 });
+  });
+
+  test('failed starts count per vendor until reset', () => {
+    const { ctx } = createTestContext();
+    linkedRunner(ctx);
+    expect(tx(ctx, () => recordFailedStart(ctx, 'R-1', 'claude'))).toBe(1);
+    expect(tx(ctx, () => recordFailedStart(ctx, 'R-1', 'codex'))).toBe(1);
+    expect(tx(ctx, () => recordFailedStart(ctx, 'R-1', 'claude'))).toBe(2);
+    tx(ctx, () => resetFailedStarts(ctx, 'R-1', 'claude'));
+    expect(holdsOf(ctx)).toEqual({
+      claude: { degradedUntil: null, failedStarts: 0, notReadySince: null },
+      codex: { degradedUntil: null, failedStarts: 1, notReadySince: null },
+    });
+    // The not-ready mark starts the count again.
+    tx(ctx, () => markVendorNotReady(ctx, 'R-1', 'codex'));
+    expect(holdsOf(ctx).codex?.failedStarts).toBe(0);
   });
 });
