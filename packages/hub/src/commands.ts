@@ -215,8 +215,11 @@ export function recordResult(
   });
 }
 
-/** Kinds that outlive the attempt's fence: they clean up after it or hand it back, so cancelling keeps them. */
-const KEPT_ON_CANCEL: readonly RunnerCommandKind[] = ['cleanup_attempt', 'upload_transcript', 'hand_back'];
+/**
+ * Kinds that outlive the attempt's fence: they clean up after it or hand it back, so cancelling keeps them, and a
+ * runner runs them for an attempt its welcome stopped.
+ */
+export const KEPT_ON_CANCEL: readonly RunnerCommandKind[] = ['cleanup_attempt', 'upload_transcript', 'hand_back'];
 
 /**
  * Cancels the attempt's pending commands, in the transaction that ends it or gives it a new fence. Cancelled commands

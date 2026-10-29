@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import {
-  type Attempt,
   type Fence,
   HubMessageSchema,
   RUNNER_COMMAND_KINDS,
@@ -22,89 +21,9 @@ import {
   toWireCommand,
 } from '../src/commands';
 import { type HubContext, afterCommit, tx } from '../src/context';
-import { addRunnerAttempt, createTestContext } from './helpers';
+import { addRunnerAttempt, createTestContext, sampleCommands } from './helpers';
 
 const sha = (char: string) => char.repeat(40);
-
-/** One tokenless command of each kind for the attempt; the mapped type makes the compiler insist on all 17. */
-function samples(attempt: Attempt): { [K in RunnerCommandKind]: Extract<StoredCommand, { kind: K }> } {
-  const { id: attemptId, fence } = attempt;
-  const restore = { paths: ['.claude/**'], base: 'refs/heads/main' };
-  return {
-    start_attempt: {
-      kind: 'start_attempt',
-      attempt: {
-        attemptId,
-        taskId: attempt.taskId,
-        role: 'worker',
-        vendor: 'claude',
-        model: null,
-        fence,
-        hubUrl: 'http://hub.test',
-        repo: { url: 'https://github.com/acme/demo', mainBranch: 'main' },
-        start: { ref: 'refs/heads/main', sha: null },
-        branch: 'agflow/T-1-do-the-thing',
-        wipRef: 'refs/agflow/T-1/a1',
-        restore,
-        acceptanceIds: ['A1'],
-        toolCaps: { defaultMs: 1_800_000, longMs: 5_400_000, checks: [] },
-        taskPack: '# T-1',
-        brief: 'You are an agflow worker.',
-        firstPrompt: 'Start.',
-        successor: false,
-      },
-    },
-    resume_attempt: {
-      kind: 'resume_attempt',
-      attemptId,
-      fence,
-      prompt: 'The runner restarted; continue from your last step.',
-      messages: [{ messageId: 4, authority: 'person', text: '> alice: also add a test' }],
-      taskPack: null,
-      restore,
-      acceptanceIds: ['A1'],
-    },
-    deliver: { kind: 'deliver', attemptId, fence, messages: [], more: 0 },
-    interrupt: { kind: 'interrupt', attemptId, fence },
-    stop_attempt: {
-      kind: 'stop_attempt',
-      attemptId,
-      fence,
-      cause: 'stop',
-      reason: 'a person stopped it',
-      handoff: true,
-      interruptFirst: false,
-      keepClone: false,
-    },
-    hold_attempt: { kind: 'hold_attempt', attemptId, fence },
-    push_submission: {
-      kind: 'push_submission',
-      attemptId,
-      fence,
-      submissionId: 'S-1',
-      branch: 'agflow/T-1-do-the-thing',
-      expectedBranchSha: null,
-      adoptable: [],
-    },
-    prepare_takeover: { kind: 'prepare_takeover', attemptId, fence, person: 'alice' },
-    hand_back: { kind: 'hand_back', attemptId, source: { kind: 'clone' } },
-    cleanup_attempt: { kind: 'cleanup_attempt', attemptId },
-    decide_approval: {
-      kind: 'decide_approval',
-      attemptId,
-      fence,
-      approvalId: '6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f',
-      decision: 'approve',
-      reason: null,
-    },
-    upload_transcript: { kind: 'upload_transcript', attemptId },
-    prepare_dependencies: { kind: 'prepare_dependencies', attemptId, fence, requestId: '1-R-1-9' },
-    refresh_vault: { kind: 'refresh_vault', taskId: attempt.taskId ?? 'T-1', refs: ['refs/agflow/T-1/a1-late-1'] },
-    preflight: { kind: 'preflight', vendor: 'codex' },
-    delete_refs: { kind: 'delete_refs', refs: [{ ref: 'refs/agflow/T-1/a1', expectedSha: sha('c') }] },
-    update_settings: { kind: 'update_settings', settings: { capacity: 3 }, version: 2 },
-  };
-}
 
 function enqueue(ctx: HubContext, runnerId: string, command: StoredCommand): CommandRow {
   return tx(ctx, () => enqueueCommand(ctx, runnerId, command));
@@ -143,7 +62,7 @@ describe('the command queue', () => {
   test('every kind can be enqueued, never reaches a runner older than its protocol, and goes out valid', () => {
     const { ctx } = createTestContext();
     const { runner, attempt } = addRunnerAttempt(ctx);
-    const commands = samples(attempt);
+    const commands = sampleCommands(attempt);
     for (const kind of RUNNER_COMMAND_KINDS) {
       const row = enqueue(ctx, runner.id, commands[kind]);
       expect(row.kind).toBe(kind);
@@ -159,7 +78,7 @@ describe('the command queue', () => {
   test('commands record their attempt and fence', () => {
     const { ctx } = createTestContext();
     const { runner, attempt } = addRunnerAttempt(ctx);
-    const commands = samples(attempt);
+    const commands = sampleCommands(attempt);
     expect(enqueue(ctx, runner.id, commands.start_attempt)).toMatchObject({ attemptId: attempt.id, fence: attempt.fence });
     expect(enqueue(ctx, runner.id, commands.stop_attempt)).toMatchObject({ attemptId: attempt.id, fence: attempt.fence });
     expect(enqueue(ctx, runner.id, commands.cleanup_attempt)).toMatchObject({ attemptId: attempt.id, fence: null });
@@ -171,7 +90,7 @@ describe('agent tokens in commands', () => {
   test('start and resume are stored without a token; each wire copy carries a fresh one, and older ones stay valid', () => {
     const { ctx } = createTestContext();
     const { runner, attempt, agent } = addRunnerAttempt(ctx);
-    const commands = samples(attempt);
+    const commands = sampleCommands(attempt);
     // A caller that passes a token still gets none stored.
     const withToken = { kind: 'start_attempt', attempt: { ...commands.start_attempt.attempt, agentToken: 'agt_secret' } };
     const start = enqueue(ctx, runner.id, withToken as StoredCommand);
@@ -207,7 +126,7 @@ describe('cancellation', () => {
     const { ctx } = createTestContext();
     const { runner, attempt } = addRunnerAttempt(ctx);
     const other = addRunnerAttempt(ctx, { runnerId: runner.id });
-    const commands = samples(attempt);
+    const commands = sampleCommands(attempt);
     for (const kind of RUNNER_COMMAND_KINDS) enqueue(ctx, runner.id, commands[kind]);
     const unrelated = enqueue(ctx, runner.id, { kind: 'interrupt', attemptId: other.attempt.id, fence: other.attempt.fence });
     const done = enqueue(ctx, runner.id, { kind: 'hold_attempt', attemptId: attempt.id, fence: attempt.fence });
@@ -249,7 +168,7 @@ describe('cancellation', () => {
     const { ctx } = createTestContext();
     const { runner, attempt } = addRunnerAttempt(ctx);
     expect(pendingResumeOf(ctx, attempt.id)).toBeNull();
-    const resume = enqueue(ctx, runner.id, samples(attempt).resume_attempt);
+    const resume = enqueue(ctx, runner.id, sampleCommands(attempt).resume_attempt);
     expect(pendingResumeOf(ctx, attempt.id)?.id).toBe(resume.id);
     tx(ctx, () => cancelPendingCommands(ctx, attempt.id));
     expect(pendingResumeOf(ctx, attempt.id)).toBeNull();
@@ -265,7 +184,7 @@ describe('results', () => {
       seen.push([command.id, result.ok, result.data]);
       emit({ type: 'test.hand_back_result', actor: 'system', data: { id: command.id } });
     };
-    const handBack = enqueue(ctx, runner.id, samples(attempt).hand_back);
+    const handBack = enqueue(ctx, runner.id, sampleCommands(attempt).hand_back);
     const preflight = enqueue(ctx, runner.id, { kind: 'preflight', vendor: 'claude' });
     clock.advance(5_000);
     const done = recordResult(ctx, runner.id, { commandId: handBack.id, ok: true, data: { sha: sha('d') } });
@@ -394,12 +313,12 @@ describe('after commit', () => {
   test('a re-fence cancels the old fence and keeps the new one pending', () => {
     const { ctx } = createTestContext();
     const { runner, attempt } = addRunnerAttempt(ctx);
-    const oldStop = enqueue(ctx, runner.id, samples(attempt).stop_attempt);
+    const oldStop = enqueue(ctx, runner.id, sampleCommands(attempt).stop_attempt);
     const fence: Fence = issueFence(ctx);
     tx(ctx, () => {
       cancelPendingCommands(ctx, attempt.id);
       updateAttempt(ctx, attempt.id, { fence });
-      enqueueCommand(ctx, runner.id, { ...samples({ ...attempt, fence }).resume_attempt });
+      enqueueCommand(ctx, runner.id, { ...sampleCommands({ ...attempt, fence }).resume_attempt });
     });
     expect(findCommand(ctx, oldStop.id)?.status).toBe('cancelled');
     expect(pendingCommands(ctx, runner.id, 1).map((row) => [row.kind, row.fence])).toEqual([['resume_attempt', fence]]);

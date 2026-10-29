@@ -268,6 +268,26 @@ export function identifyRunner(ctx: HubContext, user: string, hello: HelloMessag
   });
 }
 
+/**
+ * Stores what a hello reports about the runner: its name, version, platform, profile, git readiness and vendors (a
+ * hello with git.ready sets it back after failed WIP pushes).
+ */
+export function recordHelloInfo(ctx: HubContext, runnerId: string, hello: HelloMessage): void {
+  const row = findRunnerRow(ctx, runnerId);
+  if (!row) throw notFound(`runner ${runnerId}`);
+  const info: RunnerInfo = {
+    ...runnerInfo(row),
+    agflowVersion: hello.agflowVersion,
+    platform: hello.platform,
+    profile: hello.profile,
+    git: hello.git,
+  };
+  ctx.db
+    .query('UPDATE runners SET name = $name, info = $info WHERE id = $id')
+    .run({ id: runnerId, name: hello.name, info: JSON.stringify(info) });
+  applyVendorReport(ctx, runnerId, hello.vendors);
+}
+
 // ---------------------------------------------------------------------------
 // State (design 6.3)
 // ---------------------------------------------------------------------------

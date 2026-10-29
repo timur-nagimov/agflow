@@ -1,4 +1,4 @@
-import type { Agent, AgentRole, Attempt, RunnerVendor, Task, Vendor } from '@agflow/core';
+import type { Agent, AgentRole, Attempt, RunnerCommandKind, RunnerVendor, Task, Vendor } from '@agflow/core';
 import {
   AGFLOW_VERSION,
   type NewTask,
@@ -11,6 +11,7 @@ import {
 } from '@agflow/core';
 import { getAgent, startLiveSession } from '../src/agents';
 import { insertAttempt, issueFence, nextAttemptNumber } from '../src/attempt-store';
+import type { StoredCommand } from '../src/commands';
 import { type FetchFn, HUB_RUNNER_DEFAULTS, type HubConfig, type HubContext, createContext, tx } from '../src/context';
 import { nextId } from '../src/db';
 import { getTask, move, setAgentTask } from '../src/task-store';
@@ -84,7 +85,7 @@ export interface RunnerAttempt {
 }
 
 /** A ready vendor on a runner in test mode (design 15.1). */
-function testVendor(vendor: Vendor): RunnerVendor {
+export function testVendor(vendor: Vendor): RunnerVendor {
   return {
     vendor,
     cliVersion: null,
@@ -181,4 +182,84 @@ export function addRunnerAttempt(ctx: HubContext, options: RunnerAttemptOptions 
     setAgentTask(ctx, agentId, taskId);
     return { runner: { id: runnerId }, agent: getAgent(ctx, agentId), attempt, task: claimed };
   });
+}
+
+/** One tokenless command of each kind for the attempt; the mapped type makes the compiler insist on all 17. */
+export function sampleCommands(attempt: Attempt): { [K in RunnerCommandKind]: Extract<StoredCommand, { kind: K }> } {
+  const { id: attemptId, fence } = attempt;
+  const restore = { paths: ['.claude/**'], base: 'refs/heads/main' };
+  return {
+    start_attempt: {
+      kind: 'start_attempt',
+      attempt: {
+        attemptId,
+        taskId: attempt.taskId,
+        role: 'worker',
+        vendor: 'claude',
+        model: null,
+        fence,
+        hubUrl: 'http://hub.test',
+        repo: { url: 'https://github.com/acme/demo', mainBranch: 'main' },
+        start: { ref: 'refs/heads/main', sha: null },
+        branch: 'agflow/T-1-do-the-thing',
+        wipRef: 'refs/agflow/T-1/a1',
+        restore,
+        acceptanceIds: ['A1'],
+        toolCaps: { defaultMs: 1_800_000, longMs: 5_400_000, checks: [] },
+        taskPack: '# T-1',
+        brief: 'You are an agflow worker.',
+        firstPrompt: 'Start.',
+        successor: false,
+      },
+    },
+    resume_attempt: {
+      kind: 'resume_attempt',
+      attemptId,
+      fence,
+      prompt: 'The runner restarted; continue from your last step.',
+      messages: [{ messageId: 4, authority: 'person', text: '> alice: also add a test' }],
+      taskPack: null,
+      restore,
+      acceptanceIds: ['A1'],
+    },
+    deliver: { kind: 'deliver', attemptId, fence, messages: [], more: 0 },
+    interrupt: { kind: 'interrupt', attemptId, fence },
+    stop_attempt: {
+      kind: 'stop_attempt',
+      attemptId,
+      fence,
+      cause: 'stop',
+      reason: 'a person stopped it',
+      handoff: true,
+      interruptFirst: false,
+      keepClone: false,
+    },
+    hold_attempt: { kind: 'hold_attempt', attemptId, fence },
+    push_submission: {
+      kind: 'push_submission',
+      attemptId,
+      fence,
+      submissionId: 'S-1',
+      branch: 'agflow/T-1-do-the-thing',
+      expectedBranchSha: null,
+      adoptable: [],
+    },
+    prepare_takeover: { kind: 'prepare_takeover', attemptId, fence, person: 'alice' },
+    hand_back: { kind: 'hand_back', attemptId, source: { kind: 'clone' } },
+    cleanup_attempt: { kind: 'cleanup_attempt', attemptId },
+    decide_approval: {
+      kind: 'decide_approval',
+      attemptId,
+      fence,
+      approvalId: '6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f',
+      decision: 'approve',
+      reason: null,
+    },
+    upload_transcript: { kind: 'upload_transcript', attemptId },
+    prepare_dependencies: { kind: 'prepare_dependencies', attemptId, fence, requestId: '1-R-1-9' },
+    refresh_vault: { kind: 'refresh_vault', taskId: attempt.taskId ?? 'T-1', refs: ['refs/agflow/T-1/a1-late-1'] },
+    preflight: { kind: 'preflight', vendor: 'codex' },
+    delete_refs: { kind: 'delete_refs', refs: [{ ref: 'refs/agflow/T-1/a1', expectedSha: 'c'.repeat(40) }] },
+    update_settings: { kind: 'update_settings', settings: { capacity: 3 }, version: 2 },
+  };
 }
