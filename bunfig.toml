@@ -1,2 +1,7 @@
+[install]
+# The Agent SDK lists its bundled claude binaries as optional dependencies. The runner installs its own pinned binary
+# (design 7.1), so none of them is ever installed.
+optional = false
+
 [test]
 preload = ["./scripts/test-preload.ts"]

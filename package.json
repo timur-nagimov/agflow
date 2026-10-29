@@ -14,7 +14,16 @@
     "build:cli": "bun build --compile packages/cli/src/main.ts --outfile dist/agflow",
     "verify:real-clis": "bun packages/cli/scripts/verify-real-clis.ts",
     "demo": "bun scripts/demo-hub.ts",
-    "check:ui": "bun scripts/check-ui.ts"
+    "check:ui": "bun scripts/check-ui.ts",
+    "vendor:install": "bun packages/runner/scripts/vendor-install.ts",
+    "verify:prep": "bun packages/runner/scripts/verify-prep.ts",
+    "verify:service": "bun packages/runner/scripts/verify-service.ts",
+    "record:claude": "bun packages/runner/scripts/record-claude-stream.ts",
+    "smoke:claude": "AGFLOW_SMOKE=1 bun test packages/runner/test/claude-real",
+    "check:claude-sandbox": "AGFLOW_SMOKE=1 AGFLOW_SANDBOX_CHECKS=1 bun test packages/runner/test/claude-sandbox",
+    "gen:codex-protocol": "bun packages/runner/scripts/gen-codex-protocol.ts",
+    "smoke:codex": "AGFLOW_SMOKE=1 bun test packages/runner/test/codex",
+    "check:codex-sandbox": "AGFLOW_SMOKE=1 AGFLOW_SANDBOX_CHECKS=1 bun test packages/runner/test/codex/real/sandbox.test.ts"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",
