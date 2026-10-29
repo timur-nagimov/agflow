@@ -52,6 +52,20 @@
         "diff": "9.0.0",
         "zod": "4.6.7",
       },
+      "devDependencies": {
+        "@agflow/testkit": "workspace:*",
+      },
+    },
+    "packages/testkit": {
+      "name": "@agflow/testkit",
+      "version": "0.1.0",
+      "dependencies": {
+        "@agflow/core": "workspace:*",
+        "@agflow/runner": "workspace:*",
+      },
+      "devDependencies": {
+        "@anthropic-ai/sdk": "1.3.0",
+      },
     },
     "packages/web": {
       "name": "@agflow/web",
@@ -78,6 +92,8 @@
     "@agflow/hub": ["@agflow/hub@workspace:packages/hub"],
 
     "@agflow/runner": ["@agflow/runner@workspace:packages/runner"],
+
+    "@agflow/testkit": ["@agflow/testkit@workspace:packages/testkit"],
 
     "@agflow/web": ["@agflow/web@workspace:packages/web"],
 

@@ -15,6 +15,15 @@
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": true
   },
-  "include": ["packages/core", "packages/hub", "packages/cli", "packages/runner", "packages/web/test", "packages/web/build.ts", "scripts"],
+  "include": [
+    "packages/core",
+    "packages/hub",
+    "packages/cli",
+    "packages/runner",
+    "packages/testkit",
+    "packages/web/test",
+    "packages/web/build.ts",
+    "scripts"
+  ],
   "exclude": ["**/node_modules", "**/dist"]
 }
