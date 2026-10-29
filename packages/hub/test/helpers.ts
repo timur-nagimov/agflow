@@ -129,6 +129,8 @@ export function addRunnerAttempt(ctx: HubContext, options: RunnerAttemptOptions 
         git: { ready: true, problem: null, lastPushAt: null },
         power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
         disk: { freeBytes: 100e9, agflowBytes: 0 },
+        ceilings: {},
+        allowPaidUsage: {},
       };
       ctx.db
         .query(

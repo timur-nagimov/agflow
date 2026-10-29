@@ -127,10 +127,12 @@ export interface HubConfig extends HubRunnerSettings {
 export interface RunnerLink {
   /** Sends the runner the pending commands its connection has not had yet; nothing when it is not connected. */
   flush(runnerId: string): void;
+  /** Ends the runner's current link with this close code, as retiring it does; nothing when it is not connected. */
+  closeRunner(runnerId: string, code: number, reason: string): void;
 }
 
 /** The link until the gateway installs itself: commands wait in runner_commands for the runner's next hello. */
-export const NO_RUNNER_LINK: RunnerLink = Object.freeze({ flush: () => {} });
+export const NO_RUNNER_LINK: RunnerLink = Object.freeze({ flush: () => {}, closeRunner: () => {} });
 
 export interface HubContext {
   db: Database;

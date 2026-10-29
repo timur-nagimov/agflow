@@ -315,7 +315,7 @@ describe('after commit', () => {
     const { ctx } = createTestContext();
     const { runner, attempt } = addRunnerAttempt(ctx);
     const flushed: string[] = [];
-    ctx.link = { flush: (runnerId) => flushed.push(runnerId) };
+    ctx.link = { flush: (runnerId) => flushed.push(runnerId), closeRunner: () => {} };
     tx(ctx, () => {
       enqueueCommand(ctx, runner.id, { kind: 'interrupt', attemptId: attempt.id, fence: attempt.fence });
       enqueueCommand(ctx, runner.id, { kind: 'preflight', vendor: 'claude' });

@@ -52,7 +52,11 @@ export function createSession(ctx: HubContext, user: string, kind: SessionKind, 
 }
 
 export function verifySession(ctx: HubContext, token: string): SessionInfo | null {
-  const hash = hashToken(token);
+  return verifySessionHash(ctx, hashToken(token));
+}
+
+/** verifySession for a session known by its hash, such as the one a runner's link recorded in runners.session_hash. */
+export function verifySessionHash(ctx: HubContext, hash: string): SessionInfo | null {
   const row = ctx.db.query('SELECT login, kind, expires_at FROM sessions WHERE token_hash = $hash').get({ hash }) as {
     login: string;
     kind: SessionKind;
