@@ -1,10 +1,11 @@
 // The hub side of runner links (design 6.3): one RunnerConnection per link, hello and welcome, the acknowledged
-// position, and the commands that follow. The transport is the caller's: Bun's WebSocket handlers or an in-memory
-// test connection hand the gateway a LinkSocket and every message and close they see.
+// position and the replay, inbound events, and the commands that follow. The transport is the caller's: Bun's
+// WebSocket handlers or an in-memory test connection hand the gateway a LinkSocket and every message and close.
 import { CLOSE_CODES, type HubMessage, type RunnerMessage, parseRunnerMessage } from '@agflow/core';
 import { slideSession } from './auth';
 import { markSent, pendingCommands, recordResult, toWireCommand } from './commands';
 import { type HubContext, type RunnerLink, afterCommit, tx } from './context';
+import { acknowledgePosition, applyRunnerEvents } from './events-in';
 import { hubEpoch } from './hub-state';
 import {
   type HelloMessage,
@@ -20,7 +21,10 @@ import {
 
 /** The close code for a link whose first message is not a readable hello (WebSocket "policy violation"). */
 export const BAD_MESSAGE_CLOSE = 1008;
-/** The close code when the hub fails while handling a hello (WebSocket "internal error"). */
+/**
+ * The close code when the hub fails while handling a hello or an events message (WebSocket "internal error"): the
+ * runner reconnects with its backoff.
+ */
 export const HUB_ERROR_CLOSE = 1011;
 /** The close code when the hub stops (WebSocket "going away"): the runner reconnects with its backoff. */
 export const GOING_AWAY_CLOSE = 1001;
@@ -55,6 +59,16 @@ export class RunnerConnection {
   lastInboundAt: number;
   /** Commands sent on this link: a flush sends only the others. */
   readonly sent = new Set<string>();
+  /** The outbox epoch and highest seq the hello reported: the replay is complete once the ack reaches lastSeq. */
+  outboxEpoch: string | null = null;
+  lastSeq = 0;
+  /** The hello's lastHubEpoch is below the hub's: the hub was restored since this runner's last welcome. */
+  afterRestore = false;
+  /** The replay reached hello.lastSeq. */
+  replayed = false;
+  /** Settles when the replay is complete; never on a link that closed first, whose next hello decides again. */
+  readonly replayComplete: Promise<void>;
+  private settleReplay: () => void = () => {};
 
   constructor(
     readonly socket: LinkSocket,
@@ -62,27 +76,22 @@ export class RunnerConnection {
     now: number,
   ) {
     this.lastInboundAt = now;
+    this.replayComplete = new Promise((resolve) => {
+      this.settleReplay = resolve;
+    });
+  }
+
+  /** The acknowledged position of the hello's outbox epoch reached ackedSeq. */
+  acknowledged(outboxEpoch: string, ackedSeq: number): void {
+    if (this.closed || this.replayed || outboxEpoch !== this.outboxEpoch || ackedSeq < this.lastSeq) return;
+    this.replayed = true;
+    this.settleReplay();
   }
 }
 
 export interface GatewayOptions {
   /** Where the gateway reports what it cannot hand back to a runner; console.error by default. */
   log?: (message: string, error?: unknown) => void;
-}
-
-/**
- * Raises the runner's acknowledged position for this outbox epoch to at least firstSeq − 1, creating the row for a
- * new epoch, and returns it: the runner replays every event after it that it still has.
- */
-export function acknowledgePosition(ctx: HubContext, runnerId: string, outboxEpoch: string, firstSeq: number): number {
-  const row = ctx.db
-    .query(
-      `INSERT INTO runner_inbox (runner_id, outbox_epoch, acked_seq) VALUES ($runnerId, $outboxEpoch, $floor)
-       ON CONFLICT (runner_id, outbox_epoch) DO UPDATE SET acked_seq = MAX(acked_seq, excluded.acked_seq)
-       RETURNING acked_seq`,
-    )
-    .get({ runnerId, outboxEpoch, floor: firstSeq - 1 }) as { acked_seq: number };
-  return row.acked_seq;
 }
 
 /**
@@ -162,8 +171,34 @@ export class Gateway implements RunnerLink {
         return;
       }
       case 'events':
+        this.events(connection, message);
         return;
     }
+  }
+
+  /**
+   * Applies the events and acknowledges them, whatever each one came to (design 6.3). A message that fails as a whole
+   * (applyRunnerEvents throws: the store failed outside the per-event savepoints, or the events skip some) applies
+   * nothing, gets no ack, and ends the link with 1011. The runner never resends on the same link, as what it sent
+   * moved on, so a later message's cumulative ack would cover the lost events. It reconnects with its backoff; its
+   * hello and the welcome carry the acknowledged position, and it replays from there.
+   */
+  private events(connection: RunnerConnection, message: Extract<RunnerMessage, { t: 'events' }>): void {
+    const runnerId = connection.runnerId as string;
+    let acked: number;
+    try {
+      acked = applyRunnerEvents(this.ctx, runnerId, message, {
+        restoreReplay: connection.afterRestore && !connection.replayed,
+        helloLastSeq: message.outboxEpoch === connection.outboxEpoch ? connection.lastSeq : 0,
+      });
+    } catch (error) {
+      // Closed at once: nothing that arrives on this link after the failure applies, so no ack passes the gap.
+      this.log(`applying events from runner ${runnerId} failed`, error);
+      this.close(connection, HUB_ERROR_CLOSE, 'the hub could not apply events');
+      return;
+    }
+    this.send(connection, { t: 'ack', outboxEpoch: message.outboxEpoch, seq: acked });
+    connection.acknowledged(message.outboxEpoch, acked);
   }
 
   /** The transport saw the link close. */
@@ -234,7 +269,7 @@ export class Gateway implements RunnerLink {
         if (!identity.ok) return identity;
         const runnerId = identity.runner.id;
         const welcome: { message: Welcome | null } = { message: null };
-        afterCommit(ctx, () => this.attach(connection, runnerId, hello.protocol, welcome.message as Welcome));
+        afterCommit(ctx, () => this.attach(connection, runnerId, hello, welcome.message as Welcome));
         recordHelloInfo(ctx, runnerId, hello);
         reconcileHelloSettings(ctx, runnerId, hello.settings);
         slideSession(ctx, sessionHash);
@@ -270,16 +305,23 @@ export class Gateway implements RunnerLink {
     if (!outcome.ok) this.close(connection, outcome.code, outcome.reason);
   }
 
-  /** Makes the link the runner's current one, replacing an older link with 4409, and sends welcome then commands. */
-  private attach(connection: RunnerConnection, runnerId: string, protocol: number, welcome: Welcome): void {
+  /**
+   * Makes the link the runner's current one, replacing an older link with 4409, and sends welcome then commands. With
+   * nothing to replay, the replay is complete at once.
+   */
+  private attach(connection: RunnerConnection, runnerId: string, hello: HelloMessage, welcome: Welcome): void {
     if (connection.closed) return;
     const previous = this.links.get(runnerId);
     if (previous && previous !== connection) this.close(previous, CLOSE_CODES.replaced, 'another connection replaced this one');
     connection.runnerId = runnerId;
-    connection.protocol = protocol;
+    connection.protocol = hello.protocol;
+    connection.outboxEpoch = hello.outboxEpoch;
+    connection.lastSeq = hello.lastSeq;
+    connection.afterRestore = hello.lastHubEpoch !== null && hello.lastHubEpoch < welcome.hubEpoch;
     this.links.set(runnerId, connection);
     this.send(connection, welcome);
     connection.welcomed = true;
+    connection.acknowledged(hello.outboxEpoch, welcome.ackedSeq);
     this.flush(runnerId);
   }
 

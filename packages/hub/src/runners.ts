@@ -359,6 +359,22 @@ export function markLinked(ctx: HubContext, emit: Emit, runnerId: string, link: 
   emit({ type: 'runner.online', actor: `runner:${runnerId}`, subject: runnerId, data: { runnerId, name: row.name } });
 }
 
+/**
+ * runner.state over the runner's link: crash_loop or disk_low as reported, with the detail as lastError, or online
+ * again with ok. It emits no event: runner.updated names changed settings, and pages reload runners on their own.
+ */
+export function setReportedState(ctx: HubContext, runnerId: string, reported: ReportedState, detail: string | null): void {
+  existingRow(ctx, runnerId);
+  const state = deriveRunnerState({ linked: true, sessionValid: true, reported });
+  ctx.db
+    .query(
+      `UPDATE runners SET state = $state, state_detail = $detail,
+         last_error = CASE WHEN $reported = 'ok' THEN last_error ELSE $detail END
+       WHERE id = $id`,
+    )
+    .run({ id: runnerId, state, reported, detail });
+}
+
 function sessionVerifies(ctx: HubContext, row: Pick<RunnerRow, 'session_hash'>): boolean {
   return row.session_hash !== null && verifySessionHash(ctx, row.session_hash) !== null;
 }

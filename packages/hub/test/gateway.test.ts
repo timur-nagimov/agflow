@@ -71,14 +71,19 @@ describe('hello and welcome', () => {
     const { ctx, gateway, token } = setup();
     const runner = await connectFakeRunner(ctx, gateway, { token });
     expect(ackedSeq(ctx, 'R-1', 'outbox-1')).toBe(0);
+    runner.disconnect();
+    await settle();
+    for (let n = 0; n < 8; n++) runner.emit('runner.state', { state: 'ok', detail: null });
     ctx.db.run("UPDATE runner_inbox SET acked_seq = 5 WHERE runner_id = 'R-1'");
     // The runner still keeps events from seq 3: the hub's position stands.
-    for (let n = 0; n < 8; n++) runner.emit('runner.state', { state: 'ok', detail: null });
     runner.outbox = runner.outbox.filter((event) => event.seq >= 3);
     await runner.reconnect();
     expect(runner.welcome?.ackedSeq).toBe(5);
-    // Its outbox now starts at 9: everything before was acknowledged and pruned.
-    runner.outbox = [];
+    // The replay acknowledges the rest; the outbox now starts at 9.
+    await settle();
+    expect(runner.outbox).toEqual([]);
+    // A restored hub's older position: the empty outbox's firstSeq − 1 wins.
+    ctx.db.run("UPDATE runner_inbox SET acked_seq = 5 WHERE runner_id = 'R-1'");
     await runner.reconnect();
     expect(runner.welcome?.ackedSeq).toBe(8);
     expect(ackedSeq(ctx, 'R-1', 'outbox-1')).toBe(8);
@@ -286,6 +291,69 @@ describe('known runners and broken links', () => {
     expect(logged).toEqual(['hello from runner key runner-key-1 failed']);
   });
 
+  test('an events message the hub fails to apply closes the link with 1011 unacknowledged; the replay applies it once', async () => {
+    const logged: string[] = [];
+    const { ctx, gateway, token } = setup({}, { log: (message) => logged.push(message) });
+    const runner = await connectFakeRunner(ctx, gateway, { token });
+    const link = runner.transport;
+    const { settingsVersion } = getRunner(ctx, 'R-1');
+    // The store fails once, outside the per-event savepoints: as the first message's position is written.
+    ctx.db.run(
+      `CREATE TRIGGER full_disk BEFORE UPDATE ON runner_inbox WHEN NEW.acked_seq = 1
+       BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END`,
+    );
+    // Two messages before the hub handles either: the second waits behind the one that fails.
+    runner.emit('runner.settings', { settings: { draining: true }, baseVersion: settingsVersion });
+    runner.emit('runner.settings', { settings: { capacity: 4 }, baseVersion: settingsVersion });
+    await settle();
+    ctx.db.run('DROP TRIGGER full_disk');
+    expect(link?.closedBy).toEqual({ code: HUB_ERROR_CLOSE, reason: 'the hub could not apply events' });
+    expect(runner.closedWith?.code).toBe(HUB_ERROR_CLOSE);
+    // Neither message applied, and no ack covers them.
+    expect(link?.toRunner.filter((message) => message.t === 'ack')).toEqual([]);
+    expect(ackedSeq(ctx, 'R-1', 'outbox-1')).toBe(0);
+    expect(getRunner(ctx, 'R-1')).toMatchObject({ draining: false, capacity: 2, settingsVersion });
+    expect(logged).toEqual(['applying events from runner R-1 failed']);
+    // The runner reconnects: its hello and the welcome carry the acknowledged position, and the replay applies both
+    // edits once.
+    expect(runner.outbox.map((event) => event.seq)).toEqual([1, 2]);
+    expect((await runner.connect())?.ackedSeq).toBe(0);
+    await settle();
+    expect(runner.transport?.toRunner.filter((message) => message.t === 'ack')).toEqual([
+      { t: 'ack', outboxEpoch: 'outbox-1', seq: 2 },
+    ]);
+    expect(runner.outbox).toEqual([]);
+    expect(getRunner(ctx, 'R-1')).toMatchObject({ draining: true, capacity: 4, settingsVersion: settingsVersion + 2 });
+  });
+
+  test('a gap after the hello closes the link with 1011 unacknowledged; events the replay leaves out are acknowledged', () => {
+    const logged: string[] = [];
+    const { ctx, gateway, token } = setup({}, { log: (message) => logged.push(message) });
+    const session = { user: 'alice', sessionHash: sessionHashOf(token) };
+    const fake = new FakeRunner<FakeConnection>((endpoint) => new FakeConnection(gateway, session, endpoint));
+    const { socket, sent } = recordingSocket();
+    const connection = gateway.open(socket, session);
+    gateway.message(connection, JSON.stringify({ ...fake.hello(), firstSeq: 1, lastSeq: 4 }));
+    const events = (...seqs: number[]) =>
+      JSON.stringify({
+        t: 'events',
+        outboxEpoch: 'outbox-1',
+        events: seqs.map((seq) => ({ seq, at: 0, type: 'runner.state', data: { state: 'ok', detail: null } })),
+      });
+    const acks = () => sent.flatMap((message) => (message.t === 'ack' ? [message.seq] : []));
+    // A replay may leave out events the runner held at its hello (X-12): the cumulative ack covers them.
+    gateway.message(connection, events(2, 4));
+    expect(acks()).toEqual([4]);
+    // After the hello each event follows the one before: 6 without 5 is never acknowledged past 5, and nothing that
+    // arrives after it on the link applies.
+    gateway.message(connection, events(6));
+    gateway.message(connection, events(5));
+    expect(acks()).toEqual([4]);
+    expect(socket.closed).toEqual({ code: HUB_ERROR_CLOSE, reason: 'the hub could not apply events' });
+    expect(ackedSeq(ctx, 'R-1', 'outbox-1')).toBe(4);
+    expect(logged).toEqual(['applying events from runner R-1 failed']);
+  });
+
   test('retiring a connected runner closes its link with 4403, and its next hello is refused', async () => {
     const { ctx, gateway, token } = setup();
     const runner = await connectFakeRunner(ctx, gateway, { token });
@@ -388,14 +456,16 @@ describe('FakeRunner', () => {
     expect(link?.toHub.filter((message) => message.t === 'events')).toEqual([
       { t: 'events', outboxEpoch: 'outbox-1', events: [expect.objectContaining({ seq: 3, type: 'runner.state' })] },
     ]);
-    expect(runner.outbox.map((event) => event.seq)).toEqual([3]);
-    // A cumulative ack drops what it covers; events emitted on a live link go out at once.
+    // The hub's cumulative ack drops what it covers; events emitted on a live link go out at once.
+    const acks = link?.toRunner.filter((message) => message.t === 'ack');
+    expect(acks).toEqual([{ t: 'ack', outboxEpoch: 'outbox-1', seq: 3 }]);
+    expect(runner.outbox).toEqual([]);
     runner.emit('runner.state', { state: 'disk_low', detail: 'low' });
-    link?.socket.send(JSON.stringify({ t: 'ack', outboxEpoch: 'outbox-1', seq: 3 }));
-    await settle();
     expect(runner.outbox.map((event) => event.seq)).toEqual([4]);
-    expect(runner.hello()).toMatchObject({ firstSeq: 4, lastSeq: 4 });
     expect(link?.toHub.at(-1)).toMatchObject({ t: 'events', events: [{ seq: 4 }] });
+    await settle();
+    expect(runner.outbox).toEqual([]);
+    expect(runner.hello()).toMatchObject({ firstSeq: 5, lastSeq: 4 });
   });
 
   test('answers each of the 17 kinds by default, unless a hook replaces the answer', async () => {
@@ -438,7 +508,8 @@ describe('FakeRunner', () => {
     // Starts and resumes bring tokens, kept per attempt; settings echoes update the snapshot.
     expect(runner.tokens.get(attempt.id)).toStartWith('agt_');
     expect(runner.settings).toMatchObject({ capacity: 3, version: 2 });
-    expect(runner.outbox.at(-1)).toMatchObject({ type: 'runner.state', data: { detail: 'preflight codex' } });
+    const sent = runner.transport?.toHub.filter((message) => message.t === 'events').at(-1);
+    expect(sent).toMatchObject({ events: [{ type: 'runner.state', data: { detail: 'preflight codex' } }] });
   });
 
   test('with automatic heartbeats it sends one every welcome.timings.heartbeatMs while linked', async () => {
