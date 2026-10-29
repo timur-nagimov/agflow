@@ -2,7 +2,7 @@ import type { SearchResult } from '@agflow/core';
 import type { HubContext } from './context';
 import { getCurrentGoal } from './goal';
 import { type MessageRow, rowToMessage } from './messages';
-import { type TaskRow, rowToTask } from './task-store';
+import { TASK_SELECT, type TaskRow, rowToTask } from './task-store';
 
 export function search(ctx: HubContext, query: string): SearchResult {
   const needle = query.trim();
@@ -12,7 +12,7 @@ export function search(ctx: HubContext, query: string): SearchResult {
   const tasks = (
     ctx.db
       .query(
-        `SELECT * FROM tasks WHERE id = $exact OR contract LIKE $like ESCAPE '\\'
+        `${TASK_SELECT} WHERE id = $exact OR contract LIKE $like ESCAPE '\\'
          ORDER BY id = $exact DESC, seq DESC LIMIT 20`,
       )
       .all({ exact: needle.toUpperCase(), like }) as TaskRow[]

@@ -12,6 +12,7 @@ import {
   quoteLines,
 } from '@agflow/core';
 import { statusFor } from './agents';
+import { listAttempts } from './attempt-store';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
@@ -20,6 +21,7 @@ import { currentGoalVersion } from './goal';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
 import {
+  TASK_SELECT,
   type TaskRow,
   addNote,
   dependencyReason,
@@ -65,7 +67,7 @@ export function getTaskDetail(ctx: HubContext, id: string): TaskDetail {
     // The newest 500, oldest first: a long task drops its oldest history, never its latest changes.
     events: listEvents(ctx.db, { subject: id, latest: true, limit: 500 }).reverse(),
     messages: listMessages(ctx, { taskId: id }),
-    attempts: [],
+    attempts: listAttempts(ctx, { task: id }),
     submissions: [],
   };
 }
@@ -288,7 +290,7 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
 
 function heldTaskOf(ctx: HubContext, agentId: string): Task | null {
   const row = ctx.db
-    .query("SELECT * FROM tasks WHERE assignee = $agentId AND status IN ('claimed', 'working') LIMIT 1")
+    .query(`${TASK_SELECT} WHERE assignee = $agentId AND status IN ('claimed', 'working') LIMIT 1`)
     .get({ agentId }) as TaskRow | null;
   return row ? rowToTask(row) : null;
 }
@@ -421,7 +423,7 @@ export function sweepLeases(ctx: HubContext): string[] {
   return tx(ctx, (emit) => {
     const rows = ctx.db
       .query(
-        "SELECT * FROM tasks WHERE status IN ('claimed', 'working') AND lease_expires_at IS NOT NULL AND lease_expires_at <= $now",
+        `${TASK_SELECT} WHERE status IN ('claimed', 'working') AND lease_expires_at IS NOT NULL AND lease_expires_at <= $now`,
       )
       .all({ now: ctx.now() }) as TaskRow[];
     for (const row of rows) {
@@ -607,7 +609,7 @@ export function markMerged(ctx: HubContext, id: string, actor: string, sha?: str
 }
 
 function refreshDependents(ctx: HubContext, emit: Emit): void {
-  const rows = ctx.db.query("SELECT * FROM tasks WHERE status = 'blocked' AND blocked_kind = 'deps'").all() as TaskRow[];
+  const rows = ctx.db.query(`${TASK_SELECT} WHERE status = 'blocked' AND blocked_kind = 'deps'`).all() as TaskRow[];
   for (const row of rows) {
     const task = rowToTask(row);
     const waiting = unmetDependencies(ctx, task.dependsOn);

@@ -40,7 +40,13 @@ export interface TaskRow {
   branch_head: string | null;
   next_dispatch_at: number | null;
   dispatch_hold_until: number | null;
+  /** Not a column: TASK_SELECT counts the task's attempts. */
+  attempt_count: number;
 }
+
+/** Selects task rows with their attempt count; add WHERE and ORDER BY clauses. */
+export const TASK_SELECT =
+  'SELECT tasks.*, (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id) AS attempt_count FROM tasks';
 
 /** Submissions recorded before M2 carry no attempt or submission id. */
 type StoredSubmission = Omit<Submission, 'attemptId' | 'submissionId'> & Partial<Submission>;
@@ -66,8 +72,7 @@ export function rowToTask(row: TaskRow): Task {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     currentAttempt: row.current_attempt,
-    // Nothing records attempts yet, so a task has none.
-    attemptCount: 0,
+    attemptCount: row.attempt_count,
     workRef: row.work_ref,
     workSha: row.work_sha,
     nextDispatchAt: row.next_dispatch_at,
@@ -75,7 +80,7 @@ export function rowToTask(row: TaskRow): Task {
 }
 
 export function findTask(ctx: HubContext, id: string): Task | null {
-  const row = ctx.db.query('SELECT * FROM tasks WHERE id = $id').get({ id }) as TaskRow | null;
+  const row = ctx.db.query(`${TASK_SELECT} WHERE id = $id`).get({ id }) as TaskRow | null;
   return row ? rowToTask(row) : null;
 }
 
@@ -91,7 +96,7 @@ export interface TaskFilter {
 }
 
 export function listTasks(ctx: HubContext, filter: TaskFilter = {}): Task[] {
-  const rows = ctx.db.query('SELECT * FROM tasks ORDER BY seq').all() as TaskRow[];
+  const rows = ctx.db.query(`${TASK_SELECT} ORDER BY seq`).all() as TaskRow[];
   return rows
     .map(rowToTask)
     .filter(

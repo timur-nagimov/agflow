@@ -1,4 +1,4 @@
-import type { Agent, AgentOrigin, AgentRole, AgentStatus, Vendor } from '@agflow/core';
+import type { Agent, AgentOrigin, AgentRole, AgentStatus, AttemptStatus, Vendor } from '@agflow/core';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { forbidden, notFound } from './errors';
@@ -22,6 +22,22 @@ interface AgentRow {
   created_at: number;
   runner_id: string | null;
   attempt_id: string | null;
+  /** Not a column: AGENT_SELECT adds the status of the agent's attempt. */
+  attempt_status: AttemptStatus | null;
+}
+
+/** Selects agent rows with their attempt's status; add WHERE and ORDER BY clauses on agents' columns. */
+const AGENT_SELECT = `SELECT agents.*, attempts.status AS attempt_status
+  FROM agents LEFT JOIN attempts ON attempts.id = agents.attempt_id`;
+
+/**
+ * A runner agent lives exactly as long as its attempt, so its status follows the attempt, whatever the laptop's
+ * clock or sleep did to last_seen_at.
+ */
+export function runnerAgentStatus(attemptStatus: AttemptStatus | null): AgentStatus {
+  if (attemptStatus === 'starting' || attemptStatus === 'running') return 'active';
+  if (attemptStatus === 'quota_wait' || attemptStatus === 'holding') return 'idle';
+  return 'gone';
 }
 
 export function statusFor(lastSeenAt: number, now: number): AgentStatus {
@@ -41,7 +57,8 @@ function toAgent(ctx: HubContext, row: AgentRow): Agent {
     sessionId: row.session_id,
     label: row.label,
     currentTask: row.current_task,
-    status: statusFor(row.last_seen_at, ctx.now()),
+    status:
+      row.origin === 'runner' ? runnerAgentStatus(row.attempt_status) : statusFor(row.last_seen_at, ctx.now()),
     lastSeenAt: row.last_seen_at,
     createdAt: row.created_at,
     runnerId: row.runner_id,
@@ -50,7 +67,7 @@ function toAgent(ctx: HubContext, row: AgentRow): Agent {
 }
 
 export function findAgent(ctx: HubContext, id: string): Agent | null {
-  const row = ctx.db.query('SELECT * FROM agents WHERE id = $id').get({ id }) as AgentRow | null;
+  const row = ctx.db.query(`${AGENT_SELECT} WHERE agents.id = $id`).get({ id }) as AgentRow | null;
   return row ? toAgent(ctx, row) : null;
 }
 
@@ -62,18 +79,21 @@ export function getAgent(ctx: HubContext, id: string): Agent {
 
 export function findAgentBySession(ctx: HubContext, vendor: Vendor, sessionId: string): Agent | null {
   const row = ctx.db
-    .query('SELECT * FROM agents WHERE vendor = $vendor AND session_id = $sessionId')
+    .query(`${AGENT_SELECT} WHERE agents.vendor = $vendor AND agents.session_id = $sessionId`)
     .get({ vendor, sessionId }) as AgentRow | null;
   return row ? toAgent(ctx, row) : null;
 }
 
 export function listAgents(ctx: HubContext): Agent[] {
-  return (ctx.db.query('SELECT * FROM agents ORDER BY seq').all() as AgentRow[]).map((row) => toAgent(ctx, row));
+  return (ctx.db.query(`${AGENT_SELECT} ORDER BY agents.seq`).all() as AgentRow[]).map((row) => toAgent(ctx, row));
 }
 
 export function currentLead(ctx: HubContext): Agent | null {
   const row = ctx.db
-    .query("SELECT * FROM agents WHERE role = 'lead' AND last_seen_at > $cutoff ORDER BY last_seen_at DESC LIMIT 1")
+    .query(
+      `${AGENT_SELECT} WHERE agents.role = 'lead' AND agents.last_seen_at > $cutoff
+       ORDER BY agents.last_seen_at DESC LIMIT 1`,
+    )
     .get({ cutoff: ctx.now() - LEAD_STALE_MS }) as AgentRow | null;
   return row ? toAgent(ctx, row) : null;
 }
@@ -153,7 +173,7 @@ export function startLiveSession(ctx: HubContext, user: string, input: SessionSt
 
 export function helloAgent(ctx: HubContext, user: string, code: string): Agent {
   const row = ctx.db
-    .query('SELECT * FROM agents WHERE hello_code = $code AND login = $login')
+    .query(`${AGENT_SELECT} WHERE agents.hello_code = $code AND agents.login = $login`)
     .get({ code: code.trim().toUpperCase(), login: user }) as AgentRow | null;
   if (!row) throw notFound('hello code');
   touchAgent(ctx, row.id);

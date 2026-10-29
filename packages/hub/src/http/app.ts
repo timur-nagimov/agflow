@@ -6,6 +6,7 @@ import { verifySession } from '../auth';
 import type { HubContext } from '../context';
 import { HubError, forbidden } from '../errors';
 import { mountAgentRoutes } from './agent-routes';
+import { mountAttemptRoutes } from './attempt-routes';
 import { mountAuthRoutes } from './auth-routes';
 import { mountCliLoginPage } from './cli-login-page';
 import { mountEventRoutes } from './event-routes';
@@ -114,6 +115,7 @@ export function createApp(ctx: HubContext): App {
   mountProjectRoutes(app, ctx);
   mountTaskRoutes(app, ctx);
   mountAgentRoutes(app, ctx);
+  mountAttemptRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
   mountEventRoutes(app, ctx);
   mountCliLoginPage(app, ctx);
