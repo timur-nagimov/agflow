@@ -6,6 +6,7 @@ import { isAgentToken, resolveAgentToken, verifySession } from '../auth';
 import type { HubContext } from '../context';
 import { HubError, agentNotAllowed, forbidden } from '../errors';
 import { mountAgentRoutes } from './agent-routes';
+import { isAgentRouteAllowed } from './agent-routes-allowed';
 import { mountAttemptRoutes } from './attempt-routes';
 import { mountAuthRoutes } from './auth-routes';
 import { mountCliLoginPage } from './cli-login-page';
@@ -119,7 +120,12 @@ export function createApp(ctx: HubContext): App {
     if (cookie && !bearerToken(authorization) && !SAFE_METHODS.has(c.req.method) && crossOrigin(c, hubOrigin)) {
       throw forbidden('cross-site request refused');
     }
-    c.set('principal', resolvePrincipal(ctx, authorization, cookie, c.req.header('x-agflow-agent')));
+    const principal = resolvePrincipal(ctx, authorization, cookie, c.req.header('x-agflow-agent'));
+    // Agent tokens reach only their bridge's routes, checked here so that no route can forget it.
+    if (principal?.via === 'agent' && !isAgentRouteAllowed(c.req.method, c.req.path)) {
+      throw agentNotAllowed(`an agent token cannot use ${c.req.method} ${c.req.path}`);
+    }
+    c.set('principal', principal);
     await next();
   });
   mountAuthRoutes(app, ctx);

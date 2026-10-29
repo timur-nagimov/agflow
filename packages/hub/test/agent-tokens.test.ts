@@ -79,9 +79,8 @@ describe('agent tokens', () => {
       token: second,
     });
     for (const token of [first, second]) {
-      const me = await withToken(hub, token, 'GET', '/api/me');
-      expect(me.status).toBe(200);
-      expect(me.json).toMatchObject({ user: 'bob', via: 'agent', agent: { id: agent.id } });
+      const tasks = await withToken(hub, token, 'GET', '/api/tasks');
+      expect([tasks.status, tasks.json.tasks.length]).toEqual([200, 1]);
     }
   });
 
