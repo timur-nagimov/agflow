@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { type NewTaskInput, NewTaskSchema } from '../packages/core/src/schemas';
 import type { Agent, AgentRole, Vendor } from '../packages/core/src/types';
 import { startLiveSession, touchAgent } from '../packages/hub/src/agents';
-import { createContext } from '../packages/hub/src/context';
+import { HUB_RUNNER_DEFAULTS, createContext } from '../packages/hub/src/context';
 import { addGoalNote, updateGoal } from '../packages/hub/src/goal';
 import { createApp } from '../packages/hub/src/http/app';
 import { ackMessages, sendMessage, takeInbox } from '../packages/hub/src/messages';
@@ -38,6 +38,7 @@ const ctx = createContext({
   dbPath: ':memory:',
   now: () => Date.now() + offset,
   config: {
+    ...HUB_RUNNER_DEFAULTS,
     publicUrl: `http://localhost:${port}`,
     auth: 'dev',
     allowedUsers: ['demo'],

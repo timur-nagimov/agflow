@@ -1,7 +1,7 @@
 import type { Agent, AgentRole, Vendor } from '@agflow/core';
 import { type NewTask, type NewTaskInput, NewTaskSchema } from '@agflow/core';
 import { startLiveSession } from '../src/agents';
-import { type FetchFn, type HubConfig, type HubContext, createContext } from '../src/context';
+import { type FetchFn, HUB_RUNNER_DEFAULTS, type HubConfig, type HubContext, createContext } from '../src/context';
 
 export class TestClock {
   t = Date.UTC(2026, 9, 26, 12, 0, 0);
@@ -13,6 +13,7 @@ export class TestClock {
 
 export function makeConfig(overrides: Partial<HubConfig> = {}): HubConfig {
   return {
+    ...HUB_RUNNER_DEFAULTS,
     publicUrl: 'http://hub.test',
     auth: 'dev',
     allowedUsers: ['alice', 'bob'],

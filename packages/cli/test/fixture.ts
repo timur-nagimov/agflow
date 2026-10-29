@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { AgentRole, Vendor } from '@agflow/core';
 import { startLiveSession } from '@agflow/hub/src/agents';
 import { createSession } from '@agflow/hub/src/auth';
-import { type HubConfig, type HubContext, createContext } from '@agflow/hub/src/context';
+import { HUB_RUNNER_DEFAULTS, type HubConfig, type HubContext, createContext } from '@agflow/hub/src/context';
 import { type App, createApp } from '@agflow/hub/src/http/app';
 import { type FetchFn, HubClient } from '../src/hub-client';
 
@@ -33,6 +33,7 @@ let sessions = 0;
 export function hubFixture(overrides: Partial<HubConfig> = {}): HubFixture {
   const clock = { t: Date.UTC(2026, 9, 27, 12, 0, 0) };
   const config: HubConfig = {
+    ...HUB_RUNNER_DEFAULTS,
     publicUrl: HUB_URL,
     auth: 'dev',
     allowedUsers: ['alice', 'bob'],
