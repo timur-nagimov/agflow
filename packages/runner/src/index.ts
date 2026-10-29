@@ -4,6 +4,7 @@ export * from './clock';
 export * from './config';
 export * from './db';
 export * from './journal';
+export * from './link';
 export * from './log';
 export * from './outbox';
 export * from './paths';
