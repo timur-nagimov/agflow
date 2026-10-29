@@ -37,11 +37,18 @@ export interface ResponsesRequest {
   toolOutputsSinceUser: number;
   /** The newest user message that is not context Codex adds itself; null when there is none. */
   lastUserText: string | null;
-  /** Answered by the default reply: no handler, or the handler returned nothing. */
+  /** Codex's own compaction request: the last user text is its checkpoint prompt. */
+  isCompaction: boolean;
+  /** Answered by the default reply: no handler, or the handler returned nothing. Compactions are never flagged. */
   unmatched: boolean;
+  /** The client dropped a held stream before it was released: an interrupt, a stop or a stream timeout. */
+  aborted: boolean;
 }
 
 type Item = Record<string, unknown>;
+
+/** How Codex 0.159.2's compaction prompt starts (the 2026-10-28 probes). */
+export const COMPACTION_PROMPT_PREFIX = 'You are performing a CONTEXT CHECKPOINT COMPACTION';
 
 /** User messages Codex writes itself; they are not what a person or the runner said. */
 const CONTEXT_PREFIXES = ['<environment_context>', '# AGENTS.md instructions'];
@@ -129,7 +136,9 @@ export function parseResponsesRequest(
     toolOutputs,
     toolOutputsSinceUser,
     lastUserText,
+    isCompaction: (lastUserText ?? '').startsWith(COMPACTION_PROMPT_PREFIX),
     unmatched: false,
+    aborted: false,
   };
 }
 

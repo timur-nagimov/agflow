@@ -1,7 +1,7 @@
 // Reply builders for the scripted Responses API (design 15.1). With the pinned slug, Codex 0.159.2 runs Code Mode:
 // the model has one freeform `exec` tool that runs JavaScript, and exec_command, write_stdin, apply_patch and the MCP
 // tools (tools.mcp__agflow__<tool>) are nested inside it. So a scripted tool call is a custom_tool_call named exec
-// whose input is JavaScript.
+// whose input is JavaScript. The failure replies have the shapes Codex 0.159.2 classified in the probes.
 import { randomUUID } from 'node:crypto';
 
 /** A Responses API output item; ids are added when the reply is streamed. */
@@ -16,10 +16,77 @@ export interface StreamReply {
   headers?: Record<string, string>;
 }
 
-export type ScriptedReply = StreamReply;
+/** A plain HTTP answer, the way the API refuses a request before streaming: 429, 500, 401. */
+export interface HttpReply {
+  kind: 'http';
+  status: number;
+  body: unknown;
+  headers?: Record<string, string>;
+}
+
+/** A 200 stream that fails: response.created, then response.failed with this error. */
+export interface FailedReply {
+  kind: 'failed';
+  code: string;
+  message: string;
+  headers?: Record<string, string>;
+}
+
+/** A stream held open after response.created until the server releases its thread; then the rest of `then`. */
+export interface HangReply {
+  kind: 'hang';
+  then?: StreamReply;
+  headers?: Record<string, string>;
+}
+
+export type ScriptedReply = StreamReply | HttpReply | FailedReply | HangReply;
 
 /** What a request gets when no handler answers it. */
 export const DEFAULT_REPLY_TEXT = 'Done.';
+
+/** What a compaction request gets when no handler answers it. */
+export const DEFAULT_COMPACTION_SUMMARY =
+  'Summary of the scripted conversation so far: nothing remains to carry over. Continue with the task.';
+
+export interface RateLimitWindowHeaders {
+  usedPercent: number;
+  windowMinutes: number;
+  /** Epoch seconds. */
+  resetAt: number;
+}
+
+export interface RateLimitHeadersOptions {
+  primary?: RateLimitWindowHeaders;
+  secondary?: RateLimitWindowHeaders;
+  credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  /** rate_limit_reached, or one of the workspace credit and usage-limit kinds. */
+  reachedType?: string;
+}
+
+/**
+ * The x-codex-* headers Codex 0.159.2 turns into account/rateLimits/updated (the probes saw used percent rounded,
+ * window minutes and resetsAt in epoch seconds). They can go with any reply.
+ */
+export function rateLimitHeaders(options: RateLimitHeadersOptions): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const name of ['primary', 'secondary'] as const) {
+    const window = options[name];
+    if (!window) continue;
+    headers[`x-codex-${name}-used-percent`] = String(window.usedPercent);
+    headers[`x-codex-${name}-window-minutes`] = String(window.windowMinutes);
+    headers[`x-codex-${name}-reset-at`] = String(window.resetAt);
+  }
+  if (options.credits) {
+    headers['x-codex-credits-has-credits'] = String(options.credits.hasCredits);
+    headers['x-codex-credits-unlimited'] = String(options.credits.unlimited);
+    if (options.credits.balance !== undefined) headers['x-codex-credits-balance'] = options.credits.balance;
+  }
+  if (options.reachedType) headers['x-codex-rate-limit-reached-type'] = options.reachedType;
+  return headers;
+}
+
+const FIVE_HOURS_MINUTES = 300;
+const WEEK_MINUTES = 10_080;
 
 /** exec_command yields after at most 30 s; a longer command is polled with write_stdin. */
 const EXEC_COMMAND_MAX_YIELD_MS = 30_000;
@@ -120,6 +187,47 @@ export const reply = {
   patch(patch: string, options: { callId?: string } = {}): StreamReply {
     const source = [`const result = await tools.apply_patch(${JSON.stringify(patch)});`, 'text(result);'].join('\n');
     return execCall(source, options.callId);
+  },
+
+  /**
+   * The subscription limit as the ChatGPT backend reports it: 429 usage_limit_reached, with the five-hour window at
+   * 100% until resetInS from now. Codex reports it as usageLimitExceeded.
+   */
+  usageLimit(resetInS: number): HttpReply {
+    const now = Math.floor(Date.now() / 1000);
+    const resetAt = now + resetInS;
+    return {
+      kind: 'http',
+      status: 429,
+      body: {
+        error: {
+          type: 'usage_limit_reached',
+          message: 'You have hit your usage limit.',
+          plan_type: 'plus',
+          resets_at: resetAt,
+          resets_in_seconds: resetInS,
+        },
+      },
+      headers: rateLimitHeaders({
+        primary: { usedPercent: 100, windowMinutes: FIVE_HOURS_MINUTES, resetAt },
+        secondary: { usedPercent: 40, windowMinutes: WEEK_MINUTES, resetAt: now + WEEK_MINUTES * 60 },
+      }),
+    };
+  },
+
+  /** Any HTTP error: a 500 becomes internalServerError, a 401 httpConnectionFailed with that status. */
+  httpError(status: number, body: unknown, headers: Record<string, string> = {}): HttpReply {
+    return { kind: 'http', status, body, headers };
+  },
+
+  /** An in-stream failure: context_length_exceeded becomes contextWindowExceeded (a 400 with it is only 'other'). */
+  failed(code: string, message: string): FailedReply {
+    return { kind: 'failed', code, message };
+  },
+
+  /** Holds the turn open, for steer, interrupt and approval tests, until ResponsesServer.release. */
+  hang(then?: StreamReply): HangReply {
+    return { kind: 'hang', ...(then ? { then } : {}) };
   },
 
   /** A direct function call, outside exec: wait, or a collaboration tool with its namespace. */
