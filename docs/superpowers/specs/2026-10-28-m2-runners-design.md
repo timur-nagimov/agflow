@@ -2254,7 +2254,7 @@ Owned by M2b.
 - `runner.json` gains `test: { claudeEnv, codexConfig, skipAuthChecks, allowShortTimings }`. It is honoured only with `AGFLOW_TEST=1`, and `agflow runner install` refuses it.
 - `claudeEnv` is added after the allowlist: `ANTHROPIC_BASE_URL`, a test key, `CLAUDE_CODE_MAX_RETRIES=0`, and the switches that stop non-essential traffic.
 - With `skipAuthChecks`, preflight reports the vendor ready, with the problem "test mode", `plan` "test mode", and `accountId` core's `TEST_ACCOUNT_ID`: `337c8a0a2e66c1e6`, the first 16 hex of sha256("agflow-test"). The fake adapter and both real adapters do this, so per-account quota and owner away work in tests.
-- Codex tests put the mock provider into the scratch `CODEX_HOME`'s `config.toml`.
+- Codex tests pass `test.codexConfig` as `-c` flags; no `config.toml` is written.
 - The adapter tests use the same switches through their constructors.
 - Test mode posts no macOS notifications.
 
@@ -2364,5 +2364,6 @@ Revision 2 applies the review's upheld findings. The main changes:
 - **Adapters.** `PreflightResult` (with `weakened`), `deleteTranscript`, the optional `enrichApproval`, `AgentLaunch.cliVersion` and `projectConfigVerified`, `tool_ended.hubUnreachable`, the agflow command passed to adapter factories, and `createAdapters` with one entry file per vendor. The runner core builds the take-over commands. Claude's preflight reads the experimental usage call. Codex sends `approvalsReviewer: 'user'` and runs an unverified clone `untrusted`.
 - **Hub.** Unknown agent tokens after a restore get `attempt_refenced`, and the 401 body names the end reason. M1 operations keep their M1 preconditions. A rule for a second stop request, and a row for stopping a runner lead. `startHub` options. Hub test mode (`AGFLOW_TEST_CONFIG`) and minimums. Retention runs outside the tick, and the first hourly backup an hour after start.
 - **Plans.** A staged, parallel execution order (section 14).
+- **Test mode and the web bundle.** Codex tests pass `test.codexConfig` as `-c` flags and write no `config.toml` (15.1). `packages/web` imports values only from zod-free core modules and checks the zod modules' values in its tests, so zod stays out of the browser bundle.
 
 Later contract changes are recorded here the same way.
