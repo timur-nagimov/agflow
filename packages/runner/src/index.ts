@@ -1,3 +1,4 @@
+export * from './adapters/types';
 export * from './attempt-store';
 export * from './backoff';
 export * from './clock';
