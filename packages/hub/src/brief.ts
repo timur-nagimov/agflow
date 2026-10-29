@@ -4,7 +4,7 @@ import { listEvents } from './events';
 import { currentGoalVersion, getCurrentGoal } from './goal';
 import { listStandingRules, unreadFor } from './messages';
 import { getProject } from './project';
-import { findTask, listTasks } from './tasks';
+import { findTask, listTasks } from './task-store';
 import { clip } from './text';
 
 export const BRIEF_LIMIT = 8000;

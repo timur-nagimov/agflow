@@ -2,7 +2,7 @@ import type { SearchResult } from '@agflow/core';
 import type { HubContext } from './context';
 import { getCurrentGoal } from './goal';
 import { type MessageRow, rowToMessage } from './messages';
-import { type TaskRow, rowToTask } from './tasks';
+import { type TaskRow, rowToTask } from './task-store';
 
 export function search(ctx: HubContext, query: string): SearchResult {
   const needle = query.trim();

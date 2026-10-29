@@ -22,7 +22,6 @@ import {
   declareImpossible,
   forceRelease,
   getTaskDetail,
-  listTasks,
   markMerged,
   rejectTask,
   releaseTask,
@@ -33,6 +32,7 @@ import {
   updateTask,
   writeHandoff,
 } from '../tasks';
+import { listTasks } from '../task-store';
 import type { App } from './app';
 import { actor, agentOf, human, leadOrHuman, principal, readBody } from './util';
 

@@ -3,7 +3,8 @@ import { findAgentBySession, getAgent, touchAgent } from './agents';
 import { type HubContext, tx } from './context';
 import { forbidden } from './errors';
 import { markDelivered, unreadFor } from './messages';
-import { findTask, lastRemindedAt, markReminded } from './tasks';
+import { findTask } from './task-store';
+import { lastRemindedAt, markReminded } from './tasks';
 import { clip } from './text';
 
 export const LIVE_INBOX_CHAR_LIMIT = 6000;

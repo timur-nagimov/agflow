@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import type { TaskStatus } from '@agflow/core';
 import { ACTIVE_MS, getAgent, touchAgent } from '../src/agents';
 import { HubError } from '../src/errors';
 import { listEvents } from '../src/events';
 import { listMessages } from '../src/messages';
 import { setPaused } from '../src/project';
+import { addNote, isPathHolder, overlappingPathHolder, writeTask } from '../src/task-store';
 import {
   acceptTask,
   cancelTask,
@@ -287,5 +289,104 @@ describe('leases', () => {
     expect(resumeClaim(ctx, task.id, newSession).assignee).toBe(newSession.id);
     expect(getAgent(ctx, oldSession.id).currentTask).toBeNull();
     expect(getAgent(ctx, newSession.id).currentTask).toBe(task.id);
+  });
+});
+
+describe('path holders', () => {
+  // Nothing moves a task to these blocks yet (take-over, stop and hold, and submissions do later), so the tests write
+  // the block directly.
+  const holderBlocks = [
+    ['takeover', 'which a person has taken over'],
+    ['paused', 'which a person stopped and holds'],
+    ['branch_moved', 'whose branch moved outside agflow'],
+  ] as const;
+
+  for (const [kind, holding] of holderBlocks) {
+    test(`a task blocked as ${kind} keeps its owned paths`, () => {
+      const { ctx } = createTestContext();
+      const first = addAgent(ctx);
+      const second = addAgent(ctx, 'bob');
+      const [a, b, c] = createTasks(
+        ctx,
+        [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['src/auth/login.ts'] }), newTask({ ownedPaths: ['docs/**'] })],
+        'user:alice',
+      );
+      writeTask(ctx, a.id, { status: 'blocked', blockedKind: kind, blockedReason: 'held by a person' });
+      expect(isPathHolder(getTask(ctx, a.id))).toBe(true);
+      expect(overlappingPathHolder(ctx, getTask(ctx, b.id))?.id).toBe(a.id);
+      expect(() => claimTask(ctx, b.id, first)).toThrow(`${b.id} owns paths that overlap ${a.id}, ${holding}`);
+      claimTask(ctx, c.id, second);
+      expect(() => updateTask(ctx, c.id, { ownedPaths: ['docs/**', 'src/auth/README.md'] }, 'user:alice')).toThrow(
+        `${c.id} would own paths that overlap ${a.id}, ${holding}`,
+      );
+    });
+  }
+
+  for (const kind of ['agent', 'deps', 'impossible', 'replan', 'policy'] as const) {
+    test(`a task blocked as ${kind} holds no paths`, () => {
+      const { ctx } = createTestContext();
+      const agent = addAgent(ctx);
+      const [a, b] = createTasks(
+        ctx,
+        [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['src/auth/login.ts'] })],
+        'user:alice',
+      );
+      writeTask(ctx, a.id, { status: 'blocked', blockedKind: kind, blockedReason: 'waiting' });
+      expect(isPathHolder(getTask(ctx, a.id))).toBe(false);
+      expect(overlappingPathHolder(ctx, getTask(ctx, b.id))).toBeNull();
+      expect(claimTask(ctx, b.id, agent).status).toBe('claimed');
+    });
+  }
+
+  test('held and reviewed tasks hold their paths; ready, rejected and closed ones do not', () => {
+    const holds = (status: TaskStatus) => isPathHolder({ status, blockedKind: null });
+    for (const status of ['claimed', 'working', 'submitted', 'checking', 'reviewing'] as const) {
+      expect([status, holds(status)]).toEqual([status, true]);
+    }
+    for (const status of ['draft', 'ready', 'rejected', 'stale', 'accepted', 'merged', 'cancelled', 'failed'] as const) {
+      expect([status, holds(status)]).toEqual([status, false]);
+    }
+  });
+});
+
+describe('the task store', () => {
+  test('writeTask stores the M2 columns', () => {
+    const { ctx, clock } = createTestContext();
+    const [task] = createTasks(ctx, [newTask()], 'user:alice');
+    clock.advance(1_000);
+    const sha = 'b'.repeat(40);
+    writeTask(ctx, task.id, {
+      currentAttempt: 'T-1-a2',
+      workRef: 'refs/agflow/T-1/a2',
+      workSha: sha,
+      branchHead: 'c'.repeat(40),
+      nextDispatchAt: ctx.now() + 60_000,
+      dispatchHoldUntil: ctx.now() + 120_000,
+      ladderFloor: 2,
+    });
+    expect(ctx.db.query('SELECT * FROM tasks WHERE id = $id').get({ id: task.id })).toMatchObject({
+      current_attempt: 'T-1-a2',
+      work_ref: 'refs/agflow/T-1/a2',
+      work_sha: sha,
+      branch_head: 'c'.repeat(40),
+      next_dispatch_at: ctx.now() + 60_000,
+      dispatch_hold_until: ctx.now() + 120_000,
+      ladder_floor: 2,
+      updated_at: ctx.now(),
+    });
+    // Null clears a column; a field left out keeps its value.
+    writeTask(ctx, task.id, { workRef: null, workSha: null });
+    expect(getTask(ctx, task.id)).toMatchObject({ currentAttempt: 'T-1-a2', workRef: null, workSha: null });
+  });
+
+  test('addNote records the attempt a note belongs to', () => {
+    const { ctx } = createTestContext();
+    const [task] = createTasks(ctx, [newTask()], 'user:alice');
+    addNote(ctx, task.id, 'handoff', 'Half done.', 'agent:A-1', 'T-1-a1');
+    addNote(ctx, task.id, 'progress', 'Started.', 'agent:A-1');
+    expect(listTaskNotes(ctx, task.id).map((note) => [note.kind, note.attemptId])).toEqual([
+      ['handoff', 'T-1-a1'],
+      ['progress', null],
+    ]);
   });
 });

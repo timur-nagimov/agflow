@@ -20,7 +20,7 @@ import {
 } from '../goal';
 import { listMessages } from '../messages';
 import { getProject, setPaused } from '../project';
-import { listTasks } from '../tasks';
+import { listTasks } from '../task-store';
 import type { App } from './app';
 import { actor, human, leadOrHuman, principal, readBody, readQuery } from './util';
 

@@ -1,89 +1,44 @@
 import {
   type Agent,
-  type BlockedKind,
   type NewTask,
   type Submission,
   type Task,
   type TaskContract,
   type TaskDetail,
-  type TaskNote,
   type TaskPatch,
   type TaskStatus,
-  assertTransition,
   isClosed,
-  isDone,
   isHeld,
-  pathsOverlap,
   quoteLines,
 } from '@agflow/core';
 import { statusFor } from './agents';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
-import { badRequest, conflict, forbidden, notFound } from './errors';
+import { badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
+import {
+  type TaskRow,
+  addNote,
+  dependencyReason,
+  findTask,
+  getTask,
+  listTaskNotes,
+  listTasks,
+  move,
+  overlappingPathHolder,
+  rowToTask,
+  setAgentTask,
+  unmetDependencies,
+  waitingReason,
+  writeTask,
+} from './task-store';
 import { clip } from './text';
 
-export interface TaskRow {
-  id: string;
-  seq: number;
-  status: TaskStatus;
-  contract: string;
-  assignee: string | null;
-  branch: string | null;
-  goal_version: number;
-  lease_expires_at: number | null;
-  blocked_kind: BlockedKind | null;
-  blocked_reason: string | null;
-  submission: string | null;
-  feedback: string | null;
-  merged_sha: string | null;
-  created_by: string;
-  created_at: number;
-  updated_at: number;
-  last_reminded_at: number | null;
-  current_attempt: string | null;
-  ladder_floor: number;
-  work_ref: string | null;
-  work_sha: string | null;
-  branch_head: string | null;
-  next_dispatch_at: number | null;
-  dispatch_hold_until: number | null;
-}
-
-/** Submissions recorded before M2 carry no attempt or submission id. */
-type StoredSubmission = Omit<Submission, 'attemptId' | 'submissionId'> & Partial<Submission>;
-
-export function rowToTask(row: TaskRow): Task {
-  const contract = JSON.parse(row.contract) as TaskContract;
-  return {
-    ...contract,
-    id: row.id,
-    status: row.status,
-    assignee: row.assignee,
-    branch: row.branch,
-    goalVersion: row.goal_version,
-    leaseExpiresAt: row.lease_expires_at,
-    blockedKind: row.blocked_kind,
-    blockedReason: row.blocked_reason,
-    submission: row.submission
-      ? { attemptId: null, submissionId: null, ...(JSON.parse(row.submission) as StoredSubmission) }
-      : null,
-    feedback: row.feedback,
-    mergedSha: row.merged_sha,
-    createdBy: row.created_by,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    currentAttempt: row.current_attempt,
-    // Nothing records attempts yet, so a task has none.
-    attemptCount: 0,
-    workRef: row.work_ref,
-    workSha: row.work_sha,
-    nextDispatchAt: row.next_dispatch_at,
-  };
-}
+// The reads moved to task-store.ts; callers of this module keep importing them from here.
+export { type TaskFilter, type TaskRow, findTask, getTask, listTaskNotes, listTasks, rowToTask } from './task-store';
 
 function contractOf(task: Task): TaskContract {
   return {
@@ -102,53 +57,6 @@ function contractOf(task: Task): TaskContract {
   };
 }
 
-export function findTask(ctx: HubContext, id: string): Task | null {
-  const row = ctx.db.query('SELECT * FROM tasks WHERE id = $id').get({ id }) as TaskRow | null;
-  return row ? rowToTask(row) : null;
-}
-
-export function getTask(ctx: HubContext, id: string): Task {
-  const task = findTask(ctx, id);
-  if (!task) throw notFound(`task ${id}`);
-  return task;
-}
-
-export interface TaskFilter {
-  status?: TaskStatus[] | undefined;
-  assignee?: string | undefined;
-}
-
-export function listTasks(ctx: HubContext, filter: TaskFilter = {}): Task[] {
-  const rows = ctx.db.query('SELECT * FROM tasks ORDER BY seq').all() as TaskRow[];
-  return rows
-    .map(rowToTask)
-    .filter(
-      (task) =>
-        (!filter.status || filter.status.includes(task.status)) && (!filter.assignee || task.assignee === filter.assignee),
-    );
-}
-
-export function listTaskNotes(ctx: HubContext, taskId: string): TaskNote[] {
-  const rows = ctx.db.query('SELECT * FROM task_notes WHERE task_id = $taskId ORDER BY id').all({ taskId }) as {
-    id: number;
-    task_id: string;
-    kind: TaskNote['kind'];
-    body: string;
-    author: string;
-    created_at: number;
-    attempt_id: string | null;
-  }[];
-  return rows.map((row) => ({
-    id: row.id,
-    taskId: row.task_id,
-    kind: row.kind,
-    body: row.body,
-    author: row.author,
-    createdAt: row.created_at,
-    attemptId: row.attempt_id,
-  }));
-}
-
 export function getTaskDetail(ctx: HubContext, id: string): TaskDetail {
   const task = getTask(ctx, id);
   return {
@@ -165,89 +73,6 @@ export function getTaskDetail(ctx: HubContext, id: string): TaskDetail {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-interface Changes {
-  status?: TaskStatus;
-  assignee?: string | null;
-  branch?: string | null;
-  leaseExpiresAt?: number | null;
-  blockedKind?: BlockedKind | null;
-  blockedReason?: string | null;
-  submission?: Task['submission'];
-  feedback?: string | null;
-  mergedSha?: string | null;
-  contract?: TaskContract;
-  lastRemindedAt?: number | null;
-}
-
-const COLUMNS: Record<keyof Changes, string> = {
-  status: 'status',
-  assignee: 'assignee',
-  branch: 'branch',
-  leaseExpiresAt: 'lease_expires_at',
-  blockedKind: 'blocked_kind',
-  blockedReason: 'blocked_reason',
-  submission: 'submission',
-  feedback: 'feedback',
-  mergedSha: 'merged_sha',
-  contract: 'contract',
-  lastRemindedAt: 'last_reminded_at',
-};
-
-function writeTask(ctx: HubContext, id: string, changes: Changes): void {
-  const sets = ['updated_at = $now'];
-  const params: Record<string, string | number | null> = { id, now: ctx.now() };
-  for (const [key, value] of Object.entries(changes) as [keyof Changes, unknown][]) {
-    if (value === undefined) continue;
-    sets.push(`${COLUMNS[key]} = $${key}`);
-    const isJson = key === 'contract' || key === 'submission';
-    params[key] = isJson ? (value === null ? null : JSON.stringify(value)) : (value as string | number | null);
-  }
-  ctx.db.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = $id`).run(params);
-}
-
-interface MoveOptions {
-  changes?: Omit<Changes, 'status'>;
-  event?: string;
-  data?: Record<string, unknown>;
-}
-
-/** Moves a task to a new status, applies the changes and emits one event. */
-function move(ctx: HubContext, emit: Emit, task: Task, to: TaskStatus, actor: string, options: MoveOptions = {}): Task {
-  assertTransition(task.status, to);
-  writeTask(ctx, task.id, { ...options.changes, status: to });
-  emit({ type: options.event ?? `task.${to}`, actor, subject: task.id, data: { from: task.status, ...options.data } });
-  return getTask(ctx, task.id);
-}
-
-function setAgentTask(ctx: HubContext, agentId: string, taskId: string | null): void {
-  ctx.db.query('UPDATE agents SET current_task = $taskId WHERE id = $agentId').run({ taskId, agentId });
-}
-
-function addNote(ctx: HubContext, taskId: string, kind: TaskNote['kind'], body: string, author: string): void {
-  ctx.db
-    .query('INSERT INTO task_notes (task_id, kind, body, author, created_at) VALUES ($taskId, $kind, $body, $author, $now)')
-    .run({ taskId, kind, body, author, now: ctx.now() });
-}
-
-function unmetDependencies(ctx: HubContext, dependsOn: string[]): string[] {
-  return dependsOn.filter((id) => {
-    const dependency = findTask(ctx, id);
-    return !dependency || !isDone(dependency.status);
-  });
-}
-
-const waitingReason = (ids: string[]) => `waiting on ${ids.join(', ')}`;
-
-/**
- * Why a task is blocked on its dependencies. A cancelled dependency will never be done, so instead of
- * naming it among the tasks it waits on, the reason asks for a decision.
- */
-function dependencyReason(ctx: HubContext, waiting: string[]): string {
-  const cancelled = waiting.filter((id) => findTask(ctx, id)?.status === 'cancelled');
-  if (cancelled.length === 0) return waitingReason(waiting);
-  return `${cancelled.join(', ')} ${cancelled.length === 1 ? 'was' : 'were'} cancelled; amend or cancel this task`;
-}
 
 /**
  * What an agent wrote, inside a notice that the hub sends. Messages from "system" are the hub's own
@@ -380,7 +205,7 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
       // Decision 8 also covers paths a held task gains. Only the added ones are checked, so an overlap
       // that is already there does not block an unrelated change.
       const added = contract.ownedPaths.filter((path) => !task.ownedPaths.includes(path));
-      const clash = overlappingHeldTask(ctx, { ...task, ownedPaths: added });
+      const clash = overlappingPathHolder(ctx, { ...task, ownedPaths: added });
       if (clash) throw conflict(`${id} would own paths that overlap ${holding(clash)}`);
     }
     writeTask(ctx, id, { contract });
@@ -468,27 +293,14 @@ function heldTaskOf(ctx: HubContext, agentId: string): Task | null {
   return row ? rowToTask(row) : null;
 }
 
-/**
- * Decision 8, owned paths: a task cannot be claimed, sent back to its author or given more paths while
- * it is held, if another task whose owned paths overlap it is held or waiting for review. Work waiting
- * for review keeps its paths until it is accepted, rejected or cancelled, because a second branch on
- * the same paths would conflict with it. The overlap test is conservative: it may block a pair that a
- * full glob engine would allow, never the reverse.
- */
-const PATH_HOLDERS: TaskStatus[] = ['claimed', 'working', 'submitted', 'checking', 'reviewing'];
-
-function overlappingHeldTask(ctx: HubContext, task: Task): Task | null {
-  if (task.ownedPaths.length === 0) return null;
-  return (
-    listTasks(ctx, { status: PATH_HOLDERS }).find(
-      (other) => other.id !== task.id && pathsOverlap(task.ownedPaths, other.ownedPaths),
-    ) ?? null
-  );
-}
-
 /** Names the task that holds overlapping paths, for a refusal. */
-const holding = (task: Task): string =>
-  isHeld(task.status) ? `${task.id}, which ${task.assignee} is working on` : `${task.id}, which is waiting for review`;
+function holding(task: Task): string {
+  if (isHeld(task.status)) return `${task.id}, which ${task.assignee} is working on`;
+  if (task.blockedKind === 'takeover') return `${task.id}, which a person has taken over`;
+  if (task.blockedKind === 'paused') return `${task.id}, which a person stopped and holds`;
+  if (task.blockedKind === 'branch_moved') return `${task.id}, whose branch moved outside agflow`;
+  return `${task.id}, which is waiting for review`;
+}
 
 function requireHolder(task: Task, agent: Agent): void {
   if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
@@ -510,7 +322,7 @@ export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: st
       });
       return { waiting };
     }
-    const clash = overlappingHeldTask(ctx, task);
+    const clash = overlappingPathHolder(ctx, task);
     if (clash) throw conflict(`${id} owns paths that overlap ${holding(clash)}`);
     const claimed = move(ctx, emit, task, 'claimed', `agent:${agent.id}`, {
       changes: { assignee: agent.id, branch: branch ?? task.branch, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
@@ -714,7 +526,7 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
       author &&
       statusFor(author.last_seen_at, ctx.now()) === 'active' &&
       !heldTaskOf(ctx, author.id) &&
-      !overlappingHeldTask(ctx, task)
+      !overlappingPathHolder(ctx, task)
     ) {
       const back = move(ctx, emit, rejected, 'claimed', 'system', {
         changes: { assignee: author.id, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
