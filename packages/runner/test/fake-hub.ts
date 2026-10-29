@@ -2,16 +2,20 @@
 // the bearer token before the upgrade, validates every runner message with core's schemas (and every event with
 // parseRunnerEvent), keeps acknowledged positions per outbox epoch as the hub does, and by default welcomes each
 // hello, acknowledges each events message and answers each heartbeat. Tests script the rest through the connections.
+// GET /api/runner/whoami answers the same token check over HTTP, as the hub's probe does.
 import {
+  AGFLOW_VERSION,
   type HubMessage,
   HubMessageSchema,
   parseRunnerEvent,
+  PROTOCOL_VERSION,
   type RawRunnerEvent,
   type RunnerCommand,
   type RunnerMessage,
   RunnerMessageSchema,
 } from '@agflow/core';
 import type { ServerWebSocket } from 'bun';
+import type { Outbox } from '../src/outbox';
 
 export type WelcomeMessage = Extract<HubMessage, { t: 'welcome' }>;
 export type HelloMessage = Extract<RunnerMessage, { t: 'hello' }>;
@@ -32,6 +36,8 @@ export interface FakeHubOptions {
   autoAck?: boolean;
   /** Answer each heartbeat with heartbeat_ack; true by default. */
   heartbeatAck?: boolean;
+  /** Answer whoami with this status instead of the token check (a hub in trouble, say). */
+  whoamiStatus?: number;
 }
 
 export interface FakeConnection {
@@ -53,6 +59,10 @@ export interface FakeHub {
   /** The hub's http URL; the runner derives ws://.../api/runner/ws from it. */
   url: string;
   connections: FakeConnection[];
+  /** Upgrades refused with 401 for a wrong bearer. */
+  refusedUpgrades: number;
+  /** The Authorization header of every whoami call, in order. */
+  whoamiCalls: (string | null)[];
   /** Every message that failed core's schemas, with the reason. Tests expect it to stay empty. */
   invalid: { text: string; error: string }[];
   /** Every valid message of every connection, in arrival order. */
@@ -74,6 +84,31 @@ export interface FakeHub {
 
 const HUB_EPOCH = 1;
 const RUNNER_ID = 'R-1';
+
+/** A schema-valid hello for the runner whose outbox this is. */
+export function testHello(outbox: Outbox): HelloMessage {
+  return {
+    t: 'hello',
+    protocol: PROTOCOL_VERSION,
+    runnerKey: 'rk_test',
+    machineId: 'MACHINE-1',
+    name: 'laptop',
+    agflowVersion: AGFLOW_VERSION,
+    platform: 'darwin-arm64',
+    settings: { capacity: 2, keepAwake: 'ac', draining: false, ceilings: {}, allowPaidUsage: {}, version: 1 },
+    vendors: [],
+    quota: [],
+    profile: { name: 'standard', weakened: [], dependencyPrep: false },
+    git: { ready: true, problem: null, lastPushAt: null },
+    state: 'ok',
+    stateDetail: null,
+    outboxEpoch: outbox.epoch,
+    firstSeq: outbox.firstSeq(),
+    lastSeq: outbox.lastSeq(),
+    lastHubEpoch: null,
+    attempts: [],
+  };
+}
 
 /** A schema-valid welcome with the fake hub's defaults, for tests that send one by hand. */
 export function testWelcome(ackedSeq: number, fields: Partial<WelcomeMessage> = {}): WelcomeMessage {
@@ -104,6 +139,8 @@ export function startFakeHub(options: FakeHubOptions = {}): FakeHub {
   const events: RawRunnerEvent[] = [];
   const results = new Map<string, ResultMessage>();
   const acked = new Map<string, number>();
+  const whoamiCalls: (string | null)[] = [];
+  let refusedUpgrades = 0;
   let commandSeq = 0;
 
   const welcomeFor = (hello: HelloMessage, connection: FakeConnection): WelcomeMessage | null => {
@@ -166,9 +203,21 @@ export function startFakeHub(options: FakeHubOptions = {}): FakeHub {
     hostname: '127.0.0.1',
     port: 0,
     fetch(request, srv) {
-      if (new URL(request.url).pathname !== '/api/runner/ws') return new Response('not found', { status: 404 });
+      const path = new URL(request.url).pathname;
       const authorization = request.headers.get('authorization');
-      if (options.token !== undefined && authorization !== `Bearer ${options.token}`) {
+      const accepted = options.token === undefined || authorization === `Bearer ${options.token}`;
+      if (path === '/api/runner/whoami') {
+        whoamiCalls.push(authorization);
+        if (options.whoamiStatus !== undefined) {
+          return Response.json({ error: 'scripted' }, { status: options.whoamiStatus });
+        }
+        return accepted
+          ? Response.json({ user: 'alice' })
+          : Response.json({ error: 'unauthorized' }, { status: 401 });
+      }
+      if (path !== '/api/runner/ws') return new Response('not found', { status: 404 });
+      if (!accepted) {
+        refusedUpgrades += 1;
         return Response.json({ error: 'unauthorized' }, { status: 401 });
       }
       const connection: FakeConnection = {
@@ -224,6 +273,10 @@ export function startFakeHub(options: FakeHubOptions = {}): FakeHub {
   return {
     url: `http://127.0.0.1:${server.port}`,
     connections,
+    get refusedUpgrades() {
+      return refusedUpgrades;
+    },
+    whoamiCalls,
     invalid,
     results,
     messages: () => [...all],

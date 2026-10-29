@@ -3,10 +3,17 @@
 // heartbeats, and hands each command to the command handler, sending its result back. A link silent for deadLink is
 // terminated, a handshake without welcome times out, and a dropped link reconnects with full-jitter backoff, or at
 // once after a clock gap. canPushWip (design 7.3, X-11) reads welcomeSinceGap and lastAckAt from here.
-import { type Credentials, type HubMessage, parseHubMessage, type RunnerMessage } from '@agflow/core';
+//
+// Refusals: a socket refused before it opened is probed with whoami, because a refused WebSocket client sees only
+// "Expected 101". A 401 there means the CLI login expired: the link waits in needs_login, probing whoami every
+// loginProbe with freshly read credentials, and reconnects once one passes (design 7.1; M2c adds the side effects).
+// A CLI signed out, or signed in to another hub, needs a person's `agflow login` just the same: needs_login too.
+// The hub's close codes 4403, 4409 and 4426 end the link for good, since only a person can fix them.
+import { CLOSE_CODES, type Credentials, type HubMessage, parseHubMessage, type RunnerMessage } from '@agflow/core';
 import { Backoff } from './backoff';
 import { type AwakeClock, type ClockGap, type ClockSource, systemClock } from './clock';
 import type { RunnerTimings } from './config';
+import { RunnerHttpError, RunnerHubHttp } from './hub-http';
 import type { CommandResult } from './journal';
 import { type Logger, noopLogger } from './log';
 import type { Outbox, StoredEvent } from './outbox';
@@ -19,8 +26,11 @@ export type HeartbeatContent = Omit<Extract<RunnerMessage, { t: 'heartbeat' }>, 
 export type WelcomeMessage = Extract<HubMessage, { t: 'welcome' }>;
 export type CommandMessage = Extract<HubMessage, { t: 'command' }>;
 
-/** idle before start; connecting until welcome; online after it; backoff between connections; closed for good. */
-export type LinkState = 'idle' | 'connecting' | 'online' | 'backoff' | 'closed';
+/**
+ * idle before start; connecting until welcome; online after it; backoff between connections; needs_login while the
+ * hub refuses the CLI token; closed for good (close(), or a 4403, 4409 or 4426 from the hub).
+ */
+export type LinkState = 'idle' | 'connecting' | 'online' | 'backoff' | 'needs_login' | 'closed';
 
 export interface LinkHandlers {
   /**
@@ -33,20 +43,32 @@ export interface LinkHandlers {
   onWelcome?(welcome: WelcomeMessage): void;
   /** Each state change, with the close code and reason of the socket that ended (null and '' otherwise). */
   onState?(state: LinkState, detail: { code: number | null; reason: string }): void;
+  /**
+   * The CLI has no token this hub accepts: whoami answered 401, or the CLI is signed out or signed in to another hub.
+   * Called once each time the link enters needs_login.
+   */
+  onNeedsLogin?(): void;
+  /** 4409 on the current socket: another process uses this runner's key. The link is closed. */
+  onReplaced?(reason: string): void;
+  /** 4403: the key belongs to another owner or machine, or the runner was retired; reason is the hub's. */
+  onRefused?(reason: string): void;
+  /** 4426: the hub does not support this runner's protocol; reason names the minimum version. */
+  onIncompatible?(reason: string): void;
 }
 
 export interface LinkOptions {
   credentials: CredentialsProvider;
   /**
    * The hub this runner serves: the one its project key was derived from at start. While the CLI is signed in to
-   * another hub (one credentials.json, switched by `agflow login --hub`), the link opens no socket and backs off.
+   * another hub (one credentials.json, switched by `agflow login --hub`), the link opens no socket and waits in
+   * needs_login.
    */
   hubUrl: string;
   outbox: Outbox;
   /** The awake clock: its gaps reconnect the link, and lastAckAt is read on it. */
   clock: AwakeClock;
   /** runner.json's timings; welcome.timings override heartbeat and deadLink. */
-  timings: Pick<RunnerTimings, 'heartbeat' | 'deadLink' | 'handshake' | 'backoffBase' | 'backoffCap'>;
+  timings: Pick<RunnerTimings, 'heartbeat' | 'deadLink' | 'handshake' | 'backoffBase' | 'backoffCap' | 'loginProbe'>;
   /** Builds the hello sent first on every connection. */
   hello: () => HelloMessage | Promise<HelloMessage>;
   /** The content of each heartbeat: every live attempt's facts, power, disk and acceptingUntil. */
@@ -57,6 +79,8 @@ export interface LinkOptions {
    */
   resent?: (event: StoredEvent) => boolean;
   handlers: LinkHandlers;
+  /** The whoami probe; one over `credentials` by default. */
+  http?: Pick<RunnerHubHttp, 'whoami'>;
   logger?: Logger;
   /** Timers; the system's by default. */
   timers?: ClockSource;
@@ -107,6 +131,7 @@ export class LinkClient {
   private readonly logger: Logger;
   private readonly timers: ClockSource;
   private readonly backoff: Backoff;
+  private readonly http: Pick<RunnerHubHttp, 'whoami'>;
   private currentState: LinkState = 'idle';
   private socket: WebSocket | null = null;
   /** Counts connection attempts, so one overtaken while it read the credentials gives up. */
@@ -116,6 +141,9 @@ export class LinkClient {
   private ackAt: number | null = null;
   /** The highest seq sent on the current connection. */
   private sentSeq = 0;
+  /** Whether the current socket opened; one closed before that was refused or never reached the hub. */
+  private opened = false;
+  /** The next reconnect, or in needs_login the next whoami probe. */
   private reconnectTimer: unknown = null;
   private handshakeTimer: unknown = null;
   private deadTimer: unknown = null;
@@ -125,6 +153,7 @@ export class LinkClient {
   constructor(private readonly options: LinkOptions) {
     this.logger = options.logger ?? noopLogger;
     this.timers = options.timers ?? systemClock;
+    this.http = options.http ?? new RunnerHubHttp({ credentials: options.credentials });
     this.backoff = new Backoff({
       base: options.timings.backoffBase,
       cap: options.timings.backoffCap,
@@ -202,23 +231,10 @@ export class LinkClient {
     this.reconnectTimer = null;
     const generation = ++this.generation;
     this.setState('connecting', { code: null, reason: '' });
-    let credentials: Credentials | null;
-    try {
-      credentials = await this.options.credentials();
-    } catch (error) {
-      this.logger.warn('cannot read the CLI credentials', { error: describe(error) });
-      credentials = null;
-    }
+    const credentials = await this.hubCredentials();
     if (generation !== this.generation || this.currentState !== 'connecting') return;
-    if (!credentials) {
-      this.logger.warn('not signed in to an agflow hub; run agflow login');
-      this.scheduleReconnect({ code: null, reason: 'not signed in' });
-      return;
-    }
-    // The CLI token of another hub never goes to this one, and this runner's hello and events never go to another.
-    if (!sameHubUrl(credentials.hubUrl, this.options.hubUrl)) {
-      this.logger.warn(`the CLI is signed in to ${credentials.hubUrl}; this runner serves ${this.options.hubUrl}`);
-      this.scheduleReconnect({ code: null, reason: 'signed in to another hub' });
+    if (typeof credentials === 'string') {
+      this.enterNeedsLogin(credentials);
       return;
     }
     let socket: WebSocket;
@@ -233,13 +249,17 @@ export class LinkClient {
     }
     this.socket = socket;
     this.sentSeq = 0;
+    this.opened = false;
     // The handshake covers the upgrade and the welcome.
     this.handshakeTimer = this.timers.setTimeout(() => {
       if (this.socket !== socket) return;
       this.logger.warn('the hub sent no welcome in time; reconnecting', { ms: this.options.timings.handshake });
       this.terminate(socket, 'handshake timeout');
     }, this.options.timings.handshake);
-    socket.addEventListener('open', () => void this.sendHello(socket));
+    socket.addEventListener('open', () => {
+      if (this.socket === socket) this.opened = true;
+      void this.sendHello(socket);
+    });
     socket.addEventListener('message', (event) => this.receive(socket, event.data));
     socket.addEventListener('close', (event) => this.closed(socket, event.code, event.reason));
   }
@@ -259,6 +279,8 @@ export class LinkClient {
    * had closed, without waiting for its close event.
    */
   private terminate(socket: WebSocket, reason: string): void {
+    // Our own decision, never a refusal to probe.
+    this.opened = true;
     // Closed first: terminate() may report its own close event at once, which would replace this reason.
     this.closed(socket, 1006, reason);
     socket.terminate();
@@ -267,13 +289,113 @@ export class LinkClient {
   private closed(socket: WebSocket, code: number, reason: string): void {
     // A gap that this close is the first to see reconnects at once (onGap replaces the socket), not after a backoff.
     this.options.clock.awakeNow();
-    // A socket that a reconnect or close() already replaced has nothing more to say.
+    // A socket that a reconnect or close() already replaced has nothing more to say, a 4409 included.
     if (this.socket !== socket) return;
     this.socket = null;
     this.clearTimers();
     this.backoff.disconnected();
     this.logger.info('the hub link closed', { code, reason });
-    this.scheduleReconnect({ code, reason });
+    switch (code) {
+      case CLOSE_CODES.replaced:
+        this.logger.warn('another process connected with this runner key; closing the link', { reason });
+        this.finish({ code, reason }, this.options.handlers.onReplaced);
+        return;
+      case CLOSE_CODES.refused:
+        this.logger.error('the hub refused this runner', { reason });
+        this.finish({ code, reason }, this.options.handlers.onRefused);
+        return;
+      case CLOSE_CODES.incompatible:
+        this.logger.error('the hub does not support this runner version', { reason });
+        this.finish({ code, reason }, this.options.handlers.onIncompatible);
+        return;
+    }
+    if (this.opened) this.scheduleReconnect({ code, reason });
+    else void this.probeRefused({ code, reason });
+  }
+
+  /** Ends the link for good after a refusal only a person can fix, then tells the handler. */
+  private finish(detail: { code: number; reason: string }, handler: ((reason: string) => void) | undefined): void {
+    for (const stop of this.unsubscribe.splice(0)) stop();
+    this.generation += 1;
+    this.setState('closed', detail);
+    handler?.call(this.options.handlers, detail.reason);
+  }
+
+  /**
+   * The CLI's credentials if they are for this runner's hub, or why not. The CLI token of another hub never goes to
+   * this one, and this runner's hello, events and probes never go to another.
+   */
+  private async hubCredentials(): Promise<Credentials | string> {
+    let credentials: Credentials | null;
+    try {
+      credentials = await this.options.credentials();
+    } catch (error) {
+      this.logger.warn('cannot read the CLI credentials', { error: describe(error) });
+      credentials = null;
+    }
+    if (!credentials) return 'the CLI is not signed in';
+    if (!sameHubUrl(credentials.hubUrl, this.options.hubUrl)) {
+      return `the CLI is signed in to ${credentials.hubUrl}; this runner serves ${this.options.hubUrl}`;
+    }
+    return credentials;
+  }
+
+  /**
+   * Whoami's verdict on the current credentials: accepted, refused (401), none for this hub (whoami is not called),
+   * or no verdict at all.
+   */
+  private async probe(): Promise<'ok' | 'unauthorized' | 'signed_out' | 'failed'> {
+    const credentials = await this.hubCredentials();
+    if (typeof credentials === 'string') return 'signed_out';
+    try {
+      await this.http.whoami();
+      return 'ok';
+    } catch (error) {
+      if (error instanceof RunnerHttpError && error.status === 401) return 'unauthorized';
+      this.logger.warn('the whoami probe failed', { error: describe(error) });
+      return 'failed';
+    }
+  }
+
+  /**
+   * A socket closed before it opened: a 401 from whoami means the login expired, as do credentials gone meanwhile;
+   * anything else backs off.
+   */
+  private async probeRefused(detail: { code: number; reason: string }): Promise<void> {
+    const generation = this.generation;
+    const outcome = await this.probe();
+    if (generation !== this.generation || this.currentState === 'closed') return;
+    if (outcome === 'unauthorized') this.enterNeedsLogin('the hub refused the CLI token');
+    else if (outcome === 'signed_out') this.enterNeedsLogin('the CLI has no credentials for this hub');
+    else this.scheduleReconnect(detail);
+  }
+
+  private enterNeedsLogin(reason: string): void {
+    this.logger.warn(`${reason}; run agflow login --hub ${this.options.hubUrl}`);
+    this.setState('needs_login', { code: null, reason });
+    this.options.handlers.onNeedsLogin?.();
+    this.scheduleLoginProbe();
+  }
+
+  private scheduleLoginProbe(): void {
+    this.reconnectTimer = this.timers.setTimeout(() => void this.loginProbe(), this.options.timings.loginProbe);
+  }
+
+  /**
+   * In needs_login: once whoami accepts the re-read credentials, connect again; otherwise (refused, signed out or no
+   * verdict) probe again later.
+   */
+  private async loginProbe(): Promise<void> {
+    this.reconnectTimer = null;
+    const generation = ++this.generation;
+    const outcome = await this.probe();
+    if (generation !== this.generation || this.currentState !== 'needs_login') return;
+    if (outcome !== 'ok') {
+      this.scheduleLoginProbe();
+      return;
+    }
+    this.logger.info('the hub accepts the CLI token again; reconnecting');
+    void this.connect();
   }
 
   private scheduleReconnect(detail: { code: number | null; reason: string }): void {
@@ -313,12 +435,18 @@ export class LinkClient {
   private onGap(gap: ClockGap): void {
     if (this.currentState === 'closed') return;
     this.sinceGap = false;
+    if (this.reconnectTimer !== null) this.timers.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    // A refused token stays refused across a sleep: probe again at once instead of trying the link.
+    if (this.currentState === 'needs_login') {
+      void this.loginProbe();
+      return;
+    }
     this.logger.info('the clock jumped; reconnecting', { gapMs: gap.ms });
     const socket = this.socket;
     this.socket = null;
     this.clearTimers();
     socket?.terminate();
-    if (this.reconnectTimer !== null) this.timers.clearTimeout(this.reconnectTimer);
     this.backoff.disconnected();
     void this.connect();
   }

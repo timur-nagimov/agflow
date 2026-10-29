@@ -3,6 +3,7 @@ export * from './backoff';
 export * from './clock';
 export * from './config';
 export * from './db';
+export * from './hub-http';
 export * from './journal';
 export * from './link';
 export * from './log';

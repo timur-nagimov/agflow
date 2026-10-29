@@ -2,13 +2,7 @@ import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  AGFLOW_VERSION,
-  type AttemptFacts,
-  type Credentials,
-  PROTOCOL_VERSION,
-  type RunnerCommand,
-} from '@agflow/core';
+import type { AttemptFacts, Credentials, RunnerCommand } from '@agflow/core';
 import { AwakeClock, type ClockSource, systemClock } from '../src/clock';
 import { DEFAULT_TIMINGS } from '../src/config';
 import { openRunnerDb, type RunnerDb } from '../src/db';
@@ -24,7 +18,7 @@ import {
 } from '../src/link';
 import { memoryLogger } from '../src/log';
 import { Outbox } from '../src/outbox';
-import { type FakeHub, type FakeHubOptions, startFakeHub, testWelcome } from './fake-hub';
+import { type FakeHub, type FakeHubOptions, startFakeHub, testHello, testWelcome } from './fake-hub';
 
 // Each test serves a hub over real sockets, which take several times as long on a machine loaded by other suites.
 setDefaultTimeout(30_000);
@@ -118,29 +112,10 @@ function setup(
       handshake: 10_000,
       backoffBase: 10,
       backoffCap: 50,
+      loginProbe: 60_000,
       ...timings,
     },
-    hello: () => ({
-      t: 'hello',
-      protocol: PROTOCOL_VERSION,
-      runnerKey: 'rk_test',
-      machineId: 'MACHINE-1',
-      name: 'laptop',
-      agflowVersion: AGFLOW_VERSION,
-      platform: 'darwin-arm64',
-      settings: { capacity: 2, keepAwake: 'ac', draining: false, ceilings: {}, allowPaidUsage: {}, version: 1 },
-      vendors: [],
-      quota: [],
-      profile: { name: 'standard', weakened: [], dependencyPrep: false },
-      git: { ready: true, problem: null, lastPushAt: null },
-      state: 'ok',
-      stateDetail: null,
-      outboxEpoch: outbox.epoch,
-      firstSeq: outbox.firstSeq(),
-      lastSeq: outbox.lastSeq(),
-      lastHubEpoch: null,
-      attempts: [],
-    }),
+    hello: () => testHello(outbox),
     heartbeat: () => ({ attempts: [facts], power: null, disk: null, acceptingUntil: null }),
     handlers: {
       onCommand: async (command) => {
@@ -436,9 +411,9 @@ describe('LinkClient', () => {
   test('stays with its hub: credentials for another hub open no socket until they name this hub again', async () => {
     const other = startFakeHub({ token: 'other_token' });
     cleanups.push(() => other.stop());
-    // Signed out until the hub exists; the link backs off meanwhile.
+    // Signed out until the hub exists; the link waits for a login meanwhile.
     const credentials: { current: Credentials | null } = { current: null };
-    const { hub, link, logger } = setup({}, { credentials: () => credentials.current });
+    const { hub, link, logger } = setup({}, { credentials: () => credentials.current, timings: { loginProbe: 20 } });
     credentials.current = { hubUrl: `${hub.url}/`, token: TOKEN, user: 'alice' };
     await hub.waitFor(() => link.state === 'online');
     const before = hub.connections.length;
@@ -448,7 +423,7 @@ describe('LinkClient', () => {
     await Bun.sleep(100);
     expect(other.connections).toHaveLength(0);
     expect(hub.connections).toHaveLength(before);
-    expect(link.state).toBe('backoff');
+    expect(link.state).toBe('needs_login');
     credentials.current = { hubUrl: hub.url, token: TOKEN, user: 'alice' };
     await hub.connection(before, 2_000);
     await hub.waitFor(() => link.state === 'online');
