@@ -1,10 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { sweepAuth } from './auth';
 import { type BackupKind, backupDatabase, checkIntegrity, dailyBackupDue } from './backup';
 import { loadConfig } from './config';
 import { createContext } from './context';
-import { createApp } from './http/app';
+import { startHub } from './server';
 import { sweepLeases } from './tasks';
 
 const { config, host, port, dbPath, backupDir } = loadConfig(process.env);
@@ -27,11 +26,11 @@ setInterval(() => backup('daily'), 24 * 60 * 60_000);
 setInterval(() => {
   try {
     sweepLeases(ctx);
-    sweepAuth(ctx);
   } catch (error) {
-    console.error('sweep failed', error);
+    console.error('lease sweep failed', error);
   }
 }, 30_000);
 
-const server = Bun.serve({ hostname: host, port, fetch: createApp(ctx).fetch, idleTimeout: 120 });
-console.log(`agflow hub for "${config.projectName}" on ${config.publicUrl} (listening on ${server.url.host}, sign-in: ${config.auth})`);
+// The server's own timers sweep sign-ins and dead runner links.
+const hub = startHub(ctx, { port, hostname: host, scheduler: 'auto', dbLock: true, timers: true });
+console.log(`agflow hub for "${config.projectName}" on ${config.publicUrl} (listening on ${new URL(hub.url).host}, sign-in: ${config.auth})`);

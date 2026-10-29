@@ -14,6 +14,7 @@ import { mountEventRoutes } from './event-routes';
 import { mountGithubRoutes } from './github-routes';
 import { mountMessageRoutes } from './message-routes';
 import { mountProjectRoutes } from './project-routes';
+import { type RunnerLinkUpgrade, mountRunnerRoutes } from './runner-routes';
 import { mountStatic } from './static';
 import { mountTaskRoutes } from './task-routes';
 
@@ -87,7 +88,12 @@ export function resolvePrincipal(
   return { user: session.user, via: session.kind, agent, token };
 }
 
-export function createApp(ctx: HubContext): App {
+export interface AppOptions {
+  /** Opens runner links; startHub passes its server's. Without it, GET /api/runner/ws upgrades nothing. */
+  upgradeRunnerLink?: RunnerLinkUpgrade | undefined;
+}
+
+export function createApp(ctx: HubContext, options: AppOptions = {}): App {
   const app = new Hono<AppEnv>();
   const hubOrigin = originOf(ctx.config.publicUrl);
   app.onError((error, c) => {
@@ -136,6 +142,7 @@ export function createApp(ctx: HubContext): App {
   mountAttemptRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
   mountEventRoutes(app, ctx);
+  mountRunnerRoutes(app, options.upgradeRunnerLink);
   mountCliLoginPage(app, ctx);
   if (ctx.config.webDist) mountStatic(app, ctx.config.webDist);
   return app;

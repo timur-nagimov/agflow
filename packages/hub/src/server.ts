@@ -1,0 +1,129 @@
+// startHub (design 13): the HTTP API, the web UI and the runner link on one port, the link through Bun's own
+// WebSocket handlers. main.ts serves the hub with it; tests and the demo pass their own context.
+import type { Server, ServerWebSocket } from 'bun';
+import { sweepAuth } from './auth';
+import { type HubContext, NO_RUNNER_LINK } from './context';
+import { Gateway, type LinkSession, type LinkSocket, type RunnerConnection } from './gateway';
+import { createApp } from './http/app';
+import { refreshNeedsLogin } from './runners';
+
+export interface StartHubOptions {
+  /** 0, the default, binds a free port; HubServer.url names it. */
+  port?: number | undefined;
+  /** 127.0.0.1 by default. */
+  hostname?: string | undefined;
+  /**
+   * How the scheduler runs: 'auto' on its own timer, 'manual' only when the caller ticks or starts it, false not at
+   * all (the default). This version of the hub has no scheduler yet, so every value runs none.
+   */
+  scheduler?: 'auto' | 'manual' | false | undefined;
+  /** Keep a lock file next to the database while the hub runs; false by default. This version takes no lock yet. */
+  dbLock?: boolean | undefined;
+  /**
+   * The hub's own housekeeping, once per heartbeatMs: dead links are terminated, expired sign-ins removed, and
+   * offline runners whose session no longer verifies marked needs_login. True by default; tests that drive the
+   * clock themselves turn it off.
+   */
+  timers?: boolean | undefined;
+}
+
+export interface HubServer {
+  /** The bound origin, such as http://127.0.0.1:43211. */
+  url: string;
+  gateway: Gateway;
+  /** The scheduler the options asked for; none in this version. */
+  scheduler: null;
+  /** Closes every runner link, stops the timers and the server. */
+  stop(): Promise<void>;
+}
+
+/** What each runner link's socket carries: its session from before the upgrade, then its gateway connection. */
+interface LinkData {
+  session: LinkSession;
+  connection: RunnerConnection | null;
+}
+
+/** The most bytes a WebSocket close reason may hold (RFC 6455: 125 less the 2-byte code); Bun cuts at 123. */
+const CLOSE_REASON_BYTES = 123;
+
+/**
+ * A close reason cut to fit, at a character boundary. Bun cuts a longer one by bytes, and a cut inside a multi-byte
+ * character makes the client drop the frame as invalid UTF-8 (1003) and lose the hub's code.
+ */
+function closeReason(text: string): string {
+  let out = '';
+  let bytes = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char);
+    if (bytes + size > CLOSE_REASON_BYTES) break;
+    bytes += size;
+    out += char;
+  }
+  return out;
+}
+
+function linkSocket(ws: ServerWebSocket<LinkData>): LinkSocket {
+  return {
+    send: (text) => ws.send(text),
+    close: (code, reason) => ws.close(code, closeReason(reason)),
+    terminate: () => ws.terminate(),
+  };
+}
+
+/** Each duty in its own try, so one failing does not skip the others; the next round runs them all again. */
+function housekeeping(ctx: HubContext, gateway: Gateway): void {
+  const duties: [string, () => unknown][] = [
+    ['the dead-link sweep', () => gateway.sweepDeadLinks()],
+    ['the auth sweep', () => sweepAuth(ctx)],
+    ['the needs_login refresh', () => refreshNeedsLogin(ctx)],
+  ];
+  for (const [name, duty] of duties) {
+    try {
+      duty();
+    } catch (error) {
+      console.error(`${name} failed`, error);
+    }
+  }
+}
+
+export function startHub(ctx: HubContext, options: StartHubOptions = {}): HubServer {
+  const gateway = new Gateway(ctx);
+  // The app is made before the server it upgrades links on, so it reaches the server through this binding.
+  let upgrader: Server<LinkData> | undefined;
+  const upgradeRunnerLink = (request: Request, session: LinkSession) =>
+    upgrader?.upgrade(request, { data: { session, connection: null } }) ?? false;
+  const app = createApp(ctx, { upgradeRunnerLink });
+  const server = Bun.serve<LinkData>({
+    hostname: options.hostname ?? '127.0.0.1',
+    port: options.port ?? 0,
+    idleTimeout: 120,
+    fetch: app.fetch,
+    websocket: {
+      open(ws) {
+        ws.data.connection = gateway.open(linkSocket(ws), ws.data.session);
+      },
+      message(ws, message) {
+        const { connection } = ws.data;
+        if (connection) gateway.message(connection, typeof message === 'string' ? message : message.toString('utf8'));
+      },
+      close(ws) {
+        if (ws.data.connection) gateway.closed(ws.data.connection);
+      },
+    },
+  });
+  upgrader = server;
+  const timer = (options.timers ?? true) ? setInterval(() => housekeeping(ctx, gateway), ctx.config.heartbeatMs) : null;
+  return {
+    url: server.url.origin,
+    gateway,
+    scheduler: null,
+    async stop() {
+      if (timer) clearInterval(timer);
+      gateway.closeAll();
+      if (ctx.link === gateway) ctx.link = NO_RUNNER_LINK;
+      // The port closes at once. Its promise is not awaited: in Bun 1.3.11 it never settles once the server has
+      // closed a WebSocket itself, as closeAll just did.
+      void server.stop(true);
+    },
+  };
+}

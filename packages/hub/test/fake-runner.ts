@@ -443,3 +443,48 @@ export async function connectFakeRunner(
   await settle();
   return runner;
 }
+
+/**
+ * A FakeRunner's link to a real hub server: a WebSocket to /api/runner/ws with the CLI token, as a runner opens it.
+ * What the runner sends before the socket opens waits for it, so connect() can send hello at once.
+ */
+export class WebSocketTransport implements FakeRunnerTransport {
+  readonly socket: WebSocket;
+  private readonly waiting: string[] = [];
+
+  constructor(url: string, token: string, endpoint: FakeRunnerEndpoint) {
+    const wsUrl = new URL('/api/runner/ws', url);
+    wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    this.socket = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
+    this.socket.addEventListener('open', () => {
+      for (const text of this.waiting.splice(0)) this.socket.send(text);
+    });
+    this.socket.addEventListener('message', (event) => endpoint.receive(String(event.data)));
+    this.socket.addEventListener('close', (event) => endpoint.closed(event.code, event.reason));
+  }
+
+  send(text: string): void {
+    if (this.socket.readyState === WebSocket.CONNECTING) this.waiting.push(text);
+    else if (this.socket.readyState === WebSocket.OPEN) this.socket.send(text);
+  }
+
+  close(): void {
+    this.socket.close(1000, 'runner disconnected');
+  }
+}
+
+/**
+ * A FakeRunner linked to a hub server at url (startHub's HubServer.url) over a real WebSocket, signed in with a CLI
+ * token as agflow runner is. It resolves once the runner has its welcome, or once the hub refused or closed the link.
+ */
+export async function connectFakeRunnerWs(
+  url: string,
+  options: FakeRunnerOptions & { token: string },
+): Promise<FakeRunner<WebSocketTransport>> {
+  const runner = new FakeRunner<WebSocketTransport>(
+    (endpoint) => new WebSocketTransport(url, options.token, endpoint),
+    options,
+  );
+  await runner.connect();
+  return runner;
+}

@@ -22,6 +22,8 @@ import {
 export const BAD_MESSAGE_CLOSE = 1008;
 /** The close code when the hub fails while handling a hello (WebSocket "internal error"). */
 export const HUB_ERROR_CLOSE = 1011;
+/** The close code when the hub stops (WebSocket "going away"): the runner reconnects with its backoff. */
+export const GOING_AWAY_CLOSE = 1001;
 
 /** The hub's end of one link, as the gateway uses it. */
 export interface LinkSocket {
@@ -325,6 +327,11 @@ export class Gateway implements RunnerLink {
     } catch (error) {
       this.log(`sending ${message.t} to runner ${connection.runnerId ?? '(no hello yet)'} failed`, error);
     }
+  }
+
+  /** Closes every link, those still waiting for their hello included: the hub is stopping ("going away"). */
+  closeAll(): void {
+    for (const connection of [...this.connections]) this.close(connection, GOING_AWAY_CLOSE, 'the hub is stopping');
   }
 
   /** Ends the link from the hub's side. */

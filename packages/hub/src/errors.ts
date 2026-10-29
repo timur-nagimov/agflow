@@ -1,6 +1,6 @@
 import { BRIDGE_ANSWERS } from '@agflow/core';
 
-export type HubErrorStatus = 400 | 401 | 403 | 404 | 409 | 415;
+export type HubErrorStatus = 400 | 401 | 403 | 404 | 409 | 415 | 426;
 
 export class HubError extends Error {
   constructor(
@@ -21,6 +21,7 @@ export const forbidden = (message: string) => new HubError(403, 'forbidden', mes
 export const notFound = (what: string) => new HubError(404, 'not_found', `${what} not found`);
 export const conflict = (message: string) => new HubError(409, 'conflict', message);
 export const unsupportedMediaType = (message: string) => new HubError(415, 'unsupported_media_type', message);
+export const upgradeRequired = (message: string) => new HubError(426, 'upgrade_required', message);
 
 /** An agent token that no longer works; reason is its attempt's end reason, null when there is none or it is unknown. */
 export const attemptEnded = (reason: string | null) =>
