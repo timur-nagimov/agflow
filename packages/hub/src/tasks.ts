@@ -90,6 +90,8 @@ function contractOf(task: Task): TaskContract {
     ownedPaths: task.ownedPaths,
     dependsOn: task.dependsOn,
     priority: task.priority,
+    // Undefined for a task that never had one; JSON leaves it out of the stored contract.
+    vendorHint: task.vendorHint,
   };
 }
 
@@ -325,6 +327,7 @@ export function createTasks(ctx: HubContext, inputs: NewTask[], actor: string): 
         ownedPaths: input.ownedPaths,
         dependsOn,
         priority: input.priority,
+        vendorHint: input.vendorHint,
       };
       const seq = nextId(ctx.db, 'task');
       const id = `T-${seq}`;
@@ -388,8 +391,9 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
         writeTask(ctx, id, { blockedReason: dependencyReason(ctx, waiting) });
       }
     }
+    // The vendor hint steers only the scheduler's next placement, so the holder has nothing to follow there.
     const changed = (Object.keys(patch) as (keyof TaskContract)[]).filter(
-      (field) => JSON.stringify(contract[field]) !== JSON.stringify(task[field]),
+      (field) => field !== 'vendorHint' && JSON.stringify(contract[field]) !== JSON.stringify(task[field]),
     );
     if (isHeld(task.status) && task.assignee && changed.length > 0) {
       insertMessage(ctx, emit, {

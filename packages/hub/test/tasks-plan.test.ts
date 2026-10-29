@@ -63,6 +63,32 @@ describe('updating and cancelling', () => {
     expect(updated).toMatchObject({ title: 'New', priority: 1, objective: task.objective });
   });
 
+  test('the contract keeps the vendor hint until a patch changes it', () => {
+    const { ctx } = createTestContext();
+    const [hinted, plain] = createTasks(ctx, [newTask({ title: 'A', vendorHint: 'codex' }), newTask({ title: 'B' })], 'user:alice');
+    expect(hinted.vendorHint).toBe('codex');
+    expect(plain.vendorHint).toBeUndefined();
+    expect(updateTask(ctx, hinted.id, { title: 'A2', priority: 1 }, 'user:alice').vendorHint).toBe('codex');
+    expect(updateTask(ctx, hinted.id, { vendorHint: null }, 'user:alice').vendorHint).toBeNull();
+    expect(updateTask(ctx, plain.id, { vendorHint: 'claude' }, 'user:alice').vendorHint).toBe('claude');
+    expect(getTask(ctx, plain.id).vendorHint).toBe('claude');
+  });
+
+  test("the holder is not told about a new vendor hint: it steers only the scheduler's next placement", () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [task] = createTasks(ctx, [newTask({ title: 'Parser' })], 'user:alice');
+    claimTask(ctx, task.id, agent);
+    updateTask(ctx, task.id, { vendorHint: 'codex' }, 'user:alice');
+    expect(listMessages(ctx, { target: `agent:${agent.id}` })).toEqual([]);
+    updateTask(ctx, task.id, { vendorHint: 'claude', title: 'JSON parser' }, 'user:alice');
+    const notices = listMessages(ctx, { target: `agent:${agent.id}` });
+    expect(notices.map((notice) => notice.body.split('\n')[0])).toEqual([
+      `user:alice amended ${task.id}, which you hold. Changed: title.`,
+    ]);
+    expect(getTask(ctx, task.id).vendorHint).toBe('claude');
+  });
+
   test('adding an unmet dependency blocks a ready task, removing it unblocks', () => {
     const { ctx } = createTestContext();
     const [a, b] = createTasks(ctx, [newTask({ title: 'A' }), newTask({ title: 'B' })], 'user:alice');

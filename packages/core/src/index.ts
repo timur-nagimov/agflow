@@ -9,5 +9,6 @@ export * from './cli-login';
 export * from './fence';
 export * from './naming';
 export * from './runner-protocol';
+export * from './api-schemas';
 
 export const AGFLOW_VERSION = '0.1.0';

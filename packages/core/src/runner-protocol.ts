@@ -335,7 +335,7 @@ type Same<A, B> = (<X>() => X extends A ? 1 : 2) extends (<X>() => X extends B ?
  * Pins a schema to the type it parses: its output must be exactly T. A field or a value that only one side has
  * fails the typecheck, so a change to a type cannot leave its schema behind, or the other way round.
  */
-function schemaFor<T>() {
+export function schemaFor<T>() {
   return <S extends z.ZodType<T>>(
     schema: S & (Same<z.output<S>, T> extends true ? unknown : 'differs from its type'),
   ): z.ZodType<T> => schema;
@@ -479,8 +479,27 @@ export const RunnerSettingsSchema = schemaFor<RunnerSettings>()(
   z.strictObject({ ...settingsFields, version: NonNegativeInt }),
 );
 
-/** Some settings without their version: what update_settings sets and runner.settings reports. */
-const SettingsChangesSchema = z.strictObject(settingsFields).partial();
+/**
+ * Some settings without their version: what update_settings sets, runner.settings reports and an owner's
+ * PATCH /api/runners/:id sends, so all three share these bounds.
+ */
+export const RunnerSettingsChangesSchema = z.strictObject(settingsFields).partial();
+
+export const RunnerGitSchema = schemaFor<Runner['git']>()(
+  z.strictObject({ ready: z.boolean(), problem: z.string().nullable(), lastPushAt: NonNegativeInt.nullable() }),
+);
+
+export const RunnerPowerSchema = schemaFor<NonNullable<Runner['power']>>()(
+  z.strictObject({
+    source: z.enum(['ac', 'battery', 'unknown']),
+    batteryPercent: z.number().min(0).max(100).nullable(),
+    lowPowerMode: z.boolean(),
+  }),
+);
+
+export const RunnerDiskSchema = schemaFor<NonNullable<Runner['disk']>>()(
+  z.strictObject({ freeBytes: NonNegativeInt, agflowBytes: NonNegativeInt }),
+);
 
 /** The state a runner reports in hello and runner.state; the hub derives the rest. */
 const ReportedStateSchema = z.enum(['ok', 'crash_loop', 'disk_low']);
@@ -623,7 +642,7 @@ export const RunnerCommandSchema = schemaFor<RunnerCommand>()(
     }),
     z.strictObject({
       kind: z.literal('update_settings'),
-      settings: SettingsChangesSchema,
+      settings: RunnerSettingsChangesSchema,
       version: PositiveInt,
     }),
   ]),
@@ -687,7 +706,7 @@ const HelloSchema = z
     vendors: z.array(RunnerVendorSchema),
     quota: z.array(AccountQuotaReportSchema),
     profile: ProfileSummarySchema,
-    git: z.strictObject({ ready: z.boolean(), problem: z.string().nullable(), lastPushAt: NonNegativeInt.nullable() }),
+    git: RunnerGitSchema,
     state: ReportedStateSchema,
     stateDetail: z.string().nullable(),
     outboxEpoch: Name,
@@ -712,14 +731,8 @@ export const RunnerMessageSchema = schemaFor<RunnerMessage>()(
       t: z.literal('heartbeat'),
       at: NonNegativeInt,
       attempts: z.array(AttemptFactsSchema),
-      power: z
-        .strictObject({
-          source: z.enum(['ac', 'battery', 'unknown']),
-          batteryPercent: z.number().min(0).max(100).nullable(),
-          lowPowerMode: z.boolean(),
-        })
-        .nullable(),
-      disk: z.strictObject({ freeBytes: NonNegativeInt, agflowBytes: NonNegativeInt }).nullable(),
+      power: RunnerPowerSchema.nullable(),
+      disk: RunnerDiskSchema.nullable(),
       acceptingUntil: NonNegativeInt.nullable(),
     }),
     z.strictObject({ t: z.literal('events'), outboxEpoch: Name, events: z.array(RawRunnerEventSchema) }),
@@ -774,9 +787,9 @@ function runnerEvent<T extends `runner.${string}`, D extends z.ZodRawShape>(type
   return z.strictObject({ ...eventFields, type: z.literal(type), data: z.strictObject(data) });
 }
 
-const ApprovalKindSchema = schemaFor<Approval['kind']>()(z.enum(['command', 'file_change', 'other']));
+export const ApprovalKindSchema = schemaFor<Approval['kind']>()(z.enum(['command', 'file_change', 'other']));
 
-const ApprovalDetailSchema = schemaFor<Approval['detail']>()(
+export const ApprovalDetailSchema = schemaFor<Approval['detail']>()(
   z.strictObject({
     command: z.string().optional(),
     cwd: z.string().optional(),
@@ -879,7 +892,7 @@ const EVENT_SCHEMAS = [
   ),
   runnerEvent('runner.vendors', { vendors: z.array(RunnerVendorSchema), quota: z.array(AccountQuotaReportSchema) }),
   // The hub applies the changes and echoes update_settings at its own version + 1; only the hub assigns versions.
-  runnerEvent('runner.settings', { settings: SettingsChangesSchema, baseVersion: NonNegativeInt }),
+  runnerEvent('runner.settings', { settings: RunnerSettingsChangesSchema, baseVersion: NonNegativeInt }),
   runnerEvent('runner.state', { state: ReportedStateSchema, detail: z.string().nullable() }),
   attemptEvent('approval.requested', {
     // Minted by the runner as a UUID, like decide_approval's.
