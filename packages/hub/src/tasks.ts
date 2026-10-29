@@ -44,6 +44,13 @@ export interface TaskRow {
   created_at: number;
   updated_at: number;
   last_reminded_at: number | null;
+  current_attempt: string | null;
+  ladder_floor: number;
+  work_ref: string | null;
+  work_sha: string | null;
+  branch_head: string | null;
+  next_dispatch_at: number | null;
+  dispatch_hold_until: number | null;
 }
 
 /** Submissions recorded before M2 carry no attempt or submission id. */
@@ -69,12 +76,12 @@ export function rowToTask(row: TaskRow): Task {
     createdBy: row.created_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    // Schema version 1 has no attempts, so these hold their empty values.
-    currentAttempt: null,
+    currentAttempt: row.current_attempt,
+    // Nothing records attempts yet, so a task has none.
     attemptCount: 0,
-    workRef: null,
-    workSha: null,
-    nextDispatchAt: null,
+    workRef: row.work_ref,
+    workSha: row.work_sha,
+    nextDispatchAt: row.next_dispatch_at,
   };
 }
 
@@ -129,6 +136,7 @@ export function listTaskNotes(ctx: HubContext, taskId: string): TaskNote[] {
     body: string;
     author: string;
     created_at: number;
+    attempt_id: string | null;
   }[];
   return rows.map((row) => ({
     id: row.id,
@@ -137,7 +145,7 @@ export function listTaskNotes(ctx: HubContext, taskId: string): TaskNote[] {
     body: row.body,
     author: row.author,
     createdAt: row.created_at,
-    attemptId: null,
+    attemptId: row.attempt_id,
   }));
 }
 

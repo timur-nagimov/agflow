@@ -2,13 +2,13 @@ import type { Project } from '@agflow/core';
 import { type HubContext, tx } from './context';
 
 export function getProject(ctx: HubContext): Project {
-  const row = ctx.db.query('SELECT name, repo, paused FROM project WHERE id = 1').get() as {
+  const row = ctx.db.query('SELECT name, repo, paused, runner_leads FROM project WHERE id = 1').get() as {
     name: string;
     repo: string;
     paused: number;
+    runner_leads: number;
   };
-  // Runner leads are on unless people turn them off, which schema version 1 cannot record.
-  return { name: row.name, repo: row.repo, paused: row.paused === 1, runnerLeads: true };
+  return { name: row.name, repo: row.repo, paused: row.paused === 1, runnerLeads: row.runner_leads === 1 };
 }
 
 export function setPaused(ctx: HubContext, paused: boolean, actor: string): Project {

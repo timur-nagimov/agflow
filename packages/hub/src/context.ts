@@ -139,7 +139,8 @@ export interface ContextOptions {
 }
 
 export function createContext(options: ContextOptions): HubContext {
-  const db = openDb(options.dbPath);
+  const now = options.now ?? (() => Date.now());
+  const db = openDb(options.dbPath, now());
   db.query('INSERT OR IGNORE INTO project (id, name, repo, paused) VALUES (1, $name, $repo, 0)').run({
     name: options.config.projectName,
     repo: options.config.projectRepo,
@@ -148,7 +149,7 @@ export function createContext(options: ContextOptions): HubContext {
     db,
     bus: new EventBus(),
     config: options.config,
-    now: options.now ?? (() => Date.now()),
+    now,
     fetch: options.fetch ?? ((input, init) => fetch(input, init)),
   };
 }

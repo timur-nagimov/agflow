@@ -20,6 +20,8 @@ interface AgentRow {
   current_task: string | null;
   last_seen_at: number;
   created_at: number;
+  runner_id: string | null;
+  attempt_id: string | null;
 }
 
 export function statusFor(lastSeenAt: number, now: number): AgentStatus {
@@ -42,9 +44,8 @@ function toAgent(ctx: HubContext, row: AgentRow): Agent {
     status: statusFor(row.last_seen_at, ctx.now()),
     lastSeenAt: row.last_seen_at,
     createdAt: row.created_at,
-    // Schema version 1 has no runners or attempts.
-    runnerId: null,
-    attemptId: null,
+    runnerId: row.runner_id,
+    attemptId: row.attempt_id,
   };
 }
 
