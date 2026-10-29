@@ -1,5 +1,5 @@
 import type { Database } from 'bun:sqlite';
-import { DEFAULT_INFRA_BACKOFF_MS, DEFAULT_WIP_REF_PREFIX, type HubEvent } from '@agflow/core';
+import { DEFAULT_INFRA_BACKOFF_MS, DEFAULT_WIP_REF_PREFIX } from '@agflow/core';
 import { openDb } from './db';
 import { type Emit, EventBus, insertEvent } from './events';
 
@@ -123,12 +123,22 @@ export interface HubConfig extends HubRunnerSettings {
   webDist?: string | undefined;
 }
 
+/** The runner gateway, as the modules that queue commands see it. */
+export interface RunnerLink {
+  /** Sends the runner the pending commands its connection has not had yet; nothing when it is not connected. */
+  flush(runnerId: string): void;
+}
+
+/** The link until the gateway installs itself: commands wait in runner_commands for the runner's next hello. */
+export const NO_RUNNER_LINK: RunnerLink = Object.freeze({ flush: () => {} });
+
 export interface HubContext {
   db: Database;
   bus: EventBus;
   config: HubConfig;
   now: () => number;
   fetch: FetchFn;
+  link: RunnerLink;
 }
 
 export interface ContextOptions {
@@ -136,6 +146,7 @@ export interface ContextOptions {
   config: HubConfig;
   now?: (() => number) | undefined;
   fetch?: FetchFn | undefined;
+  link?: RunnerLink | undefined;
 }
 
 export function createContext(options: ContextOptions): HubContext {
@@ -151,18 +162,65 @@ export function createContext(options: ContextOptions): HubContext {
     config: options.config,
     now,
     fetch: options.fetch ?? ((input, init) => fetch(input, init)),
+    link: options.link ?? NO_RUNNER_LINK,
   };
 }
 
-/** Runs fn in one SQLite transaction and publishes its events only after the commit. */
+interface CommitWork {
+  run: () => void;
+  /** Work with a key is queued once per transaction. */
+  key: string | undefined;
+}
+
+/** The work afterCommit queued during each context's outermost tx(); no entry outside one. */
+const commitQueues = new WeakMap<HubContext, CommitWork[]>();
+
+/**
+ * Runs fn in one SQLite transaction. Its events are published, and the work given to afterCommit runs, only once the
+ * outermost tx() commits. A nested tx() is a savepoint: when it rolls back, the work it queued is dropped with it.
+ */
 export function tx<T>(ctx: HubContext, fn: (emit: Emit) => T): T {
-  const emitted: HubEvent[] = [];
+  const outer = commitQueues.get(ctx);
+  const queue = outer ?? [];
+  const mark = queue.length;
+  if (!outer) commitQueues.set(ctx, queue);
   const emit: Emit = (event) => {
     const stored = insertEvent(ctx.db, ctx.now(), event);
-    emitted.push(stored);
+    queue.push({ run: () => ctx.bus.publish(stored), key: undefined });
     return stored;
   };
-  const result = ctx.db.transaction(() => fn(emit))() as T;
-  for (const event of emitted) ctx.bus.publish(event);
+  let result: T;
+  try {
+    result = ctx.db.transaction(() => fn(emit))() as T;
+  } catch (error) {
+    queue.length = mark;
+    if (!outer) commitQueues.delete(ctx);
+    throw error;
+  }
+  if (outer) return result;
+  commitQueues.delete(ctx);
+  for (const work of queue) {
+    try {
+      work.run();
+    } catch (error) {
+      // The transaction is committed; one failing piece of work must not keep the others from running.
+      console.error('after-commit work failed', error);
+    }
+  }
   return result;
+}
+
+/**
+ * Runs fn once the current tx() commits, or at once outside a transaction. Things that leave the hub, such as commands
+ * to runners, go out this way, so a rollback never sends them. Work with a key runs once per transaction.
+ */
+export function afterCommit(ctx: HubContext, fn: () => void, key?: string): void {
+  const queue = commitQueues.get(ctx);
+  if (!queue) {
+    if (ctx.db.inTransaction) throw new Error('afterCommit needs a transaction opened with tx()');
+    fn();
+    return;
+  }
+  if (key !== undefined && queue.some((work) => work.key === key)) return;
+  queue.push({ run: fn, key });
 }
