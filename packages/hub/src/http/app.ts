@@ -2,9 +2,9 @@ import { type Agent, TransitionError } from '@agflow/core';
 import { type Context, Hono } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { findAgent, touchAgent } from '../agents';
-import { verifySession } from '../auth';
+import { isAgentToken, resolveAgentToken, verifySession } from '../auth';
 import type { HubContext } from '../context';
-import { HubError, forbidden } from '../errors';
+import { HubError, agentNotAllowed, forbidden } from '../errors';
 import { mountAgentRoutes } from './agent-routes';
 import { mountAttemptRoutes } from './attempt-routes';
 import { mountAuthRoutes } from './auth-routes';
@@ -20,7 +20,8 @@ export const SESSION_COOKIE = 'agflow_session';
 
 export interface Principal {
   user: string;
-  via: 'web' | 'cli';
+  /** agent: a runner agent's token, which always names its agent. */
+  via: 'web' | 'cli' | 'agent';
   agent: Agent | null;
   token: string;
 }
@@ -61,7 +62,14 @@ export function resolvePrincipal(
   cookie: string | undefined,
   agentId: string | undefined,
 ): Principal | null {
-  const token = bearerToken(authorization) || cookie;
+  const bearer = bearerToken(authorization);
+  // An agent token is never looked up as a session, and it names its own agent.
+  if (bearer && isAgentToken(bearer)) {
+    if (agentId) throw agentNotAllowed('an agent token names its agent; X-Agflow-Agent is refused with it');
+    const grant = resolveAgentToken(ctx, bearer);
+    return { user: grant.user, via: 'agent', agent: grant.agent, token: bearer };
+  }
+  const token = bearer || cookie;
   if (!token) return null;
   const session = verifySession(ctx, token);
   if (!session) return null;
@@ -70,6 +78,8 @@ export function resolvePrincipal(
     const found = findAgent(ctx, agentId);
     if (!found) throw new HubError(401, 'unknown_agent', `unknown agent ${agentId}; call hello again`);
     if (found.user !== session.user) throw forbidden('this agent belongs to another user');
+    // The owner's CLI token must not stand in for a runner agent, whose authority is its own scoped token.
+    if (found.origin === 'runner') throw forbidden('a runner agent acts only with its own agent token');
     touchAgent(ctx, found.id);
     agent = findAgent(ctx, found.id);
   }
@@ -80,7 +90,9 @@ export function createApp(ctx: HubContext): App {
   const app = new Hono<AppEnv>();
   const hubOrigin = originOf(ctx.config.publicUrl);
   app.onError((error, c) => {
-    if (error instanceof HubError) return c.json({ error: error.code, message: error.message }, error.status);
+    if (error instanceof HubError) {
+      return c.json({ error: error.code, message: error.message, ...error.extra }, error.status);
+    }
     if (error instanceof TransitionError) return c.json({ error: 'invalid_transition', message: error.message }, 409);
     console.error(error);
     return c.json({ error: 'internal', message: 'internal error' }, 500);

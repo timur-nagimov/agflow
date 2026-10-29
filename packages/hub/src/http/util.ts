@@ -50,6 +50,15 @@ export function agentOf(c: Ctx): Agent {
   return p.agent;
 }
 
+/**
+ * The agent acting on a held task, with the agent token it called with (null for a live agent). The holder test
+ * resolves the token again inside its transaction (requireHolder).
+ */
+export function holderOf(c: Ctx): { agent: Agent; token: string | null } {
+  const p = principal(c);
+  return { agent: agentOf(c), token: p.via === 'agent' ? p.token : null };
+}
+
 export function leadOrHuman(c: Ctx): Principal {
   const p = principal(c);
   if (p.agent) {

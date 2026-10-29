@@ -12,7 +12,8 @@ import {
   quoteLines,
 } from '@agflow/core';
 import { statusFor } from './agents';
-import { listAttempts } from './attempt-store';
+import { findAttempt, listAttempts } from './attempt-store';
+import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
@@ -304,8 +305,42 @@ function holding(task: Task): string {
   return `${task.id}, which is waiting for review`;
 }
 
-function requireHolder(task: Task, agent: Agent): void {
-  if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
+/**
+ * What the holder test asks of a runner agent (design 6.5): 'attempt', only that its attempt is the task's current
+ * one and open, at its current fence, in any task status (progress, handoff); 'claim', also that the task is claimed
+ * or working and no stop is recorded (submit, block, impossible, release). Live agents keep M1's test for both: they
+ * are the assignee of a claimed or working task.
+ */
+export type HolderTest = 'attempt' | 'claim';
+
+/**
+ * The holder test, run inside the action's transaction. A route passes the agent token the request came with: the
+ * auth middleware resolved it before the body arrived, and a re-fence or revocation can land in between, so the
+ * token is resolved again here and its attempt is the one tested (401 attempt_ended or attempt_refenced otherwise).
+ * Without a token, the hub's own callers vouch for the runner agent's current attempt.
+ */
+export function requireHolder(
+  ctx: HubContext,
+  task: Task,
+  agent: Agent,
+  test: HolderTest,
+  token: string | null = null,
+): void {
+  if (agent.origin !== 'runner') {
+    if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
+    return;
+  }
+  const grant = token === null ? null : resolveAgentToken(ctx, token);
+  if (grant && grant.agent.id !== agent.id) throw forbidden(`you do not hold ${task.id}`);
+  const attempt = grant ? grant.attempt : agent.attemptId ? findAttempt(ctx, agent.attemptId) : null;
+  if (!attempt || attempt.status === 'ended' || task.currentAttempt !== attempt.id) {
+    throw forbidden(`you do not hold ${task.id}`);
+  }
+  if (test === 'attempt') return;
+  if (!isHeld(task.status)) throw conflict(`${task.id} is ${task.status}; write a handoff note if you have not, and stop`);
+  if (attempt.stopRequested) {
+    throw conflict(`your attempt on ${task.id} is being stopped; write a handoff note if you have not, and stop`);
+  }
 }
 
 export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: string): Task {
@@ -361,31 +396,32 @@ export function resumeClaim(ctx: HubContext, id: string, agent: Agent): Task {
   });
 }
 
-export function reportProgress(ctx: HubContext, id: string, agent: Agent, note: string): Task {
+export function reportProgress(ctx: HubContext, id: string, agent: Agent, note: string, token: string | null = null): Task {
   return tx(ctx, (emit) => {
     let task = getTask(ctx, id);
-    requireHolder(task, agent);
-    addNote(ctx, id, 'progress', note, `agent:${agent.id}`);
+    requireHolder(ctx, task, agent, 'attempt', token);
+    addNote(ctx, id, 'progress', note, `agent:${agent.id}`, agent.attemptId);
     if (task.status === 'claimed') task = move(ctx, emit, task, 'working', `agent:${agent.id}`);
-    writeTask(ctx, id, { leaseExpiresAt: ctx.now() + ctx.config.leaseMs });
+    // A runner attempt holds a runner lease instead; the task's M1 lease stays NULL for it (design 6.4).
+    if (agent.origin !== 'runner') writeTask(ctx, id, { leaseExpiresAt: ctx.now() + ctx.config.leaseMs });
     emit({ type: 'task.progress', actor: `agent:${agent.id}`, subject: id, data: { note: clip(note, 500) } });
     return getTask(ctx, id);
   });
 }
 
-export function writeHandoff(ctx: HubContext, id: string, agent: Agent, note: string): void {
+export function writeHandoff(ctx: HubContext, id: string, agent: Agent, note: string, token: string | null = null): void {
   tx(ctx, (emit) => {
-    requireHolder(getTask(ctx, id), agent);
-    addNote(ctx, id, 'handoff', note, `agent:${agent.id}`);
+    requireHolder(ctx, getTask(ctx, id), agent, 'attempt', token);
+    addNote(ctx, id, 'handoff', note, `agent:${agent.id}`, agent.attemptId);
     emit({ type: 'task.handoff_written', actor: `agent:${agent.id}`, subject: id });
   });
 }
 
-export function releaseTask(ctx: HubContext, id: string, agent: Agent, reason: string): Task {
+export function releaseTask(ctx: HubContext, id: string, agent: Agent, reason: string, token: string | null = null): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    requireHolder(task, agent);
-    addNote(ctx, id, 'release', reason, `agent:${agent.id}`);
+    requireHolder(ctx, task, agent, 'claim', token);
+    addNote(ctx, id, 'release', reason, `agent:${agent.id}`, agent.attemptId);
     const released = move(ctx, emit, task, 'ready', `agent:${agent.id}`, {
       changes: { assignee: null, leaseExpiresAt: null },
       event: 'task.released',
@@ -456,10 +492,16 @@ export interface SubmitInput {
   headSha?: string | undefined;
 }
 
-export function submitTask(ctx: HubContext, id: string, agent: Agent, input: SubmitInput): Task {
+export function submitTask(
+  ctx: HubContext,
+  id: string,
+  agent: Agent,
+  input: SubmitInput,
+  token: string | null = null,
+): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    requireHolder(task, agent);
+    requireHolder(ctx, task, agent, 'claim', token);
     const branch = input.branch ?? task.branch;
     const submission: Submission = {
       summary: input.summary,
@@ -554,10 +596,11 @@ export function blockTask(
   agent: Agent,
   reason: string,
   kind: 'agent' | 'impossible' = 'agent',
+  token: string | null = null,
 ): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    requireHolder(task, agent);
+    requireHolder(ctx, task, agent, 'claim', token);
     const blocked = move(ctx, emit, task, 'blocked', `agent:${agent.id}`, {
       changes: { assignee: null, leaseExpiresAt: null, blockedKind: kind, blockedReason: reason },
       event: kind === 'impossible' ? 'task.impossible' : 'task.blocked',
@@ -573,8 +616,14 @@ export function blockTask(
   });
 }
 
-export function declareImpossible(ctx: HubContext, id: string, agent: Agent, evidence: string): Task {
-  return blockTask(ctx, id, agent, evidence, 'impossible');
+export function declareImpossible(
+  ctx: HubContext,
+  id: string,
+  agent: Agent,
+  evidence: string,
+  token: string | null = null,
+): Task {
+  return blockTask(ctx, id, agent, evidence, 'impossible', token);
 }
 
 export function unblockTask(ctx: HubContext, id: string, actor: string, note?: string): Task {

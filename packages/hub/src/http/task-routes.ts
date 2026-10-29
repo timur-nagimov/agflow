@@ -34,7 +34,7 @@ import {
 } from '../tasks';
 import { listTasks } from '../task-store';
 import type { App } from './app';
-import { actor, agentOf, human, leadOrHuman, principal, readBody } from './util';
+import { actor, agentOf, holderOf, human, leadOrHuman, principal, readBody } from './util';
 
 export function mountTaskRoutes(app: App, ctx: HubContext): void {
   app.get('/api/tasks', (c) => {
@@ -115,40 +115,41 @@ export function mountTaskRoutes(app: App, ctx: HubContext): void {
     return c.json({ task: resumeClaim(ctx, c.req.param('id'), agent) });
   });
 
+  // The holder; the token is checked again in the action's transaction, since the body arrives after it was resolved.
   app.post('/api/tasks/:id/progress', async (c) => {
-    const agent = agentOf(c);
+    const { agent, token } = holderOf(c);
     const { note } = await readBody(c, ProgressInputSchema);
-    return c.json({ task: reportProgress(ctx, c.req.param('id'), agent, note) });
+    return c.json({ task: reportProgress(ctx, c.req.param('id'), agent, note, token) });
   });
 
   app.post('/api/tasks/:id/submit', async (c) => {
-    const agent = agentOf(c);
+    const { agent, token } = holderOf(c);
     const input = await readBody(c, SubmitInputSchema);
-    return c.json({ task: submitTask(ctx, c.req.param('id'), agent, input) });
+    return c.json({ task: submitTask(ctx, c.req.param('id'), agent, input, token) });
   });
 
   app.post('/api/tasks/:id/block', async (c) => {
-    const agent = agentOf(c);
+    const { agent, token } = holderOf(c);
     const { reason } = await readBody(c, ReasonInputSchema);
-    return c.json({ task: blockTask(ctx, c.req.param('id'), agent, reason) });
+    return c.json({ task: blockTask(ctx, c.req.param('id'), agent, reason, 'agent', token) });
   });
 
   app.post('/api/tasks/:id/impossible', async (c) => {
-    const agent = agentOf(c);
+    const { agent, token } = holderOf(c);
     const { evidence } = await readBody(c, ImpossibleInputSchema);
-    return c.json({ task: declareImpossible(ctx, c.req.param('id'), agent, evidence) });
+    return c.json({ task: declareImpossible(ctx, c.req.param('id'), agent, evidence, token) });
   });
 
   app.post('/api/tasks/:id/handoff', async (c) => {
-    const agent = agentOf(c);
+    const { agent, token } = holderOf(c);
     const { note } = await readBody(c, HandoffInputSchema);
-    writeHandoff(ctx, c.req.param('id'), agent, note);
+    writeHandoff(ctx, c.req.param('id'), agent, note, token);
     return c.json({ ok: true });
   });
 
   app.post('/api/tasks/:id/release', async (c) => {
-    const agent = agentOf(c);
+    const { agent, token } = holderOf(c);
     const { reason } = await readBody(c, ReasonInputSchema);
-    return c.json({ task: releaseTask(ctx, c.req.param('id'), agent, reason) });
+    return c.json({ task: releaseTask(ctx, c.req.param('id'), agent, reason, token) });
   });
 }

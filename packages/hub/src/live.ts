@@ -1,7 +1,7 @@
 import { type Agent, type LiveInbox, type LivePeek, type Message, type StopCheckResult, type Vendor, formatMessage, isHeld } from '@agflow/core';
 import { findAgentBySession, getAgent, touchAgent } from './agents';
 import { type HubContext, tx } from './context';
-import { forbidden } from './errors';
+import { conflict, forbidden } from './errors';
 import { markDelivered, unreadFor } from './messages';
 import { findTask } from './task-store';
 import { lastRemindedAt, markReminded } from './tasks';
@@ -14,10 +14,21 @@ export const LIVE_INBOX_CHAR_LIMIT = 6000;
  */
 export const LIVE_INBOX_HARD_LIMIT = 9000;
 
-function sessionAgent(ctx: HubContext, user: string, vendor: Vendor, sessionId: string): Agent | null {
+/**
+ * The live agent a hook's session id names. A runner agent's session id is refused: the owner's CLI token must not
+ * read its inbox, which would mark its messages delivered, nor renew a lease its runner holds (design 5.3).
+ */
+function liveSessionAgent(ctx: HubContext, user: string, vendor: Vendor, sessionId: string): Agent | null {
   const agent = findAgentBySession(ctx, vendor, sessionId);
   if (!agent) return null;
   if (agent.user !== user) throw forbidden('this session belongs to another user');
+  if (agent.origin === 'runner') throw conflict('this session belongs to a runner agent');
+  return agent;
+}
+
+function sessionAgent(ctx: HubContext, user: string, vendor: Vendor, sessionId: string): Agent | null {
+  const agent = liveSessionAgent(ctx, user, vendor, sessionId);
+  if (!agent) return null;
   touchAgent(ctx, agent.id);
   return getAgent(ctx, agent.id);
 }
@@ -81,9 +92,8 @@ export function stopCheck(ctx: HubContext, user: string, input: StopCheckInput):
  * count as activity.
  */
 export function peekInbox(ctx: HubContext, user: string, vendor: Vendor, sessionId: string): LivePeek {
-  const agent = findAgentBySession(ctx, vendor, sessionId);
+  const agent = liveSessionAgent(ctx, user, vendor, sessionId);
   if (!agent) return { unread: 0, first: null };
-  if (agent.user !== user) throw forbidden('this session belongs to another user');
   const unread = unreadFor(ctx, agent);
   const first = unread[0];
   return { unread: unread.length, first: first ? { from: first.from } : null };
