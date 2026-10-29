@@ -153,7 +153,7 @@ export async function remoteGitEnv(
   return environment;
 }
 
-/** The paths agentGitEnv names, all inside the clone's .agflow/run/ (task 11 writes them). */
+/** The paths agentGitEnv names: runner-owned files outside the clone, which agents cannot write (writeRunDir). */
 export interface AgentGitPaths {
   /** The agent's GIT_CONFIG_GLOBAL: identity, no credential helper, local protocols only. */
   gitconfig: string;

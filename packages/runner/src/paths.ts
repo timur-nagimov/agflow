@@ -39,6 +39,12 @@ export interface RunnerPaths {
   quarantine(project: string, attemptId: string): string;
   /** A base checkout of main, Claude's project config root. */
   baseCheckout(project: string, sha: string): string;
+  /**
+   * One attempt's runner-owned files that unsandboxed processes run or read as git config: the agent gitconfig,
+   * the refusal scripts and gh's and glab's config directories. Outside the clone, so no agent can rewrite them;
+   * under vaults/, which agents may read but never write (7.6).
+   */
+  agentTools(project: string, attemptId: string): string;
   work: string;
   /** The attempt clone, the agent's cwd. */
   clone(project: string, attemptId: string): string;
@@ -89,6 +95,7 @@ export function runnerPaths(home: string = agflowHome()): RunnerPaths {
       if (!/^[0-9a-f]{12,40}$/.test(sha)) throw new Error(`expected a commit sha, not ${JSON.stringify(sha)}`);
       return join(vaults, `${segment(project)}.base`, sha.slice(0, 12));
     },
+    agentTools: (project, attemptId) => join(vaults, `${segment(project)}.agent`, segment(attemptId)),
     work,
     clone: (project, attemptId) => join(work, segment(project), segment(attemptId)),
   };

@@ -42,6 +42,7 @@ describe('runnerPaths', () => {
     expect(paths.vault('demo-1a2b')).toBe('/h/vaults/demo-1a2b.git');
     expect(paths.quarantine('demo-1a2b', 'T-4-a1')).toBe('/h/vaults/demo-1a2b.quarantine/T-4-a1');
     expect(paths.baseCheckout('demo-1a2b', 'a'.repeat(40))).toBe(`/h/vaults/demo-1a2b.base/${'a'.repeat(12)}`);
+    expect(paths.agentTools('demo-1a2b', 'T-4-a1')).toBe('/h/vaults/demo-1a2b.agent/T-4-a1');
     expect(paths.work).toBe('/h/work');
     expect(paths.clone('demo-1a2b', 'T-4-a1')).toBe('/h/work/demo-1a2b/T-4-a1');
   });
