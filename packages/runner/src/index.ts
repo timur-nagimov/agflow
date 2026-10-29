@@ -4,6 +4,7 @@ export * from './clock';
 export * from './config';
 export * from './db';
 export * from './git/run';
+export * from './git/vault';
 export * from './hub-http';
 export * from './journal';
 export * from './link';
