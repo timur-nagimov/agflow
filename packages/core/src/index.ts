@@ -12,5 +12,6 @@ export * from './runner-protocol';
 export * from './api-schemas';
 export * from './credentials';
 export * from './protected-paths';
+export * from './stall';
 
 export const AGFLOW_VERSION = '0.1.0';
