@@ -7,4 +7,5 @@ export * from './journal';
 export * from './log';
 export * from './outbox';
 export * from './paths';
+export * from './processes';
 export * from './vendor/pins';
