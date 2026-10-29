@@ -1,12 +1,15 @@
-// The runner link, protocol 1 (design 6.3): the messages, commands and attempt specs the hub and runners
-// exchange over a runner's WebSocket. Both sides import these schemas, and each schema is pinned to its
-// TypeScript type, so the types, the core types and the wire format cannot drift apart.
+// The runner link, protocol 1 (design 6.3): the messages, commands, attempt specs and events the hub and runners
+// exchange over a runner's WebSocket, and the closed code lists senders import. Both sides import these schemas,
+// and each schema is pinned to its TypeScript type, so the types, the core types and the wire format cannot drift
+// apart.
 import { z } from 'zod';
 import { isValidWipRefPrefix, parseAttemptId } from './naming';
 import { BranchSchema, CommitShaSchema, RoleSchema, TaskIdSchema, VendorSchema } from './schemas';
 import type {
   AgentRole,
+  Approval,
   AttemptFacts,
+  AttemptLogEntry,
   AttemptPhase,
   Fence,
   ProfileSummary,
@@ -31,6 +34,66 @@ export const CLOSE_CODES = {
 
 /** The account id every adapter reports in test mode: the first 16 hex of sha256('agflow-test') (design 15.1). */
 export const TEST_ACCOUNT_ID = '337c8a0a2e66c1e6';
+
+// The closed code lists of design 6.3's event table. Senders import them instead of writing literals, and any
+// other value makes the event a reject.
+
+/** attempt.failed_to_start.refused: why a runner turned a start down without trying it. */
+export const START_REFUSALS = [
+  'draining',
+  'at_capacity',
+  'vendor_not_ready',
+  'disk_low',
+  'battery_low',
+  'waking',
+  'needs_login',
+] as const;
+export type StartRefusal = (typeof START_REFUSALS)[number];
+
+/** attempt.activity kinds, each also an attempt_log kind. Adapter warnings are sent as note. */
+export const ACTIVITY_KINDS = [
+  'tool',
+  'turn',
+  'text',
+  'compaction',
+  'vendor_error',
+  'note',
+] as const satisfies readonly AttemptLogEntry['kind'][];
+export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
+
+/** attempt.violation phases. A hand-back from the clone reports wip. */
+export const VIOLATION_PHASES = ['start', 'wip', 'submit', 'takeover'] as const;
+export type ViolationPhase = (typeof VIOLATION_PHASES)[number];
+
+/** attempt.submitted error codes. */
+export const SUBMIT_ERRORS = [
+  'dirty',
+  'protected_paths',
+  'needs_merge',
+  'branch_moved',
+  'remote',
+  'interrupted',
+] as const;
+export type SubmitError = (typeof SUBMIT_ERRORS)[number];
+
+/** The submit refusals that go back to the agent to fix. */
+export const FIXABLE_SUBMIT_ERRORS = [
+  'dirty',
+  'protected_paths',
+  'needs_merge',
+] as const satisfies readonly SubmitError[];
+
+/** attempt.exited.cause: the runner's own stops. Every other exit has null. */
+export const EXIT_CAUSES = ['suspend', 'runner_stop'] as const;
+export type ExitCause = (typeof EXIT_CAUSES)[number];
+
+/** attempt.exited.stoppedBy: the step of the stop ladder that ended the process, or none (design 7.4). */
+export const STOPPED_BY = ['interrupt', 'close', 'sigterm', 'sigkill', 'none'] as const;
+export type StoppedBy = (typeof STOPPED_BY)[number];
+
+/** attempt.vendor_outcome kinds. denials and session_budget count as the stall rule budget. */
+export const VENDOR_OUTCOME_KINDS = ['auth', 'context', 'policy', 'denials', 'session_budget'] as const;
+export type VendorOutcomeKind = (typeof VENDOR_OUTCOME_KINDS)[number];
 
 // ---------------------------------------------------------------------------
 // Types
@@ -416,6 +479,12 @@ export const RunnerSettingsSchema = schemaFor<RunnerSettings>()(
   z.strictObject({ ...settingsFields, version: NonNegativeInt }),
 );
 
+/** Some settings without their version: what update_settings sets and runner.settings reports. */
+const SettingsChangesSchema = z.strictObject(settingsFields).partial();
+
+/** The state a runner reports in hello and runner.state; the hub derives the rest. */
+const ReportedStateSchema = z.enum(['ok', 'crash_loop', 'disk_low']);
+
 export const LiveAttemptSchema = schemaFor<LiveAttempt>()(
   z.strictObject({
     attemptId: AttemptIdSchema,
@@ -554,7 +623,7 @@ export const RunnerCommandSchema = schemaFor<RunnerCommand>()(
     }),
     z.strictObject({
       kind: z.literal('update_settings'),
-      settings: z.strictObject(settingsFields).partial(),
+      settings: SettingsChangesSchema,
       version: PositiveInt,
     }),
   ]),
@@ -619,7 +688,7 @@ const HelloSchema = z
     quota: z.array(AccountQuotaReportSchema),
     profile: ProfileSummarySchema,
     git: z.strictObject({ ready: z.boolean(), problem: z.string().nullable(), lastPushAt: NonNegativeInt.nullable() }),
-    state: z.enum(['ok', 'crash_loop', 'disk_low']),
+    state: ReportedStateSchema,
     stateDetail: z.string().nullable(),
     outboxEpoch: Name,
     firstSeq: PositiveInt,
@@ -690,6 +759,151 @@ export const HubMessageSchema = schemaFor<HubMessage>()(
 );
 
 // ---------------------------------------------------------------------------
+// Runner events
+// ---------------------------------------------------------------------------
+
+const eventFields = { seq: PositiveInt, at: NonNegativeInt };
+
+/** attempt.* and approval.* events name their attempt and carry its fence. */
+function attemptEvent<T extends `attempt.${string}` | `approval.${string}`, D extends z.ZodRawShape>(type: T, data: D) {
+  return z.strictObject({ ...eventFields, type: z.literal(type), ...attemptFields, data: z.strictObject(data) });
+}
+
+/** runner.* events are about the runner itself, so they carry neither. */
+function runnerEvent<T extends `runner.${string}`, D extends z.ZodRawShape>(type: T, data: D) {
+  return z.strictObject({ ...eventFields, type: z.literal(type), data: z.strictObject(data) });
+}
+
+const ApprovalKindSchema = schemaFor<Approval['kind']>()(z.enum(['command', 'file_change', 'other']));
+
+const ApprovalDetailSchema = schemaFor<Approval['detail']>()(
+  z.strictObject({
+    command: z.string().optional(),
+    cwd: z.string().optional(),
+    reason: z.string().optional(),
+    diff: z.string().optional(),
+    manifestDiff: z.string().optional(),
+    grantRoot: z.string().optional(),
+  }),
+);
+
+/** attempt.wip.logStat: git log --stat of the WIP since main, clipped by the runner; handoff notes quote it. */
+const LOG_STAT_MAX = 4_000;
+
+// The event table of design 6.3, in its order: one schema per type. Runners read shas from git, so every sha an
+// event reports is full.
+const EVENT_SCHEMAS = [
+  attemptEvent('attempt.spawned', {
+    sessionRef: Name,
+    pid: PositiveInt,
+    model: Name,
+    cliVersion: Name,
+    permissionMode: Name.nullable(),
+    // Null on a resume.
+    startSha: FullShaSchema.nullable(),
+  }),
+  attemptEvent('attempt.failed_to_start', { error: z.string(), refused: z.enum(START_REFUSALS).nullable() }),
+  attemptEvent('attempt.activity', { kind: z.enum(ACTIVITY_KINDS), summary: z.string() }),
+  attemptEvent('attempt.first_output', { text: z.string() }),
+  // Runners never report message 0 (hub text), but it parses, so the hub can ignore it without rejecting the event.
+  attemptEvent('attempt.delivered', { messageIds: z.array(NonNegativeInt) }),
+  attemptEvent('attempt.acknowledged', { messageIds: z.array(NonNegativeInt) }),
+  attemptEvent('attempt.quota', {
+    vendor: VendorSchema,
+    // Null when the runner does not know the account: the hub then moves the attempt and updates no account.
+    accountId: AccountIdSchema.nullable(),
+    quota: VendorQuotaSchema,
+  }),
+  attemptEvent('attempt.prepared', {
+    // Null for a preparation the runner ran before a start or resume.
+    requestId: CommandIdSchema.nullable(),
+    ok: z.boolean(),
+    error: z.string().nullable(),
+    logTail: z.string().nullable(),
+  }),
+  attemptEvent('attempt.wip', {
+    ref: RefSchema,
+    sha: FullShaSchema,
+    // Protected paths taken out of the WIP, files over 10 MB left out, and embedded repositories (design 7.3).
+    stripped: z.array(Name),
+    skipped: z.array(Name),
+    embedded: z.array(Name),
+    logStat: z.string().max(LOG_STAT_MAX),
+  }),
+  // failures: the runner's consecutive failed WIP pushes, over all its attempts.
+  attemptEvent('attempt.wip_failed', { error: z.string(), failures: PositiveInt }),
+  attemptEvent('attempt.violation', { phase: z.enum(VIOLATION_PHASES), paths: z.array(Name) }),
+  attemptEvent('attempt.submitted', {
+    submissionId: SubmissionIdSchema,
+    ok: z.boolean(),
+    headSha: FullShaSchema.nullable(),
+    remoteHead: FullShaSchema.nullable(),
+    error: z.enum(SUBMIT_ERRORS).nullable(),
+    detail: z.string().nullable(),
+  })
+    // The hub records a success and fails a refusal, so an outcome must not contradict itself.
+    .refine(({ data }) => data.ok === (data.error === null), {
+      error: 'a submission succeeds (ok) exactly when it has no error code',
+      path: ['data', 'error'],
+    })
+    .refine(({ data }) => !data.ok || data.headSha !== null, {
+      error: 'a successful submission reports the head it pushed',
+      path: ['data', 'headSha'],
+    }),
+  attemptEvent('attempt.taken_over', {
+    // local is null when the take-over failed after the agent stopped.
+    commands: z.strictObject({ local: Name.nullable(), anywhere: Name }),
+    wipSha: FullShaSchema.nullable(),
+    error: z.string().nullable(),
+  }),
+  attemptEvent('attempt.handed_back', { ref: RefSchema, sha: FullShaSchema }),
+  attemptEvent('attempt.vendor_outcome', { kind: z.enum(VENDOR_OUTCOME_KINDS), detail: z.string().nullable() }),
+  attemptEvent('attempt.exited', {
+    code: z.number().int().nullable(),
+    signal: Name.nullable(),
+    stoppedBy: z.enum(STOPPED_BY),
+    handoffWritten: z.boolean(),
+    cause: z.enum(EXIT_CAUSES).nullable(),
+    // The harvested head, whenever the harvest succeeded.
+    finalSha: FullShaSchema.nullable(),
+    // Null when no final WIP was pushed: the push failed (pushError), the attempt had already ended (its work goes
+    // to a late-work ref), or a lead, which has no WIP.
+    finalWip: z.strictObject({ ref: RefSchema, sha: FullShaSchema }).nullable(),
+    pushError: z.string().nullable(),
+  }),
+  // The hub files the late work of an attempt it does not know under taskId, so it must be the task the attempt id
+  // names. Leads have no WIP, so no late work either.
+  attemptEvent('attempt.late_work', { taskId: TaskIdSchema, ref: RefSchema, sha: FullShaSchema }).refine(
+    (event) => parseAttemptId(event.attemptId)?.taskId === event.data.taskId,
+    { error: 'expected the task the attempt id names; a lead attempt has no late work', path: ['data', 'taskId'] },
+  ),
+  runnerEvent('runner.vendors', { vendors: z.array(RunnerVendorSchema), quota: z.array(AccountQuotaReportSchema) }),
+  // The hub applies the changes and echoes update_settings at its own version + 1; only the hub assigns versions.
+  runnerEvent('runner.settings', { settings: SettingsChangesSchema, baseVersion: NonNegativeInt }),
+  runnerEvent('runner.state', { state: ReportedStateSchema, detail: z.string().nullable() }),
+  attemptEvent('approval.requested', {
+    // Minted by the runner as a UUID, like decide_approval's.
+    approvalId: z.uuid(),
+    kind: ApprovalKindSchema,
+    summary: z.string(),
+    detail: ApprovalDetailSchema,
+  }),
+  attemptEvent('approval.voided', { approvalId: z.uuid() }),
+] as const;
+
+export type RunnerEvent = z.output<(typeof EVENT_SCHEMAS)[number]>;
+export type RunnerEventType = RunnerEvent['type'];
+/** The data of each event type. */
+export type RunnerEventData = { [E in RunnerEvent as E['type']]: E['data'] };
+
+/** The 22 event types of protocol 1, in the order of design 6.3's event table. */
+export const RUNNER_EVENT_TYPES: readonly RunnerEventType[] = EVENT_SCHEMAS.map((schema) => schema.shape.type.value);
+
+const EVENT_SCHEMA_BY_TYPE = new Map<string, z.ZodType<RunnerEvent>>(
+  EVENT_SCHEMAS.map((schema) => [schema.shape.type.value, schema]),
+);
+
+// ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
 
@@ -757,4 +971,18 @@ export function parseHubMessage(text: string): ParsedHubMessage {
   if (parsed.ok) return parsed;
   const envelope = CommandEnvelopeSchema.safeParse(json.value);
   return { ...parsed, commandId: envelope.success ? envelope.data.id : null };
+}
+
+/**
+ * Reads one event of an events message. The hub applies each event on its own, so an invalid one becomes a
+ * reject and never fails its batch. An unknown type or bad data gives an error that names the type; nothing
+ * throws.
+ */
+export function parseRunnerEvent(event: unknown): Parsed<RunnerEvent> {
+  const type = typeof event === 'object' && event !== null && 'type' in event ? event.type : undefined;
+  if (typeof type !== 'string') return { ok: false, error: 'an event needs a type' };
+  const schema = EVENT_SCHEMA_BY_TYPE.get(type);
+  if (!schema) return { ok: false, error: `unknown event type ${JSON.stringify(type)}` };
+  const parsed = parseWith(schema, event);
+  return parsed.ok ? parsed : { ok: false, error: `${type}: ${parsed.error}` };
 }
