@@ -3,7 +3,7 @@
 // test connection hand the gateway a LinkSocket and every message and close they see.
 import { CLOSE_CODES, type HubMessage, type RunnerMessage, parseRunnerMessage } from '@agflow/core';
 import { slideSession } from './auth';
-import { markSent, pendingCommands, toWireCommand } from './commands';
+import { markSent, pendingCommands, recordResult, toWireCommand } from './commands';
 import { type HubContext, type RunnerLink, afterCommit, tx } from './context';
 import { hubEpoch } from './hub-state';
 import {
@@ -11,8 +11,11 @@ import {
   checkRunnerIdentity,
   identifyRunner,
   markLinked,
+  markUnlinked,
   reconcileHelloSettings,
+  recordHeartbeatInfo,
   recordHelloInfo,
+  unlinkAll,
 } from './runners';
 
 /** The close code for a link whose first message is not a readable hello (WebSocket "policy violation"). */
@@ -96,6 +99,7 @@ export class Gateway implements RunnerLink {
     options: GatewayOptions = {},
   ) {
     this.log = options.log ?? ((message, error) => console.error(message, error ?? ''));
+    unlinkAll(ctx);
     ctx.link = this;
   }
 
@@ -124,17 +128,65 @@ export class Gateway implements RunnerLink {
       this.log(`runner ${connection.runnerId} sent a message the hub cannot read: ${parsed.error}`);
       return;
     }
-    this.handle(connection, parsed.value);
+    try {
+      this.handle(connection, parsed.value);
+    } catch (error) {
+      // The gateway is the boundary for runner input: a throw here would reach the transport, and in Bun's websocket
+      // handlers end the hub. What was rolled back comes again: a pending command is resent after the next welcome.
+      this.log(`handling ${parsed.value.t} from runner ${connection.runnerId} failed`, error);
+    }
   }
 
   /** Every inbound message keeps the link alive; hello is allowed only once. */
   private handle(connection: RunnerConnection, message: RunnerMessage): void {
-    if (message.t === 'hello') this.close(connection, BAD_MESSAGE_CLOSE, 'hello was already received on this link');
+    const { ctx } = this;
+    const runnerId = connection.runnerId as string;
+    switch (message.t) {
+      case 'hello':
+        this.close(connection, BAD_MESSAGE_CLOSE, 'hello was already received on this link');
+        return;
+      case 'heartbeat':
+        try {
+          tx(ctx, () => recordHeartbeatInfo(ctx, runnerId, message));
+        } catch (error) {
+          // The link is alive whatever the hub could store about it.
+          this.log(`recording a heartbeat from runner ${runnerId} failed`, error);
+        }
+        this.send(connection, { t: 'heartbeat_ack', at: message.at, hubTime: ctx.now() });
+        return;
+      case 'result': {
+        const { t: _, ...result } = message;
+        recordResult(ctx, runnerId, result);
+        return;
+      }
+      case 'events':
+        return;
+    }
   }
 
   /** The transport saw the link close. */
   closed(connection: RunnerConnection): void {
     this.drop(connection);
+  }
+
+  /**
+   * Terminates every link with no inbound message for deadLinkMs by the context clock, those still waiting for their
+   * hello included. A dead link would never answer a closing handshake, so none is attempted. Returns how many.
+   */
+  sweepDeadLinks(): number {
+    const cutoff = this.ctx.now() - this.ctx.config.deadLinkMs;
+    let terminated = 0;
+    for (const connection of [...this.connections]) {
+      if (connection.lastInboundAt > cutoff) continue;
+      this.drop(connection);
+      terminated += 1;
+      try {
+        connection.socket.terminate();
+      } catch (error) {
+        this.log(`terminating the link of runner ${connection.runnerId ?? '(no hello yet)'} failed`, error);
+      }
+    }
+    return terminated;
   }
 
   private firstMessage(connection: RunnerConnection, text: string): void {
@@ -143,7 +195,14 @@ export class Gateway implements RunnerLink {
       const envelope = parsed.hello;
       if (envelope) {
         // A newer runner's hello may be unreadable here: it still gets 4426, so it stops instead of retrying.
-        const checked = tx(this.ctx, () => checkRunnerIdentity(this.ctx, connection.session.user, envelope));
+        let checked: ReturnType<typeof checkRunnerIdentity>;
+        try {
+          checked = tx(this.ctx, () => checkRunnerIdentity(this.ctx, connection.session.user, envelope));
+        } catch (error) {
+          this.log(`hello from runner key ${envelope.runnerKey} failed`, error);
+          this.close(connection, HUB_ERROR_CLOSE, 'the hub could not process hello');
+          return;
+        }
         if (!checked.ok) {
           this.close(connection, checked.code, checked.reason);
           return;
@@ -279,12 +338,19 @@ export class Gateway implements RunnerLink {
     }
   }
 
+  /** Forgets the link; when it was the runner's current link, the runner goes offline (or needs_login). */
   private drop(connection: RunnerConnection): void {
     if (connection.closed) return;
     connection.closed = true;
     this.connections.delete(connection);
-    if (connection.runnerId !== null && this.links.get(connection.runnerId) === connection) {
-      this.links.delete(connection.runnerId);
+    const runnerId = connection.runnerId;
+    if (runnerId === null || this.links.get(runnerId) !== connection) return;
+    this.links.delete(runnerId);
+    try {
+      // A replaced link's runner already names its new link, so only the current one marks it offline.
+      tx(this.ctx, (emit) => markUnlinked(this.ctx, emit, runnerId, connection.id));
+    } catch (error) {
+      this.log(`marking runner ${runnerId} offline failed`, error);
     }
   }
 }

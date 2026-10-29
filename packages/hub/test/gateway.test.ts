@@ -8,7 +8,7 @@ import {
   type RunnerCommandKind,
 } from '@agflow/core';
 import { SESSION_TTL, createSession, sessionHashOf } from '../src/auth';
-import { type StoredCommand, enqueueCommand, pendingCommands } from '../src/commands';
+import { RESULT_HANDLERS, type StoredCommand, enqueueCommand, findCommand, pendingCommands } from '../src/commands';
 import { tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { BAD_MESSAGE_CLOSE, Gateway, type GatewayOptions, HUB_ERROR_CLOSE, type LinkSocket } from '../src/gateway';
@@ -126,7 +126,8 @@ describe('hello and welcome', () => {
     // A later hello with the confirmed snapshot queues no settings.
     await runner.reconnect();
     await settle();
-    expect(pendingCommands(ctx, 'R-1', PROTOCOL_VERSION)).toHaveLength(1);
+    expect(runner.commands).toHaveLength(1);
+    expect(pendingCommands(ctx, 'R-1', PROTOCOL_VERSION)).toEqual([]);
   });
 });
 
@@ -293,6 +294,7 @@ describe('known runners and broken links', () => {
     await settle();
     expect(runner.closedWith).toEqual(retired);
     expect(gateway.connectionOf('R-1')).toBeNull();
+    expect(findRunnerRow(ctx, 'R-1')).toMatchObject({ state: 'offline', connection_id: null });
     expect(await runner.connect()).toBeNull();
     expect(runner.closedWith).toEqual(retired);
   });
@@ -350,7 +352,9 @@ describe('commands on the link', () => {
     await settle();
     const seqs = () => runner.commands.map((message) => message.seq);
     expect(seqs()).toEqual([1, 2, 3]);
-    // Results are not recorded yet, so the next welcome resends them, and the journal answers the same.
+    // Results lost with the link leave their commands pending: the next welcome resends them, and the journal
+    // answers the same.
+    ctx.db.run("UPDATE runner_commands SET status = 'pending' WHERE seq > 1");
     await runner.reconnect();
     await settle();
     expect(seqs()).toEqual([1, 2, 3, 2, 3]);
@@ -364,11 +368,8 @@ describe('commands on the link', () => {
     tx(ctx, () => enqueueCommand(ctx, 'R-1', { kind: 'cleanup_attempt', attemptId: 'T-1-a1' }));
     await settle();
     expect(seqs()).toEqual([1, 2, 3, 2, 3, 4]);
-    expect(pendingCommands(ctx, 'R-1', PROTOCOL_VERSION).map((row) => row.sentAt)).toEqual([
-      ctx.now(),
-      ctx.now(),
-      ctx.now(),
-    ]);
+    expect(findCommand(ctx, '1-R-1-4')).toMatchObject({ status: 'done', sentAt: ctx.now() });
+    expect(pendingCommands(ctx, 'R-1', PROTOCOL_VERSION)).toEqual([]);
   });
 });
 
@@ -518,5 +519,163 @@ describe('FakeRunner', () => {
     expect(calls).toBe(1);
     const results = runner.transport?.toHub.filter((message) => message.t === 'result' && message.commandId === preflight.id);
     expect(results).toEqual([{ t: 'result', commandId: preflight.id, ok: true, data: { call: 1 } }]);
+  });
+});
+
+describe('heartbeats, results and dead links', () => {
+  test('every heartbeat gets heartbeat_ack and stores power, disk, last seen and acceptingUntil', async () => {
+    const { ctx, clock, gateway, token } = setup();
+    let accepting: number | null = 120_000;
+    const runner = await connectFakeRunner(ctx, gateway, {
+      token,
+      acceptingUntil: () => accepting,
+      power: () => ({ source: 'battery', batteryPercent: 18, lowPowerMode: true }),
+      disk: () => ({ freeBytes: 5e9, agflowBytes: 2e9 }),
+    });
+    clock.advance(10_000);
+    const sentAt = ctx.now();
+    runner.heartbeat();
+    clock.advance(250);
+    await settle();
+    expect(runner.received.at(-1)).toEqual({ t: 'heartbeat_ack', at: sentAt, hubTime: ctx.now() });
+    expect(getRunner(ctx, 'R-1')).toMatchObject({
+      power: { source: 'battery', batteryPercent: 18, lowPowerMode: true },
+      disk: { freeBytes: 5e9, agflowBytes: 2e9 },
+      lastSeenAt: ctx.now(),
+      // acceptingUntil arrives as ms from now and is stored as an epoch time.
+      acceptingUntil: ctx.now() + 120_000,
+    });
+    accepting = null;
+    runner.heartbeat();
+    await settle();
+    expect(getRunner(ctx, 'R-1').acceptingUntil).toBeNull();
+    expect(runner.received.filter((message) => message.t === 'heartbeat_ack')).toHaveLength(2);
+  });
+
+  test('results are recorded on their commands', async () => {
+    const { ctx, gateway, token } = setup();
+    await connectFakeRunner(ctx, gateway, {
+      token,
+      answers: { preflight: () => ({ ok: false, error: 'binary missing' }) },
+    });
+    const [preflight, cleanup] = tx(ctx, () => [
+      enqueueCommand(ctx, 'R-1', { kind: 'preflight', vendor: 'codex' }),
+      enqueueCommand(ctx, 'R-1', { kind: 'cleanup_attempt', attemptId: 'T-1-a1' }),
+    ]);
+    await settle();
+    expect(findCommand(ctx, preflight?.id ?? '')).toMatchObject({
+      status: 'failed',
+      result: { ok: false, error: 'binary missing' },
+    });
+    expect(findCommand(ctx, cleanup?.id ?? '')).toMatchObject({ status: 'done', result: { ok: true } });
+    // The settings echo of the first hello was answered too, so nothing is left to resend.
+    expect(pendingCommands(ctx, 'R-1', PROTOCOL_VERSION)).toEqual([]);
+  });
+
+  test('a result whose handling throws is logged: the link stays up and the command stays pending', async () => {
+    const logged: string[] = [];
+    const { ctx, gateway, token } = setup({}, { log: (message) => logged.push(message) });
+    const runner = await connectFakeRunner(ctx, gateway, { token, answers: { hand_back: () => ({ ok: true, data: {} }) } });
+    const previous = RESULT_HANDLERS.hand_back;
+    RESULT_HANDLERS.hand_back = (_ctx, _emit, _command, result) => {
+      // A handler reading runner-supplied data it did not check.
+      (result.data as { pids: string[] }).pids.join(',');
+    };
+    try {
+      const handBack = tx(ctx, () =>
+        enqueueCommand(ctx, 'R-1', { kind: 'hand_back', attemptId: 'T-1-a1', source: { kind: 'clone' } }),
+      );
+      await settle();
+      expect(findCommand(ctx, handBack.id)?.status).toBe('pending');
+      expect(runner.connected).toBe(true);
+      expect(gateway.connectionOf('R-1')).toBe(runner.transport?.connection ?? null);
+      expect(logged).toEqual(['handling result from runner R-1 failed']);
+    } finally {
+      if (previous) RESULT_HANDLERS.hand_back = previous;
+      else delete RESULT_HANDLERS.hand_back;
+    }
+  });
+
+  test('a heartbeat the hub fails to record is still acknowledged: the link is alive', async () => {
+    const logged: string[] = [];
+    const { ctx, gateway, token } = setup({}, { log: (message) => logged.push(message) });
+    const runner = await connectFakeRunner(ctx, gateway, { token });
+    ctx.db.run("CREATE TRIGGER full_disk BEFORE UPDATE ON runners BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END");
+    runner.heartbeat();
+    await settle();
+    expect(runner.received.at(-1)).toMatchObject({ t: 'heartbeat_ack' });
+    expect(runner.connected).toBe(true);
+    expect(logged).toEqual(['recording a heartbeat from runner R-1 failed']);
+  });
+
+  test('an unreadable hello the hub fails to judge closes the link with 1011', async () => {
+    const logged: string[] = [];
+    const { ctx, gateway, token } = setup({}, { log: (message) => logged.push(message) });
+    const runner = await connectFakeRunner(ctx, gateway, { token });
+    runner.disconnect();
+    await settle();
+    ctx.db.run("CREATE TRIGGER full_disk BEFORE UPDATE ON runners BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END");
+    const { socket } = recordingSocket();
+    const connection = gateway.open(socket, { user: 'alice', sessionHash: sessionHashOf(token) });
+    const unreadable = { t: 'hello', protocol: PROTOCOL_VERSION + 1, runnerKey: 'runner-key-1', machineId: 'machine-1' };
+    expect(() => gateway.message(connection, JSON.stringify(unreadable))).not.toThrow();
+    expect(socket.closed).toEqual({ code: HUB_ERROR_CLOSE, reason: 'the hub could not process hello' });
+    expect(logged).toEqual(['hello from runner key runner-key-1 failed']);
+  });
+
+  test('sweepDeadLinks terminates links silent for deadLinkMs by the context clock, and never closes them', async () => {
+    const { ctx, clock, gateway, token } = setup({ deadLinkMs: 45_000 });
+    const quiet = await connectFakeRunner(ctx, gateway, { token });
+    const busy = await connectFakeRunner(ctx, gateway, { token, runnerKey: 'key-2', machineId: 'machine-2' });
+    const { socket } = recordingSocket();
+    gateway.open(socket, { user: 'alice', sessionHash: sessionHashOf(token) });
+    clock.advance(30_000);
+    busy.heartbeat();
+    await settle();
+    clock.advance(15_000);
+    expect(gateway.sweepDeadLinks()).toBe(2);
+    await settle();
+    expect(socket).toMatchObject({ terminated: true, closed: null });
+    expect(quiet.closedWith?.code).toBe(1006);
+    expect(busy.connected).toBe(true);
+    expect(getRunner(ctx, 'R-1').state).toBe('offline');
+    expect(getRunner(ctx, 'R-2').state).toBe('online');
+    expect(gateway.sweepDeadLinks()).toBe(0);
+  });
+
+  test('a closed link emits runner.offline, and needs_login once its session no longer verifies', async () => {
+    const { ctx, gateway, token } = setup();
+    const runner = await connectFakeRunner(ctx, gateway, { token });
+    runner.disconnect();
+    await settle();
+    expect(getRunner(ctx, 'R-1').state).toBe('offline');
+    const offline = () => listEvents(ctx.db).filter((event) => event.type === 'runner.offline');
+    expect(offline().map((event) => event.data)).toEqual([{ runnerId: 'R-1', name: 'fake-runner', state: 'offline' }]);
+    await runner.connect();
+    await settle();
+    // The person signs the CLI out while the runner is connected.
+    ctx.db.query('DELETE FROM sessions WHERE token_hash = $hash').run({ hash: sessionHashOf(token) });
+    runner.disconnect();
+    await settle();
+    expect(getRunner(ctx, 'R-1').state).toBe('needs_login');
+    expect(offline().at(-1)?.data).toEqual({ runnerId: 'R-1', name: 'fake-runner', state: 'needs_login' });
+  });
+
+  test('a replaced link going away leaves the runner online', async () => {
+    const { ctx, gateway, token } = setup();
+    await connectFakeRunner(ctx, gateway, { token });
+    await connectFakeRunner(ctx, gateway, { token });
+    await settle();
+    expect(getRunner(ctx, 'R-1').state).toBe('online');
+    expect(listEvents(ctx.db).filter((event) => event.type === 'runner.offline')).toEqual([]);
+  });
+
+  test('a new gateway finds no links: runners an earlier hub process left linked read offline', async () => {
+    const { ctx, gateway, token } = setup();
+    await connectFakeRunner(ctx, gateway, { token });
+    expect(getRunner(ctx, 'R-1').state).toBe('online');
+    new Gateway(ctx);
+    expect(getRunner(ctx, 'R-1').state).toBe('offline');
+    expect(findRunnerRow(ctx, 'R-1')?.connection_id).toBeNull();
   });
 });

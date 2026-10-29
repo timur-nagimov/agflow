@@ -288,6 +288,28 @@ export function recordHelloInfo(ctx: HubContext, runnerId: string, hello: HelloM
   applyVendorReport(ctx, runnerId, hello.vendors);
 }
 
+/** What each heartbeat reports about the runner itself. */
+export type HeartbeatInfo = Pick<Extract<RunnerMessage, { t: 'heartbeat' }>, 'power' | 'disk' | 'acceptingUntil'>;
+
+/**
+ * Records a heartbeat: power, disk and the time it was seen. acceptingUntil comes as ms from now, so clocks need
+ * not agree, and is stored as epoch ms; null clears it.
+ */
+export function recordHeartbeatInfo(ctx: HubContext, runnerId: string, heartbeat: HeartbeatInfo): void {
+  const row = findRunnerRow(ctx, runnerId);
+  if (!row) throw notFound(`runner ${runnerId}`);
+  const now = ctx.now();
+  const info: RunnerInfo = { ...runnerInfo(row), power: heartbeat.power, disk: heartbeat.disk };
+  ctx.db
+    .query('UPDATE runners SET info = $info, accepting_until = $acceptingUntil, last_seen_at = $now WHERE id = $id')
+    .run({
+      id: runnerId,
+      info: JSON.stringify(info),
+      acceptingUntil: heartbeat.acceptingUntil === null ? null : now + heartbeat.acceptingUntil,
+      now,
+    });
+}
+
 // ---------------------------------------------------------------------------
 // State (design 6.3)
 // ---------------------------------------------------------------------------
@@ -363,6 +385,20 @@ export function markUnlinked(ctx: HubContext, emit: Emit, runnerId: string, conn
     .run({ id: runnerId, state });
   emitOffline(emit, row, state);
   return true;
+}
+
+/**
+ * A starting hub has no links yet: runners an earlier hub process left linked are unlinked, offline or needs_login.
+ * Returns how many.
+ */
+export function unlinkAll(ctx: HubContext): number {
+  return tx(ctx, (emit) => {
+    const rows = ctx.db
+      .query(`${RUNNER_SELECT} WHERE connection_id IS NOT NULL ORDER BY seq`)
+      .all() as RunnerRow[];
+    for (const row of rows) markUnlinked(ctx, emit, row.id, row.connection_id as string);
+    return rows.length;
+  });
 }
 
 /**
