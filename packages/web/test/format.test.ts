@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test';
-import type { Agent, HubEvent, MessageView, Task, TaskStatus } from '@agflow/core';
+import type { Agent, BlockedKind, HubEvent, MessageView, Submission, Task, TaskNote, TaskStatus } from '@agflow/core';
 import {
   actionBody,
   actionHint,
   actionsFor,
   ago,
+  BLOCKED_TITLES,
   categoryOf,
+  COLUMNS,
   columnCounts,
   columnOf,
   deliveryLabel,
@@ -17,13 +19,20 @@ import {
   groupTasks,
   inConversation,
   mergeEvents,
+  NOTE_LABELS,
+  NOTE_TONES,
+  percent,
   repoLink,
+  shortSha,
   splitTaskMentions,
   STATUS_LABELS,
   statusLabel,
   targetLabel,
   targetOptions,
   threadTarget,
+  toneOf,
+  untilText,
+  VENDOR_NAMES,
   who,
 } from '../src/format';
 
@@ -61,6 +70,58 @@ function task(overrides: Partial<Task> = {}): Task {
     ...overrides,
   };
 }
+
+function submission(overrides: Partial<Submission> = {}): Submission {
+  return {
+    summary: 's',
+    evidence: [],
+    branch: null,
+    headSha: null,
+    submittedAt: 0,
+    by: 'A-4',
+    attemptId: null,
+    submissionId: null,
+    ...overrides,
+  };
+}
+
+const BLOCKED_KINDS: BlockedKind[] = ['deps', 'agent', 'impossible', 'takeover', 'replan', 'paused', 'branch_moved', 'policy'];
+
+describe('blocked kinds', () => {
+  test('every blocked kind has a label, a tone and a column', () => {
+    const rows = BLOCKED_KINDS.map((kind) => {
+      const blocked = task({ status: 'blocked', blockedKind: kind });
+      return [kind, statusLabel('blocked', kind), toneOf('blocked', kind), columnOf(blocked)];
+    });
+    expect(rows).toEqual([
+      ['deps', 'Waiting', 'wait', 'todo'],
+      ['agent', 'Blocked', 'trouble', 'attention'],
+      ['impossible', 'Blocked', 'trouble', 'attention'],
+      ['takeover', 'Taken over', 'active', 'doing'],
+      ['replan', 'Re-plan', 'trouble', 'attention'],
+      ['paused', 'Paused', 'trouble', 'attention'],
+      ['branch_moved', 'Branch moved', 'trouble', 'attention'],
+      ['policy', 'Refused', 'trouble', 'attention'],
+    ]);
+  });
+
+  test('every blocked kind has an attention heading', () => {
+    expect(Object.keys(BLOCKED_TITLES).sort()).toEqual([...BLOCKED_KINDS].sort());
+    expect(BLOCKED_TITLES.deps).toBe('Waiting on other tasks');
+    expect(BLOCKED_TITLES.impossible).toBe('The agent says this cannot be done as written');
+    expect(BLOCKED_TITLES.takeover).toBe('Taken over by a person');
+    expect(BLOCKED_TITLES.paused).toBe('Stopped and held by a person');
+    expect(BLOCKED_TITLES.replan).toBe('Its attempts kept failing: re-plan it');
+    expect(BLOCKED_TITLES.branch_moved).toBe('The task branch moved outside agflow');
+    expect(BLOCKED_TITLES.policy).toBe('The vendor refused this work on policy grounds');
+  });
+
+  test("the column hints mention people's take-overs and holds", () => {
+    const hints = Object.fromEntries(COLUMNS.map((column) => [column.key, column.hint]));
+    expect(hints.doing).toBe('Claimed by an agent, or taken over by a person.');
+    expect(hints.attention).toBe('Blocked, paused, rejected or stale.');
+  });
+});
 
 describe('board columns', () => {
   test('a task waiting on dependencies is still to do; one blocked by its agent needs attention', () => {
@@ -108,20 +169,45 @@ describe('task actions', () => {
     );
     expect(actionHint(task({ status: 'accepted' }))).toBe('Accepted. Merge its branch, then mark it merged.');
     expect(actionHint(task({ status: 'ready' }))).toBe('');
-    const submission = {
-      summary: 's',
-      evidence: [],
-      branch: null,
-      headSha: null,
-      submittedAt: 0,
-      by: 'A-4',
-      attemptId: null,
-      submissionId: null,
-    };
-    expect(actionHint(task({ status: 'submitted', submission }))).toBe(
+    expect(actionHint(task({ status: 'submitted', submission: submission() }))).toBe(
       'A-4 submitted this for review. Accept it, or reject it with feedback.',
     );
     expect(actionHint(task({ status: 'blocked' }))).toBe('Unblock it once the problem is solved, or cancel it.');
+  });
+
+  test('a task held by a runner agent offers Stop instead of Release claim, which its agent row provides', () => {
+    for (const status of ['claimed', 'working'] as const) {
+      expect(actionsFor(task({ status }), 'runner')).toEqual(['cancel']);
+      expect(actionsFor(task({ status }), 'live')).toEqual(['release', 'cancel']);
+      expect(actionsFor(task({ status }), 'nobody')).toEqual(['release', 'cancel']);
+      expect(actionsFor(task({ status }))).toEqual(['release', 'cancel']);
+    }
+    expect(actionsFor(task({ status: 'submitted' }), 'runner')).toEqual(['accept', 'reject', 'cancel']);
+  });
+
+  test('a taken-over task is handed back, never unblocked; the other blocked kinds can be unblocked', () => {
+    expect(actionsFor(task({ status: 'blocked', blockedKind: 'takeover' }))).toEqual(['cancel']);
+    for (const kind of ['paused', 'replan', 'branch_moved', 'policy', 'agent', 'impossible', 'deps'] as const) {
+      expect([kind, actionsFor(task({ status: 'blocked', blockedKind: kind }))]).toEqual([kind, ['unblock', 'cancel']]);
+    }
+  });
+
+  test('hints for runner-held, taken-over, paused, re-plan, branch-moved and refused tasks', () => {
+    expect(actionHint(task({ status: 'working', assignee: 'A-9' }), 'runner')).toBe(
+      'A-9 is working on this on a runner. Stop it only if it is stuck, or take it over to work on it yourself.',
+    );
+    expect(actionHint(task({ status: 'claimed', assignee: 'A-2' }), 'live')).toBe(
+      'A-2 is working on this. Release the claim only if the agent is stuck or gone.',
+    );
+    const blocked = (kind: BlockedKind) => actionHint(task({ status: 'blocked', blockedKind: kind }));
+    expect(blocked('takeover')).toBe('A person has taken this over. Hand it back when the work is ready, or cancel it.');
+    expect(blocked('paused')).toBe('A person stopped and held this. Unblock it to let an agent go on from its last work, or cancel it.');
+    expect(blocked('replan')).toBe('Its attempts kept failing. Split, clarify or amend it, then unblock it; or cancel it.');
+    expect(blocked('branch_moved')).toBe(
+      'Its branch moved outside agflow. Unblock it to go on from the new head, or cancel it.',
+    );
+    expect(blocked('policy')).toBe('The vendor refused this work. Change the task before you unblock it, or cancel it.');
+    expect(blocked('agent')).toBe('Unblock it once the problem is solved, or cancel it.');
   });
 
   test('bodies carry the text in the right field, and required text is enforced', () => {
@@ -151,6 +237,13 @@ describe('the thread on a task', () => {
       expect(target).not.toHaveProperty('taskId');
       expect(target.placeholder).toBe('Nobody holds this task; the next agent to claim it gets your message…');
     }
+  });
+
+  test('on a taken-over task it waits for the next agent, since the person works outside agflow', () => {
+    expect(threadTarget(task({ status: 'blocked', blockedKind: 'takeover', assignee: 'A-9' }))).toEqual({
+      to: 'task:T-1',
+      placeholder: 'A person has taken this task over; the next agent to work on it gets your message…',
+    });
   });
 
   test('once the work is handed in or the task is closed, a message goes to the lead and stays in the thread', () => {
@@ -289,6 +382,37 @@ describe('events', () => {
     const a = { ...event('a'), id: 1 };
     const b = { ...event('b'), id: 2 };
     expect(mergeEvents([b], [a, b]).map((e) => e.id)).toEqual([2, 1]);
+  });
+});
+
+describe('notes and shared words', () => {
+  test('every note kind has a label and a tone', () => {
+    const kinds: TaskNote['kind'][] = ['progress', 'handoff', 'release', 'restatement', 'late_work'];
+    expect(Object.keys(NOTE_LABELS).sort()).toEqual([...kinds].sort());
+    expect(Object.keys(NOTE_TONES).sort()).toEqual([...kinds].sort());
+    expect(NOTE_LABELS.restatement).toBe('Restatement');
+    expect(NOTE_LABELS.late_work).toBe('Late work');
+    expect(NOTE_TONES).toEqual({
+      progress: 'active',
+      handoff: 'wait',
+      release: 'closed',
+      restatement: 'review',
+      late_work: 'trouble',
+    });
+  });
+
+  test('vendor names, percents, short shas and times to come', () => {
+    expect(VENDOR_NAMES).toEqual({ claude: 'Claude Code', codex: 'Codex' });
+    expect(percent(0.423)).toBe('42%');
+    expect(percent(1)).toBe('100%');
+    expect(percent(0)).toBe('0%');
+    expect(shortSha('0123456789abcdef0123456789abcdef01234567')).toBe('0123456');
+    const now = 1_000_000_000;
+    expect(untilText(now + 12 * 60_000, now)).toBe('in 12 min');
+    expect(untilText(now + 90 * 60_000, now)).toBe('in 1 h 30 min');
+    expect(untilText(now + 20_000, now)).toBe('in under a minute');
+    expect(untilText(now, now)).toBe('now');
+    expect(untilText(now - 60_000, now)).toBe('now');
   });
 });
 

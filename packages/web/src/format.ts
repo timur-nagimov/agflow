@@ -10,6 +10,7 @@ import {
   type TaskKind,
   type TaskNote,
   type TaskStatus,
+  type Vendor,
   canTransition,
   isClosed,
   isHeld,
@@ -39,9 +40,32 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   failed: 'Failed',
 };
 
-/** A task blocked only by unfinished dependencies is waiting, not in trouble. */
+/** What a blocked task reads as on its chip; an agent's block and an impossible task both read Blocked. */
+export const BLOCKED_LABELS: Record<BlockedKind, string> = {
+  deps: 'Waiting',
+  agent: 'Blocked',
+  impossible: 'Blocked',
+  takeover: 'Taken over',
+  replan: 'Re-plan',
+  paused: 'Paused',
+  branch_moved: 'Branch moved',
+  policy: 'Refused',
+};
+
+/** The heading of a blocked task's attention card. */
+export const BLOCKED_TITLES: Record<BlockedKind, string> = {
+  deps: 'Waiting on other tasks',
+  agent: 'Blocked',
+  impossible: 'The agent says this cannot be done as written',
+  takeover: 'Taken over by a person',
+  replan: 'Its attempts kept failing: re-plan it',
+  paused: 'Stopped and held by a person',
+  branch_moved: 'The task branch moved outside agflow',
+  policy: 'The vendor refused this work on policy grounds',
+};
+
 export function statusLabel(status: TaskStatus, blockedKind: BlockedKind | null = null): string {
-  return status === 'blocked' && blockedKind === 'deps' ? 'Waiting' : STATUS_LABELS[status];
+  return status === 'blocked' && blockedKind ? BLOCKED_LABELS[blockedKind] : STATUS_LABELS[status];
 }
 
 export function toneOf(status: TaskStatus, blockedKind: BlockedKind | null = null): Tone {
@@ -61,7 +85,8 @@ export function toneOf(status: TaskStatus, blockedKind: BlockedKind | null = nul
     case 'merged':
       return 'done';
     case 'blocked':
-      return blockedKind === 'deps' ? 'wait' : 'trouble';
+      // A task waiting only on dependencies is not in trouble, and a taken-over one is being worked on by a person.
+      return blockedKind === 'deps' ? 'wait' : blockedKind === 'takeover' ? 'active' : 'trouble';
     case 'rejected':
     case 'stale':
     case 'failed':
@@ -75,9 +100,9 @@ export type ColumnKey = 'todo' | 'doing' | 'review' | 'attention' | 'done' | 'cl
 
 export const COLUMNS: { key: ColumnKey; label: string; tone: Tone; hint: string }[] = [
   { key: 'todo', label: 'To do', tone: 'wait', hint: 'Ready to claim, or waiting on other tasks.' },
-  { key: 'doing', label: 'In progress', tone: 'active', hint: 'Claimed by an agent.' },
+  { key: 'doing', label: 'In progress', tone: 'active', hint: 'Claimed by an agent, or taken over by a person.' },
   { key: 'review', label: 'In review', tone: 'review', hint: 'Submitted and waiting for the lead or a person.' },
-  { key: 'attention', label: 'Needs attention', tone: 'trouble', hint: 'Blocked by an agent, rejected or stale.' },
+  { key: 'attention', label: 'Needs attention', tone: 'trouble', hint: 'Blocked, paused, rejected or stale.' },
   { key: 'done', label: 'Done', tone: 'done', hint: 'Accepted or merged.' },
   { key: 'closed', label: 'Closed', tone: 'closed', hint: 'Cancelled or failed.' },
 ];
@@ -88,7 +113,7 @@ export function columnOf(task: Pick<Task, 'status' | 'blockedKind'>): ColumnKey 
     case 'ready':
       return 'todo';
     case 'blocked':
-      return task.blockedKind === 'deps' ? 'todo' : 'attention';
+      return task.blockedKind === 'deps' ? 'todo' : task.blockedKind === 'takeover' ? 'doing' : 'attention';
     case 'claimed':
     case 'working':
       return 'doing';
@@ -206,29 +231,51 @@ export const TASK_ACTIONS: Record<TaskAction, ActionSpec> = {
   },
 };
 
-/** The actions a person can take on a task in its current status. */
-export function actionsFor(task: Pick<Task, 'status'>): TaskAction[] {
+/** Who works on a task: a runner agent, a live chat, or nobody. */
+export type TaskHolder = 'runner' | 'live' | 'nobody';
+
+/**
+ * The actions a person can take on a task in its current status. On a task a runner agent holds, Release claim
+ * becomes the agent's Stop (design 11), which the runner actions offer; a taken-over task is handed back instead of
+ * unblocked (6.12). Without a holder the M1 actions apply.
+ */
+export function actionsFor(task: Pick<Task, 'status' | 'blockedKind'>, holder?: TaskHolder): TaskAction[] {
   const actions: TaskAction[] = [];
   if (task.status === 'submitted') actions.push('accept', 'reject');
   if (task.status === 'accepted') actions.push('merged');
-  if (task.status === 'blocked') actions.push('unblock');
-  if (task.status === 'claimed' || task.status === 'working') actions.push('release');
+  if (task.status === 'blocked' && task.blockedKind !== 'takeover') actions.push('unblock');
+  if ((task.status === 'claimed' || task.status === 'working') && holder !== 'runner') actions.push('release');
   if (canTransition(task.status, 'cancelled')) actions.push('cancel');
   return actions;
 }
 
+const BLOCKED_HINTS: Partial<Record<BlockedKind, string>> = {
+  takeover: 'A person has taken this over. Hand it back when the work is ready, or cancel it.',
+  paused: 'A person stopped and held this. Unblock it to let an agent go on from its last work, or cancel it.',
+  replan: 'Its attempts kept failing. Split, clarify or amend it, then unblock it; or cancel it.',
+  branch_moved: 'Its branch moved outside agflow. Unblock it to go on from the new head, or cancel it.',
+  policy: 'The vendor refused this work. Change the task before you unblock it, or cancel it.',
+};
+
 /** One line telling a person what the actions are for in the task's current status. */
-export function actionHint(task: Pick<Task, 'status' | 'assignee' | 'submission'>): string {
+export function actionHint(
+  task: Pick<Task, 'status' | 'blockedKind' | 'assignee' | 'submission'>,
+  holder?: TaskHolder,
+): string {
   switch (task.status) {
     case 'submitted':
       return `${task.submission?.by ?? 'The agent'} submitted this for review. Accept it, or reject it with feedback.`;
     case 'accepted':
       return 'Accepted. Merge its branch, then mark it merged.';
     case 'blocked':
-      return 'Unblock it once the problem is solved, or cancel it.';
+      return (
+        (task.blockedKind && BLOCKED_HINTS[task.blockedKind]) ?? 'Unblock it once the problem is solved, or cancel it.'
+      );
     case 'claimed':
     case 'working':
-      return `${task.assignee ?? 'An agent'} is working on this. Release the claim only if the agent is stuck or gone.`;
+      return holder === 'runner'
+        ? `${task.assignee ?? 'A runner agent'} is working on this on a runner. Stop it only if it is stuck, or take it over to work on it yourself.`
+        : `${task.assignee ?? 'An agent'} is working on this. Release the claim only if the agent is stuck or gone.`;
     default:
       return '';
   }
@@ -256,9 +303,16 @@ export interface ThreadTarget {
  * it. Once the work is handed in, or the task is finished or closed, nobody reads the thread any more,
  * although `assignee` stays set. A message then goes to the lead, who reviews the task.
  */
-export function threadTarget(task: Pick<Task, 'id' | 'status' | 'assignee'>): ThreadTarget {
+export function threadTarget(task: Pick<Task, 'id' | 'status' | 'blockedKind' | 'assignee'>): ThreadTarget {
   if (isHeld(task.status)) {
     return { to: `task:${task.id}`, placeholder: `Write to ${task.assignee ?? 'the agent'}, who holds this task…` };
+  }
+  // The person who took the task over works outside agflow and reads no thread; the agent after the hand-back does.
+  if (task.status === 'blocked' && task.blockedKind === 'takeover') {
+    return {
+      to: `task:${task.id}`,
+      placeholder: 'A person has taken this task over; the next agent to work on it gets your message…',
+    };
   }
   if (task.status === 'draft' || task.status === 'ready' || task.status === 'blocked') {
     return { to: `task:${task.id}`, placeholder: 'Nobody holds this task; the next agent to claim it gets your message…' };
@@ -500,6 +554,13 @@ export function ago(ts: number, now: number): string {
   return `${Math.floor(elapsed / DAY)} d ago`;
 }
 
+/** How long until a time to come: "in 12 min", or "now" once it has passed. */
+export function untilText(ts: number, now: number): string {
+  const left = ts - now;
+  if (left <= 0) return 'now';
+  return left < MINUTE ? 'in under a minute' : `in ${duration(left)}`;
+}
+
 /** A short duration such as "1 h 20 min" or "3 d 4 h". */
 export function duration(ms: number): string {
   const minutes = Math.max(0, Math.round(ms / MINUTE));
@@ -521,6 +582,31 @@ export const NOTE_LABELS: Record<TaskNote['kind'], string> = {
   restatement: 'Restatement',
   late_work: 'Late work',
 };
+
+/** Late work arrived after its attempt ended and needs a look; a restatement is for the reader to check. */
+export const NOTE_TONES: Record<TaskNote['kind'], Tone> = {
+  progress: 'active',
+  handoff: 'wait',
+  release: 'closed',
+  restatement: 'review',
+  late_work: 'trouble',
+};
+
+// ---------------------------------------------------------------------------
+// Shared words
+// ---------------------------------------------------------------------------
+
+export const VENDOR_NAMES: Record<Vendor, string> = { claude: 'Claude Code', codex: 'Codex' };
+
+/** A fraction 0..1 as a whole percent: 0.423 is "42%". */
+export function percent(fraction: number): string {
+  return `${Math.round(fraction * 100)}%`;
+}
+
+/** The 7 characters of a commit sha that people recognise. */
+export function shortSha(sha: string): string {
+  return sha.slice(0, 7);
+}
 
 export function evidenceText(evidence: Evidence): string {
   switch (evidence.kind) {
