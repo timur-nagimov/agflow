@@ -108,6 +108,42 @@ export function testVendor(vendor: Vendor): RunnerVendor {
   };
 }
 
+/** An online runner of the owner's, offering the vendors in test mode, with room for two attempts; returns its id. */
+export function addRunner(ctx: HubContext, options: { owner?: string; vendors?: Vendor[] } = {}): string {
+  const owner = options.owner ?? 'alice';
+  const now = ctx.now();
+  const seq = nextId(ctx.db, 'runner');
+  const runnerId = `R-${seq}`;
+  const info = {
+    agflowVersion: AGFLOW_VERSION,
+    platform: 'darwin-arm64',
+    vendors: (options.vendors ?? ['claude']).map(testVendor),
+    profile: { name: 'standard', weakened: [], dependencyPrep: true },
+    git: { ready: true, problem: null, lastPushAt: null },
+    power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
+    disk: { freeBytes: 100e9, agflowBytes: 0 },
+    ceilings: {},
+    allowPaidUsage: {},
+  };
+  ctx.db
+    .query(
+      `INSERT INTO runners (id, seq, runner_key, machine_id, owner, name, state, capacity, protocol, info,
+         last_seen_at, created_at)
+       VALUES ($id, $seq, $key, $machine, $owner, $name, 'online', 2, 1, $info, $now, $now)`,
+    )
+    .run({
+      id: runnerId,
+      seq,
+      key: `runner-key-${seq}`,
+      machine: `machine-${seq}`,
+      owner,
+      name: `${owner}-laptop-${seq}`,
+      info: JSON.stringify(info),
+      now,
+    });
+  return runnerId;
+}
+
 /**
  * A runner worker holding a task as if its runner had reported attempt.spawned: an online runner, its agent, and a
  * running attempt with a fence and a runner lease that is the task's current attempt. It mints no agent token and
@@ -120,38 +156,7 @@ export function addRunnerAttempt(ctx: HubContext, options: RunnerAttemptOptions 
   if (!taskId) throw new Error('no task to attempt');
   return tx(ctx, (emit) => {
     const now = ctx.now();
-    let runnerId = options.runnerId;
-    if (!runnerId) {
-      const seq = nextId(ctx.db, 'runner');
-      runnerId = `R-${seq}`;
-      const info = {
-        agflowVersion: AGFLOW_VERSION,
-        platform: 'darwin-arm64',
-        vendors: [testVendor(vendor)],
-        profile: { name: 'standard', weakened: [], dependencyPrep: true },
-        git: { ready: true, problem: null, lastPushAt: null },
-        power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
-        disk: { freeBytes: 100e9, agflowBytes: 0 },
-        ceilings: {},
-        allowPaidUsage: {},
-      };
-      ctx.db
-        .query(
-          `INSERT INTO runners (id, seq, runner_key, machine_id, owner, name, state, capacity, protocol, info,
-             last_seen_at, created_at)
-           VALUES ($id, $seq, $key, $machine, $owner, $name, 'online', 2, 1, $info, $now, $now)`,
-        )
-        .run({
-          id: runnerId,
-          seq,
-          key: `runner-key-${seq}`,
-          machine: `machine-${seq}`,
-          owner,
-          name: `${owner}-laptop-${seq}`,
-          info: JSON.stringify(info),
-          now,
-        });
-    }
+    const runnerId = options.runnerId ?? addRunner(ctx, { owner, vendors: [vendor] });
     const agentSeq = nextId(ctx.db, 'agent');
     const agentId = `A-${agentSeq}`;
     const number = nextAttemptNumber(ctx, taskId);
