@@ -60,9 +60,10 @@ export class Vault {
   readonly path: string;
   readonly project: string;
   readonly mainBranch: string;
+  /** The local environment every command on the vault runs with. */
+  readonly local: GitEnvironment;
   private readonly paths: RunnerPaths;
   private readonly url: string;
-  private readonly local: GitEnvironment;
   private readonly remote: () => Promise<GitEnvironment>;
 
   constructor(options: VaultOptions) {
