@@ -13,6 +13,9 @@
 // A worker's work is pushed to its WIP ref every wip interval while the clone changed, and before the agent starts
 // in a clone that already existed (work.ts); canPushWip decides each push, and a harvest it forbids waits in the
 // vault for the next welcome. Leads are never harvested.
+// When the agent exits, the exit job (exit.ts) runs on the queue: an exit the runner did not request first kills
+// every recorded group and sweeps the clone (X-15); then the final harvest and push, the transcript tail, the
+// voided approvals, and only then attempt.exited. Work the final push could not place goes to a late-work ref.
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,26 +24,38 @@ import {
   type AttemptPhase,
   type AttemptSpec,
   compareFence,
+  type ExitCause,
   type Fence,
   type InjectedMessage,
   type StartRefusal,
+  type StoppedBy,
   type Vendor,
 } from '@agflow/core';
-import type { AgentEvent, AgentLaunch, AgentSession, AgflowCommand, VendorAdapter } from '../adapters/types';
+import type {
+  AgentEvent,
+  AgentLaunch,
+  AgentSession,
+  AgflowCommand,
+  ExitInfo,
+  VendorAdapter,
+} from '../adapters/types';
 import type { AttemptStore } from '../attempt-store';
 import type { AwakeClock } from '../clock';
 import type { RunnerConfig } from '../config';
 import { buildAgentEnv } from '../env';
 import { diffFingerprint, FactsTracker } from '../facts';
-import { lsRemote, type PushResult, pushWip } from '../git/push';
+import { lsRemote, pushLateWork, type PushResult, pushWip } from '../git/push';
 import { type GitEnvironment, runGit } from '../git/run';
 import type { Vault } from '../git/vault';
+import type { RunnerHubHttp } from '../hub-http';
 import type { Logger } from '../log';
 import type { NewEvent, Outbox } from '../outbox';
 import type { RunnerPaths } from '../paths';
 import type { SerialQueue } from '../queue';
-import type { ProcessIdentity } from '../processes';
+import { boundedWait, type ProcessIdentity } from '../processes';
 import type { DependencyPreparer, Notifier, RunnerHealth } from '../seams';
+import { killAndSweep } from '../stop-ladder';
+import { clipPushError, EVENTS_AFTER_EXIT_MS, LateWorkRetries, pushWithRetries, uploadTranscriptTail } from './exit';
 import { buildLaunch, ProcessRegistration } from './launch';
 import { ACTIVITY_SUMMARY_MAX, clip, EventPump, type PumpEvent } from './pump';
 import {
@@ -52,6 +67,7 @@ import {
   type WipStanding,
   type WorkResult,
   withPausedGroups,
+  wipRefusal,
 } from './work';
 import {
   clipStartError,
@@ -105,6 +121,8 @@ export interface ControllerDeps {
   wipGate: WipGate;
   /** The runner's consecutive failed WIP pushes, shared by every controller. */
   wipFailures: WipFailures;
+  /** Where transcript tails go: POST /api/runner/attempts/:id/transcript. */
+  hub: Pick<RunnerHubHttp, 'uploadTranscript'>;
 }
 
 /** The agent process of the attempt's current start or resume, while the controller follows it. */
@@ -120,7 +138,31 @@ interface LiveAgent {
   /** The runner-owned directory of the facts' fingerprint index. */
   factsDir: string;
   /** Settles once the agent's events have ended. */
+  events: Promise<void>;
+  /** Settles once the agent's events have ended and its exit was dealt with. */
   done: Promise<void>;
+  /** Its exit was dealt with: attempt.exited is reported once per process. */
+  finished: boolean;
+}
+
+/** How an exit came about: the ladder step that ended it, and the runner's own cause. */
+interface ExitContext {
+  stoppedBy: StoppedBy;
+  cause: ExitCause | null;
+  /** The runner asked for the exit; an unrequested one is killed and swept before the harvest (X-15). */
+  requested: boolean;
+}
+
+/**
+ * The final work's part of attempt.exited, and what still has to go to a late-work ref. Work unchanged since the last
+ * push, or since the start when none was pushed, gives that work as finalSha (the start's sha then), the last push or
+ * null as finalWip, no pushError and nothing late: finalWip null with pushError null is no work left behind.
+ */
+interface FinalWork {
+  finalSha: string | null;
+  finalWip: { ref: string; sha: string } | null;
+  pushError: string | null;
+  late: { sha: string; now: boolean } | null;
 }
 
 export type StartOutcome = { started: true } | { started: false; refused: StartRefusal | null; error: string };
@@ -178,6 +220,7 @@ export class AttemptController {
   /** Protected paths already reported as violations. */
   private readonly reported = new Set<string>();
   private wipTimer: ReturnType<typeof setInterval> | null = null;
+  private late: LateWorkRetries | null = null;
 
   constructor(
     readonly attemptId: string,
@@ -231,6 +274,27 @@ export class AttemptController {
       await live.done;
       if (this.live === live) return;
     }
+  }
+
+  /** Stops the controller's timers: the WIP timer and the late-work retries. */
+  close(): void {
+    this.stopWipTimer();
+    this.late?.cancel();
+    this.late = null;
+  }
+
+  /**
+   * After a restart (the runtime calls it at the first welcome): late work a previous run left pending, as its record's
+   * lateWorkSha names it, is retried until it lands, as the exit's retries were. The attempt has exited, so its WIP
+   * ref is never pushed again. Does nothing when nothing is pending or the retries already run.
+   */
+  resumeLateWork(): void {
+    const record = this.deps.store.get(this.attemptId);
+    if (record === null || record.lateWorkSha === null || this.late !== null) return;
+    this.current ??= record.spec;
+    this.currentFence ??= record.fence;
+    this.standing.exited = true;
+    this.startLateWork(record.lateWorkSha, true);
   }
 
   /** deliver: the messages go to the live agent at once, in order, with one line about `more` (X-4). */
@@ -439,7 +503,9 @@ export class AttemptController {
       facts,
       pump,
       factsDir,
+      events: Promise.resolve(),
       done: Promise.resolve(),
+      finished: false,
     };
     this.live = live;
     live.done = this.follow(live).catch((error) => {
@@ -661,11 +727,23 @@ export class AttemptController {
   }
 
   /**
-   * Reads the agent's events, once its process is recorded, until they end. An event the runner fails to handle is
-   * logged and the next one read, so one bad event never ends supervision; events that fail to arrive have ended.
+   * Reads the agent's events, once its process is recorded; once it has exited, deals with its exit. Its events are
+   * waited for a bounded time after the exit, since an escaped process that inherited its pipes can hold them open:
+   * the exit's kill and sweep end that process, and with it the events.
    */
   private async follow(live: LiveAgent): Promise<void> {
     await live.registration.recorded();
+    live.events = this.readEvents(live);
+    const exit = await live.session.exited;
+    await boundedWait(live.events, EVENTS_AFTER_EXIT_MS);
+    await this.enqueue(() => this.finishExit(live, exit, { stoppedBy: 'none', cause: null, requested: false }));
+  }
+
+  /**
+   * Reads the agent's events until they end. An event the runner fails to handle is logged and the next one read,
+   * so one bad event never ends supervision; events that fail to arrive have ended.
+   */
+  private async readEvents(live: LiveAgent): Promise<void> {
     const iterator = live.session.events[Symbol.asyncIterator]();
     for (;;) {
       let next: IteratorResult<AgentEvent>;
@@ -673,21 +751,13 @@ export class AttemptController {
         next = await iterator.next();
       } catch (error) {
         this.deps.logger.error("the agent's events failed", { attemptId: this.attemptId, error: describe(error) });
-        break;
+        return;
       }
-      if (next.done) break;
+      if (next.done) return;
       const event = next.value;
       await this.guarded(event, () => live.facts.observe(event));
       await this.guarded(event, () => (event.type === 'started' ? this.spawned(live, event) : live.pump.handle(event)));
     }
-    await live.session.exited;
-    this.stopWipTimer();
-    live.pump.close();
-    await live.pump.settled();
-    live.facts.close();
-    await rm(live.factsDir, { recursive: true, force: true });
-    if (this.live === live) this.live = null;
-    this.currentPhase = null;
   }
 
   /** Runs one step of an event's handling; a failure is logged, never thrown. */
@@ -698,6 +768,220 @@ export class AttemptController {
       const fields = { attemptId: this.attemptId, type: event.type, error: describe(error) };
       this.deps.logger.error('cannot handle an agent event', fields);
     }
+  }
+
+  /** The groups a kill reaches: the recorded ones and those the descendant snapshots found. */
+  private async groupsOf(live: LiveAgent): Promise<ProcessIdentity[]> {
+    await live.pump.settled();
+    return [...this.deps.store.processes(this.attemptId), ...live.pump.groups()];
+  }
+
+  /**
+   * Everything after the agent's exit, on the serial queue and once per process: for an unrequested exit the kill
+   * and sweep first, then the final work, the transcript tail and the voided approvals, and attempt.exited last. A
+   * step that fails still leads to attempt.exited, its pushError naming the failure, and to the cleanup, so the
+   * attempt never stays live without a process.
+   */
+  private async finishExit(live: LiveAgent, exit: ExitInfo, context: ExitContext): Promise<void> {
+    if (live.finished) return;
+    live.finished = true;
+    const { logger } = this.deps;
+    this.stopWipTimer();
+    if (!context.requested) {
+      try {
+        await killAndSweep({ groups: () => this.groupsOf(live), clone: live.workspace.clone });
+      } catch (error) {
+        logger.error('cannot kill and sweep after an exit', { attemptId: this.attemptId, error: describe(error) });
+      }
+    }
+    const final = await this.endWork(live);
+    // Work left for a late-work ref is on record before the exit is reported, so a restart still pushes it.
+    if (final.late !== null) this.recordLateWork(final.late.sha);
+    try {
+      this.report(this.currentFence ?? live.spec.fence, {
+        type: 'attempt.exited',
+        data: {
+          code: exit.code,
+          signal: exit.signal,
+          stoppedBy: context.stoppedBy,
+          handoffWritten: live.pump.handoffWritten,
+          cause: context.cause,
+          finalSha: final.finalSha,
+          finalWip: final.finalWip,
+          pushError: final.pushError,
+        },
+      });
+    } finally {
+      // The WIP ref never moves after attempt.exited, and nothing of the process is left, whatever failed.
+      this.standing.exited = true;
+      await this.cleanUpExit(live, final, context);
+    }
+  }
+
+  /**
+   * The exit's work before attempt.exited: the pump closed, the final work, the transcript tail and the voided
+   * approvals. A failure is logged and gives a final work with finalWip null and the failure as pushError; work
+   * already harvested then goes to a late-work ref.
+   */
+  private async endWork(live: LiveAgent): Promise<FinalWork> {
+    const harvested: { sha: string | null } = { sha: null };
+    let final: FinalWork;
+    try {
+      live.pump.close();
+      await live.pump.settled();
+      live.facts.close();
+      this.setPhase('stopping');
+      final = await this.finalWork(live, harvested);
+    } catch (error) {
+      this.deps.logger.error('the final work failed', { attemptId: this.attemptId, error: describe(error) });
+      const sha = harvested.sha;
+      const pushError = `the final work failed: ${describe(error)}`;
+      final = { finalSha: sha, finalWip: null, pushError, late: sha === null ? null : { sha, now: false } };
+    }
+    await uploadTranscriptTail({
+      adapter: this.deps.adapters.get(live.spec.vendor) as VendorAdapter,
+      hub: this.deps.hub,
+      attemptId: this.attemptId,
+      sessionRef: live.session.sessionRef,
+      clone: live.workspace.clone,
+      logger: this.deps.logger,
+    });
+    try {
+      live.pump.voidAll();
+    } catch (error) {
+      this.deps.logger.error('cannot void the pending approvals', { attemptId: this.attemptId, error: describe(error) });
+    }
+    return { ...final, pushError: final.pushError === null ? null : clipPushError(final.pushError) };
+  }
+
+  /** Persist the outcome before completion: a crash or failed write must never hide pending work from purge. */
+  private recordFinalWork(state: 'stopped' | 'suspended', final: FinalWork): void {
+    this.deps.store.update(this.attemptId, {
+      state,
+      pushError: final.pushError,
+      ...(final.late === null ? {} : { lateWorkSha: final.late.sha }),
+    });
+    this.deps.store.update(this.attemptId, { finalizedAt: Date.now() });
+  }
+
+  /** After attempt.exited: the record, the registry, the base checkout and the facts' files; then the late work. */
+  private async cleanUpExit(live: LiveAgent, final: FinalWork, context: ExitContext): Promise<void> {
+    const { store, logger } = this.deps;
+    const state = context.cause === 'suspend' ? 'suspended' : 'stopped';
+    try {
+      this.recordFinalWork(state, final);
+      store.forgetProcesses(this.attemptId);
+    } catch (error) {
+      logger.error('cannot record the exit', { attemptId: this.attemptId, error: describe(error) });
+    }
+    try {
+      await live.workspace.baseCheckout?.release();
+    } catch (error) {
+      logger.warn('cannot release a base checkout', { attemptId: this.attemptId, error: describe(error) });
+    }
+    await rm(live.factsDir, { recursive: true, force: true }).catch(() => {});
+    if (this.live === live) this.live = null;
+    this.currentPhase = null;
+    if (final.late !== null) this.startLateWork(final.late.sha, final.late.now);
+  }
+
+  /**
+   * The final harvest, strip and push of a worker, with retries for up to finalPush, canPushWip asked before each
+   * try. Work canPushWip keeps from the WIP ref, or that the push could not place, is left for a late-work ref; a lead
+   * has no harvest. The harvest's sha is noted in harvested as soon as it is known.
+   */
+  private async finalWork(live: LiveAgent, harvested: { sha: string | null }): Promise<FinalWork> {
+    const spec = this.current;
+    const none: FinalWork = { finalSha: null, finalWip: null, pushError: null, late: null };
+    if (spec === null || spec.role !== 'worker' || spec.branch === null || spec.wipRef === null) return none;
+    const { store, vault, local, wipGate, config } = this.deps;
+    const ref = spec.wipRef;
+    let work: WorkResult;
+    try {
+      work = await this.collect(spec, live.workspace.clone, spec.branch);
+    } catch (error) {
+      return { ...none, pushError: `cannot harvest the clone: ${describe(error)}` };
+    }
+    harvested.sha = work.sha;
+    // Protected changes are reported whatever happens next: a change only there strips back to the pushed tree.
+    this.reportViolations(work.stripped);
+    const pushed = store.get(this.attemptId)?.pushedSha ?? null;
+    const last = this.lastWork;
+    if (last !== null && last.tree === work.tree && (last.head === null || last.head === work.head)) {
+      return { ...none, finalSha: work.sha, finalWip: pushed === null ? null : { ref, sha: pushed } };
+    }
+    const result = await pushWithRetries({
+      budgetMs: config().timings.finalPush,
+      refusal: () => wipRefusal(wipGate, this.standing),
+      push: async () => {
+        const previous = store.get(this.attemptId)?.pushedSha ?? null;
+        try {
+          return await pushWip({ vault, local, remote: await this.deps.remote(), ref, sha: work.sha, previous });
+        } catch (error) {
+          return { ok: false, error: 'remote', refs: [], detail: describe(error) };
+        }
+      },
+    });
+    if (!result.ok && result.error === 'refused') {
+      // Known ended: the hub expects no WIP, and takes the work as late work.
+      const pushError = this.standing.ended ? null : `the final WIP push was not allowed: ${result.detail}`;
+      return { finalSha: work.sha, finalWip: null, pushError, late: { sha: work.sha, now: true } };
+    }
+    if (!result.ok) {
+      const pushError = `cannot push ${ref}: ${result.detail}`;
+      return { finalSha: work.sha, finalWip: null, pushError, late: { sha: work.sha, now: false } };
+    }
+    // A WIP push like any other (design 7.3), reported before attempt.exited: a handoff note the hub assembles for
+    // the exit quotes the newest attempt.wip's git log --stat (6.8, X-3).
+    await this.wipPushed(spec, ref, work);
+    return { ...none, finalSha: work.sha, finalWip: { ref, sha: work.sha } };
+  }
+
+  /**
+   * Retries the work to late-work refs until one lands (attempt.late_work); never gated by canPushWip. The record's
+   * lateWorkSha keeps the work pending across a restart (resumeLateWork) until it lands.
+   */
+  private startLateWork(sha: string, now: boolean): void {
+    this.recordLateWork(sha);
+    this.late?.cancel();
+    this.late = new LateWorkRetries({
+      delay: this.deps.config().timings.lateRetry,
+      logger: this.deps.logger,
+      attemptId: this.attemptId,
+      attempt: () => this.enqueue(() => this.lateWorkJob(sha)),
+    });
+    this.late.start(now);
+  }
+
+  /** The record's lateWorkSha: the work waits for a late-work ref. A failure is logged; the retries still run. */
+  private recordLateWork(sha: string): void {
+    try {
+      this.deps.store.update(this.attemptId, { lateWorkSha: sha });
+    } catch (error) {
+      const fields = { attemptId: this.attemptId, error: describe(error) };
+      this.deps.logger.error('cannot record the pending late work', fields);
+    }
+  }
+
+  private async lateWorkJob(sha: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const spec = this.current;
+    if (spec === null || spec.taskId === null) return { ok: true };
+    const { vault, local, store } = this.deps;
+    const pushed = await pushLateWork({
+      vault,
+      local,
+      remote: await this.deps.remote(),
+      wipRefPrefix: this.deps.wipRefPrefix(),
+      attemptId: this.attemptId,
+      sha,
+    });
+    if (!pushed.ok) return { ok: false, error: pushed.detail };
+    store.update(this.attemptId, { lateWorkCount: pushed.n, pushError: null, lateWorkSha: null });
+    this.report(this.currentFence ?? spec.fence, {
+      type: 'attempt.late_work',
+      data: { taskId: spec.taskId, ref: pushed.ref, sha },
+    });
+    return { ok: true };
   }
 
   /** The phase the controller and the facts report. */

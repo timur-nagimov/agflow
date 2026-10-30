@@ -146,13 +146,21 @@ export interface WipStanding {
   exited: boolean;
 }
 
-/** Whether a push to the attempt's WIP ref may go now (X-11). */
-export function canPushWip(gate: WipGate, attempt: WipStanding): boolean {
-  if (attempt.fenced || attempt.ended || attempt.exited) return false;
-  if (!gate.welcomeSinceGap()) return false;
+/** Why a push to the attempt's WIP ref may not go now; null when it may (X-11). */
+export function wipRefusal(gate: WipGate, attempt: WipStanding): string | null {
+  if (attempt.fenced) return 'the attempt was re-fenced';
+  if (attempt.ended) return 'the hub ended the attempt';
+  if (attempt.exited) return 'the attempt already reported its exit';
+  if (!gate.welcomeSinceGap()) return 'the hub has not welcomed the runner since its last clock gap';
   const age = gate.ackAgeMs();
   const grace = gate.wipGraceMs();
-  return age !== null && grace !== null && age < grace;
+  if (age === null || grace === null || age >= grace) return 'the hub has not answered within the WIP grace';
+  return null;
+}
+
+/** Whether a push to the attempt's WIP ref may go now (X-11). */
+export function canPushWip(gate: WipGate, attempt: WipStanding): boolean {
+  return wipRefusal(gate, attempt) === null;
 }
 
 /** The runner's consecutive failed WIP pushes over all its attempts (attempt.wip_failed.failures, X-3). */

@@ -190,10 +190,15 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
   const store = new AttemptStore(db);
   const outbox = new Outbox(db);
   const controllers: AttemptController[] = [];
-  // Every agent still running is killed, and its controller's work waited for, before the files go.
+  // Every agent still running is killed, and its controller's work waited for, before the files go. Whatever a test
+  // left behind, that work stays short: no timer pushes, and a final push makes one try, so a broken origin costs
+  // nothing.
   cleanups.push(async () => {
+    for (const controller of controllers) controller.close();
+    fixture.config.timings.finalPush = 0;
     for (const record of store.processes()) await killGroup(record, 'SIGKILL');
     await Promise.all(controllers.map((controller) => controller.settled()));
+    for (const controller of controllers) controller.close();
   });
   const fixture: RunnerFixture = {
     home,
@@ -270,6 +275,7 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
         wipGraceMs: () => fixture.gate.wipGraceMs,
       },
       wipFailures: fixture.wipFailures,
+      hub: fixture.hub,
       ...overrides,
     }),
     controller: (attemptId = 'T-4-a1', overrides = {}) => {
