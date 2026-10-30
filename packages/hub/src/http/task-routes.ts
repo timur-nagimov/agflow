@@ -1,4 +1,5 @@
 import {
+  BRIDGE_HEADER,
   ClaimInputSchema,
   CreateTasksInputSchema,
   FeedbackInputSchema,
@@ -34,7 +35,7 @@ import {
 } from '../tasks';
 import { listTasks } from '../task-store';
 import type { App } from './app';
-import { actor, agentOf, holderOf, human, leadBody, principal, readBody } from './util';
+import { actor, agentOf, holderOf, human, intParam, leadBody, principal, readBody } from './util';
 
 export function mountTaskRoutes(app: App, ctx: HubContext): void {
   app.get('/api/tasks', (c) => {
@@ -100,7 +101,8 @@ export function mountTaskRoutes(app: App, ctx: HubContext): void {
   app.post('/api/tasks/:id/claim', async (c) => {
     const agent = agentOf(c);
     const { branch } = await readBody(c, ClaimInputSchema);
-    return c.json({ task: claimTask(ctx, c.req.param('id'), agent, branch) });
+    const bridge = intParam(c.req.header(BRIDGE_HEADER)) ?? null;
+    return c.json({ task: claimTask(ctx, c.req.param('id'), agent, branch, bridge) });
   });
 
   app.post('/api/tasks/:id/resume-claim', (c) => {

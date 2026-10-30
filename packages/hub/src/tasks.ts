@@ -1,6 +1,7 @@
 import {
   type Agent,
   type Attempt,
+  BRIDGE_VERSION,
   type NewTask,
   type Submission,
   type Task,
@@ -11,6 +12,7 @@ import {
   PROTECTED_CLASSES,
   isClosed,
   isHeld,
+  isTaskBranch,
   quoteLines,
   restoreSet,
 } from '@agflow/core';
@@ -31,7 +33,7 @@ import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
-import { badRequest, conflict, forbidden } from './errors';
+import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
@@ -381,7 +383,25 @@ export function requireHolder(
   return attempt;
 }
 
-export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: string): Task {
+/**
+ * Whether a live claim of the task needs a bridge of BRIDGE_VERSION (design 10): an older bridge starts only from the
+ * task's own branch, when it is a task branch, or from main, so any other position (a WIP, late-work or take-over ref,
+ * under refs/heads/ too, or a branch a ref hand-back named) would be dropped and the task started again from main.
+ */
+const needsNewBridge = (task: Pick<Task, 'id' | 'branch' | 'workRef'>): boolean =>
+  task.workRef !== null && !(isTaskBranch(task.id, task.branch) && task.workRef === `refs/heads/${task.branch}`);
+
+/**
+ * A live claim (design 6.4, 10). The answer's task names its work position (workRef, workSha), where the bridge
+ * starts the task branch; bridge is the version the request's BRIDGE_HEADER declares, null without one.
+ */
+export function claimTask(
+  ctx: HubContext,
+  id: string,
+  agent: Agent,
+  branch?: string,
+  bridge: number | null = null,
+): Task {
   const outcome = tx(ctx, (emit): { claimed: Task } | { waiting: string[] } => {
     if (getProject(ctx).paused) throw conflict('the project is paused, so no new work can start');
     const held = heldTaskOf(ctx, agent.id);
@@ -390,6 +410,14 @@ export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: st
     if (task.status !== 'ready') throw conflict(`${id} is ${task.status}, not ready`);
     // An unblocked task is ready while its last attempt still stops; its successor starts from that one's final WIP.
     if (openAttemptOf(ctx, id)) throw conflict('the previous attempt is still stopping');
+    if (needsNewBridge(task) && (bridge === null || bridge < BRIDGE_VERSION)) {
+      throw new HubError(
+        409,
+        'bridge_outdated',
+        `${id} continues from ${task.workRef}, which this agflow bridge cannot start from; update agflow and ` +
+          'restart the chat, then claim it again',
+      );
+    }
     // A dependency added while the task was held does not stop it from coming back to the pool ready.
     // So the claim checks again, and moves the task to blocked, where the board shows it waiting.
     const waiting = unmetDependencies(ctx, task.dependsOn);

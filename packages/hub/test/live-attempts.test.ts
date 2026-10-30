@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type Agent, compareFence } from '@agflow/core';
+import { type Agent, BRIDGE_HEADER, BRIDGE_VERSION, compareFence } from '@agflow/core';
 import { ACTIVE_MS } from '../src/agents';
 import { getAttempt, listAttempts } from '../src/attempt-store';
 import { endAttempt, ladderRequirement } from '../src/attempts';
@@ -23,6 +23,7 @@ import {
   sweepLeases,
 } from '../src/tasks';
 import { addAgent, addRunnerAttempt, createTestContext, newTask } from './helpers';
+import { createTestHub } from './http-helpers';
 
 const SHA = 'c'.repeat(40);
 
@@ -75,7 +76,7 @@ describe('live claims', () => {
     const { ctx } = createTestContext();
     const [task] = createTasks(ctx, [newTask()], 'user:alice');
     writeTask(ctx, task?.id as string, { workRef: 'refs/agflow/T-1/a1', workSha: SHA });
-    claimTask(ctx, task?.id as string, addAgent(ctx));
+    claimTask(ctx, task?.id as string, addAgent(ctx), undefined, BRIDGE_VERSION);
     expect(current(ctx, task?.id as string)).toMatchObject({ startRef: 'refs/agflow/T-1/a1', startSha: SHA });
   });
 
@@ -87,6 +88,97 @@ describe('live claims', () => {
     expect(getAttempt(ctx, first.id)).toMatchObject({ status: 'ended', endReason: 'superseded', failureClass: null });
     expect(current(ctx, taskId)).toMatchObject({ number: 2, agentId: next.id, status: 'running', runnerId: null });
     expect(agent.id).not.toBe(next.id);
+  });
+});
+
+describe('the claim answer and the bridge version', () => {
+  /** A hub with a ready task and a live agent of bob's that may claim it. */
+  async function hubWithTask() {
+    const hub = createTestHub();
+    const [task] = createTasks(hub.ctx, [newTask({ title: 'Login' })], 'user:alice');
+    const agent = await hub.liveAgent('bob', 'session-bob');
+    const claim = (headers: Record<string, string> = {}) =>
+      hub.call('POST', `/api/tasks/${task?.id}/claim`, { user: 'bob', agent, body: {}, headers });
+    return { hub, taskId: task?.id as string, claim };
+  }
+
+  test('the claim answer names the work position, and null for main', async () => {
+    const { hub, taskId, claim } = await hubWithTask();
+    const fromMain = await claim();
+    expect(fromMain.status).toBe(200);
+    expect(fromMain.json.task).toMatchObject({ id: taskId, workRef: null, workSha: null });
+
+    const [other] = createTasks(hub.ctx, [newTask({ title: 'Logout' })], 'user:alice');
+    const otherId = other?.id as string;
+    writeTask(hub.ctx, otherId, { workRef: 'refs/agflow/T-2/a1', workSha: SHA });
+    const agent = await hub.liveAgent('bob', 'session-bob-2');
+    const headers = { [BRIDGE_HEADER]: String(BRIDGE_VERSION) };
+    const fromWip = await hub.call('POST', `/api/tasks/${otherId}/claim`, { user: 'bob', agent, body: {}, headers });
+    expect(fromWip.status).toBe(200);
+    expect(fromWip.json.task).toMatchObject({ id: otherId, workRef: 'refs/agflow/T-2/a1', workSha: SHA });
+  });
+
+  test('a WIP-ref position needs a bridge that declares version 2; branch and main positions need none', async () => {
+    const { hub, taskId, claim } = await hubWithTask();
+    writeTask(hub.ctx, taskId, { workRef: 'refs/agflow/T-1/a1', workSha: SHA });
+    const outdated: Record<string, string>[] = [{}, { [BRIDGE_HEADER]: '1' }, { [BRIDGE_HEADER]: 'two' }];
+    for (const headers of outdated) {
+      const refused = await claim(headers);
+      expect(refused.status).toBe(409);
+      expect(refused.json.error).toBe('bridge_outdated');
+      expect(refused.json.message).toContain('refs/agflow/T-1/a1');
+    }
+    expect(getTask(hub.ctx, taskId)).toMatchObject({ status: 'ready', assignee: null, attemptCount: 0 });
+    expect((await claim({ [BRIDGE_HEADER]: '3' })).status).toBe(200);
+
+    // A live submit's task branch, as an older bridge can check it out.
+    const [other] = createTasks(hub.ctx, [newTask({ title: 'Logout' })], 'user:alice');
+    const otherId = other?.id as string;
+    writeTask(hub.ctx, otherId, {
+      branch: 'agflow/T-2-logout',
+      workRef: 'refs/heads/agflow/T-2-logout',
+      workSha: SHA,
+    });
+    const agent = await hub.liveAgent('bob', 'session-bob-2');
+    const onBranch = await hub.call('POST', `/api/tasks/${otherId}/claim`, { user: 'bob', agent, body: {} });
+    expect(onBranch.status).toBe(200);
+  });
+
+  test("a position on any other branch needs the new bridge: an older one follows only the task's own", async () => {
+    const { hub, taskId, claim } = await hubWithTask();
+    // A ref hand-back may leave the position on any branch, and the task's branch is another one.
+    writeTask(hub.ctx, taskId, {
+      branch: 'agflow/T-1-login',
+      workRef: 'refs/heads/feature/handed-back',
+      workSha: SHA,
+    });
+    const refused = await claim();
+    expect(refused.status).toBe(409);
+    expect(refused.json.error).toBe('bridge_outdated');
+    expect((await claim({ [BRIDGE_HEADER]: String(BRIDGE_VERSION) })).status).toBe(200);
+  });
+
+  test('a WIP position under a refs/heads/ prefix needs the new bridge', async () => {
+    const hub = createTestHub({ wipRefPrefix: 'refs/heads/agflow-wip/' });
+    const [task] = createTasks(hub.ctx, [newTask({ title: 'Login' })], 'user:alice');
+    const taskId = task?.id as string;
+    writeTask(hub.ctx, taskId, { workRef: 'refs/heads/agflow-wip/T-1/a1', workSha: SHA });
+    const agent = await hub.liveAgent('bob', 'session-bob');
+    const refused = await hub.call('POST', `/api/tasks/${taskId}/claim`, { user: 'bob', agent, body: {} });
+    expect(refused.status).toBe(409);
+    expect(refused.json.error).toBe('bridge_outdated');
+  });
+
+  test("a claim while the previous attempt is open gets 409 'the previous attempt is still stopping'", async () => {
+    const { hub, taskId, claim } = await hubWithTask();
+    const held = addRunnerAttempt(hub.ctx, { taskId });
+    // Unblocked while its attempt still stops: ready, but nobody takes it until that attempt ends.
+    writeTask(hub.ctx, taskId, { status: 'ready', assignee: null });
+    const refused = await claim();
+    expect(refused.status).toBe(409);
+    expect(refused.json).toEqual({ error: 'conflict', message: 'the previous attempt is still stopping' });
+    endAttempt(hub.ctx, { attemptId: held.attempt.id, trigger: 'stop' });
+    expect((await claim()).status).toBe(200);
   });
 });
 
