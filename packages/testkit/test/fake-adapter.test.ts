@@ -1,129 +1,26 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { TEST_ACCOUNT_ID } from '@agflow/core';
+import { processIdentity } from '@agflow/runner';
+import { FAKE_AGENT_PATH, FakeAdapter } from '../src/fake-adapter';
+import { gitIn } from '../src/git-fixtures';
 import {
-  type AgentEvent,
-  type AgentLaunch,
-  type AgentSession,
-  agentGitEnv,
-  processIdentity,
-  removeAgentTools,
-  standardProfile,
-  writeRunDir,
-} from '@agflow/runner';
-import { FAKE_AGENT_PATH, FakeAdapter, type FakeAdapterOptions, type FakeScript } from '../src/fake-adapter';
-import { gitIn, originRepo } from '../src/git-fixtures';
+  countOf,
+  killLater,
+  record,
+  runCleanups,
+  setup,
+  start,
+  tempDir,
+  turnEnded,
+  waitFile,
+} from './fake-helpers';
 
-const cleanups: (() => void)[] = [];
-afterEach(() => {
-  for (const cleanup of cleanups.splice(0).reverse()) cleanup();
-});
+afterEach(runCleanups);
 
 // Every test here runs git or agent processes, which take several times as long on a machine loaded by other suites.
 setDefaultTimeout(30_000);
-
-function tempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
-
-/** Kills a process group at the end of the test, whatever state it is in. */
-function killLater(pgid: number): void {
-  cleanups.push(() => {
-    try {
-      process.kill(-pgid, 'SIGKILL');
-    } catch {
-      // Already gone.
-    }
-  });
-}
-
-const IDENTITY = { name: 'Agent Smith', email: 'agent@agflow.invalid' };
-
-/** A clone on its task branch with the agent's .agflow/run/, and a launch for it. */
-async function setup(overrides: Partial<AgentLaunch> = {}): Promise<{ launch: AgentLaunch; clone: string }> {
-  const origin = await originRepo({ 'README.md': '# demo\n' });
-  cleanups.push(() => origin.remove());
-  const clone = join(tempDir('agflow-fake-clone-'), 'T-4-a1');
-  await gitIn(tmpdir(), ['clone', '--quiet', origin.path, clone]);
-  await gitIn(clone, ['checkout', '--quiet', '-b', 'agflow/T-4-tidy']);
-  const tools = join(tempDir('agflow-fake-tools-'), 'T-4-a1');
-  cleanups.push(() => removeAgentTools(tools));
-  const runDir = writeRunDir({ clone, tools, taskPack: '# T-4\n', brief: 'brief', identity: IDENTITY });
-  // As the runner's clones do, so the agent's `git add -A` leaves .agflow/run/ out.
-  appendFileSync(join(clone, '.git', 'info', 'exclude'), '/.agflow/run/\n');
-  const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: tempDir('agflow-fake-home-'), ...agentGitEnv(runDir) };
-  const launch: AgentLaunch = {
-    attemptId: 'T-4-a1',
-    role: 'worker',
-    model: 'fake-model',
-    cliVersion: '9.9.9',
-    clone,
-    baseCheckout: null,
-    projectConfigVerified: true,
-    tmpDir: runDir.tmp,
-    env,
-    bridge: { command: '/bin/false', args: [], env: {} },
-    profile: standardProfile,
-    brief: 'brief',
-    firstPrompt: 'start working',
-    resume: null,
-    logFile: join(tempDir('agflow-fake-logs-'), 'T-4-a1.log'),
-    registerProcess: () => {},
-    ...overrides,
-  };
-  return { launch, clone };
-}
-
-async function start(
-  launch: AgentLaunch,
-  script: FakeScript,
-  options: Omit<FakeAdapterOptions, 'script'> = {},
-): Promise<AgentSession> {
-  const session = await new FakeAdapter({ ...options, script }).start(launch);
-  killLater(session.pid);
-  return session;
-}
-
-/** Reads every event of a session in the background. */
-function record(session: AgentSession) {
-  const events: AgentEvent[] = [];
-  void (async () => {
-    for await (const event of session.events) events.push(event);
-  })();
-  return {
-    events,
-    types: () =>
-      events.map((event) =>
-        event.type === 'delivered' || event.type === 'acknowledged' ? `${event.type} ${event.id}` : event.type,
-      ),
-    async waitFor(check: (event: AgentEvent) => boolean, timeoutMs = 5_000): Promise<AgentEvent> {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const found = events.find(check);
-        if (found) return found;
-        if (Date.now() > deadline) throw new Error(`no such event in ${JSON.stringify(events)}`);
-        await Bun.sleep(5);
-      }
-    },
-  };
-}
-
-const turnEnded = (event: AgentEvent) => event.type === 'turn_ended';
-const countOf = (events: AgentEvent[], type: AgentEvent['type']) =>
-  events.filter((event) => event.type === type).length;
-
-async function waitFile(path: string): Promise<string> {
-  const deadline = Date.now() + 5_000;
-  while (!existsSync(path) || readFileSync(path, 'utf8').trim() === '') {
-    if (Date.now() > deadline) throw new Error(`${path} never appeared`);
-    await Bun.sleep(10);
-  }
-  return readFileSync(path, 'utf8').trim();
-}
 
 describe('FakeAdapter.start', () => {
   test('runs the fake agent detached in its own group, registered before its output is read', async () => {
@@ -194,9 +91,14 @@ describe('FakeAdapter.start', () => {
   });
 
   test('a resumed session keeps its sessionRef and waits for a message instead of the first prompt', async () => {
-    const { launch } = await setup({ resume: { sessionRef: 'session-7' } });
-    const session = await start(launch, { turns: [[{ do: 'text', text: 'resumed' }]] });
-    expect(session.sessionRef).toBe('session-7');
+    const { launch } = await setup();
+    const first = await start(launch, { turns: [[{ do: 'text', text: 'first' }]] });
+    await record(first).waitFor(turnEnded);
+    await first.close();
+    await first.exited;
+    const resume = { sessionRef: first.sessionRef };
+    const session = await start({ ...launch, resume }, { turns: [[{ do: 'text', text: 'resumed' }]] });
+    expect(session.sessionRef).toBe(first.sessionRef);
     const reader = record(session);
     await reader.waitFor((event) => event.type === 'started');
     await Bun.sleep(100);
@@ -556,11 +458,11 @@ describe('FakeAdapter.preflight', () => {
     expect(await reader.waitFor((event) => event.type === 'started')).toMatchObject({ permissionMode: null });
   });
 
-  test('the basic fake keeps no transcript and raises no approvals', async () => {
+  test('a session that never ran has no transcript, and an approval nobody asked for is refused', async () => {
+    const { launch, clone } = await setup();
     const adapter = new FakeAdapter({ script: { turns: [] } });
-    expect(await adapter.readTranscriptTail({ sessionRef: 's', clone: '/tmp', maxChars: 100 })).toBeNull();
-    await adapter.deleteTranscript({ sessionRef: 's', clone: '/tmp' });
-    const { launch } = await setup();
+    expect(await adapter.readTranscriptTail({ sessionRef: 's', clone, maxChars: 100 })).toBeNull();
+    await adapter.deleteTranscript({ sessionRef: 's', clone });
     const session = await start(launch, { turns: [] });
     expect(await session.answerApproval('A-1', 'approve', null)).toBe(false);
   });
