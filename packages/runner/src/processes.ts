@@ -4,7 +4,7 @@
 // and exported for M2g's harness (X-42).
 import { realpathSync } from 'node:fs';
 import { mkdir, open } from 'node:fs/promises';
-import { dirname, isAbsolute, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { AttemptStore, ProcessRecord } from './attempt-store';
 
 /** A process as ps names it: lstart, ps's start time to the second, tells a reused pid apart. */
@@ -209,7 +209,8 @@ function inside(path: string, root: string): boolean {
  * Ladder step 4 (design 7.4): finds the user's processes whose cwd is inside the clone with
  * `lsof -a -d cwd -u <uid> -Fpn` and kills each one after an identity check. The clone must be an absolute path at
  * least two levels deep: a relative one would resolve against the runner's cwd, which is / under launchd, and a sweep
- * of / kills every process of the owner.
+ * of / kills every process of the owner. Only the runner-owned parent is resolved (/tmp is /private/tmp): the last
+ * component is the agent's to replace, and a link there must not widen the sweep to wherever it points.
  */
 export async function sweepCloneProcesses(
   clone: string,
@@ -219,7 +220,7 @@ export async function sweepCloneProcesses(
   if (!isAbsolute(clone)) throw new Error(`refusing to sweep a clone path that is not absolute: '${clone}'`);
   let root: string;
   try {
-    root = realpathSync(clone);
+    root = join(realpathSync(dirname(clone)), basename(clone));
   } catch {
     root = resolve(clone);
   }
