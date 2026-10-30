@@ -83,6 +83,7 @@ import { emptySeat, insertLeadNote, seatHolderId, takeSeat } from './hub-state';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject } from './project';
+import { recordQuotaReports } from './quota';
 import {
   findRunnerRow,
   markGitNotReady,
@@ -1575,6 +1576,52 @@ function endOnExit(
 }
 
 // ---------------------------------------------------------------------------
+// quota_wait (design 6.10)
+// ---------------------------------------------------------------------------
+
+/**
+ * attempt.quota (design 6.10, quota_wait; X-14). The account's quota is stored when the event names the account; a
+ * null account id updates no account (X-21). An exhaustion moves a running attempt to quota_wait until its reset, and
+ * state ok, which the runner reports when it resumes the waiting turn, moves it back to running. A waiting attempt
+ * keeps its runner lease, renewed by heartbeats like any other.
+ */
+export function onAttemptQuota(
+  ctx: HubContext,
+  emit: Emit,
+  runnerId: string,
+  attempt: Attempt,
+  data: RunnerEventData['attempt.quota'],
+): void {
+  const { vendor, accountId, quota } = data;
+  if (accountId !== null) recordQuotaReports(ctx, emit, runnerId, [{ vendor, accountId, quota }]);
+  if (quota.state === 'ok') {
+    leaveQuotaWait(ctx, emit, attempt);
+    return;
+  }
+  if (quota.state !== 'exhausted') return;
+  if (attempt.status === 'quota_wait') {
+    updateAttempt(ctx, attempt.id, { quotaResetsAt: quota.resetsAt });
+    return;
+  }
+  if (attempt.status !== 'running') return;
+  updateAttempt(ctx, attempt.id, { status: 'quota_wait', quotaResetsAt: quota.resetsAt });
+  emit({
+    type: 'attempt.quota_wait',
+    actor: byRunner(attempt),
+    subject: attemptSubject(attempt),
+    data: { ...attemptData(attempt), resetsAt: quota.resetsAt },
+  });
+}
+
+/** A waiting attempt whose turn goes on runs again (X-14). */
+function leaveQuotaWait(ctx: HubContext, emit: Emit, attempt: Attempt): void {
+  if (attempt.status !== 'quota_wait') return;
+  updateAttempt(ctx, attempt.id, { status: 'running', quotaResetsAt: null });
+  const subject = attemptSubject(attempt);
+  emit({ type: 'attempt.running', actor: byRunner(attempt), subject, data: attemptData(attempt) });
+}
+
+// ---------------------------------------------------------------------------
 // Runner leases and heartbeat facts (design 6.4 Runner lease, Lease expiry; 6.8 Facts, Freshness)
 // ---------------------------------------------------------------------------
 
@@ -1584,10 +1631,10 @@ const LEASED: readonly AttemptStatus[] = ['starting', 'running', 'quota_wait'];
 /**
  * A heartbeat's facts (design 6.4, 6.8). Each attempt listed that runs on this runner, holds a lease and is at its
  * current fence gets its lease renewed for runnerLeaseMs and its agent seen now, and its facts are stored with the
- * time they arrived, its phase and its active time. Facts at another fence say nothing about the attempt as the hub
- * has it, and are ignored. Returns how many attempts it renewed.
+ * time they arrived, its phase and its active time; one in quota_wait whose facts report a turn runs again. Facts at
+ * another fence say nothing about the attempt as the hub has it, and are ignored. Returns how many attempts it renewed.
  */
-export function renewLeases(ctx: HubContext, runnerId: string, facts: readonly AttemptFacts[]): number {
+export function renewLeases(ctx: HubContext, emit: Emit, runnerId: string, facts: readonly AttemptFacts[]): number {
   const now = ctx.now();
   let renewed = 0;
   for (const fact of facts) {
@@ -1602,6 +1649,8 @@ export function renewLeases(ctx: HubContext, runnerId: string, facts: readonly A
       activeMs: fact.activeMs,
     });
     ctx.db.query('UPDATE agents SET last_seen_at = $now WHERE id = $id').run({ now, id: attempt.agentId });
+    // The turn goes on, so the wait is over, should the runner's attempt.quota ok have been lost (X-14).
+    if (fact.phase === 'turn') leaveQuotaWait(ctx, emit, attempt);
     renewed += 1;
   }
   return renewed;

@@ -18,6 +18,7 @@ import {
 import { appendAttemptLog, findAttempt } from './attempt-store';
 import {
   onActivity,
+  onAttemptQuota,
   onExited,
   onFailedToStart,
   onFirstOutput,
@@ -144,11 +145,8 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
     applyVendorReport(ctx, runnerId, event.data.vendors);
     recordQuotaReports(ctx, emit, runnerId, event.data.quota);
   },
-  // A runner that does not know the account reports none, and no account changes (X-21).
-  'attempt.quota': (ctx, event, { runnerId, emit }) => {
-    const { vendor, accountId, quota } = event.data;
-    if (accountId !== null) recordQuotaReports(ctx, emit, runnerId, [{ vendor, accountId, quota }]);
-  },
+  'attempt.quota': (ctx, event, context) =>
+    onAttemptQuota(ctx, context.emit, context.runnerId, attemptOf(context), event.data),
 };
 
 /**

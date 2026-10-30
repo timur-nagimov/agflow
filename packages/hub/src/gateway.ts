@@ -161,9 +161,9 @@ export class Gateway implements RunnerLink {
         return;
       case 'heartbeat':
         try {
-          tx(ctx, () => {
+          tx(ctx, (emit) => {
             recordHeartbeatInfo(ctx, runnerId, message);
-            renewLeases(ctx, runnerId, message.attempts);
+            renewLeases(ctx, emit, runnerId, message.attempts);
           });
         } catch (error) {
           // The link is alive whatever the hub could store about it.

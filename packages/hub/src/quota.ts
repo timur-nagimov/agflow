@@ -2,10 +2,11 @@
 // every runner of that owner logged in to the account, as hello, runner.vendors and attempt.quota report it. The
 // placement rules that read it live only in core's usableVendors; placement.ts hands them these accounts.
 import type { AccountQuota, AccountQuotaReport, AccountView, Vendor, VendorQuota } from '@agflow/core';
-import type { HubContext } from './context';
+import { enqueueCommand } from './commands';
+import { type HubContext, tx } from './context';
 import { notFound } from './errors';
 import type { Emit } from './events';
-import { findRunnerRow, runnerInfo } from './runners';
+import { type RunnerRow, findRunnerRow, findRunnerRows, runnerInfo } from './runners';
 
 interface AccountRow {
   owner: string;
@@ -139,4 +140,59 @@ export function accountViews(ctx: HubContext): AccountView[] {
     ...account,
     openAttempts: counts.get(accountKey(account.owner, account.vendor, account.accountId)) ?? 0,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Unknown reset times (design 6.10)
+// ---------------------------------------------------------------------------
+
+/** The owner's runners logged in to the account, in runner order. */
+const runnersOn = (ctx: HubContext, account: AccountQuota): RunnerRow[] =>
+  findRunnerRows(ctx).filter(
+    (row) =>
+      row.owner === account.owner &&
+      runnerInfo(row).vendors.some((slot) => slot.vendor === account.vendor && slot.accountId === account.accountId),
+  );
+
+/** When the hub last sent a Codex preflight to one of the runners, or null. */
+function lastCodexPreflight(ctx: HubContext, runnerIds: readonly string[]): number | null {
+  if (runnerIds.length === 0) return null;
+  const row = ctx.db
+    .query(
+      `SELECT MAX(created_at) AS at FROM runner_commands
+       WHERE kind = 'preflight' AND json_extract(payload, '$.vendor') = 'codex'
+         AND runner_id IN (SELECT value FROM json_each($runnerIds))`,
+    )
+    .get({ runnerIds: JSON.stringify(runnerIds) }) as { at: number | null };
+  return row.at;
+}
+
+/**
+ * The Codex reset probe (design 6.10, Unknown reset times; X-14). An exhausted Codex account whose reset is unknown
+ * gets one preflight { vendor: 'codex' }, on the first online runner of its owner logged in to it, once quotaUnknownMs
+ * has passed since the report and since the last Codex preflight to those runners: preflight reads the account's rate
+ * limits, and its runner.vendors answer lifts the exhaustion. Claude's probe is its next start (core's usableVendors).
+ * One account's failure is logged and leaves the others probed. Returns how many preflights it sent.
+ */
+export function probeUnknownResets(ctx: HubContext): number {
+  const now = ctx.now();
+  const wait = ctx.config.quotaUnknownMs;
+  let sent = 0;
+  for (const account of listAccounts(ctx)) {
+    const { quota } = account;
+    if (account.vendor !== 'codex' || quota.state !== 'exhausted' || quota.resetsAt !== null) continue;
+    if (now < quota.updatedAt + wait) continue;
+    const runners = runnersOn(ctx, account);
+    const last = lastCodexPreflight(ctx, runners.map((row) => row.id));
+    if (last !== null && now < last + wait) continue;
+    const online = runners.find((row) => row.state === 'online');
+    if (!online) continue;
+    try {
+      tx(ctx, () => enqueueCommand(ctx, online.id, { kind: 'preflight', vendor: 'codex' }));
+      sent += 1;
+    } catch (error) {
+      console.error(`probing the reset of ${account.owner}'s codex account ${account.accountId} failed`, error);
+    }
+  }
+  return sent;
 }
