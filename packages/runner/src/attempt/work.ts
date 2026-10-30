@@ -47,6 +47,8 @@ export interface WorkResult {
   tree: string;
   /** Protected paths taken out against the restore base. */
   stripped: string[];
+  /** The paths with uncommitted changes, which the snapshot captured; a submission refuses them (dirty). */
+  uncommitted: string[];
   /** Files over 10 MB left out. */
   skipped: string[];
   /** Embedded repositories captured as files. */
@@ -73,6 +75,7 @@ export async function collectWork(input: WorkInput): Promise<WorkResult> {
     branch: input.branch,
   });
   const snapshot = await snapshotWork({ vault, local, clone, head: harvest.head, identity, now });
+  const uncommitted = snapshot.changed ? await changedPaths({ vault, local }, harvest.head, snapshot.sha) : [];
   const base = await resolveRestoreBase(vault, spec);
   const strip = await stripProtected({ vault, local }, {
     base,
@@ -88,10 +91,18 @@ export async function collectWork(input: WorkInput): Promise<WorkResult> {
     sha: strip.sha,
     tree: tree.stdout.trim(),
     stripped: strip.stripped,
+    uncommitted,
     skipped: snapshot.skipped,
     embedded: snapshot.embedded,
     warnings: harvest.warnings,
   };
+}
+
+/** The paths two commits of the vault differ in, from -z output, sorted. */
+async function changedPaths(git: { vault: Vault; local: GitEnvironment }, from: string, to: string): Promise<string[]> {
+  const args = [`--git-dir=${git.vault.path}`, 'diff-tree', '-r', '-z', '--name-only', '--no-renames', from, to];
+  const diff = await runGit(git.local, args);
+  return diff.stdout.split('\0').filter((path) => path !== '').sort();
 }
 
 /**

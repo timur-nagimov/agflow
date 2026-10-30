@@ -20,7 +20,8 @@
 // handoff turn, or the end of the running turn), run the stop ladder and do the same exit work, once per process.
 // What the runner sends the agent on its own, continuations, vendor-error retries, quota waits and the one nudge
 // after an outage, is the turn policy's (turns.ts). A resume (resume.ts) stops a live process first, then prepares
-// the clone the attempt has and resumes its session with the new fence and token.
+// the clone the attempt has and resumes its session with the new fence and token. A submission (submit.ts) harvests
+// the clone and pushes the task branch and the WIP ref together; a stop or hold arriving meanwhile ends its retries.
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -50,7 +51,8 @@ import type { AwakeClock } from '../clock';
 import type { RunnerConfig } from '../config';
 import { buildAgentEnv } from '../env';
 import { diffFingerprint, FactsTracker } from '../facts';
-import { lsRemote, pushLateWork, type PushResult, pushWip } from '../git/push';
+import { lsRemote, pushLateWork, pushSubmission, type PushResult, pushWip, type SubmitPushOutcome } from '../git/push';
+import { detectProtected, resolveRestoreBase } from '../git/protect';
 import { type GitEnvironment, runGit } from '../git/run';
 import type { Vault } from '../git/vault';
 import type { RunnerHubHttp } from '../hub-http';
@@ -72,6 +74,16 @@ import {
   reopenClone,
   resumedSpec,
 } from './resume';
+import {
+  dirtyDetail,
+  isOwnBranch,
+  protectedDetail,
+  pushSubmissionWithRetries,
+  type SubmitCommand,
+  submissionBase,
+  type SubmitResult,
+  type SubmittedData,
+} from './submit';
 import { TurnPolicy } from './turns';
 import { prepareForStop, RUNNER_STOP_REASON, type StopOptions, type StopOutcome, TurnWatch } from './stop';
 import {
@@ -256,6 +268,9 @@ export class AttemptController {
   private readonly reported = new Set<string>();
   private wipTimer: ReturnType<typeof setInterval> | null = null;
   private late: LateWorkRetries | null = null;
+  /** Stops, holds and resumes that arrived so far; a submission's retries end when it moves. */
+  private stopsArrived = 0;
+  private readonly stopListeners = new Set<() => void>();
 
   constructor(
     readonly attemptId: string,
@@ -470,6 +485,31 @@ export class AttemptController {
     });
   }
 
+  /**
+   * push_submission (design 6.13): only to the attempt's own task branch; the clone harvested and refused when dirty
+   * or with protected changes; then the task branch and the WIP ref together, remote failures retried until
+   * submitRetry passes or a stop or hold arrives. The outcome is reported as attempt.submitted and given back.
+   */
+  submit(command: SubmitCommand): Promise<SubmitResult> {
+    // A stop that arrives while the submission still waits on the queue ends its retries too.
+    const stops = this.stopsArrived;
+    return this.enqueue(async () => {
+      const record = this.deps.store.get(this.attemptId);
+      const spec = this.current ?? record?.spec ?? null;
+      const fence = this.currentFence ?? record?.fence ?? null;
+      if (spec === null || fence === null || compareFence(command.fence, fence) !== 0) {
+        return { ok: false, error: 'stale_fence' };
+      }
+      if (!isOwnBranch(spec, command.branch)) {
+        this.report(fence, { type: 'attempt.violation', data: { phase: 'submit', paths: [command.branch] } });
+        return { ok: false, error: 'branch_refused' };
+      }
+      const outcome = await this.submission(spec, command, record?.clone ?? null, stops);
+      this.report(fence, { type: 'attempt.submitted', data: outcome });
+      return { ok: true, outcome };
+    });
+  }
+
   /** The hub told the runner the attempt's fence is no longer current: its WIP ref is not pushed again. */
   markFenced(): void {
     this.standing.fenced = true;
@@ -588,6 +628,115 @@ export class AttemptController {
       // The agent is gone already: its exit is dealt with as any other.
       this.deps.logger.warn('cannot send the resume prompt', { attemptId: this.attemptId, error: describe(error) });
     }
+  }
+
+  /** A submission's harvest, checks and push, inside its job; gives its outcome. */
+  private async submission(
+    spec: Omit<AttemptSpec, 'agentToken'>,
+    command: SubmitCommand,
+    recordedClone: string | null,
+    stops: number,
+  ): Promise<SubmittedData> {
+    const { vault, local, logger, store, wipGate } = this.deps;
+    const branch = command.branch;
+    const refused = (fields: Pick<SubmittedData, 'error' | 'detail'> & Partial<SubmittedData>): SubmittedData => ({
+      submissionId: command.submissionId,
+      ok: false,
+      headSha: null,
+      remoteHead: null,
+      ...fields,
+    });
+    const clone = this.prepared?.clone ?? recordedClone;
+    if (clone === null) return refused({ error: 'remote', detail: 'the attempt has no clone on this runner' });
+    // main as it is now, for the advice on protected paths; a fetch that fails leaves the vault's.
+    await vault.fetchForAttempt({ taskId: spec.taskId, start: spec.start }, this.deps.wipRefPrefix()).catch((error) => {
+      logger.warn('cannot fetch the vault before a submission', { attemptId: this.attemptId, error: describe(error) });
+    });
+    let work: WorkResult;
+    try {
+      work = await this.collect(spec, clone, branch);
+    } catch (error) {
+      return refused({ error: 'remote', detail: `cannot harvest the clone: ${describe(error)}` });
+    }
+    const headSha = work.head;
+    // Every skipped file is an uncommitted change the snapshot left out: the submission would go without it.
+    const dirty = [...new Set([...work.uncommitted, ...work.skipped])].sort();
+    if (dirty.length > 0) return refused({ error: 'dirty', headSha, detail: dirtyDetail(dirty) });
+    let sha = work.sha;
+    let tree = work.tree;
+    if (work.stripped.length > 0) {
+      const restoreBase = await resolveRestoreBase(vault, spec);
+      const base = await submissionBase({ vault, local, restoreBase, head: work.head });
+      const paths =
+        base === restoreBase
+          ? work.stripped
+          : (await detectProtected({ vault, local }, { base, head: work.head, paths: spec.restore.paths })).map(
+              (change) => change.path,
+            );
+      if (paths.length > 0) {
+        const detail = await protectedDetail({ vault, local, base, paths });
+        return refused({ error: 'protected_paths', headSha, detail });
+      }
+      // The branch merged main and carries main's own versions: it goes as it is, not stripped back to the start.
+      sha = work.head;
+      tree = (await runGit(local, [`--git-dir=${vault.path}`, 'rev-parse', `${sha}^{tree}`])).stdout.trim();
+    }
+    const wipRef = spec.wipRef as string;
+    const settled = () => this.standing.fenced || this.standing.ended || this.standing.exited;
+    const pushed = await pushSubmissionWithRetries({
+      budgetMs: this.deps.config().timings.submitRetry,
+      interrupted: () => this.stopsArrived !== stops,
+      stopArrived: () => this.nextStop(),
+      // Only the link's gate clears by itself; a fenced, ended or exited attempt never pushes again.
+      retryable: () => !settled(),
+      onRetry: (outcome, delayMs) => {
+        const { detail } = outcome;
+        logger.warn('a submission push failed; retrying', { attemptId: this.attemptId, delayMs, detail });
+      },
+      push: async (): Promise<SubmitPushOutcome> => {
+        const notNow = wipRefusal(wipGate, this.standing);
+        if (notNow !== null) return { ok: false, headSha, remoteHead: null, error: 'remote', detail: notNow };
+        try {
+          return await pushSubmission({
+            vault,
+            local,
+            remote: await this.deps.remote(),
+            taskId: spec.taskId as string,
+            wipRefPrefix: this.deps.wipRefPrefix(),
+            branch,
+            wipRef,
+            sha,
+            expectedBranchSha: command.expectedBranchSha,
+            previousWip: store.get(this.attemptId)?.pushedSha ?? null,
+            adoptable: command.adoptable,
+          });
+        } catch (error) {
+          return { ok: false, headSha, remoteHead: null, error: 'remote', detail: describe(error) };
+        }
+      },
+    });
+    if (pushed === 'interrupted') {
+      return refused({ error: 'interrupted', headSha, detail: 'a stop or hold arrived while the push was retried' });
+    }
+    if (pushed.ok) {
+      store.update(this.attemptId, { wipSha: sha, pushedSha: sha, lastPushAt: Date.now() });
+      this.lastWork = { head: work.head, tree };
+      this.heldWork = null;
+      this.deps.wipFailures.succeeded();
+    }
+    const { ok, remoteHead, error, detail } = pushed;
+    return { submissionId: command.submissionId, ok, headSha, remoteHead, error, detail };
+  }
+
+  /** Resolves when the next stop, hold or resume arrives. */
+  private nextStop(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const listener = () => {
+        this.stopListeners.delete(listener);
+        resolve();
+      };
+      this.stopListeners.add(listener);
+    });
   }
 
   /** Releases the base checkout of a start that failed; a failure is only logged. */
@@ -1003,13 +1152,18 @@ export class AttemptController {
     }
   }
 
-  /** A stop or hold arrives: the live agent gets nothing more, even before the stop's turn on the queue. */
+  /**
+   * A stop or hold arrives: the live agent gets nothing more, and a submission retrying its push ends, even before
+   * the stop's turn on the queue.
+   */
   private stopArriving(): void {
     const live = this.live;
     if (live !== null) {
       live.stopping = true;
       live.handoffsAtStop ??= live.pump.handoffs;
     }
+    this.stopsArrived += 1;
+    for (const listener of [...this.stopListeners]) listener();
   }
 
   /** Prepares the live agent as the options say, runs the stop ladder, then the exit work. */

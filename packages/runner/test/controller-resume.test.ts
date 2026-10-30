@@ -301,6 +301,8 @@ describe('AttemptController: resume', () => {
     expect(await controller.interrupt({ fence: OLD })).toEqual({ ok: false, error: 'stale_fence' });
     expect(await controller.hold({ fence: OLD })).toEqual({ ok: false, error: 'stale_fence' });
     expect(await controller.resume({ ...resumeCommand(f), fence: OLD })).toEqual({ resumed: false, error: 'stale_fence' });
+    const submission = { fence: OLD, submissionId: 'S-1', branch: 'agflow/T-4-tidy', expectedBranchSha: null, adoptable: [] };
+    expect(await controller.submit(submission)).toEqual({ ok: false, error: 'stale_fence' });
     await waitFor(() => existsSync(join(f.paths.clone(FIXTURE_PROJECT, 'T-4-a1'), 'more.txt')));
     expect(await controller.pushWip()).toMatchObject({ status: 'pushed' });
     const wips = f.events('attempt.wip');
