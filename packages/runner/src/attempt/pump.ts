@@ -93,6 +93,8 @@ export interface EventPumpOptions {
   root(): Promise<ProcessIdentity | null>;
   /** DESCENDANT_SNAPSHOT_MS by default. */
   snapshotEveryMs?: number;
+  /** A resumed session: the attempt's first output came from an earlier process, so none is reported again. */
+  firstOutputReported?: boolean;
 }
 
 export class EventPump {
@@ -111,6 +113,15 @@ export class EventPump {
 
   constructor(options: EventPumpOptions) {
     this.options = options;
+    this.firstOutputSent = options.firstOutputReported ?? false;
+  }
+
+  /**
+   * The resumed session started fresh after all (one that never ran a turn): its first text answers the first
+   * prompt, so it is the restatement.
+   */
+  freshSession(): void {
+    this.firstOutputSent = false;
   }
 
   /** Whether the agent wrote its handoff note (a write_handoff with a normal result). */

@@ -101,14 +101,24 @@ export async function realClonePath(path: string): Promise<string> {
 }
 
 /** The commit a vault ref names, or null. */
-async function commitOf(vault: Vault, local: GitEnvironment, ref: string): Promise<string | null> {
+export async function commitOf(vault: Vault, local: GitEnvironment, ref: string): Promise<string | null> {
   const args = [`--git-dir=${vault.path}`, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`];
   const result = await runGit(local, args, { check: false });
   const sha = result.stdout.trim();
   return result.code === 0 && sha !== '' ? sha : null;
 }
 
-/** Makes the clone, or keeps the one there; gives the commit it was made at. */
+/**
+ * How a preparation gets its clone at the clone path, after the vault's fetch: whether it made it, and the commit it
+ * was made at, the attempt's start pin.
+ */
+export type CloneStep = (
+  deps: WorkspaceDeps,
+  spec: AttemptSpec,
+  path: string,
+) => Promise<{ created: boolean; startSha: string }>;
+
+/** A start's clone step: makes the clone, or keeps the one there; gives the commit it was made at. */
 async function ensureClone(deps: WorkspaceDeps, spec: AttemptSpec, clone: string) {
   const { vault, local } = deps;
   const target = { vault, local, attemptId: spec.attemptId, clone };
@@ -198,13 +208,17 @@ export interface OpenedClone {
  * Step 1 of the attempt clone: the vault fetched, then the clone made, or the one there kept. Nothing in a kept
  * clone is changed yet, so the controller can harvest and push its work as the agent left it (design 7.4).
  */
-export async function openWorkspace(deps: WorkspaceDeps, spec: AttemptSpec): Promise<OpenedClone> {
+export async function openWorkspace(
+  deps: WorkspaceDeps,
+  spec: AttemptSpec,
+  cloneStep: CloneStep = ensureClone,
+): Promise<OpenedClone> {
   const { vault, paths } = deps;
   const path = paths.clone(vault.project, spec.attemptId);
   // A link left at the clone path stays there for forensics; nothing is done through it.
   await assertCloneDirectory(path);
   await vault.fetchForAttempt({ taskId: spec.taskId, start: spec.start }, deps.wipRefPrefix());
-  const { created, startSha } = await ensureClone(deps, spec, path);
+  const { created, startSha } = await cloneStep(deps, spec, path);
   return { clone: await realClonePath(path), created, startSha };
 }
 
@@ -259,9 +273,13 @@ export async function prepareOpened(
   };
 }
 
-/** openWorkspace and prepareOpened together. */
-export async function prepareWorkspace(deps: WorkspaceDeps, spec: AttemptSpec): Promise<PreparedWorkspace> {
-  return prepareOpened(deps, spec, await openWorkspace(deps, spec));
+/** openWorkspace and prepareOpened together. A resume gives its own clone step, which reopens the clone it has. */
+export async function prepareWorkspace(
+  deps: WorkspaceDeps,
+  spec: AttemptSpec,
+  cloneStep: CloneStep = ensureClone,
+): Promise<PreparedWorkspace> {
+  return prepareOpened(deps, spec, await openWorkspace(deps, spec, cloneStep));
 }
 
 /**

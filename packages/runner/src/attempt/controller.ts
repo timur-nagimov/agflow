@@ -19,7 +19,9 @@
 // Stops, holds and the runner's own stops (stop.ts) run on the queue too: they prepare the agent (an interrupt, a
 // handoff turn, or the end of the running turn), run the stop ladder and do the same exit work, once per process.
 // What the runner sends the agent on its own, continuations, vendor-error retries, quota waits and the one nudge
-// after an outage, is the turn policy's (turns.ts).
+// after an outage, is the turn policy's (turns.ts). A resume (resume.ts) stops a live process first, then prepares
+// the clone the attempt has and resumes its session with the new fence and token.
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,7 +45,7 @@ import type {
   ExitInfo,
   VendorAdapter,
 } from '../adapters/types';
-import type { AttemptStore } from '../attempt-store';
+import type { AttemptRecord, AttemptStore } from '../attempt-store';
 import type { AwakeClock } from '../clock';
 import type { RunnerConfig } from '../config';
 import { buildAgentEnv } from '../env';
@@ -62,6 +64,14 @@ import { killAndSweep, runStopLadder } from '../stop-ladder';
 import { clipPushError, EVENTS_AFTER_EXIT_MS, LateWorkRetries, pushWithRetries, uploadTranscriptTail } from './exit';
 import { buildLaunch, ProcessRegistration } from './launch';
 import { ACTIVITY_SUMMARY_MAX, clip, EventPump, type PumpEvent } from './pump';
+import {
+  RESUME_SEND_MS,
+  RESUME_STOP_REASON,
+  type ResumeInput,
+  type ResumeOutcome,
+  reopenClone,
+  resumedSpec,
+} from './resume';
 import { TurnPolicy } from './turns';
 import { prepareForStop, RUNNER_STOP_REASON, type StopOptions, type StopOutcome, TurnWatch } from './stop';
 import {
@@ -155,6 +165,8 @@ interface LiveAgent {
   events: Promise<void>;
   /** Settles once the agent's events have ended and its exit was dealt with. */
   done: Promise<void>;
+  /** Started by a resume: attempt.spawned carries no start sha. */
+  resumed: boolean;
   /** A stop or hold arrived for it: nothing more is sent to it. */
   stopping: boolean;
   /** The handoff notes it had written when the first stop arrived; a stop asks again unless one came after. */
@@ -408,6 +420,56 @@ export class AttemptController {
     });
   }
 
+  /**
+   * resume_attempt: a live process is stopped first, without a handoff turn, its work pushed; then the clone the
+   * attempt has is prepared again and its session resumed with the new fence and token, the CLI version it started
+   * with, and the prompt and messages after it. A command with an older fence is refused; one with the current fence
+   * and a live process is done already.
+   */
+  resume(command: ResumeInput): Promise<ResumeOutcome> {
+    if (this.currentFence === null || compareFence(command.fence, this.currentFence) > 0) this.stopArriving();
+    return this.enqueue(async () => {
+      const record = this.deps.store.get(this.attemptId);
+      const current = this.currentFence ?? record?.fence ?? null;
+      if (current !== null && compareFence(command.fence, current) < 0) return { resumed: false, error: 'stale_fence' };
+      const same = current !== null && compareFence(command.fence, current) === 0;
+      if (this.live !== null && same) return { resumed: true };
+      if (record === null) {
+        const failed = this.failedToStart(command.fence, `${this.attemptId} has no record on this runner`);
+        return { resumed: false, error: failed.error };
+      }
+      if (this.live !== null) {
+        const options = { handoff: false, interruptFirst: false, reason: RESUME_STOP_REASON, cause: null };
+        await this.stopLive(this.live, options);
+      }
+      const spec = resumedSpec(record.spec, command);
+      this.currentFence = spec.fence;
+      this.currentPhase = 'starting';
+      const { agentToken: _token, ...stored } = spec;
+      this.current = stored;
+      this.standing.fenced = false;
+      this.standing.exited = false;
+      this.prepared = null;
+      this.cloneDir = null;
+      this.deps.store.update(this.attemptId, { spec: stored, fence: spec.fence, state: 'starting', finalizedAt: null });
+      try {
+        await this.resumeAdmitted(spec, record, command);
+        return { resumed: true };
+      } catch (error) {
+        // The clone's work goes out before the failure is reported, under the new fence.
+        await this.releaseBaseCheckout();
+        await this.wipJob().catch((pushError) => {
+          this.deps.logger.warn('cannot push the work of a failed resume', {
+            attemptId: this.attemptId,
+            error: describe(pushError),
+          });
+        });
+        const failed = this.failedToStart(spec.fence, describe(error));
+        return { resumed: false, error: failed.error };
+      }
+    });
+  }
+
   /** The hub told the runner the attempt's fence is no longer current: its WIP ref is not pushed again. */
   markFenced(): void {
     this.standing.fenced = true;
@@ -482,6 +544,52 @@ export class AttemptController {
     });
   }
 
+  /**
+   * A resume's work after the stop: the clone the attempt has, prepared as for a start, the dependencies and the
+   * project config, then the session resumed and the prompt and messages sent; throws on a failure.
+   */
+  private async resumeAdmitted(spec: AttemptSpec, record: AttemptRecord, command: ResumeInput): Promise<void> {
+    const { store } = this.deps;
+    const workspace = await startStep('cannot prepare the clone', () => prepareWorkspace(this.deps, spec, reopenClone));
+    this.prepared = workspace;
+    this.cloneDir = workspace.clone;
+    store.update(spec.attemptId, { clone: workspace.clone, tmpDir: workspace.tmpDir });
+    const fresh = workspace.violations.filter((path) => !this.reported.has(path));
+    if (fresh.length > 0) {
+      const listed = clipViolationPaths(fresh);
+      this.report(spec.fence, { type: 'attempt.violation', data: { phase: 'start', paths: listed } });
+      for (const path of fresh) this.reported.add(path);
+    }
+    await this.recallPushedWork(workspace.startSha);
+    const prep = await this.prepareDependencies(spec, workspace);
+    if (prep.error !== null) throw new Error(`dependency preparation failed: ${prep.error}`);
+    await startStep('cannot verify the clone', () =>
+      finishWorkspace(this.deps, spec, workspace, { prepared: prep.ran }),
+    );
+    // The version that wrote the session (X-13); one the record lacks is the pin's, recorded now.
+    const cliVersion = record.cliVersion ?? this.deps.cliVersion(spec.vendor);
+    if (record.cliVersion === null) store.update(spec.attemptId, { cliVersion });
+    const resume = record.sessionRef === null ? null : { sessionRef: record.sessionRef };
+    await startStep('cannot resume the agent', () =>
+      this.launchAgent(spec, workspace, { cliVersion, resume, resumed: true }),
+    );
+    const live = this.live;
+    if (live === null) return;
+    const { prompt } = command;
+    const sending = (async () => {
+      if (prompt !== '') await live.session.send({ id: randomUUID(), text: prompt, authority: 'system' });
+      await live.pump.deliver(command.messages, 0);
+    })();
+    try {
+      // Bounded, so an agent that takes no input never holds the attempt's queue.
+      const sent = await boundedWait(sending, RESUME_SEND_MS);
+      if (!sent.done) this.deps.logger.warn('the resume prompt was not taken in time', { attemptId: this.attemptId });
+    } catch (error) {
+      // The agent is gone already: its exit is dealt with as any other.
+      this.deps.logger.warn('cannot send the resume prompt', { attemptId: this.attemptId, error: describe(error) });
+    }
+  }
+
   /** Releases the base checkout of a start that failed; a failure is only logged. */
   private async releaseBaseCheckout(): Promise<void> {
     try {
@@ -522,7 +630,9 @@ export class AttemptController {
     );
     const cliVersion = this.deps.cliVersion(spec.vendor);
     store.update(spec.attemptId, { cliVersion });
-    await startStep('cannot start the agent', () => this.launchAgent(spec, workspace, { cliVersion, resume: null }));
+    await startStep('cannot start the agent', () =>
+      this.launchAgent(spec, workspace, { cliVersion, resume: null, resumed: false }),
+    );
   }
 
   /**
@@ -532,7 +642,7 @@ export class AttemptController {
   private async launchAgent(
     spec: AttemptSpec,
     workspace: PreparedWorkspace,
-    options: { cliVersion: string; resume: AgentLaunch['resume'] },
+    options: { cliVersion: string; resume: AgentLaunch['resume']; resumed: boolean },
   ): Promise<void> {
     const { store, logger, config, paths, agflow, local, vault } = this.deps;
     const adapter = this.deps.adapters.get(spec.vendor);
@@ -586,6 +696,7 @@ export class AttemptController {
       report: (event) => this.report(this.currentFence ?? spec.fence, event),
       setPhase: (phase) => this.setPhase(phase),
       root: () => registration.recorded(),
+      firstOutputReported: options.resume !== null,
     });
     const watch = new TurnWatch();
     const live: LiveAgent = {
@@ -614,6 +725,7 @@ export class AttemptController {
       factsDir,
       events: Promise.resolve(),
       done: Promise.resolve(),
+      resumed: options.resumed,
       stopping: false,
       handoffsAtStop: null,
       finished: false,
@@ -1155,6 +1267,7 @@ export class AttemptController {
   /** The agent's started event: attempt.spawned with the start tip the clone was made at. */
   private spawned(live: LiveAgent, event: Extract<AgentEvent, { type: 'started' }>): void {
     const { spec, launch, session, workspace } = live;
+    if (launch.resume !== null && event.sessionRef !== launch.resume.sessionRef) live.pump.freshSession();
     this.deps.store.update(spec.attemptId, { state: 'running', sessionRef: event.sessionRef });
     this.report(spec.fence, {
       type: 'attempt.spawned',
@@ -1164,7 +1277,7 @@ export class AttemptController {
         model: launch.model,
         cliVersion: launch.cliVersion,
         permissionMode: event.permissionMode,
-        startSha: workspace.startSha,
+        startSha: live.resumed ? null : workspace.startSha,
       },
     });
   }
@@ -1212,7 +1325,7 @@ export class AttemptController {
   }
 
   /** attempt.failed_to_start for a start the runner tried: refused null, class infra, the error clipped. */
-  private failedToStart(fence: Fence, error: string): StartOutcome {
+  private failedToStart(fence: Fence, error: string): Extract<StartOutcome, { started: false }> {
     this.currentPhase = null;
     const clipped = clipStartError(error);
     this.report(fence, { type: 'attempt.failed_to_start', data: { error: clipped, refused: null } });
