@@ -10,7 +10,7 @@ import { listEvents } from '../src/events';
 import { Gateway } from '../src/gateway';
 import { RESTART_PROMPT, reconcileOnHello } from '../src/recovery';
 import { getRunner } from '../src/runners';
-import { findSubmission } from '../src/submission-store';
+import { branchHeadOf, findSubmission } from '../src/submission-store';
 import { requestSubmission } from '../src/submissions';
 import { getTask, listTaskNotes } from '../src/task-store';
 import { createTasks } from '../src/tasks';
@@ -167,6 +167,31 @@ describe('reconciliation on hello', () => {
     expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'ended', endReason: 'stopped' });
     expect(getTask(ctx, one.id)).toMatchObject({ status: 'ready', assignee: null });
     expect(findSubmission(ctx, submission.id)).toMatchObject({ status: 'failed', error: 'attempt ended: stopped' });
+  });
+
+  test('a success the replay brings after the deferred stop completed records only the branch head', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    const agent = getAgent(ctx, attempt.agentId);
+    const submission = requestSubmission(ctx, one.id, agent, { summary: 'Done.', evidence: [] });
+    requestStop(ctx, { attemptId: attempt.id, cause: 'stop_hold', reason: 'look', by: 'user:alice' });
+    await settle();
+    runner.disconnect();
+    await settle();
+    const at = { attemptId: attempt.id, fence: attempt.fence };
+    const head = FINAL_SHA;
+    const outcome = { submissionId: submission.id, ok: true, headSha: head, remoteHead: head, error: null, detail: null };
+    runner.emit('attempt.submitted', outcome, at);
+    live.push(reported(ctx, attempt.id, 'stopped'));
+
+    await hello(runner);
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'ended', endReason: 'stopped' });
+    expect(findSubmission(ctx, submission.id)).toMatchObject({ status: 'failed', headSha: head });
+    // The hold the person asked for stands, and the pushed head is recorded.
+    expect(getTask(ctx, one.id)).toMatchObject({ status: 'blocked', blockedKind: 'paused' });
+    expect(branchHeadOf(ctx, one.id)).toBe(head);
   });
 
   test('a take-over in flight with a clone keeps going: its pending prepare_takeover is sent again', async () => {

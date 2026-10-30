@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import { isValidWipRefPrefix, parseAttemptId } from './naming';
 import { BranchSchema, CommitShaSchema, RoleSchema, TaskIdSchema, VendorSchema } from './schemas';
+import { SUBMIT_ERRORS } from './submit-errors';
 import type {
   AgentRole,
   Approval,
@@ -65,23 +66,8 @@ export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 export const VIOLATION_PHASES = ['start', 'wip', 'submit', 'takeover'] as const;
 export type ViolationPhase = (typeof VIOLATION_PHASES)[number];
 
-/** attempt.submitted error codes. */
-export const SUBMIT_ERRORS = [
-  'dirty',
-  'protected_paths',
-  'needs_merge',
-  'branch_moved',
-  'remote',
-  'interrupted',
-] as const;
-export type SubmitError = (typeof SUBMIT_ERRORS)[number];
-
-/** The submit refusals that go back to the agent to fix. */
-export const FIXABLE_SUBMIT_ERRORS = [
-  'dirty',
-  'protected_paths',
-  'needs_merge',
-] as const satisfies readonly SubmitError[];
+// attempt.submitted error codes live in the zod-free submit-errors.ts, which the web UI imports (X-48).
+export { FIXABLE_SUBMIT_ERRORS, SUBMIT_ERRORS, type SubmitError } from './submit-errors';
 
 /** attempt.exited.cause: the runner's own stops. Every other exit has null. */
 export const EXIT_CAUSES = ['suspend', 'runner_stop'] as const;

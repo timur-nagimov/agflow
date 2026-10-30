@@ -1,16 +1,17 @@
 import { describe, expect, test } from 'bun:test';
-import type { RawRunnerEvent } from '@agflow/core';
+import type { RawRunnerEvent, RunnerEventData } from '@agflow/core';
 import { ACTIVE_MS } from '../src/agents';
-import { getAttempt, updateAttempt } from '../src/attempt-store';
+import { attemptLog, getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, expireRunnerLeases, requestStop, resumeAttempt } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
 import { pendingCommands } from '../src/commands';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
-import { findSubmission, insertSubmission, pendingSubmissionOf } from '../src/submission-store';
-import { requestSubmission } from '../src/submissions';
+import { listMessages } from '../src/messages';
+import { branchHeadOf, findSubmission, insertSubmission, pendingSubmissionOf } from '../src/submission-store';
+import { expireSubmissions, requestSubmission } from '../src/submissions';
 import { getTask, writeTask } from '../src/task-store';
-import { claimTask, createTasks, getTaskDetail, rejectTask, submitTask } from '../src/tasks';
+import { claimTask, createTasks, getTaskDetail, rejectTask, submitTask, unblockTask } from '../src/tasks';
 import { type RunnerAttempt, addAgent, addRunnerAttempt, newTask } from './helpers';
 import { createTestHub } from './http-helpers';
 
@@ -273,5 +274,338 @@ describe('while a submission is pending', () => {
       ['S-2', 'pending'],
       ['S-1', 'failed'],
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Outcomes and timeouts
+// ---------------------------------------------------------------------------
+
+type Outcome = RunnerEventData['attempt.submitted'];
+
+/** The runner reports a submission's outcome for the attempt, at its fence as the hub has it now. */
+function report(hub: Hub, held: RunnerAttempt, outcome: Outcome): void {
+  const raw: RawRunnerEvent = {
+    seq: ++seq,
+    at: hub.ctx.now(),
+    type: 'attempt.submitted',
+    attemptId: held.attempt.id,
+    fence: getAttempt(hub.ctx, held.attempt.id).fence,
+    data: outcome,
+  };
+  applyRunnerEvents(hub.ctx, held.runner.id, { outboxEpoch: 'outbox-1', events: [raw] }, { restoreReplay: false });
+  expect(hub.ctx.db.query('SELECT error FROM runner_event_rejects').all()).toEqual([]);
+}
+
+const pushed = (submissionId: string, headSha = sha('a')): Outcome => ({
+  submissionId,
+  ok: true,
+  headSha,
+  remoteHead: headSha,
+  error: null,
+  detail: null,
+});
+
+const refused = (submissionId: string, error: Outcome['error'], detail: string | null, remoteHead = sha('e')): Outcome => ({
+  submissionId,
+  ok: false,
+  headSha: sha('a'),
+  remoteHead,
+  error,
+  detail,
+});
+
+const toAgent = (hub: Hub, agentId: string) =>
+  listMessages(hub.ctx, { target: `agent:${agentId}` }).map((message) => message.body);
+/** The commands queued after the push, which stays pending until the runner's result. */
+const afterPush = (hub: Hub, held: RunnerAttempt) =>
+  pendingCommands(hub.ctx, held.runner.id, 1).filter((row) => row.kind !== 'push_submission');
+const kindsFor = (hub: Hub, held: RunnerAttempt) => afterPush(hub, held).map((row) => row.kind);
+const eventsOf = (hub: Hub, taskId: string, type: string) =>
+  listEvents(hub.ctx.db, { subject: taskId }).filter((event) => event.type === type);
+
+/** A runner attempt with a pending submission S-1. */
+async function pendingSetup() {
+  const { hub, held, token, taskId } = setup();
+  await submit(hub, token, taskId);
+  return { hub, held, token, taskId };
+}
+
+describe('a successful outcome', () => {
+  test('submits the task, holds the attempt, drops a deferred stop, tells the lead and emits the events', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    requestStop(hub.ctx, { attemptId: held.attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    report(hub, held, pushed('S-1'));
+    const task = getTask(hub.ctx, taskId);
+    expect(task).toMatchObject({
+      status: 'submitted',
+      assignee: held.agent.id,
+      workRef: `refs/heads/${held.task.branch}`,
+      workSha: sha('a'),
+      submission: {
+        summary: work.summary,
+        evidence: work.evidence,
+        branch: held.task.branch,
+        headSha: sha('a'),
+        by: held.agent.id,
+        attemptId: held.attempt.id,
+        submissionId: 'S-1',
+      },
+    });
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('a'));
+    expect(getAttempt(hub.ctx, held.attempt.id)).toMatchObject({
+      status: 'holding',
+      leaseExpiresAt: null,
+      submittedSha: sha('a'),
+      stopRequested: null,
+    });
+    expect(afterPush(hub, held).map((row) => row.command)).toEqual([
+      { kind: 'hold_attempt', attemptId: held.attempt.id, fence: held.attempt.fence },
+    ]);
+    expect(findSubmission(hub.ctx, 'S-1')).toMatchObject({ status: 'submitted', headSha: sha('a'), error: null });
+    const lead = listMessages(hub.ctx, { target: 'lead' });
+    expect(lead[0]?.body).toContain(`was submitted by ${held.agent.id} for review on branch ${held.task.branch}`);
+    expect(lead[0]?.body).toContain(`> ${work.summary}`);
+    const dropped = listMessages(hub.ctx, { target: 'humans' });
+    expect(dropped[0]?.body).toContain('user:alice');
+    expect(dropped[0]?.body).toContain('was dropped');
+    expect(eventsOf(hub, taskId, 'submission.recorded').map((event) => event.data)).toEqual([
+      {
+        submissionId: 'S-1',
+        attemptId: held.attempt.id,
+        taskId,
+        agentId: held.agent.id,
+        runnerId: held.runner.id,
+        headSha: sha('a'),
+        branch: held.task.branch,
+      },
+    ]);
+    expect(eventsOf(hub, taskId, 'attempt.holding').map((event) => event.data.submissionId)).toEqual(['S-1']);
+  });
+
+  test("a lead's deferred stop is dropped with word to the lead", async () => {
+    const { hub, held } = await pendingSetup();
+    const lead = addAgent(hub.ctx, 'alice', 'lead');
+    requestStop(hub.ctx, { attemptId: held.attempt.id, cause: 'replace', reason: 'slow', by: `agent:${lead.id}` });
+    report(hub, held, pushed('S-1'));
+    expect(toAgent(hub, lead.id)[0]).toContain('was dropped');
+  });
+
+  test('a stop that moves the task only when the attempt ends does not keep a success from being recorded', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    requestStop(hub.ctx, { attemptId: held.attempt.id, cause: 'released', reason: 'done', by: `agent:${held.agent.id}` });
+    expect(kindsFor(hub, held)).toEqual(['stop_attempt']);
+    report(hub, held, pushed('S-1'));
+    expect(getTask(hub.ctx, taskId)).toMatchObject({ status: 'submitted', submission: { submissionId: 'S-1' } });
+    expect(getAttempt(hub.ctx, held.attempt.id)).toMatchObject({ status: 'holding', stopRequested: null });
+    expect(findSubmission(hub.ctx, 'S-1')?.status).toBe('submitted');
+    // The stop the runner had not taken yet is cancelled with it.
+    expect(kindsFor(hub, held)).toEqual(['hold_attempt']);
+    expect(listMessages(hub.ctx, { target: 'lead' })).toHaveLength(1);
+  });
+
+  test('the same success reported again records the heads and says nothing more', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    report(hub, held, pushed('S-1'));
+    report(hub, held, pushed('S-1'));
+    expect(getTask(hub.ctx, taskId).status).toBe('submitted');
+    expect(findSubmission(hub.ctx, 'S-1')).toMatchObject({ status: 'submitted', headSha: sha('a') });
+    expect(listMessages(hub.ctx, { target: 'lead' })).toHaveLength(1);
+    expect(toAgent(hub, held.agent.id)).toEqual([]);
+    expect(kindsFor(hub, held)).toEqual(['hold_attempt']);
+    expect(eventsOf(hub, taskId, 'submission.recorded')).toHaveLength(1);
+  });
+
+  test('an exit after the recorded submission leaves the task submitted', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    report(hub, held, pushed('S-1'));
+    exit(hub, held);
+    expect(getAttempt(hub.ctx, held.attempt.id).status).toBe('holding');
+    expect(getTask(hub.ctx, taskId).status).toBe('submitted');
+  });
+});
+
+describe('a refused outcome', () => {
+  const fixes: [Outcome['error'], string, string][] = [
+    ['dirty', 'uncommitted changes', 'src/parser.ts is modified'],
+    ['protected_paths', 'protected paths', 'merge main rather than revert: main changed .github/workflows/ci.yml'],
+    ['needs_merge', 'git fetch origin && git merge origin/', 'origin has 2 commits on top of agflow work'],
+  ];
+  for (const [error, fix, detail] of fixes) {
+    test(`${error} fails it and tells the agent what to fix, with the runner's detail unchanged`, async () => {
+      const { hub, held, taskId } = await pendingSetup();
+      report(hub, held, refused('S-1', error, detail));
+      expect(findSubmission(hub.ctx, 'S-1')).toMatchObject({ status: 'failed', error: `${error}: ${detail}` });
+      const [told] = toAgent(hub, held.agent.id);
+      expect(told).toContain('S-1');
+      expect(told).toContain(fix);
+      expect(told).toContain(`> ${detail}`);
+      expect(told).toContain('submit again');
+      expect(getTask(hub.ctx, taskId).status).toBe('claimed');
+      expect(getAttempt(hub.ctx, held.attempt.id).status).toBe('running');
+      expect(eventsOf(hub, taskId, 'submission.failed').map((event) => event.data.error)).toEqual([`${error}: ${detail}`]);
+      // The agent may submit again at once.
+      expect(requestSubmission(hub.ctx, taskId, held.agent, work).id).toBe('S-2');
+    });
+  }
+
+  test('a fixable refusal applies a stop held back for the submission', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    requestStop(hub.ctx, { attemptId: held.attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    hub.clock.advance(1_000);
+    report(hub, held, refused('S-1', 'dirty', 'src/parser.ts is modified'));
+    expect(getAttempt(hub.ctx, held.attempt.id).stopRequested).toMatchObject({
+      cause: 'stop',
+      deferred: false,
+      at: hub.ctx.now(),
+    });
+    expect(kindsFor(hub, held)).toEqual(['stop_attempt']);
+    expect(getTask(hub.ctx, taskId).status).toBe('claimed');
+  });
+
+  test('branch_moved blocks the task with both shas and stops the attempt with a handoff', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    report(hub, held, refused('S-1', 'branch_moved', 'the branch is not agflow work', sha('e')));
+    const task = getTask(hub.ctx, taskId);
+    expect(task).toMatchObject({ status: 'blocked', blockedKind: 'branch_moved' });
+    expect(task.blockedReason).toContain(sha('a'));
+    expect(task.blockedReason).toContain(sha('e'));
+    expect(getAttempt(hub.ctx, held.attempt.id).stopRequested).toMatchObject({
+      cause: 'branch_moved',
+      handoff: true,
+      deferred: false,
+    });
+    expect(kindsFor(hub, held)).toEqual(['stop_attempt']);
+    expect(findSubmission(hub.ctx, 'S-1')?.status).toBe('failed');
+    expect(listMessages(hub.ctx, { target: 'humans' })[0]?.body).toContain(sha('e'));
+    expect(toAgent(hub, held.agent.id)[0]).toContain('safe in your WIP ref');
+    expect(toAgent(hub, held.agent.id)[0]).toContain('> the branch is not agflow work');
+    // Unblocking adopts the remote head the task shows.
+    unblockTask(hub.ctx, taskId, 'user:alice');
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('e'));
+  });
+
+  for (const error of ['remote', 'interrupted'] as const) {
+    test(`${error} fails it like the timeout: the work is safe, and a deferred stop applies`, async () => {
+      const { hub, held, taskId } = await pendingSetup();
+      requestStop(hub.ctx, { attemptId: held.attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+      hub.clock.advance(1_000);
+      report(hub, held, refused('S-1', error, error === 'remote' ? 'HTTP 503 from origin' : null));
+      expect(findSubmission(hub.ctx, 'S-1')?.status).toBe('failed');
+      const [told] = toAgent(hub, held.agent.id);
+      expect(told).toContain(`safe in your WIP ref ${held.attempt.wipRef}`);
+      expect(told).toContain('submit again, or call declare_blocked');
+      if (error === 'remote') expect(told).toContain('> HTTP 503 from origin');
+      expect(getAttempt(hub.ctx, held.attempt.id).stopRequested).toMatchObject({
+        cause: 'stop',
+        deferred: false,
+        at: hub.ctx.now(),
+      });
+      expect(kindsFor(hub, held)).toEqual(['stop_attempt']);
+      expect(eventsOf(hub, taskId, 'submission.failed')).toHaveLength(1);
+    });
+  }
+
+  test('expireSubmissions fails one pending past submitTimeoutMs: error remote, push cancelled, stop applied', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    requestStop(hub.ctx, { attemptId: held.attempt.id, cause: 'replace', reason: 'slow', by: 'user:alice' });
+    hub.clock.advance(hub.ctx.config.submitTimeoutMs - 1);
+    expect(expireSubmissions(hub.ctx)).toBe(0);
+    hub.clock.advance(1);
+    expect(expireSubmissions(hub.ctx)).toBe(1);
+    expect(findSubmission(hub.ctx, 'S-1')).toMatchObject({ status: 'failed', error: 'remote' });
+    expect(pushesOf(hub, held)).toEqual([]);
+    expect(kindsFor(hub, held)).toEqual(['stop_attempt']);
+    expect(getAttempt(hub.ctx, held.attempt.id).stopRequested).toMatchObject({ cause: 'replace', deferred: false });
+    expect(toAgent(hub, held.agent.id)[0]).toContain('safe in your WIP ref');
+    expect(eventsOf(hub, taskId, 'submission.failed').map((event) => event.data.error)).toEqual(['remote']);
+    expect(expireSubmissions(hub.ctx)).toBe(0);
+  });
+});
+
+describe('outcomes the hub cannot match', () => {
+  test("a success naming another attempt's submission records nothing, and is logged on the reporting attempt", async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    const other = addRunnerAttempt(hub.ctx, { runnerId: held.runner.id });
+    report(hub, other, pushed('S-1', sha('9')));
+    expect(findSubmission(hub.ctx, 'S-1')).toMatchObject({ status: 'pending', headSha: null });
+    expect(branchHeadOf(hub.ctx, taskId)).toBeNull();
+    expect(branchHeadOf(hub.ctx, other.task.id)).toBeNull();
+    expect(attemptLog(hub.ctx, other.attempt.id).map((entry) => entry.kind)).toContain('rejected');
+  });
+
+  test('a success naming a submission the hub does not have still records the branch head', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    report(hub, held, pushed('S-77', sha('7')));
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('7'));
+    expect(findSubmission(hub.ctx, 'S-1')?.status).toBe('pending');
+    expect(attemptLog(hub.ctx, held.attempt.id).at(-1)?.summary).toContain('S-77');
+
+    // An attempt the hub does not know, after a restore: its id names the task.
+    const raw: RawRunnerEvent = {
+      seq: ++seq,
+      at: hub.ctx.now(),
+      type: 'attempt.submitted',
+      attemptId: `${taskId}-a9`,
+      fence: held.attempt.fence,
+      data: pushed('S-78', sha('8')),
+    };
+    applyRunnerEvents(hub.ctx, held.runner.id, { outboxEpoch: 'outbox-1', events: [raw] }, { restoreReplay: false });
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('8'));
+    expect(getTask(hub.ctx, taskId).status).toBe('claimed');
+    // A refusal records nothing.
+    report(hub, held, refused('S-79', 'remote', null));
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('8'));
+  });
+});
+
+describe('outcomes that come late', () => {
+  test('every outcome of a failed submission reaches the agent; a late success records the head only', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    hub.clock.advance(hub.ctx.config.submitTimeoutMs);
+    expireSubmissions(hub.ctx);
+    report(hub, held, refused('S-1', 'remote', 'HTTP 503 from origin'));
+    report(hub, held, pushed('S-1'));
+    const told = toAgent(hub, held.agent.id);
+    expect(told).toHaveLength(3);
+    expect(told[1]).toContain('HTTP 503 from origin');
+    expect(told[0]).toContain(`${held.task.branch} is at ${sha('a')}`);
+    expect(findSubmission(hub.ctx, 'S-1')).toMatchObject({ status: 'failed', headSha: sha('a') });
+    expect(getTask(hub.ctx, taskId).status).toBe('claimed');
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('a'));
+    expect(listMessages(hub.ctx, { target: 'lead' })[0]?.body).toContain(`${held.task.branch} moved to ${sha('a')}`);
+  });
+
+  test('a success for an older submission records only the head and tells the lead and the holder', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    report(hub, held, refused('S-1', 'dirty', 'src/parser.ts is modified'));
+    requestSubmission(hub.ctx, taskId, held.agent, work);
+    report(hub, held, pushed('S-1', sha('b')));
+    expect(findSubmission(hub.ctx, 'S-2')?.status).toBe('pending');
+    expect(getTask(hub.ctx, taskId).status).toBe('claimed');
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('b'));
+    expect(listMessages(hub.ctx, { target: 'lead' })[0]?.body).toContain(`moved to ${sha('b')}`);
+    // The holder is the agent that submitted it: one message, as for any outcome of a failed submission.
+    const told = toAgent(hub, held.agent.id);
+    expect(told).toHaveLength(2);
+    expect(told[0]).toContain(`${held.task.branch} is at ${sha('b')}`);
+  });
+
+  test('a success of an attempt that ended records only the head, and the new holder is told to merge', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    endAttempt(hub.ctx, { attemptId: held.attempt.id, trigger: 'crashed', error: 'boom' });
+    const next = addRunnerAttempt(hub.ctx, { taskId, runnerId: held.runner.id });
+    report(hub, held, pushed('S-1', sha('c')));
+    expect(findSubmission(hub.ctx, 'S-1')).toMatchObject({ status: 'failed', error: 'attempt ended: crashed' });
+    expect(branchHeadOf(hub.ctx, taskId)).toBe(sha('c'));
+    expect(getTask(hub.ctx, taskId)).toMatchObject({ status: 'claimed', currentAttempt: next.attempt.id });
+    const branchRef = `refs/heads/${held.task.branch}`;
+    expect(pendingCommands(hub.ctx, held.runner.id, 1).map((row) => row.command)).toContainEqual({
+      kind: 'refresh_vault',
+      taskId,
+      refs: [branchRef],
+    });
+    expect(toAgent(hub, next.agent.id)[0]).toContain(`git fetch origin && git merge origin/${held.task.branch}`);
+    expect(listMessages(hub.ctx, { target: 'lead' })[0]?.body).toContain(`moved to ${sha('c')}`);
   });
 });

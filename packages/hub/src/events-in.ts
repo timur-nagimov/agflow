@@ -33,6 +33,7 @@ import type { Emit } from './events';
 import { recordQuotaReports } from './quota';
 import { resumeDeferred } from './recovery';
 import { applyRunnerSettings, applyVendorReport, markGitPushed, setReportedState } from './runners';
+import { onSubmitted } from './submissions';
 import { clip } from './text';
 
 /**
@@ -120,6 +121,8 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   },
   'attempt.late_work': (ctx, event, context) =>
     onLateWork(ctx, context.emit, context.runnerId, context.attempt, event),
+  'attempt.submitted': (ctx, event, context) =>
+    onSubmitted(ctx, context.emit, context.runnerId, context.attempt, event),
   'runner.state': (ctx, event, { runnerId, helloLastSeq }) => {
     // The hello reported the runner's state after this event, so a replayed one must not undo it, nor resume what
     // the hello deferred (X-36).

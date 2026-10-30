@@ -9,6 +9,7 @@ export * from './cli-login';
 export * from './fence';
 export * from './naming';
 export * from './runner-protocol';
+export * from './submit-errors';
 export * from './api-schemas';
 export * from './credentials';
 export * from './protected-paths';

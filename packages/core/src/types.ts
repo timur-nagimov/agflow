@@ -486,6 +486,11 @@ export interface SubmissionRecord {
   summary: string;
   evidence: string[];
   headSha: string | null;
+  /**
+   * Why it failed; null unless failed. A runner's refusal is its SubmitError code, or '<code>: <the runner's detail>'
+   * when the runner sent one; the submit timeout is 'remote'; an ending is 'attempt ended: <end reason>'. Read it
+   * with splitSubmitError.
+   */
   error: string | null;
   requestedAt: number;
   decidedAt: number | null;
