@@ -5,6 +5,7 @@ export * from './clock';
 export * from './config';
 export * from './db';
 export * from './env';
+export * from './facts';
 export * from './git/clone';
 export * from './git/harvest';
 export * from './git/protect';
