@@ -311,6 +311,95 @@ function claim(ctx: HubContext, emit: Emit, task: Task | null, attempt: Attempt,
 }
 
 // ---------------------------------------------------------------------------
+// Live-chat attempts (design 6.4, Live-chat attempts): M1's operations move the task, and the attempt follows
+// ---------------------------------------------------------------------------
+
+/** The task's current attempt while it is open in a live chat, or null; a claim made before M2 has none. */
+export function openLiveAttempt(ctx: HubContext, task: Pick<Task, 'currentAttempt'>): Attempt | null {
+  const attempt = task.currentAttempt === null ? null : findAttempt(ctx, task.currentAttempt);
+  return attempt && attempt.status !== 'ended' && attempt.runnerId === null ? attempt : null;
+}
+
+/**
+ * A live claim's attempt, in the claim's transaction (design 6.4): running at once, with a fence, from the task's
+ * work position, and with no runner and no runner lease: the task's M1 lease stays authoritative for it. It becomes
+ * the task's current attempt; it is never on the ladder and takes no worker slot.
+ */
+export function startLiveAttempt(ctx: HubContext, emit: Emit, task: Task, agent: Agent): Attempt {
+  const number = nextAttemptNumber(ctx, task.id);
+  const fence = issueFence(ctx);
+  const start = startPositionFor(ctx, task);
+  const attempt = insertAttempt(ctx, {
+    id: attemptId(task.id, number, fence.epoch),
+    taskId: task.id,
+    number,
+    // An attempt at a task is a worker's, whoever holds the seat.
+    role: 'worker',
+    agentId: agent.id,
+    runnerId: null,
+    vendor: agent.vendor,
+    fence,
+    status: 'running',
+    startRef: start.ref,
+    startSha: start.sha,
+  });
+  emit({
+    type: 'attempt.started',
+    actor: `agent:${agent.id}`,
+    subject: attemptSubject(attempt),
+    data: { ...attemptData(attempt), vendor: attempt.vendor, role: attempt.role },
+  });
+  return attempt;
+}
+
+/**
+ * Ends the task's open live attempt as the live-chat table says, after M1's operation moved the task: release,
+ * block, a forced release (stop), the lease sweep (lost), cancel, accept, a rejection not returned to its author, or a
+ * resume_claim (superseded). Null when the task has none.
+ */
+export function endLiveAttempt(
+  ctx: HubContext,
+  task: Pick<Task, 'currentAttempt'>,
+  trigger: EndingTrigger,
+  actor: string,
+): Ending | null {
+  const attempt = openLiveAttempt(ctx, task);
+  return attempt ? endAttempt(ctx, { attemptId: attempt.id, trigger, actor }) : null;
+}
+
+/** A live submit: the attempt holds while its work is reviewed. */
+export function holdLiveAttempt(ctx: HubContext, emit: Emit, task: Pick<Task, 'currentAttempt'>, actor: string): void {
+  const attempt = openLiveAttempt(ctx, task);
+  if (!attempt) return;
+  updateAttempt(ctx, attempt.id, { status: 'holding' });
+  emit({
+    type: 'attempt.holding',
+    actor,
+    subject: attemptSubject(attempt),
+    data: { ...attemptData(attempt), submissionId: null },
+  });
+}
+
+/** A rejection M1 returned to its live author: the attempt runs again, at a new fence. */
+export function refenceLiveAttempt(
+  ctx: HubContext,
+  emit: Emit,
+  task: Pick<Task, 'currentAttempt'>,
+  actor: string,
+): void {
+  const attempt = openLiveAttempt(ctx, task);
+  if (!attempt) return;
+  const fence = issueFence(ctx);
+  updateAttempt(ctx, attempt.id, { status: 'running', fence });
+  emit({
+    type: 'attempt.resumed',
+    actor,
+    subject: attemptSubject(attempt),
+    data: { ...attemptData(attempt), fence, reason: RESUME_CAUSES.review },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Resume (design 6.4): a new fence for an open attempt
 // ---------------------------------------------------------------------------
 

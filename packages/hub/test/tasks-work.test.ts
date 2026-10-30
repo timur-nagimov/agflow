@@ -238,7 +238,13 @@ describe('task detail', () => {
     claimTask(ctx, task.id, agent);
     reportProgress(ctx, task.id, agent, 'first');
     const { events } = getTaskDetail(ctx, task.id);
-    expect(events.map((event) => event.type)).toEqual(['task.created', 'task.claimed', 'task.working', 'task.progress']);
+    expect(events.map((event) => event.type)).toEqual([
+      'task.created',
+      'task.claimed',
+      'attempt.started',
+      'task.working',
+      'task.progress',
+    ]);
     expect(events).toEqual(listEvents(ctx.db, { subject: task.id }));
   });
 

@@ -16,7 +16,17 @@ import {
 } from '@agflow/core';
 import { statusFor } from './agents';
 import { findAttempt, listAttempts, openAttemptOf } from './attempt-store';
-import { endAttempt, openRunnerAttempt, rejectRunnerAttempt, requestStop } from './attempts';
+import {
+  endAttempt,
+  endLiveAttempt,
+  holdLiveAttempt,
+  openLiveAttempt,
+  openRunnerAttempt,
+  refenceLiveAttempt,
+  rejectRunnerAttempt,
+  requestStop,
+  startLiveAttempt,
+} from './attempts';
 import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
@@ -274,6 +284,7 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
       data: attempt ? { reason, attemptId: attempt.id } : { reason },
     });
     if (attempt) requestStop(ctx, { attemptId: attempt.id, cause: 'cancel', reason, by: actor });
+    else endLiveAttempt(ctx, task, 'cancel', actor);
     if (holder) {
       setAgentTask(ctx, holder, null);
       insertMessage(ctx, emit, {
@@ -340,8 +351,9 @@ export type HolderTest = 'attempt' | 'claim';
  * The holder test, run inside the action's transaction. A route passes the agent token the request came with: the
  * auth middleware resolved it before the body arrived, and a re-fence or revocation can land in between, so the
  * token is resolved again here and its attempt is the one tested (401 attempt_ended or attempt_refenced otherwise).
- * Without a token, the hub's own callers vouch for the runner agent's current attempt. Returns the runner attempt it
- * tested, whose id the notes the agent writes carry (X-22); null for a live agent.
+ * Without a token, the hub's own callers vouch for the runner agent's current attempt. Returns the holder's attempt,
+ * whose id the notes the agent writes carry (X-22): the runner attempt it tested, or a live agent's open attempt; null
+ * for a live claim made before M2, which has none.
  */
 export function requireHolder(
   ctx: HubContext,
@@ -352,7 +364,8 @@ export function requireHolder(
 ): Attempt | null {
   if (agent.origin !== 'runner') {
     if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
-    return null;
+    const live = openLiveAttempt(ctx, task);
+    return live?.agentId === agent.id ? live : null;
   }
   const grant = token === null ? null : resolveAgentToken(ctx, token);
   if (grant && grant.agent.id !== agent.id) throw forbidden(`you do not hold ${task.id}`);
@@ -392,7 +405,8 @@ export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: st
       changes: { assignee: agent.id, branch: branch ?? task.branch, leaseExpiresAt: ctx.now() + ctx.config.leaseMs },
     });
     setAgentTask(ctx, agent.id, id);
-    return { claimed };
+    startLiveAttempt(ctx, emit, claimed, agent);
+    return { claimed: getTask(ctx, id) };
   });
   // Refused after the transaction, so that the move to blocked is kept.
   if ('waiting' in outcome) throw conflict(`${id} cannot be claimed: it is ${waitingReason(outcome.waiting)}`);
@@ -414,6 +428,9 @@ export function resumeClaim(ctx: HubContext, id: string, agent: Agent): Task {
     writeTask(ctx, id, { assignee: agent.id, leaseExpiresAt: ctx.now() + ctx.config.leaseMs });
     setAgentTask(ctx, task.assignee, null);
     setAgentTask(ctx, agent.id, id);
+    // The old chat's attempt gives way to the new chat's (design 6.4).
+    endLiveAttempt(ctx, task, 'superseded', `agent:${agent.id}`);
+    startLiveAttempt(ctx, emit, getTask(ctx, id), agent);
     emit({
       type: 'task.claim_transferred',
       actor: `agent:${agent.id}`,
@@ -450,18 +467,19 @@ export function releaseTask(ctx: HubContext, id: string, agent: Agent, reason: s
     const task = getTask(ctx, id);
     const attempt = requireHolder(ctx, task, agent, 'claim', token);
     addNote(ctx, id, 'release', reason, `agent:${agent.id}`, attempt?.id ?? null);
-    if (attempt) {
+    if (attempt && attempt.runnerId !== null) {
       // The released row: the agent stops without a handoff turn, and the task goes ready on its exit (design 6.4).
       requestStop(ctx, { attemptId: attempt.id, cause: 'released', reason, by: `agent:${agent.id}` });
       return getTask(ctx, id);
     }
-    const released = move(ctx, emit, task, 'ready', `agent:${agent.id}`, {
+    move(ctx, emit, task, 'ready', `agent:${agent.id}`, {
       changes: { assignee: null, leaseExpiresAt: null },
       event: 'task.released',
       data: { reason, forced: false },
     });
     setAgentTask(ctx, agent.id, null);
-    return released;
+    endLiveAttempt(ctx, task, 'released', `agent:${agent.id}`);
+    return getTask(ctx, id);
   });
 }
 
@@ -477,19 +495,20 @@ export function forceRelease(ctx: HubContext, id: string, actor: string, reason:
       requestStop(ctx, { attemptId: attempt.id, cause: 'stop', reason, by: actor });
       return getTask(ctx, id);
     }
-    const released = move(ctx, emit, task, 'ready', actor, {
+    move(ctx, emit, task, 'ready', actor, {
       changes: { assignee: null, leaseExpiresAt: null },
       event: 'task.released',
       data: { reason, forced: true, holder },
     });
     setAgentTask(ctx, holder, null);
+    endLiveAttempt(ctx, task, 'stop', actor);
     insertMessage(ctx, emit, {
       from: actor,
       to: `agent:${holder}`,
       taskId: id,
       body: `Your claim on ${id} was released by ${actor}: ${reason}\nStop working on it. Commit and push anything worth keeping to ${task.branch ?? 'its branch'}.`,
     });
-    return released;
+    return getTask(ctx, id);
   });
 }
 
@@ -513,6 +532,7 @@ export function sweepLeases(ctx: HubContext): string[] {
       });
       move(ctx, emit, stale, 'ready', 'system', { changes: { assignee: null } });
       if (task.assignee) setAgentTask(ctx, task.assignee, null);
+      endLiveAttempt(ctx, task, 'lost', 'system');
       insertMessage(ctx, emit, {
         from: 'system',
         to: 'lead',
@@ -544,7 +564,7 @@ export function submitTask(
 ): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    requireHolder(ctx, task, agent, 'claim', token);
+    const attempt = requireHolder(ctx, task, agent, 'claim', token);
     const branch = input.branch ?? task.branch;
     const submission: Submission = {
       summary: input.summary,
@@ -553,21 +573,24 @@ export function submitTask(
       headSha: input.headSha ?? null,
       submittedAt: ctx.now(),
       by: agent.id,
-      attemptId: null,
+      attemptId: attempt?.id ?? null,
       submissionId: null,
     };
-    const result = move(ctx, emit, task, 'submitted', `agent:${agent.id}`, {
-      changes: { submission, branch, leaseExpiresAt: null },
+    // A live submit's branch is where the next attempt starts (design 6.4, Work position).
+    const position = branch ? { workRef: `refs/heads/${branch}`, workSha: input.headSha ?? null } : {};
+    move(ctx, emit, task, 'submitted', `agent:${agent.id}`, {
+      changes: { submission, branch, leaseExpiresAt: null, ...position },
       data: { branch, headSha: input.headSha ?? null },
     });
     setAgentTask(ctx, agent.id, null);
+    holdLiveAttempt(ctx, emit, task, `agent:${agent.id}`);
     insertMessage(ctx, emit, {
       from: 'system',
       to: 'lead',
       taskId: id,
       body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\n${wrote(agent.id, clip(input.summary, 1500))}\nReview it with accept_task or reject_task.`,
     });
-    return result;
+    return getTask(ctx, id);
   });
 }
 
@@ -581,20 +604,23 @@ export function acceptTask(ctx: HubContext, id: string, actor: string, note?: st
       throw forbidden(`${id} was submitted by you; an agent cannot accept its own work`);
     }
     const attempt = openRunnerAttempt(ctx, task);
-    const accepted = move(ctx, emit, task, 'accepted', actor, { changes: { feedback: null }, data: { note: note ?? null } });
+    move(ctx, emit, task, 'accepted', actor, { changes: { feedback: null }, data: { note: note ?? null } });
     if (attempt) {
       // The accepted row: the holding attempt ends at once and its cleanup is queued; nobody would read a message.
       endAttempt(ctx, { attemptId: attempt.id, trigger: 'accepted', actor });
-    } else if (task.assignee) {
-      insertMessage(ctx, emit, {
-        from: actor,
-        to: `agent:${task.assignee}`,
-        taskId: id,
-        body: `${id} was accepted.${note ? ` ${note}` : ''}`,
-      });
+    } else {
+      endLiveAttempt(ctx, task, 'accepted', actor);
+      if (task.assignee) {
+        insertMessage(ctx, emit, {
+          from: actor,
+          to: `agent:${task.assignee}`,
+          taskId: id,
+          body: `${id} was accepted.${note ? ` ${note}` : ''}`,
+        });
+      }
     }
     refreshDependents(ctx, emit);
-    return accepted;
+    return getTask(ctx, id);
   });
 }
 
@@ -631,6 +657,7 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
         data: { to: author.id },
       });
       setAgentTask(ctx, author.id, id);
+      refenceLiveAttempt(ctx, emit, task, actor);
       insertMessage(ctx, emit, {
         from: actor,
         to: `agent:${author.id}`,
@@ -639,6 +666,8 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
       });
       return back;
     }
+    // Not returned: the live attempt ends rejected, which the ladder never counts.
+    endLiveAttempt(ctx, task, 'rejected', actor);
     return move(ctx, emit, rejected, 'ready', 'system', { changes: { assignee: null, leaseExpiresAt: null } });
   });
 }
@@ -654,7 +683,7 @@ export function blockTask(
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
     const attempt = requireHolder(ctx, task, agent, 'claim', token);
-    if (attempt) {
+    if (attempt && attempt.runnerId !== null) {
       // The blocked and impossible rows: blocked at once, and the agent stopped without a handoff turn (design 6.4).
       const cause = kind === 'impossible' ? 'impossible' : 'blocked';
       requestStop(ctx, { attemptId: attempt.id, cause, reason, by: `agent:${agent.id}` });
@@ -665,6 +694,7 @@ export function blockTask(
         data: { reason: clip(reason, 500) },
       });
       setAgentTask(ctx, agent.id, null);
+      endLiveAttempt(ctx, task, kind === 'impossible' ? 'impossible' : 'blocked', `agent:${agent.id}`);
     }
     const body =
       kind === 'impossible'
