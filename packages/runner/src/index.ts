@@ -1,4 +1,5 @@
 export * from './adapters/types';
+export * from './attempt/controller';
 export * from './attempt-store';
 export * from './backoff';
 export * from './clock';
@@ -21,6 +22,8 @@ export * from './outbox';
 export * from './paths';
 export * from './processes';
 export * from './profile';
+export * from './queue';
 export * from './run-dir';
+export * from './seams';
 export * from './stop-ladder';
 export * from './vendor/pins';
