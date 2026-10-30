@@ -142,7 +142,7 @@ export function createApp(ctx: HubContext, options: AppOptions = {}): App {
   mountAttemptRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
   mountEventRoutes(app, ctx);
-  mountRunnerRoutes(app, options.upgradeRunnerLink);
+  mountRunnerRoutes(app, ctx, options.upgradeRunnerLink);
   mountCliLoginPage(app, ctx);
   if (ctx.config.webDist) mountStatic(app, ctx.config.webDist);
   return app;

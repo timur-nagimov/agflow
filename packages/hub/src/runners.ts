@@ -40,6 +40,11 @@ export interface RunnerInfo {
    * heartbeat clears it. Rows written before it existed have none.
    */
   startRefusal?: StartRefusalMark | null;
+  /**
+   * Attempts its last hello reported stopped or suspended while it was not ok (X-36): their resumes wait for
+   * runner.state ok. Rows written before it existed have none.
+   */
+  deferredResumes?: string[];
 }
 
 /** A refused start: the runner's code for it, and when the hub heard of it. */
@@ -354,6 +359,20 @@ export function markGitPushed(ctx: HubContext, runnerId: string): void {
   const info = runnerInfo(existingRow(ctx, runnerId));
   info.git = { ready: true, problem: null, lastPushAt: ctx.now() };
   ctx.db.query('UPDATE runners SET info = $info WHERE id = $id').run({ id: runnerId, info: JSON.stringify(info) });
+}
+
+/** Records the attempts whose resumes wait for the runner's runner.state ok; an empty list clears them. */
+export function setDeferredResumes(ctx: HubContext, runnerId: string, attemptIds: string[]): void {
+  const info = runnerInfo(existingRow(ctx, runnerId));
+  info.deferredResumes = attemptIds;
+  ctx.db.query('UPDATE runners SET info = $info WHERE id = $id').run({ id: runnerId, info: JSON.stringify(info) });
+}
+
+/** The attempts whose resumes waited for runner.state ok, which are no longer recorded once taken. */
+export function takeDeferredResumes(ctx: HubContext, runnerId: string): string[] {
+  const deferred = runnerInfo(existingRow(ctx, runnerId)).deferredResumes ?? [];
+  if (deferred.length > 0) setDeferredResumes(ctx, runnerId, []);
+  return deferred;
 }
 
 // ---------------------------------------------------------------------------

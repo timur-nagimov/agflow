@@ -1,10 +1,14 @@
-// The runner link's HTTP side (design 6.3, 6.16): the WebSocket upgrade at /api/runner/ws, and the whoami probe a
-// runner calls after a refused upgrade, because a refused WebSocket client sees only "Expected 101".
+// The runner link's HTTP side (design 6.3, 6.16): the WebSocket upgrade at /api/runner/ws, the whoami probe a runner
+// calls after a refused upgrade, because a refused WebSocket client sees only "Expected 101", and the transcript tails
+// runners upload.
+import { TranscriptInputSchema } from '@agflow/core';
 import { sessionHashOf } from '../auth';
+import type { HubContext } from '../context';
 import { unauthorized, upgradeRequired } from '../errors';
 import type { LinkSession } from '../gateway';
+import { storeTranscriptTail } from '../recovery';
 import type { App, Principal } from './app';
-import { type Ctx, principal } from './util';
+import { type Ctx, principal, readBody } from './util';
 
 /** Upgrades the request to a runner link signed in with the session; false when it is no WebSocket handshake. */
 export type RunnerLinkUpgrade = (request: Request, session: LinkSession) => boolean;
@@ -19,8 +23,15 @@ function cliSession(c: Ctx): Principal {
   return p;
 }
 
-export function mountRunnerRoutes(app: App, upgrade: RunnerLinkUpgrade | undefined): void {
+export function mountRunnerRoutes(app: App, ctx: HubContext, upgrade: RunnerLinkUpgrade | undefined): void {
   app.get('/api/runner/whoami', (c) => c.json({ user: cliSession(c).user }));
+
+  app.post('/api/runner/attempts/:id/transcript', async (c) => {
+    const p = cliSession(c);
+    const { tail } = await readBody(c, TranscriptInputSchema);
+    storeTranscriptTail(ctx, p.user, c.req.param('id'), tail);
+    return c.json({ ok: true });
+  });
 
   app.get('/api/runner/ws', (c) => {
     const p = cliSession(c);

@@ -282,7 +282,7 @@ export class Gateway implements RunnerLink {
         markFactsStale(ctx, runnerId);
         const ackedSeq = acknowledgePosition(ctx, runnerId, hello.outboxEpoch, hello.firstSeq);
         const replayPending = hello.lastSeq > ackedSeq;
-        const { stop } = reconcileOnHello(ctx, runnerId, hello.attempts, { replayPending });
+        const { stop } = reconcileOnHello(ctx, runnerId, hello, { replayPending });
         slideSession(ctx, sessionHash);
         markLinked(ctx, emit, runnerId, {
           connectionId: connection.id,

@@ -30,6 +30,7 @@ import {
 } from './attempts';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
+import { resumeDeferred } from './recovery';
 import { applyRunnerSettings, applyVendorReport, markGitPushed, setReportedState } from './runners';
 import { clip } from './text';
 
@@ -46,6 +47,8 @@ export interface EventContext {
   /** The attempt an attempt event is about; null for runner events and for attempts the hub does not know. */
   attempt: Attempt | null;
   standing: EventStanding;
+  /** The highest seq the link's hello reported: events up to it were emitted before that hello (ApplyOptions). */
+  helloLastSeq: number;
 }
 
 export type EventHandler<T extends RunnerEventType = RunnerEventType> = (
@@ -116,7 +119,13 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   },
   'attempt.late_work': (ctx, event, context) =>
     onLateWork(ctx, context.emit, context.runnerId, context.attempt, event),
-  'runner.state': (ctx, event, { runnerId }) => setReportedState(ctx, runnerId, event.data.state, event.data.detail),
+  'runner.state': (ctx, event, { runnerId, helloLastSeq }) => {
+    // The hello reported the runner's state after this event, so a replayed one must not undo it, nor resume what
+    // the hello deferred (X-36).
+    if (event.seq <= helloLastSeq) return;
+    setReportedState(ctx, runnerId, event.data.state, event.data.detail);
+    if (event.data.state === 'ok') resumeDeferred(ctx, runnerId);
+  },
   'runner.settings': (ctx, event, { runnerId, emit }) => {
     applyRunnerSettings(ctx, emit, runnerId, event.data.settings);
   },
@@ -143,10 +152,11 @@ export interface ApplyOptions {
   restoreReplay: boolean;
   /**
    * For a message on a runner link, the lastSeq of its hello for the message's outbox epoch (0 for another epoch).
-   * The runner's replay may leave out some of the events up to it, ones the hub had (X-12) or that the runner no
-   * longer holds, and the cumulative ack covers them. After it, each event the runner sends follows the one before: a
-   * gap there is events the hub never had, so applyRunnerEvents throws rather than acknowledge past them. Undefined for
-   * a message from no link: no gap is looked for.
+   * The runner emitted the events up to it before it said hello, so the hello's own report supersedes theirs. Its
+   * replay may also leave some of those out, ones the hub had (X-12) or that the runner no longer holds, and the
+   * cumulative ack covers them. After it, each event the runner sends follows the one before: a gap there is events
+   * the hub never had, so applyRunnerEvents throws rather than acknowledge past them. Undefined for a message from no
+   * link: it counts as 0, and no gap is looked for.
    */
   helloLastSeq?: number | undefined;
 }
@@ -205,8 +215,9 @@ function dispatch(
   options: ApplyOptions,
 ): string | null {
   const handler = EVENT_HANDLERS[event.type] as EventHandler | undefined;
+  const helloLastSeq = options.helloLastSeq ?? 0;
   if (!('attemptId' in event)) {
-    handler?.(ctx, event, { runnerId, emit, attempt: null, standing: 'current' });
+    handler?.(ctx, event, { runnerId, emit, attempt: null, standing: 'current', helloLastSeq });
     return null;
   }
   const attempt = findAttempt(ctx, event.attemptId);
@@ -224,7 +235,7 @@ function dispatch(
     appendAttemptLog(ctx, attempt.id, 'rejected', `${event.type} at fence ${formatFence(event.fence)} ignored: ${why}`);
     return null;
   }
-  handler?.(ctx, event, { runnerId, emit, attempt, standing });
+  handler?.(ctx, event, { runnerId, emit, attempt, standing, helloLastSeq });
   return null;
 }
 

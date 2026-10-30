@@ -1,13 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { type LiveAttempt, type RunnerCommand, compareFence } from '@agflow/core';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
-import { endAttempt, recentResumes, requestStop, startRunnerAttempt } from '../src/attempts';
+import { endAttempt, expireRunnerLeases, recentResumes, requestStop, startRunnerAttempt } from '../src/attempts';
 import { createSession, resolveAgentToken } from '../src/auth';
 import { enqueueCommand } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { Gateway } from '../src/gateway';
 import { RESTART_PROMPT, reconcileOnHello } from '../src/recovery';
+import { getRunner } from '../src/runners';
 import { getTask, listTaskNotes } from '../src/task-store';
 import { createTasks } from '../src/tasks';
 import { type FakeConnection, type FakeRunner, connectFakeRunner, settle } from './fake-runner';
@@ -343,7 +344,7 @@ describe('the reconciliation result', () => {
       reported(ctx, kept.id, 'running'),
       reported(ctx, resumed.id, 'suspended'),
     ];
-    const result = tx(ctx, () => reconcileOnHello(ctx, runnerId, reports));
+    const result = tx(ctx, () => reconcileOnHello(ctx, runnerId, { attempts: reports, state: 'ok' }));
     expect(result.actions).toEqual([
       { attemptId: ended.id, action: 'ended' },
       { attemptId: takeover.id, action: 'takeover' },
@@ -354,5 +355,207 @@ describe('the reconciliation result', () => {
       { attemptId: unresumable.id, action: 'unresumable' },
     ]);
     expect(result.stop).toEqual([{ attemptId: ended.id, reason: 'the attempt ended (stopped)' }]);
+
+    // While the runner is not ok, the resume row waits.
+    const laterReports = [
+      reported(ctx, takeover.id, 'stopped'),
+      reported(ctx, kept.id, 'running'),
+      reported(ctx, resumed.id, 'suspended'),
+    ];
+    const later = tx(ctx, () => reconcileOnHello(ctx, runnerId, { attempts: laterReports, state: 'crash_loop' }));
+    expect(later.actions).toEqual([
+      { attemptId: takeover.id, action: 'takeover' },
+      { attemptId: kept.id, action: 'kept' },
+      { attemptId: resumed.id, action: 'deferred' },
+      { attemptId: resent.id, action: 'resent' },
+      { attemptId: unresumable.id, action: 'unresumable' },
+    ]);
+  });
+});
+
+describe('a runner that comes back', () => {
+  test('an attempt that ended lost goes to welcome.stop and gets upload_transcript; its ready task waits', async () => {
+    const { ctx, clock, runnerId, tasks, runner, live } = await setup();
+    const [one, two] = tasks;
+    if (!one || !two) throw new Error('no tasks');
+    const lost = await running(ctx, runner, runnerId, one.id);
+    const replaced = await running(ctx, runner, runnerId, two.id);
+    runner.disconnect();
+    await settle();
+    clock.advance(ctx.config.runnerLeaseMs);
+    expect(expireRunnerLeases(ctx)).toBe(2);
+    // The second task is already held again elsewhere, so it has nothing to wait for.
+    const elsewhere = addRunner(ctx, { owner: 'bob' });
+    startRunnerAttempt(ctx, { runnerId: elsewhere, taskId: two.id, role: 'worker', vendor: 'claude' });
+    clock.advance(1_000);
+    live.push(reported(ctx, lost.id, 'running'), reported(ctx, replaced.id, 'running'));
+    const since = runner.received.length;
+    const welcome = await hello(runner);
+    expect(welcome.stop).toEqual([
+      { attemptId: lost.id, reason: 'the attempt ended (lost)' },
+      { attemptId: replaced.id, reason: 'the attempt ended (lost)' },
+    ]);
+    for (const attempt of [lost, replaced]) {
+      expect(sentFor(runner, attempt.id, since)).toContain('upload_transcript');
+    }
+    expect(getTask(ctx, one.id).status).toBe('ready');
+    expect(dispatchHold(ctx, one.id)).toBe(ctx.now() + ctx.config.dispatchHoldMs);
+    expect(dispatchHold(ctx, two.id)).toBeNull();
+
+    // A later hello listing them again asks for nothing more.
+    clock.advance(1_000);
+    const again = runner.received.length;
+    await hello(runner);
+    expect(sentFor(runner, lost.id, again)).toEqual([]);
+    expect(dispatchHold(ctx, one.id)).toBe(ctx.now() - 1_000 + ctx.config.dispatchHoldMs);
+  });
+
+  test('in disk_low or crash_loop, resuming stopped or suspended attempts waits for runner.state ok', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one, two] = tasks;
+    if (!one || !two) throw new Error('no tasks');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    const stopping = await running(ctx, runner, runnerId, two.id);
+    requestStop(ctx, { attemptId: stopping.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    await settle();
+    runner.options.state = 'crash_loop';
+    runner.options.stateDetail = '3 unclean exits in 10 minutes';
+    live.push(reported(ctx, attempt.id, 'suspended'), reported(ctx, stopping.id, 'stopped'));
+    const since = runner.received.length;
+    await hello(runner);
+    // Not a resume: a stop whose process is gone still ends.
+    expect(getAttempt(ctx, stopping.id).status).toBe('ended');
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'running', fence: attempt.fence });
+    expect(sentFor(runner, attempt.id, since)).toEqual([]);
+
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    await settle();
+    const resumed = getAttempt(ctx, attempt.id);
+    expect(resumed.status).toBe('starting');
+    expect(compareFence(resumed.fence, attempt.fence)).toBe(1);
+    expect(sentFor(runner, attempt.id, since)).toEqual(['resume_attempt']);
+    // A second ok resumes nothing more.
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    await settle();
+    expect(getAttempt(ctx, attempt.id).fence).toEqual(resumed.fence);
+  });
+
+  test('a report that is still not ok resumes nothing; a later ok does', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    runner.options.state = 'crash_loop';
+    live.push(reported(ctx, attempt.id, 'suspended'));
+    await hello(runner);
+    runner.emit('runner.state', { state: 'disk_low', detail: 'low' });
+    await settle();
+    expect(getRunner(ctx, runnerId).state).toBe('disk_low');
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'running', fence: attempt.fence });
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    await settle();
+    expect(getAttempt(ctx, attempt.id).status).toBe('starting');
+  });
+
+  test('a stop requested while the resume waited ends the attempt with its cause instead', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    runner.options.state = 'disk_low';
+    live.push(reported(ctx, attempt.id, 'stopped'));
+    await hello(runner);
+    const since = runner.received.length;
+    requestStop(ctx, { attemptId: attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    await settle();
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    await settle();
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'ended', endReason: 'stopped' });
+    expect(sentFor(runner, attempt.id, since)).not.toContain('resume_attempt');
+  });
+
+  test('an ok hello resumes what an earlier hello deferred, and a later runner.state ok resumes it no more', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    runner.options.state = 'crash_loop';
+    live.push(reported(ctx, attempt.id, 'suspended'));
+    await hello(runner);
+    runner.options.state = 'ok';
+    await hello(runner);
+    expect(getAttempt(ctx, attempt.id).status).toBe('starting');
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    await settle();
+    expect(getAttempt(ctx, attempt.id).status).toBe('starting');
+    expect(recentResumes(ctx, attempt.id, 'runner_restart', ctx.config.resumeWindowMs)).toBe(1);
+  });
+
+  test('a runner.state the runner emitted before its hello is superseded by the hello, also in the replay', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    runner.disconnect();
+    await settle();
+    // An ok the hub never acknowledged, from before the runner fell into crash_loop.
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    runner.options.state = 'crash_loop';
+    runner.options.stateDetail = '3 unclean exits in 10 minutes';
+    live.push(reported(ctx, attempt.id, 'suspended'));
+    await hello(runner);
+    expect(runner.outbox).toEqual([]);
+    expect(getRunner(ctx, runnerId).state).toBe('crash_loop');
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'running', fence: attempt.fence });
+    // A new ok resumes it.
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    await settle();
+    expect(getRunner(ctx, runnerId).state).toBe('online');
+    expect(getAttempt(ctx, attempt.id).status).toBe('starting');
+  });
+
+  test('a replayed ok then disk_low leaves the runner disk_low and the attempt waiting', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    runner.disconnect();
+    await settle();
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    runner.emit('runner.state', { state: 'disk_low', detail: '2 GB free' });
+    runner.options.state = 'disk_low';
+    runner.options.stateDetail = '2 GB free';
+    live.push(reported(ctx, attempt.id, 'suspended'));
+    await hello(runner);
+    expect(getRunner(ctx, runnerId).state).toBe('disk_low');
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'running', fence: attempt.fence });
+
+    // And an older disk_low replayed after an ok hello leaves the runner online.
+    runner.disconnect();
+    await settle();
+    runner.emit('runner.state', { state: 'disk_low', detail: '2 GB free' });
+    runner.options.state = 'ok';
+    runner.options.stateDetail = null;
+    live.splice(0, live.length, reported(ctx, attempt.id, 'suspended'));
+    await hello(runner);
+    expect(getRunner(ctx, runnerId).state).toBe('online');
+  });
+
+  test('a deferred resume that never comes ends at the lease expiry, lost', async () => {
+    const { ctx, clock, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    runner.options.state = 'disk_low';
+    live.push(reported(ctx, attempt.id, 'stopped'));
+    await hello(runner);
+    expect(getAttempt(ctx, attempt.id).status).toBe('running');
+    clock.advance(ctx.config.runnerLeaseMs);
+    expect(expireRunnerLeases(ctx)).toBe(1);
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'ended', endReason: 'lost' });
+    // An ok after that resumes nothing.
+    runner.emit('runner.state', { state: 'ok', detail: null });
+    await settle();
+    expect(getAttempt(ctx, attempt.id).status).toBe('ended');
   });
 });
