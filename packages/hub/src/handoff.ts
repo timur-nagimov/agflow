@@ -3,6 +3,7 @@
 // Only the hub's framing and the goal, which only people set and which the lead's brief also shows as is, are
 // unquoted; every other part an agent or a person wrote is quoted under a line naming where it came from.
 import { type Attempt, type Message, type TaskNote, formatMessage, quoteLines } from '@agflow/core';
+import { unpushedHead } from './attempt-store';
 import { newestLeadHandoff, situationReport } from './brief';
 import type { HubContext } from './context';
 import { getCurrentGoal } from './goal';
@@ -85,6 +86,15 @@ function shownMessage(message: Message, max: number): string {
   return `${header}\n${quotedWithin(message.body, max)}`;
 }
 
+/** Where the newest work is when an attempt's final push failed: on its runner only, until late work brings it. */
+function unpushedLine(unpushed: { runnerId: string; sha: string }): string {
+  const { runnerId, sha } = unpushed;
+  return (
+    `Its last commit, ${sha}, is only on runner ${runnerId}: its final push failed. A successor on ${runnerId} ` +
+    `starts from it; agflow records it as late work once ${runnerId} pushes it.`
+  );
+}
+
 /** What the attempt row keeps that the Attempt view leaves out. */
 function recorded(ctx: HubContext, attemptId: string): { compaction: string | null; transcript: string | null } {
   const row = ctx.db
@@ -155,11 +165,13 @@ export function assembleHandoffNote(ctx: HubContext, attempt: Attempt): Assemble
       "the agent's own handoff notes."
     : `The previous attempt at ${task.id} ${ended} without a handoff note, so agflow put this one together from what ` +
       'it recorded.';
+  // A failed final push leaves the newest work on one runner only (design 6.8, Replacement step 4).
+  const unpushed = unpushedHead(ctx, task, attempt);
   const sections = [
     `# Handoff note assembled by agflow\n${intro} Everything quoted below was written by the agent, a person or a ` +
       'tool, not by agflow.',
     `## The previous attempt\n${attempt.id} by agent ${attempt.agentId} ${runner}: ${attempt.vendor}, ${model}, ran ` +
-      `${ran}, ${ended}.`,
+      `${ran}, ${ended}.${unpushed ? `\n${unpushedLine(unpushed)}` : ''}`,
   ];
   if (handoffs.length > 0) {
     const each = Math.floor(LIMITS.handoffs / handoffs.length);

@@ -15,7 +15,16 @@ import {
   parseRunnerEvent,
 } from '@agflow/core';
 import { appendAttemptLog, findAttempt } from './attempt-store';
-import { onActivity, onExited, onFailedToStart, onFirstOutput, onSpawned } from './attempts';
+import {
+  onActivity,
+  onExited,
+  onFailedToStart,
+  onFirstOutput,
+  onSpawned,
+  onViolation,
+  onWip,
+  onWipFailed,
+} from './attempts';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
 import { applyRunnerSettings, applyVendorReport, setReportedState } from './runners';
@@ -78,6 +87,11 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   },
   'attempt.activity': (ctx, event, context) => onActivity(ctx, attemptOf(context), event.data),
   'attempt.first_output': (ctx, event, context) => onFirstOutput(ctx, attemptOf(context), event.data),
+  'attempt.wip': (ctx, event, context) => {
+    if (context.standing === 'current') onWip(ctx, context.emit, attemptOf(context), event.data);
+  },
+  'attempt.wip_failed': (ctx, event, context) => onWipFailed(ctx, attemptOf(context), event.data),
+  'attempt.violation': (ctx, event, context) => onViolation(ctx, context.emit, attemptOf(context), event.data),
   'attempt.exited': (ctx, event, context) => {
     onExited(ctx, context.emit, attemptOf(context), event.data);
   },

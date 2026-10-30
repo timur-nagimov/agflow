@@ -34,6 +34,7 @@ import {
   isTaskBranch,
   ladderStep,
   leadAttemptId,
+  localPinRefs,
   plannedTaskMove,
   quoteLines,
   restoreSet,
@@ -50,10 +51,13 @@ import {
   findAttempt,
   getAttempt,
   insertAttempt,
+  isUnpushed,
   issueFence,
   listAttempts,
   nextAttemptNumber,
   openAttemptOf,
+  positionIsOwn,
+  unpushedHead,
   updateAttempt,
 } from './attempt-store';
 import { revokeAgentTokens } from './auth';
@@ -76,6 +80,8 @@ import { insertMessage } from './messages';
 import { getProject } from './project';
 import {
   findRunnerRow,
+  markGitNotReady,
+  markGitPushed,
   markVendorNotReady,
   recordFailedStart,
   recordStartRefusal,
@@ -108,11 +114,33 @@ const restoreBase = (ctx: HubContext): string => `refs/heads/${ctx.config.mainBr
 
 /**
  * Where an attempt starts (design 6.4, Work position): the task's work position, or main when it has none, as for
- * every lead attempt. The runner fetches the ref and reports the commit it actually used.
+ * every lead attempt. When the previous attempt's final push failed and its harvested head is still the newest work, a
+ * successor on that attempt's runner starts from the head its vault pins (design 6.8, Replacement step 4); the task's
+ * work position stays the last pushed ref, which a successor elsewhere starts from. The runner fetches the ref and
+ * reports the commit it actually used.
  */
-export function startPositionFor(ctx: HubContext, task: Task | null): AttemptSpec['start'] {
+export function startPositionFor(
+  ctx: HubContext,
+  task: Task | null,
+  runnerId: string | null = null,
+): AttemptSpec['start'] {
+  const unpushed = task && runnerId !== null ? unpushedWork(ctx, task) : null;
+  if (unpushed && unpushed.runnerId === runnerId) {
+    return { ref: localPinRefs(unpushed.attemptId).head, sha: unpushed.sha };
+  }
   if (task?.workRef) return { ref: task.workRef, sha: task.workSha };
   return { ref: restoreBase(ctx), sha: null };
+}
+
+/**
+ * The task's newest attempt's unpushed head, while that attempt has ended on a runner (unpushedHead); null otherwise.
+ * Its runner's late work would make it the work position.
+ */
+function unpushedWork(ctx: HubContext, task: Task): { attemptId: string; runnerId: string; sha: string } | null {
+  const [last] = listAttempts(ctx, { task: task.id, limit: 1 });
+  if (!last || last.status !== 'ended') return null;
+  const unpushed = unpushedHead(ctx, task, last);
+  return unpushed && { attemptId: last.id, ...unpushed };
 }
 
 /** The restore set and its base, recomputed for every start and resume (X-16). */
@@ -221,7 +249,7 @@ export function startRunnerAttempt(ctx: HubContext, input: StartAttemptInput): S
         runnerId: runner.id,
         attemptId: id,
       });
-    const start = startPositionFor(ctx, task);
+    const start = startPositionFor(ctx, task, runner.id);
     const attempt = insertAttempt(ctx, {
       id,
       taskId: task?.id ?? null,
@@ -1002,6 +1030,109 @@ export function onFirstOutput(ctx: HubContext, attempt: Attempt, data: RunnerEve
 }
 
 // ---------------------------------------------------------------------------
+// WIP, the final push and violations (design 6.3, 6.4 Work position, 6.8 Replacement step 4, 7.3)
+// ---------------------------------------------------------------------------
+
+/** Consecutive failed WIP pushes of a runner, over all its attempts, that mark its git not ready (X-3). */
+const WIP_FAILURES_LIMIT = 3;
+
+/** What the runner did about protected paths in each phase (design 7.3). */
+const VIOLATION_TEXT: Readonly<Record<RunnerEventData['attempt.violation']['phase'], string>> = {
+  start: 'its start commit changed these protected paths; the runner restored them and strips them from its pushes',
+  wip: 'it changed these protected paths; the runner stripped them from what it pushed',
+  submit: 'its submission touched protected paths or another branch; the runner refused it',
+  takeover: "its clone's git held config, hooks or links the runner does not allow; it moved them aside",
+};
+
+/** The attempt's pushed WIP, and the task's work position while the task names the attempt (design 6.4). */
+function recordWip(ctx: HubContext, attempt: Attempt, ref: string, sha: string): void {
+  updateAttempt(ctx, attempt.id, { wipRef: ref, wipSha: sha });
+  if (attempt.taskId === null) return;
+  const task = getTask(ctx, attempt.taskId);
+  if (task.currentAttempt === attempt.id) writeTask(ctx, task.id, { workRef: ref, workSha: sha });
+}
+
+/**
+ * attempt.wip of the current attempt: its WIP and the task's work position, and the attempt.wip event with what the
+ * push left out and its git log --stat, which assembled handoff notes quote (X-3). The runner's git pushed, so it is
+ * ready again.
+ */
+export function onWip(ctx: HubContext, emit: Emit, attempt: Attempt, data: RunnerEventData['attempt.wip']): void {
+  recordWip(ctx, attempt, data.ref, data.sha);
+  if (attempt.runnerId !== null) markGitPushed(ctx, attempt.runnerId);
+  emit({
+    type: 'attempt.wip',
+    actor: byRunner(attempt),
+    subject: attemptSubject(attempt),
+    data: { ...attemptData(attempt), ...data },
+  });
+}
+
+/**
+ * attempt.wip_failed: logged on the attempt. The event carries the runner's own count of failed pushes in a row, over
+ * all its attempts; from the third the runner's git is not ready, until a WIP push or a hello with git.ready (X-3).
+ */
+export function onWipFailed(ctx: HubContext, attempt: Attempt, data: RunnerEventData['attempt.wip_failed']): void {
+  const inRow = `${data.failures} in a row on the runner`;
+  appendAttemptLog(ctx, attempt.id, 'note', `a WIP push failed (${inRow}): ${data.error}`);
+  if (data.failures >= WIP_FAILURES_LIMIT && attempt.runnerId !== null) {
+    markGitNotReady(ctx, attempt.runnerId, `the last ${data.failures} WIP pushes failed: ${clip(data.error, 300)}`);
+  }
+}
+
+/**
+ * attempt.violation, of a current or an ended attempt: logged, emitted, and told to people and the lead. The paths
+ * name files in the agent's clone, so they are quoted.
+ */
+export function onViolation(
+  ctx: HubContext,
+  emit: Emit,
+  attempt: Attempt,
+  data: RunnerEventData['attempt.violation'],
+): void {
+  const paths = clip(data.paths.join('\n'), 2_000);
+  appendAttemptLog(ctx, attempt.id, 'violation', `${data.phase}: ${paths}`);
+  emit({
+    type: 'attempt.violation',
+    actor: byRunner(attempt),
+    subject: attemptSubject(attempt),
+    data: { ...attemptData(attempt), phase: data.phase, paths: data.paths },
+  });
+  const about = attempt.taskId === null ? 'the lead' : attempt.taskId;
+  const body =
+    `Attempt ${attempt.id} at ${about} (agent ${attempt.agentId} on runner ${attempt.runnerId ?? 'none'}): ` +
+    `${VIOLATION_TEXT[data.phase]}:\n${quoteLines(paths)}\n` +
+    'Runner agents never change these paths. If the task needs them changed, a person should do it.';
+  for (const to of ['humans', 'lead']) insertMessage(ctx, emit, { from: 'system', to, taskId: attempt.taskId, body });
+}
+
+/**
+ * A final push that failed (design 6.8, Replacement step 4): the harvested head is only in the runner's vault. While
+ * the task names the attempt, dispatch waits dispatchHoldMs for that runner's late work, and a note with the attempt's
+ * id names the commit, for a successor on another runner, which starts from the last pushed position without it.
+ */
+function holdForUnpushed(ctx: HubContext, attempt: Attempt, data: RunnerEventData['attempt.exited']): void {
+  const sha = data.finalSha;
+  if (attempt.taskId === null || !isUnpushed(sha, attempt)) return;
+  appendAttemptLog(ctx, attempt.id, 'note', `the final push of ${sha} failed: ${data.pushError ?? 'no error given'}`);
+  const task = getTask(ctx, attempt.taskId);
+  if (task.currentAttempt !== attempt.id) return;
+  writeTask(ctx, task.id, { dispatchHoldUntil: ctx.now() + ctx.config.dispatchHoldMs });
+  const runner = attempt.runnerId as string;
+  const position = task.workRef ? `${task.workRef} at ${task.workSha ?? 'its tip'}` : ctx.config.mainBranch;
+  addNote(
+    ctx,
+    task.id,
+    'late_work',
+    `The final push of ${attempt.id} failed, so its last commit, ${sha}, is only on runner ${runner}. A successor ` +
+      `on ${runner} starts from that commit; one on another runner starts from ${position}, without it. Once ` +
+      `${runner} pushes the commit, agflow records it as late work.`,
+    'system',
+    attempt.id,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Process exits (design 6.4 exit rows, invariant c; 6.11 Process exits)
 // ---------------------------------------------------------------------------
 
@@ -1030,8 +1161,10 @@ export function exitedInTurn(ctx: HubContext, attempt: Attempt): boolean {
 
 /**
  * attempt.exited: the agent's process is gone, and the trigger table decides what follows (design 6.4). The harvested
- * head is recorded in every case. An attempt that ended already keeps its ending (design 6.3). A holding attempt stays
- * holding, and one being taken over waits for attempt.taken_over (invariant c). Otherwise:
+ * head is recorded in every case. An attempt that ended already keeps its ending (design 6.3). Otherwise its final WIP
+ * becomes its WIP and the work position, and a failed final push of an attempt the exit ends holds the task's dispatch
+ * for the runner's late work (design 6.8, Replacement step 4). A holding attempt stays holding, and one being taken
+ * over waits for attempt.taken_over (invariant c). Otherwise:
  * - a stop the hub asked for ends it with that cause, whatever the runner says caused the exit;
  * - the runner's own stop ends it stopped (infra, with no backoff or signature);
  * - a suspend keeps it open: its lease runs without renewal until the runner says hello again;
@@ -1054,6 +1187,20 @@ export function onExited(
     return null;
   }
   appendAttemptLog(ctx, attempt.id, 'note', how);
+  // The final WIP is the attempt's own, wherever the exit leads (invariant a), and its successor starts from it.
+  if (data.finalWip !== null) recordWip(ctx, attempt, data.finalWip.ref, data.finalWip.sha);
+  const ending = endOnExit(ctx, emit, getAttempt(ctx, attempt.id), data);
+  if (ending && data.pushError !== null) holdForUnpushed(ctx, ending.attempt, data);
+  return ending;
+}
+
+/** The trigger table's exit rows, for an attempt that had not ended. */
+function endOnExit(
+  ctx: HubContext,
+  emit: Emit,
+  attempt: Attempt,
+  data: RunnerEventData['attempt.exited'],
+): Ending | null {
   const stop = attempt.stopRequested;
   if (attempt.status === 'holding' || stop?.cause === 'takeover') return null;
   const actor = byRunner(attempt);

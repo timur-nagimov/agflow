@@ -8,7 +8,7 @@ import {
   type TaskStatus,
   quoteLines,
 } from '@agflow/core';
-import { findAttempt } from './attempt-store';
+import { findAttempt, listAttempts, unpushedHead } from './attempt-store';
 import type { HubContext } from './context';
 import { listEvents } from './events';
 import { currentGoalVersion, getCurrentGoal } from './goal';
@@ -163,17 +163,40 @@ export function isSuccessor(attempt: Pick<Attempt, 'number'>): boolean {
   return attempt.number > 1;
 }
 
+/**
+ * Where the previous attempt's newest work is when its final push failed (design 6.8, Replacement step 4): only on its
+ * runner, which this attempt starts from when it runs there. Null when nothing is unpushed.
+ */
+function unpushedSection(ctx: HubContext, attempt: Attempt): string | null {
+  const task = findTask(ctx, attempt.taskId as string);
+  const [previous] = listAttempts(ctx, { task: attempt.taskId as string }).filter(
+    (other) => other.number < attempt.number,
+  );
+  if (!task || !previous) return null;
+  const unpushed = unpushedHead(ctx, task, previous);
+  if (!unpushed) return null;
+  const { runnerId, sha } = unpushed;
+  const start =
+    attempt.runnerId === runnerId
+      ? 'You start from it.'
+      : `You start without it; agflow records it as late work once ${runnerId} pushes it, and tells you to merge it.`;
+  return `The last commit of ${previous.id}, ${sha}, is only on runner ${runnerId}: its final push failed. ${start}`;
+}
+
 /** The newest handoff note of the task, quoted under a line naming who wrote it, or word that there is none. */
 function handoffSection(ctx: HubContext, attempt: Attempt): string {
   const heading = '## Handoff from the previous attempt';
   const taskId = attempt.taskId as string;
   const pointer = `Call \`get_task\` with id "${taskId}" for the task's other notes and its messages.`;
+  // The hub's own word on unpushed work comes first, so no long note can push it out of the brief.
+  const unpushed = unpushedSection(ctx, attempt);
+  const top = unpushed ? `${heading}\n${unpushed}` : heading;
   const note = listTaskNotes(ctx, taskId)
     .filter((entry) => entry.kind === 'handoff')
     .at(-1);
-  if (!note) return `${heading}\nThe previous attempt wrote no handoff note. ${pointer}`;
+  if (!note) return `${top}\nThe previous attempt wrote no handoff note. ${pointer}`;
   const source = `${note.author} wrote this handoff note${note.attemptId ? ` in attempt ${note.attemptId}` : ''}:`;
-  return `${heading}\n${source}\n${quotedWithin(note.body, BRIEF_HANDOFF_LIMIT)}\n${pointer}`;
+  return `${top}\n${source}\n${quotedWithin(note.body, BRIEF_HANDOFF_LIMIT)}\n${pointer}`;
 }
 
 /** The newest lead handoff (POST /api/lead/handoff, or one the hub assembled), or null. */

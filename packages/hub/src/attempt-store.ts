@@ -10,6 +10,7 @@ import type {
   AttemptStatus,
   FailureClass,
   Fence,
+  Task,
   Vendor,
 } from '@agflow/core';
 import type { HubContext } from './context';
@@ -362,4 +363,44 @@ export function attemptLog(ctx: HubContext, attemptId: string): AttemptLogEntry[
 /** The subject of an attempt's events (design 6.17): its task, or for a lead attempt the attempt itself. */
 export function attemptSubject(attempt: Pick<Attempt, 'id' | 'taskId'>): string {
   return attempt.taskId ?? attempt.id;
+}
+
+// ---------------------------------------------------------------------------
+// Unpushed work (design 6.4 Work position, 6.8 Replacement step 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the task's work position is still the attempt's own (design 6.4): its WIP, or, when it never pushed one,
+ * where it started, which for an attempt that started from main is no position at all.
+ */
+export function positionIsOwn(task: Pick<Task, 'workSha'>, attempt: Pick<Attempt, 'wipSha' | 'startSha'>): boolean {
+  if (attempt.wipSha !== null) return task.workSha === attempt.wipSha;
+  return task.workSha === null || task.workSha === attempt.startSha;
+}
+
+/** A commit the attempt harvested that is neither its pushed WIP nor where it started: its final push failed. */
+export const isUnpushed = (sha: string | null, attempt: Pick<Attempt, 'wipSha' | 'startSha'>): sha is string =>
+  sha !== null && sha !== attempt.wipSha && sha !== attempt.startSha;
+
+/** The harvested head an attempt reported at its exit, even when its push failed. */
+function finalShaOf(ctx: HubContext, attemptId: string): string | null {
+  const row = ctx.db.query('SELECT final_sha FROM attempts WHERE id = $id').get({ id: attemptId }) as {
+    final_sha: string | null;
+  } | null;
+  return row?.final_sha ?? null;
+}
+
+/**
+ * The runner attempt's harvested head while it is only in its runner's vault: its final push failed, no late work
+ * brought it to the task yet, and the task's work position is still the attempt's own. Null otherwise.
+ */
+export function unpushedHead(
+  ctx: HubContext,
+  task: Pick<Task, 'workSha'>,
+  attempt: Attempt,
+): { runnerId: string; sha: string } | null {
+  if (attempt.runnerId === null) return null;
+  const sha = finalShaOf(ctx, attempt.id);
+  if (!isUnpushed(sha, attempt) || sha === task.workSha || !positionIsOwn(task, attempt)) return null;
+  return { runnerId: attempt.runnerId, sha };
 }
