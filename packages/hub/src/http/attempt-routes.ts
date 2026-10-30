@@ -1,9 +1,11 @@
-import { AttemptsQuerySchema } from '@agflow/core';
+import { AttemptsQuerySchema, PrepareInputSchema } from '@agflow/core';
 import { attemptLog, getAttempt, listAttempts } from '../attempt-store';
 import type { HubContext } from '../context';
+import { forbidden } from '../errors';
+import { getPreparation, requestPreparation } from '../prepare';
 import { getSubmission } from '../submissions';
 import type { App } from './app';
-import { principal, readQuery } from './util';
+import { type Ctx, principal, readBody, readQuery } from './util';
 
 export function mountAttemptRoutes(app: App, ctx: HubContext): void {
   app.get('/api/attempts', (c) => {
@@ -31,4 +33,23 @@ export function mountAttemptRoutes(app: App, ctx: HubContext): void {
     const p = principal(c);
     return c.json({ submission: getSubmission(ctx, c.req.param('id'), p.agent?.id ?? null) });
   });
+
+  // Dependency preparation: the agent token names the attempt (design 7.7).
+  app.post('/api/prepare', async (c) => {
+    const { token } = runnerAgent(c);
+    await readBody(c, PrepareInputSchema);
+    return c.json({ request: requestPreparation(ctx, token) }, 202);
+  });
+
+  app.get('/api/prepare/:id', (c) => {
+    const { agentId } = runnerAgent(c);
+    return c.json({ request: getPreparation(ctx, c.req.param('id'), agentId) });
+  });
+}
+
+/** A runner agent calling with its agent token: only it asks for and reads dependency preparations. */
+function runnerAgent(c: Ctx): { agentId: string; token: string } {
+  const p = principal(c);
+  if (p.via !== 'agent' || !p.agent) throw forbidden('only a runner agent prepares dependencies, with its agent token');
+  return { agentId: p.agent.id, token: p.token };
 }

@@ -117,15 +117,20 @@ export function findCommand(ctx: HubContext, id: string): CommandRow | null {
 
 /**
  * Queues a command for the runner, in the caller's transaction. The runner's link is flushed once that transaction
- * commits; a rollback sends nothing.
+ * commits; a rollback sends nothing. A command that names itself, as prepare_dependencies does with its requestId
+ * (X-40), is built from its id.
  */
-export function enqueueCommand(ctx: HubContext, runnerId: string, command: StoredCommand): CommandRow {
+export function enqueueCommand(
+  ctx: HubContext,
+  runnerId: string,
+  command: StoredCommand | ((id: string) => StoredCommand),
+): CommandRow {
   const epoch = hubEpoch(ctx);
   const { seq } = ctx.db
     .query('SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM runner_commands WHERE runner_id = $runnerId AND hub_epoch = $epoch')
     .get({ runnerId, epoch }) as { seq: number };
   const id = `${epoch}-${runnerId}-${seq}`;
-  const stored = withoutToken(command);
+  const stored = withoutToken(typeof command === 'function' ? command(id) : command);
   const { attemptId, fence } = targetOf(stored);
   ctx.db
     .query(
