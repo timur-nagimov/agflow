@@ -68,13 +68,14 @@ import {
   type CommandRow,
   type StoredCommand,
   cancelPendingCommands,
+  cancelPendingDeliveries,
   cancelPendingOfKind,
   enqueueCommand,
   pendingResumeOf,
 } from './commands';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
-import { deliverBacklog, messagesInFlight, retargetDeliveries } from './delivery';
+import { deliverBacklog, messagesInFlight, retargetDeliveries, settleDeliveriesOnEnd } from './delivery';
 import { HubError, badRequest, conflict, notFound } from './errors';
 import type { Emit } from './events';
 import { assembleHandoffNote, handoffWritten } from './handoff';
@@ -610,8 +611,9 @@ const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted'];
  * and queues cleanup_attempt, except for a take-over, whose cleanup follows its hand-back. It clears the holder fields
  * (invariant e) and makes the row's on-exit move, only while the task is claimed or working and names this attempt
  * (X-34); a stop held back for the submission makes its at-once move first. It stores an assembled handoff note,
- * with the attempt's id, when the row asks and the agent wrote none, and empties the seat its lead held. A live
- * chat's attempt only ends: M1's operations move its task. Null when the attempt had already ended.
+ * with the attempt's id, when the row asks and the agent wrote none, and empties the seat its lead held. A runner
+ * attempt's deliveries are settled (settleDeliveriesOnEnd) before its pending commands are cancelled. A live chat's
+ * attempt only ends: M1's operations move its task. Null when the attempt had already ended.
  */
 export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | null {
   return tx(ctx, (emit) => {
@@ -641,6 +643,7 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
     let noteAdded = false;
     let ladder: LadderOutcome | null = null;
     if (attempt.runnerId !== null) {
+      settleDeliveriesOnEnd(ctx, emit, attempt);
       cancelPendingCommands(ctx, attempt.id);
       if (row.endReason !== 'taken_over') {
         enqueueCommand(ctx, attempt.runnerId, { kind: 'cleanup_attempt', attemptId: attempt.id });
@@ -1062,6 +1065,8 @@ export function requestStop(ctx: HubContext, input: StopRequestInput): StopReque
         at: ctx.now(),
       },
     });
+    // From stop_requested on nothing more is pushed to the attempt, and a deliver still pending would be (design 6.7).
+    cancelPendingDeliveries(ctx, attempt.id);
     // A deferred stop may still be dropped, and a move made now could not be.
     if (!deferred) moveAtRequest(ctx, emit, attempt, input);
     const stopping = getAttempt(ctx, attempt.id);

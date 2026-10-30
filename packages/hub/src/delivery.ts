@@ -8,7 +8,7 @@ import { getAttempt } from './attempt-store';
 import { type CommandRow, RESULT_HANDLERS, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
-import { type MessageRow, markDelivered, rowToMessage, unreadFor } from './messages';
+import { type MessageRow, insertMessage, markDelivered, rowToMessage, unreadFor } from './messages';
 
 /** The most characters of message text one deliver command carries (design 6.7, Batching). */
 export const DELIVERY_CHAR_LIMIT = 6000;
@@ -16,9 +16,9 @@ export const DELIVERY_CHAR_LIMIT = 6000;
 /** Runner attempts that take deliveries; starting ones wait for attempt.spawned, holding ones for their resume. */
 const DELIVERABLE: readonly AttemptStatus[] = ['running', 'quota_wait'];
 
-/** Whether the hub pushes messages to this attempt now. */
+/** Whether the hub pushes messages to this attempt now: from stop_requested on, nothing (design 6.7, Endings). */
 function deliverable(attempt: Attempt): boolean {
-  return attempt.runnerId !== null && DELIVERABLE.includes(attempt.status);
+  return attempt.runnerId !== null && DELIVERABLE.includes(attempt.status) && attempt.stopRequested === null;
 }
 
 /** Who a message's authority is: people, the hub, or agents (design 6.7, Authority). */
@@ -101,7 +101,10 @@ export interface FlushResult {
 export function flushDeliveries(ctx: HubContext): FlushResult {
   const statuses = DELIVERABLE.map((status) => `'${status}'`).join(', ');
   const ids = ctx.db
-    .query(`SELECT id FROM attempts WHERE runner_id IS NOT NULL AND status IN (${statuses}) ORDER BY rowid`)
+    .query(
+      `SELECT id FROM attempts
+       WHERE runner_id IS NOT NULL AND status IN (${statuses}) AND stop_requested IS NULL ORDER BY rowid`,
+    )
     .all() as { id: string }[];
   const commands: CommandRow[] = [];
   let dueAt: number | null = null;
@@ -200,6 +203,49 @@ export function onAcknowledged(ctx: HubContext, emit: Emit, attempt: Attempt, me
   );
   for (const id of ids) ack.run({ now: ctx.now(), id, agentId: attempt.agentId });
   emit({ type: 'message.acknowledged', actor: `agent:${attempt.agentId}`, data: { ids } });
+}
+
+/**
+ * What a worker never acknowledged, oldest first: messages delivered to its agent with no acknowledgement, those in
+ * flight to the attempt, and those it never got that were sent to the agent itself or to everyone since it was made
+ * (unreadFor's rule; a successor is a new agent, so a broadcast it predates would reach nobody). Its task's own
+ * thread is left out: the successor reads that anyway.
+ */
+const UNACKNOWLEDGED_SQL = `
+SELECT m.* FROM messages m
+WHERE m.target != $thread AND m.sender != $self AND (
+  EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.agent_id = $agentId AND d.acked_at IS NULL)
+  OR EXISTS (SELECT 1 FROM pending_deliveries p WHERE p.message_id = m.id AND p.attempt_id = $attemptId)
+  OR ((m.target = $self OR (m.target = 'all' AND m.created_at >= $createdAt))
+    AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.agent_id = $agentId))
+)
+ORDER BY m.id`;
+
+/**
+ * Settles a runner attempt's deliveries as it ends (design 6.7, Endings), before the ending's cancel frees the rows
+ * of its pending commands. A worker's unacknowledged messages are copied, from their sender, to its task's thread
+ * (task:<id>), so the successor reads them. A lead's unacknowledged deliveries of lead messages are deleted, so the
+ * next seat holder gets them unread. Either way the attempt's rows go.
+ */
+export function settleDeliveriesOnEnd(ctx: HubContext, emit: Emit, attempt: Attempt): void {
+  if (attempt.runnerId === null) return;
+  const { agentId, taskId } = attempt;
+  if (taskId !== null) {
+    const thread = `task:${taskId}`;
+    const { createdAt } = getAgent(ctx, agentId);
+    const rows = ctx.db
+      .query(UNACKNOWLEDGED_SQL)
+      .all({ thread, self: `agent:${agentId}`, agentId, attemptId: attempt.id, createdAt }) as MessageRow[];
+    for (const row of rows) insertMessage(ctx, emit, { from: row.sender, to: thread, body: row.body, taskId });
+  } else {
+    ctx.db
+      .query(
+        `DELETE FROM deliveries WHERE agent_id = $agentId AND acked_at IS NULL
+           AND message_id IN (SELECT id FROM messages WHERE target = 'lead')`,
+      )
+      .run({ agentId });
+  }
+  ctx.db.query('DELETE FROM pending_deliveries WHERE attempt_id = $attemptId').run({ attemptId: attempt.id });
 }
 
 /**

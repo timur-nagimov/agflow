@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { type Attempt, type Message, type RawRunnerEvent, formatMessage } from '@agflow/core';
 import { getAgent } from '../src/agents';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
-import { onSpawned, resumeAttempt, startRunnerAttempt } from '../src/attempts';
+import { endAttempt, onSpawned, requestStop, resumeAttempt, startRunnerAttempt } from '../src/attempts';
 import {
   type CommandRow,
   cancelPendingOfKind,
@@ -22,7 +22,7 @@ import {
 } from '../src/delivery';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
-import { type NewMessage, sendMessage, takeInbox, unreadFor } from '../src/messages';
+import { type NewMessage, listMessages, sendMessage, takeInbox, unreadFor } from '../src/messages';
 import { claimTask, createTasks } from '../src/tasks';
 import { addAgent, addRunner, addRunnerAttempt, addRunnerLead, createTestContext, newTask } from './helpers';
 
@@ -432,5 +432,157 @@ describe('watchDeliveries', () => {
     clock.advance(20);
     await Bun.sleep(60);
     expect(delivers(ctx, first.attempt)).toHaveLength(1);
+  });
+});
+
+describe('deliveries when attempts end', () => {
+  test('from stop_requested on nothing is pushed, and a pending deliver is cancelled', () => {
+    const { ctx, held, flush } = setup();
+    const first = send(ctx, { from: 'user:alice', to: `agent:${held.agent.id}`, body: 'one' });
+    flush();
+    const [deliver] = delivers(ctx, held.attempt);
+    requestStop(ctx, { attemptId: held.attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    expect(findCommand(ctx, deliver?.id as string)?.status).toBe('cancelled');
+    expect(rowsOf(ctx, held.attempt.id)).toEqual([]);
+    send(ctx, { from: 'user:alice', to: `agent:${held.agent.id}`, body: 'two' });
+    expect(flush().commands).toEqual([]);
+    expect(unreadFor(ctx, getAgent(ctx, held.agent.id)).map((message) => message.id)).toContain(first.id);
+  });
+
+  test('a deliver already sent keeps its rows at a stop request, so its report is recorded', () => {
+    const { ctx, held, flush } = setup();
+    const message = send(ctx, { from: 'user:alice', to: `agent:${held.agent.id}`, body: 'Do it now.' });
+    flush();
+    const [deliver] = delivers(ctx, held.attempt);
+    markSent(ctx, deliver?.id as string);
+    requestStop(ctx, { attemptId: held.attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    // Cancelled, so it is never sent again; the runner may have injected it already.
+    expect(findCommand(ctx, deliver?.id as string)?.status).toBe('cancelled');
+    expect(rowsOf(ctx, held.attempt.id)).toEqual([[message.id, deliver?.id]]);
+    const { id: attemptId, fence } = held.attempt;
+    const events: RawRunnerEvent[] = [
+      { seq: 1, at: 0, type: 'attempt.delivered', attemptId, fence, data: { messageIds: [message.id] } },
+      { seq: 2, at: 0, type: 'attempt.acknowledged', attemptId, fence, data: { messageIds: [message.id] } },
+    ];
+    applyRunnerEvents(ctx, held.runner.id, { outboxEpoch: 'outbox-1', events }, { restoreReplay: false });
+    expect(deliveriesOf(ctx, held.agent.id)).toEqual([{ message_id: message.id, acked_at: ctx.now() }]);
+    expect(takeInbox(ctx, getAgent(ctx, held.agent.id))).toEqual([]);
+    endAttempt(ctx, { attemptId, trigger: 'stop' });
+    const copies = listMessages(ctx, { target: `task:${held.task.id}` });
+    expect(copies.filter((copy) => copy.body === message.body)).toEqual([]);
+  });
+
+  test("a lead message already sent to a stopping lead is not given to the next seat holder once acknowledged", () => {
+    const { ctx, flush } = setup();
+    const lead = addRunnerLead(ctx);
+    const message = send(ctx, { from: 'user:alice', to: 'lead', body: 'Plan the next step.' });
+    flush();
+    const [deliver] = delivers(ctx, lead.attempt);
+    markSent(ctx, deliver?.id as string);
+    requestStop(ctx, { attemptId: lead.attempt.id, cause: 'rotation', reason: 'rotate', by: 'system' });
+    const { id: attemptId, fence, runnerId } = lead.attempt;
+    const events: RawRunnerEvent[] = [
+      { seq: 1, at: 0, type: 'attempt.delivered', attemptId, fence, data: { messageIds: [message.id] } },
+      { seq: 2, at: 0, type: 'attempt.acknowledged', attemptId, fence, data: { messageIds: [message.id] } },
+    ];
+    applyRunnerEvents(ctx, runnerId as string, { outboxEpoch: 'outbox-1', events }, { restoreReplay: false });
+    expect(deliveriesOf(ctx, lead.agent.id)).toEqual([{ message_id: message.id, acked_at: ctx.now() }]);
+    endAttempt(ctx, { attemptId, trigger: 'rotation' });
+    const next = addRunnerLead(ctx);
+    expect(unreadFor(ctx, getAgent(ctx, next.agent.id))).toEqual([]);
+  });
+
+  test('a resumed attempt that is stopping gets no backlog on spawned', () => {
+    const { ctx, held } = setup();
+    requestStop(ctx, { attemptId: held.attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    resumeAttempt(ctx, { attemptId: held.attempt.id, cause: 'runner_restart', prompt: 'Go on.' });
+    send(ctx, { from: 'user:alice', to: `agent:${held.agent.id}`, body: 'one' });
+    tx(ctx, (emit) => onSpawned(ctx, emit, getAttempt(ctx, held.attempt.id), SPAWNED));
+    expect(delivers(ctx, held.attempt)).toEqual([]);
+  });
+
+  test("an ending drops the attempt's rows", () => {
+    const { ctx, held, flush } = setup();
+    send(ctx, { from: 'user:alice', to: `agent:${held.agent.id}`, body: 'one' });
+    flush();
+    const [deliver] = delivers(ctx, held.attempt);
+    // Its result arrived, so the ending's cancel leaves it alone; the row goes with the ending.
+    recordResult(ctx, held.runner.id, { commandId: deliver?.id as string, ok: true });
+    endAttempt(ctx, { attemptId: held.attempt.id, trigger: 'crashed', error: 'boom' });
+    expect(rowsOf(ctx, held.attempt.id)).toEqual([]);
+  });
+
+  test("a worker's unacknowledged messages are copied to its task's thread", () => {
+    const { ctx, held, flush } = setup();
+    const to = `agent:${held.agent.id}`;
+    const acked = send(ctx, { from: 'user:alice', to, body: 'read and done' });
+    const unacked = send(ctx, { from: 'user:alice', to, body: 'delivered, not acknowledged' });
+    const thread = send(ctx, { from: 'agent:A-9', to: `task:${held.task.id}`, body: 'already in the thread' });
+    flush();
+    const attempt = getAttempt(ctx, held.attempt.id);
+    tx(ctx, (emit) => onDelivered(ctx, emit, attempt, [acked.id, unacked.id, thread.id]));
+    tx(ctx, (emit) => onAcknowledged(ctx, emit, attempt, [acked.id]));
+    const inFlight = send(ctx, { from: 'agent:A-9', to: 'all', body: 'in flight' });
+    flush();
+    const unread = send(ctx, { from: 'system', to, body: 'never pushed' });
+    endAttempt(ctx, { attemptId: held.attempt.id, trigger: 'crashed', error: 'boom' });
+    const copies = listMessages(ctx, { target: `task:${held.task.id}` })
+      .filter((message) => message.id !== thread.id)
+      .reverse()
+      .map((message) => [message.from, message.body, message.taskId]);
+    expect(copies).toEqual([
+      ['user:alice', unacked.body, held.task.id],
+      ['agent:A-9', inFlight.body, held.task.id],
+      ['system', unread.body, held.task.id],
+    ]);
+  });
+
+  test('broadcasts a worker never got are copied for its successor, which is a new agent', () => {
+    const { ctx, held, flush } = setup();
+    const before = send(ctx, { from: 'user:alice', to: 'all', body: 'in flight at the stop' });
+    flush();
+    requestStop(ctx, { attemptId: held.attempt.id, cause: 'replace', reason: 'start over', by: 'user:alice' });
+    const during = send(ctx, { from: 'user:alice', to: 'all', body: 'sent while it stops' });
+    endAttempt(ctx, { attemptId: held.attempt.id, trigger: 'replace' });
+    const thread = `task:${held.task.id}`;
+    const copies = listMessages(ctx, { target: thread }).reverse();
+    expect(copies.map((copy) => [copy.from, copy.body])).toEqual([
+      ['user:alice', before.body],
+      ['user:alice', during.body],
+    ]);
+    const successor = startRunnerAttempt(ctx, {
+      runnerId: held.runner.id,
+      taskId: held.task.id,
+      role: 'worker',
+      vendor: 'claude',
+    });
+    const unread = unreadFor(ctx, getAgent(ctx, successor.attempt.agentId));
+    expect(unread.filter((message) => message.to === thread).map((message) => message.body)).toEqual([
+      before.body,
+      during.body,
+    ]);
+  });
+
+  test("a runner lead's unacknowledged lead deliveries are deleted, so the next seat holder gets them unread", () => {
+    const { ctx, flush } = setup();
+    const lead = addRunnerLead(ctx);
+    const acked = send(ctx, { from: 'user:alice', to: 'lead', body: 'done with' });
+    const unacked = send(ctx, { from: 'user:alice', to: 'lead', body: 'still open' });
+    flush();
+    const attempt = getAttempt(ctx, lead.attempt.id);
+    tx(ctx, (emit) => onDelivered(ctx, emit, attempt, [acked.id, unacked.id]));
+    tx(ctx, (emit) => onAcknowledged(ctx, emit, attempt, [acked.id]));
+    const inFlight = send(ctx, { from: 'user:alice', to: 'lead', body: 'in flight' });
+    // A message to the lead agent itself is its own, not the seat's: its delivery stays.
+    const direct = send(ctx, { from: 'user:alice', to: `agent:${lead.agent.id}`, body: 'just for you' });
+    flush();
+    tx(ctx, (emit) => onDelivered(ctx, emit, getAttempt(ctx, lead.attempt.id), [direct.id]));
+    endAttempt(ctx, { attemptId: lead.attempt.id, trigger: 'crashed', error: 'boom' });
+    expect(deliveriesOf(ctx, lead.agent.id).map((row) => row.message_id)).toEqual([acked.id, direct.id]);
+    // Nothing is copied anywhere for a lead.
+    expect(listMessages(ctx, {}).filter((message) => message.body === unacked.body)).toHaveLength(1);
+    const next = addRunnerLead(ctx);
+    const unread = unreadFor(ctx, getAgent(ctx, next.agent.id));
+    expect(unread.map((message) => message.id)).toEqual([unacked.id, inFlight.id]);
   });
 });

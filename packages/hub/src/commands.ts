@@ -265,6 +265,23 @@ export function cancelPendingOfKind(ctx: HubContext, attemptId: string, kind: Ru
 }
 
 /**
+ * Cancels the attempt's pending delivers at a stop request, so nothing is sent again from stop_requested on (design
+ * 6.7, Endings). Only those never sent free their rows: one that went out may already be in the session, and its rows
+ * stay until attempt.delivered, a new fence that carries them, or the ending settles them. Returns how many.
+ */
+export function cancelPendingDeliveries(ctx: HubContext, attemptId: string): number {
+  const rows = ctx.db
+    .query(
+      `UPDATE runner_commands SET status = 'cancelled', done_at = $now
+       WHERE attempt_id = $attemptId AND kind = 'deliver' AND status = 'pending'
+       RETURNING id, sent_at`,
+    )
+    .all({ attemptId, now: ctx.now() }) as { id: string; sent_at: number | null }[];
+  freeDeliveries(ctx, rows.filter((row) => row.sent_at === null).map((row) => row.id));
+  return rows.length;
+}
+
+/**
  * Cancels the runner's pending update_settings, when the hub adopts a newer snapshot from its hello: every one of them
  * carries an older version, which would undo the adopted settings on the runner. Returns how many.
  */
