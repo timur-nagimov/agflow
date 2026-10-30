@@ -226,7 +226,8 @@ describe('the retry ladder', () => {
     const signature = third.attempt.failureSignature as string;
     expect(third.task?.blockedReason).toContain(signature);
     for (const to of ['lead', 'humans']) {
-      const [told] = messagesTo(ctx, to);
+      // The lost attempt told the lead its task went stale first.
+      const told = messagesTo(ctx, to).find((message) => message.body.includes('blocked for a re-plan'));
       expect(told?.body).toContain(`> ${signature}`);
       expect(told?.taskId).toBe(taskId);
     }

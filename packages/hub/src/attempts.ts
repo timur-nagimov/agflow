@@ -1,11 +1,14 @@
 // Runner attempts (design 6.4): the one transaction that starts one, the AttemptSpec its start_attempt carries, the
 // re-fence that resumes one, stop requests and their timeout, endAttempt, the one path every ending takes, the retry
-// ladder that follows an ending (design 6.9), and what the attempt events a runner reports do (design 6.3).
+// ladder that follows an ending (design 6.9), what the attempt events a runner reports do (design 6.3), and runner
+// leases with the heartbeat facts that renew them (design 6.4, 6.8).
 import {
   type Agent,
   type AgentRole,
   type Attempt,
+  type AttemptFacts,
   type AttemptSpec,
+  type AttemptStatus,
   COUNTED_CLASSES,
   ENDING_MOVES,
   type EndingTrigger,
@@ -21,6 +24,7 @@ import {
   attemptId,
   backoffApplies,
   branchEpoch,
+  compareFence,
   computeToolCaps,
   countedAttempts,
   endingClass,
@@ -43,6 +47,7 @@ import {
   type ResumeLogEntry,
   appendAttemptLog,
   attemptSubject,
+  findAttempt,
   getAttempt,
   insertAttempt,
   issueFence,
@@ -498,6 +503,7 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
       setAgentTask(ctx, attempt.agentId, null);
       if (task) {
         ({ task, moved } = moveOnEnd(ctx, emit, task, attempt, input.trigger, actor));
+        if (moved[0] === 'stale') tellLeadStale(ctx, emit, task, attempt);
         noteAdded = addAssembledNote(ctx, attempt, input.trigger);
         // The ladder and the failure-signature rule run only when a move to ready actually happened (design 6.4).
         if (moved.at(-1) === 'ready') {
@@ -545,6 +551,21 @@ function moveOnEnd(
     current = move(ctx, emit, current, status, actor, { changes, data: { attemptId: attempt.id } });
   }
   return { task: current, moved: path };
+}
+
+/**
+ * A task that went stale wakes the lead, as M1's lease sweep does (design 6.11). Only hub-known fields are named, so
+ * nothing an agent wrote is unquoted.
+ */
+function tellLeadStale(ctx: HubContext, emit: Emit, task: Task, attempt: Attempt): void {
+  insertMessage(ctx, emit, {
+    from: 'system',
+    to: 'lead',
+    taskId: task.id,
+    body:
+      `${named(task)} went stale: its runner attempt ${attempt.id} on ${attempt.runnerId ?? 'unknown'} was lost (no ` +
+      'heartbeat for the runner lease). It is ready again.',
+  });
 }
 
 /** Stores the assembled handoff note when the trigger's row asks for one (design 6.8). */
@@ -1055,4 +1076,79 @@ export function onExited(
     }
   }
   return endAttempt(ctx, { attemptId: attempt.id, trigger: 'crashed', error, actor });
+}
+
+// ---------------------------------------------------------------------------
+// Runner leases and heartbeat facts (design 6.4 Runner lease, Lease expiry; 6.8 Facts, Freshness)
+// ---------------------------------------------------------------------------
+
+/** The statuses that hold a runner lease: the agent's process is there, or about to be. */
+const LEASED: readonly AttemptStatus[] = ['starting', 'running', 'quota_wait'];
+
+/**
+ * A heartbeat's facts (design 6.4, 6.8). Each attempt listed that runs on this runner, holds a lease and is at its
+ * current fence gets its lease renewed for runnerLeaseMs and its agent seen now, and its facts are stored with the
+ * time they arrived, its phase and its active time. Facts at another fence say nothing about the attempt as the hub
+ * has it, and are ignored. Returns how many attempts it renewed.
+ */
+export function renewLeases(ctx: HubContext, runnerId: string, facts: readonly AttemptFacts[]): number {
+  const now = ctx.now();
+  let renewed = 0;
+  for (const fact of facts) {
+    const attempt = findAttempt(ctx, fact.attemptId);
+    if (!attempt || attempt.runnerId !== runnerId || !LEASED.includes(attempt.status)) continue;
+    if (compareFence(fact.fence, attempt.fence) !== 0) continue;
+    updateAttempt(ctx, attempt.id, {
+      leaseExpiresAt: now + ctx.config.runnerLeaseMs,
+      facts: fact,
+      factsAt: now,
+      phase: fact.phase,
+      activeMs: fact.activeMs,
+    });
+    ctx.db.query('UPDATE agents SET last_seen_at = $now WHERE id = $id').run({ now, id: attempt.agentId });
+    renewed += 1;
+  }
+  return renewed;
+}
+
+/**
+ * A new link from the runner: the facts its earlier link reported stay for the pages but are no longer fresh, so no
+ * stall rule judges by them (design 6.8, Freshness).
+ */
+export function markFactsStale(ctx: HubContext, runnerId: string): void {
+  ctx.db.query('UPDATE attempts SET facts_at = NULL WHERE runner_id = $runnerId').run({ runnerId });
+}
+
+/**
+ * Whether the attempt's facts may be judged (design 6.8, Freshness): they came on the runner's current link within the
+ * last two heartbeat intervals. Their ages are as of that heartbeat; nothing extrapolates them.
+ */
+export function factsAreFresh(ctx: HubContext, attemptId: string): boolean {
+  const row = ctx.db.query('SELECT facts_at FROM attempts WHERE id = $id').get({ id: attemptId }) as {
+    facts_at: number | null;
+  } | null;
+  return row?.facts_at != null && ctx.now() - row.facts_at <= 2 * ctx.config.heartbeatMs;
+}
+
+/**
+ * Ends every runner attempt whose lease ran out (design 6.4, Lease expiry), each in its own transaction: lost (infra),
+ * its tokens revoked, and a held task through stale back to ready, with the backoff and an assembled handoff note. A
+ * take-over in flight ends taken_over instead, as its row says. When the runner comes back, welcome.stop names the
+ * attempt. Returns how many ended.
+ */
+export function expireRunnerLeases(ctx: HubContext): number {
+  const now = ctx.now();
+  const due = listAttempts(ctx, { status: [...LEASED] }).filter(
+    (attempt) => attempt.runnerId !== null && attempt.leaseExpiresAt !== null && attempt.leaseExpiresAt <= now,
+  );
+  let ended = 0;
+  for (const attempt of due) {
+    try {
+      const trigger = attempt.stopRequested?.cause === 'takeover' ? 'takeover' : 'lost';
+      if (endAttempt(ctx, { attemptId: attempt.id, trigger })) ended += 1;
+    } catch (error) {
+      console.error(`ending attempt ${attempt.id} at its lease expiry failed`, error);
+    }
+  }
+  return ended;
 }

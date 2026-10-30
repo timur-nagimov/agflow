@@ -2,6 +2,7 @@
 // position and the replay, inbound events, and the commands that follow. The transport is the caller's: Bun's
 // WebSocket handlers or an in-memory test connection hand the gateway a LinkSocket and every message and close.
 import { CLOSE_CODES, type HubMessage, type RunnerMessage, parseRunnerMessage } from '@agflow/core';
+import { markFactsStale, renewLeases } from './attempts';
 import { slideSession } from './auth';
 import { markSent, pendingCommands, recordResult, toWireCommand } from './commands';
 import { type HubContext, type RunnerLink, afterCommit, tx } from './context';
@@ -158,7 +159,10 @@ export class Gateway implements RunnerLink {
         return;
       case 'heartbeat':
         try {
-          tx(ctx, () => recordHeartbeatInfo(ctx, runnerId, message));
+          tx(ctx, () => {
+            recordHeartbeatInfo(ctx, runnerId, message);
+            renewLeases(ctx, runnerId, message.attempts);
+          });
         } catch (error) {
           // The link is alive whatever the hub could store about it.
           this.log(`recording a heartbeat from runner ${runnerId} failed`, error);
@@ -272,6 +276,8 @@ export class Gateway implements RunnerLink {
         afterCommit(ctx, () => this.attach(connection, runnerId, hello, welcome.message as Welcome));
         recordHelloInfo(ctx, runnerId, hello);
         reconcileHelloSettings(ctx, runnerId, hello.settings);
+        // Facts count only from the runner's current link.
+        markFactsStale(ctx, runnerId);
         slideSession(ctx, sessionHash);
         const ackedSeq = acknowledgePosition(ctx, runnerId, hello.outboxEpoch, hello.firstSeq);
         markLinked(ctx, emit, runnerId, {
@@ -387,7 +393,10 @@ export class Gateway implements RunnerLink {
     }
   }
 
-  /** Forgets the link; when it was the runner's current link, the runner goes offline (or needs_login). */
+  /**
+   * Forgets the link; when it was the runner's current link, the runner goes offline (or needs_login) and its facts
+   * are no longer fresh.
+   */
   private drop(connection: RunnerConnection): void {
     if (connection.closed) return;
     connection.closed = true;
@@ -396,8 +405,11 @@ export class Gateway implements RunnerLink {
     if (runnerId === null || this.links.get(runnerId) !== connection) return;
     this.links.delete(runnerId);
     try {
-      // A replaced link's runner already names its new link, so only the current one marks it offline.
-      tx(this.ctx, (emit) => markUnlinked(this.ctx, emit, runnerId, connection.id));
+      // A replaced link's runner already names its new link, so only the current one marks it offline. An unheard
+      // runner's attempts are judged only by their leases, so what it reported is no longer fresh (design 6.8).
+      tx(this.ctx, (emit) => {
+        if (markUnlinked(this.ctx, emit, runnerId, connection.id)) markFactsStale(this.ctx, runnerId);
+      });
     } catch (error) {
       this.log(`marking runner ${runnerId} offline failed`, error);
     }
