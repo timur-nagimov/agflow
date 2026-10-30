@@ -8,6 +8,7 @@ export * from './env';
 export * from './git/clone';
 export * from './git/harvest';
 export * from './git/protect';
+export * from './git/push';
 export * from './git/run';
 export * from './git/snapshot';
 export * from './git/vault';
