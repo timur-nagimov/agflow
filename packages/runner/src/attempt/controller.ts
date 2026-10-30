@@ -16,6 +16,8 @@
 // When the agent exits, the exit job (exit.ts) runs on the queue: an exit the runner did not request first kills
 // every recorded group and sweeps the clone (X-15); then the final harvest and push, the transcript tail, the
 // voided approvals, and only then attempt.exited. Work the final push could not place goes to a late-work ref.
+// Stops, holds and the runner's own stops (stop.ts) run on the queue too: they prepare the agent (an interrupt, a
+// handoff turn, or the end of the running turn), run the stop ladder and do the same exit work, once per process.
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -54,10 +56,11 @@ import type { RunnerPaths } from '../paths';
 import type { SerialQueue } from '../queue';
 import { boundedWait, type ProcessIdentity } from '../processes';
 import type { DependencyPreparer, Notifier, RunnerHealth } from '../seams';
-import { killAndSweep } from '../stop-ladder';
+import { killAndSweep, runStopLadder } from '../stop-ladder';
 import { clipPushError, EVENTS_AFTER_EXIT_MS, LateWorkRetries, pushWithRetries, uploadTranscriptTail } from './exit';
 import { buildLaunch, ProcessRegistration } from './launch';
 import { ACTIVITY_SUMMARY_MAX, clip, EventPump, type PumpEvent } from './pump';
+import { prepareForStop, RUNNER_STOP_REASON, type StopOptions, type StopOutcome, TurnWatch } from './stop';
 import {
   canPushWip,
   collectWork,
@@ -123,6 +126,8 @@ export interface ControllerDeps {
   wipFailures: WipFailures;
   /** Where transcript tails go: POST /api/runner/attempts/:id/transcript. */
   hub: Pick<RunnerHubHttp, 'uploadTranscript'>;
+  /** How long a handoff note is waited for: welcome.timings.handoffMs, or runner.json's handoff before a welcome. */
+  handoffMs(): number;
 }
 
 /** The agent process of the attempt's current start or resume, while the controller follows it. */
@@ -135,12 +140,18 @@ interface LiveAgent {
   registration: ProcessRegistration;
   facts: FactsTracker;
   pump: EventPump;
+  /** Its turns, as stops wait on them. */
+  watch: TurnWatch;
   /** The runner-owned directory of the facts' fingerprint index. */
   factsDir: string;
   /** Settles once the agent's events have ended. */
   events: Promise<void>;
   /** Settles once the agent's events have ended and its exit was dealt with. */
   done: Promise<void>;
+  /** A stop or hold arrived for it: nothing more is sent to it. */
+  stopping: boolean;
+  /** The handoff notes it had written when the first stop arrived; a stop asks again unless one came after. */
+  handoffsAtStop: number | null;
   /** Its exit was dealt with: attempt.exited is reported once per process. */
   finished: boolean;
 }
@@ -183,6 +194,11 @@ export type LiveOutcome = { ok: true } | { ok: false; error: 'stale_fence' | 'no
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Whether the agent wrote a handoff note after its first stop arrived: an older one does not spare the handoff turn. */
+function handoffSinceStop(live: LiveAgent): boolean {
+  return live.pump.handoffs > (live.handoffsAtStop ?? live.pump.handoffs);
 }
 
 /** Runs one step of a start, its error prefixed with what failed. */
@@ -328,6 +344,57 @@ export class AttemptController {
     return { applied: await live.pump.answer(command.approvalId, command.decision, command.reason) };
   }
 
+  /**
+   * stop_attempt (design 6.8): the interrupt when a tool is in flight or interruptFirst is set, the handoff turn when
+   * asked for, then the stop ladder and the exit work. keepClone needs nothing here: a stop never removes the clone or
+   * the session, cleanup_attempt does.
+   */
+  stop(command: {
+    fence: Fence;
+    reason: string;
+    handoff: boolean;
+    interruptFirst: boolean;
+    keepClone: boolean;
+  }): Promise<StopOutcome> {
+    const { fence, reason, handoff, interruptFirst } = command;
+    if (this.isCurrentFence(fence)) this.stopArriving();
+    return this.enqueue(async () => {
+      const live = this.liveAt(fence);
+      if (!('pump' in live)) return live;
+      return this.stopLive(live, { handoff, interruptFirst, reason, cause: null });
+    });
+  }
+
+  /**
+   * hold_attempt (design 6.13): no further continuation; the running turn may end by itself, for at most hold, so the
+   * agent sees its submit's result; then the agent is stopped without a handoff turn, its WIP pushed, and its clone
+   * and session kept.
+   */
+  hold(command: { fence: Fence }): Promise<StopOutcome> {
+    if (this.isCurrentFence(command.fence)) this.stopArriving();
+    return this.enqueue(async () => {
+      const live = this.liveAt(command.fence);
+      if (!('pump' in live)) return live;
+      live.stopping = true;
+      await boundedWait(live.watch.turnEnded(), this.deps.config().timings.hold);
+      return this.stopLive(live, { handoff: false, interruptFirst: false, reason: 'the attempt is held', cause: null });
+    });
+  }
+
+  /**
+   * The runner's own stops (X-7, X-41): runner_stop with a handoff turn (agflow runner stop and uninstall) or without
+   * one (the disk and battery guards), and suspend, which records the attempt as suspended. The exit reports cause.
+   */
+  stopForRunner(cause: ExitCause, options: { handoff: boolean }): Promise<StopOutcome> {
+    this.stopArriving();
+    return this.enqueue(async () => {
+      const live = this.live;
+      if (live === null) return { ok: false, error: 'not_running' };
+      const { handoff } = options;
+      return this.stopLive(live, { handoff, interruptFirst: false, reason: RUNNER_STOP_REASON, cause });
+    });
+  }
+
   /** The hub told the runner the attempt's fence is no longer current: its WIP ref is not pushed again. */
   markFenced(): void {
     this.standing.fenced = true;
@@ -352,6 +419,15 @@ export class AttemptController {
       const spec = this.current;
       if (held !== null && spec !== null) await this.pushWork(spec, held);
     });
+  }
+
+  /**
+   * Whether a command's fence is the attempt's: its current one, or its record's before a start. Only such a stop or
+   * hold counts as arrived before its turn on the queue; a stale one is refused there and changes nothing.
+   */
+  private isCurrentFence(fence: Fence): boolean {
+    const current = this.currentFence ?? this.deps.store.get(this.attemptId)?.fence ?? null;
+    return current !== null && compareFence(fence, current) === 0;
   }
 
   /** The live agent, when the fence is the attempt's current one. */
@@ -502,9 +578,12 @@ export class AttemptController {
       registration,
       facts,
       pump,
+      watch: new TurnWatch(),
       factsDir,
       events: Promise.resolve(),
       done: Promise.resolve(),
+      stopping: false,
+      handoffsAtStop: null,
       finished: false,
     };
     this.live = live;
@@ -544,6 +623,8 @@ export class AttemptController {
     if (spec === null || spec.role !== 'worker' || spec.branch === null || spec.wipRef === null || clone === null) {
       return { status: 'skipped' };
     }
+    // A timer job queued behind the exit: the final push had the last word.
+    if (this.standing.exited) return { status: 'skipped' };
     let work: WorkResult;
     try {
       work = await this.collect(spec, clone, spec.branch);
@@ -745,18 +826,25 @@ export class AttemptController {
    */
   private async readEvents(live: LiveAgent): Promise<void> {
     const iterator = live.session.events[Symbol.asyncIterator]();
-    for (;;) {
-      let next: IteratorResult<AgentEvent>;
-      try {
-        next = await iterator.next();
-      } catch (error) {
-        this.deps.logger.error("the agent's events failed", { attemptId: this.attemptId, error: describe(error) });
-        return;
+    try {
+      for (;;) {
+        let next: IteratorResult<AgentEvent>;
+        try {
+          next = await iterator.next();
+        } catch (error) {
+          this.deps.logger.error("the agent's events failed", { attemptId: this.attemptId, error: describe(error) });
+          return;
+        }
+        // Events read after the exit was dealt with come from a process that still holds the agent's pipes: they
+        // would report a dead attempt as live, or under a resumed process's fence.
+        if (next.done || live.finished) return;
+        const event = next.value;
+        await this.guarded(event, () => live.facts.observe(event));
+        await this.guarded(event, () => (event.type === 'started' ? this.spawned(live, event) : live.pump.handle(event)));
+        await this.guarded(event, () => live.watch.observe(event));
       }
-      if (next.done) return;
-      const event = next.value;
-      await this.guarded(event, () => live.facts.observe(event));
-      await this.guarded(event, () => (event.type === 'started' ? this.spawned(live, event) : live.pump.handle(event)));
+    } finally {
+      live.watch.end();
     }
   }
 
@@ -770,6 +858,46 @@ export class AttemptController {
     }
   }
 
+  /** A stop or hold arrives: the live agent gets nothing more, even before the stop's turn on the queue. */
+  private stopArriving(): void {
+    const live = this.live;
+    if (live !== null) {
+      live.stopping = true;
+      live.handoffsAtStop ??= live.pump.handoffs;
+    }
+  }
+
+  /** Prepares the live agent as the options say, runs the stop ladder, then the exit work. */
+  private async stopLive(live: LiveAgent, options: StopOptions): Promise<StopOutcome> {
+    live.stopping = true;
+    live.handoffsAtStop ??= live.pump.handoffs;
+    const { timings } = this.deps.config();
+    await prepareForStop({
+      session: live.session,
+      watch: live.watch,
+      toolInFlight: () => live.pump.toolInFlight,
+      handoffWritten: () => handoffSinceStop(live),
+      options,
+      interruptMs: timings.stopInterrupt,
+      handoffMs: this.deps.handoffMs(),
+    });
+    this.setPhase('stopping');
+    const ladder = await runStopLadder({
+      session: live.session,
+      turnEnded: () => live.watch.turnEnded(),
+      groups: () => this.groupsOf(live),
+      clone: live.workspace.clone,
+      timings,
+    });
+    await boundedWait(live.events, EVENTS_AFTER_EXIT_MS);
+    // Killed, with its exit not reported in time.
+    const exit = ladder.exit ?? { code: null, signal: ladder.stoppedBy === 'sigkill' ? 'SIGKILL' : null };
+    const context = { stoppedBy: ladder.stoppedBy, cause: options.cause, requested: true };
+    const exitedSeq = await this.finishExit(live, exit, context);
+    if (exitedSeq === null) return { ok: false, error: 'not_running' };
+    return { ok: true, stoppedBy: ladder.stoppedBy, exitedSeq };
+  }
+
   /** The groups a kill reaches: the recorded ones and those the descendant snapshots found. */
   private async groupsOf(live: LiveAgent): Promise<ProcessIdentity[]> {
     await live.pump.settled();
@@ -780,10 +908,10 @@ export class AttemptController {
    * Everything after the agent's exit, on the serial queue and once per process: for an unrequested exit the kill
    * and sweep first, then the final work, the transcript tail and the voided approvals, and attempt.exited last. A
    * step that fails still leads to attempt.exited, its pushError naming the failure, and to the cleanup, so the
-   * attempt never stays live without a process.
+   * attempt never stays live without a process. Gives attempt.exited's seq; null when the exit was already dealt with.
    */
-  private async finishExit(live: LiveAgent, exit: ExitInfo, context: ExitContext): Promise<void> {
-    if (live.finished) return;
+  private async finishExit(live: LiveAgent, exit: ExitInfo, context: ExitContext): Promise<number | null> {
+    if (live.finished) return null;
     live.finished = true;
     const { logger } = this.deps;
     this.stopWipTimer();
@@ -798,7 +926,7 @@ export class AttemptController {
     // Work left for a late-work ref is on record before the exit is reported, so a restart still pushes it.
     if (final.late !== null) this.recordLateWork(final.late.sha);
     try {
-      this.report(this.currentFence ?? live.spec.fence, {
+      return this.report(this.currentFence ?? live.spec.fence, {
         type: 'attempt.exited',
         data: {
           code: exit.code,
@@ -1083,8 +1211,8 @@ export class AttemptController {
     return { code, error: `the runner refused the start: ${code}` };
   }
 
-  /** Appends one of this attempt's events with the fence it belongs to. */
-  private report(fence: Fence, event: PumpEvent): void {
-    this.deps.outbox.append({ ...event, attemptId: this.attemptId, fence } as NewEvent);
+  /** Appends one of this attempt's events with the fence it belongs to; gives its seq. */
+  private report(fence: Fence, event: PumpEvent): number {
+    return this.deps.outbox.append({ ...event, attemptId: this.attemptId, fence } as NewEvent).seq;
   }
 }

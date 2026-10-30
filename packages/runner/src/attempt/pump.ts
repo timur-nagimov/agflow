@@ -107,7 +107,7 @@ export class EventPump {
   private snapshotTimer: ReturnType<typeof setInterval> | null = null;
   private snapshotting: Promise<void> = Promise.resolve();
   private firstOutputSent = false;
-  private wroteHandoff = false;
+  private handoffCount = 0;
 
   constructor(options: EventPumpOptions) {
     this.options = options;
@@ -115,7 +115,12 @@ export class EventPump {
 
   /** Whether the agent wrote its handoff note (a write_handoff with a normal result). */
   get handoffWritten(): boolean {
-    return this.wroteHandoff;
+    return this.handoffCount > 0;
+  }
+
+  /** How many handoff notes the agent wrote, so a stop can tell a note written after it arrived. */
+  get handoffs(): number {
+    return this.handoffCount;
   }
 
   /** Whether a tool call is in flight. */
@@ -153,7 +158,7 @@ export class EventPump {
       case 'tool_ended':
         this.tools.delete(event.toolId);
         if (this.tools.size === 0) this.stopSnapshots();
-        if (event.terminal === 'handoff') this.wroteHandoff = true;
+        if (event.terminal === 'handoff') this.handoffCount += 1;
         return;
       case 'text':
         this.activity('text', event.text);

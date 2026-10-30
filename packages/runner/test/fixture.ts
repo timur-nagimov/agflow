@@ -276,6 +276,7 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
       },
       wipFailures: fixture.wipFailures,
       hub: fixture.hub,
+      handoffMs: () => fixture.config.timings.handoff,
       ...overrides,
     }),
     controller: (attemptId = 'T-4-a1', overrides = {}) => {
