@@ -56,12 +56,15 @@ export function fixtureAgentToken(attemptId: string): string {
   return `agt_${createHash('sha256').update(attemptId).digest('base64url')}`;
 }
 
-/** Timings short enough for tests; runner.json's test block allows them. */
+/**
+ * Timings short enough for tests; runner.json's test block allows them. continuationWait is long, so an agent idles
+ * after its turn unless a test asks for continuations.
+ */
 const TEST_TIMINGS = {
   stopInterrupt: 500,
   stopClose: 500,
   stopKill: 500,
-  continuationWait: 100,
+  continuationWait: 60_000,
   finalPush: 5_000,
   hold: 2_000,
   handoff: 2_000,
@@ -115,6 +118,8 @@ export interface RunnerFixture {
   tmpRoot: string;
   /** What deps.liveAttempts() answers. */
   liveAttempts: number;
+  /** What deps.linkUp() answers: up by default. */
+  link: { up: boolean };
   /** What deps.vendorReady(vendor) answers. */
   ready: Record<Vendor, boolean>;
   /** The outbox's events, oldest first; only those of the type when one is given. */
@@ -220,6 +225,7 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
     wipFailures: new WipFailures(),
     tmpRoot,
     liveAttempts: 0,
+    link: { up: true },
     ready: { claude: true, codex: true },
     events: <T extends RunnerEvent['type']>(type?: T) =>
       outbox.eventsAfter(0).filter((event) => type === undefined || event.type === type) as Extract<
@@ -277,6 +283,7 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
       wipFailures: fixture.wipFailures,
       hub: fixture.hub,
       handoffMs: () => fixture.config.timings.handoff,
+      linkUp: () => fixture.link.up,
       ...overrides,
     }),
     controller: (attemptId = 'T-4-a1', overrides = {}) => {

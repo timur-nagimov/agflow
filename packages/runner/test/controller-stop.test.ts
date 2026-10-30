@@ -255,6 +255,17 @@ describe('AttemptController: stops', () => {
     expect(f.store.get('T-5-a1')?.state).toBe('stopped');
   });
 
+  test('a stale stop or hold changes nothing: the agent still gets its continuation', async () => {
+    const f = await createRunnerFixture({ config: { timings: { continuationWait: 300 } }, script: { turns: [[], []] } });
+    const controller = f.controller();
+    await controller.start(f.spec({ fence: { epoch: 1, counter: 2 } }));
+    await waitFor(() => f.events('attempt.activity').some((event) => event.data.summary.startsWith('turn completed')));
+    expect(await controller.hold({ fence: FENCE })).toEqual({ ok: false, error: 'stale_fence' });
+    expect(await controller.stop({ ...STOP, fence: FENCE })).toEqual({ ok: false, error: 'stale_fence' });
+    await waitFor(() => userTexts(f).length === 2);
+    expect(controller.facts()?.continuations).toBe(1);
+  });
+
   test('a stop after the process already exited reports nothing twice; a stale fence is refused', async () => {
     const f = await createRunnerFixture();
     const controller = await started(f);

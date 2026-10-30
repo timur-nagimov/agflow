@@ -18,6 +18,8 @@
 // voided approvals, and only then attempt.exited. Work the final push could not place goes to a late-work ref.
 // Stops, holds and the runner's own stops (stop.ts) run on the queue too: they prepare the agent (an interrupt, a
 // handoff turn, or the end of the running turn), run the stop ladder and do the same exit work, once per process.
+// What the runner sends the agent on its own, continuations, vendor-error retries, quota waits and the one nudge
+// after an outage, is the turn policy's (turns.ts).
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -60,6 +62,7 @@ import { killAndSweep, runStopLadder } from '../stop-ladder';
 import { clipPushError, EVENTS_AFTER_EXIT_MS, LateWorkRetries, pushWithRetries, uploadTranscriptTail } from './exit';
 import { buildLaunch, ProcessRegistration } from './launch';
 import { ACTIVITY_SUMMARY_MAX, clip, EventPump, type PumpEvent } from './pump';
+import { TurnPolicy } from './turns';
 import { prepareForStop, RUNNER_STOP_REASON, type StopOptions, type StopOutcome, TurnWatch } from './stop';
 import {
   canPushWip,
@@ -128,6 +131,8 @@ export interface ControllerDeps {
   hub: Pick<RunnerHubHttp, 'uploadTranscript'>;
   /** How long a handoff note is waited for: welcome.timings.handoffMs, or runner.json's handoff before a welcome. */
   handoffMs(): number;
+  /** Whether the link to the hub is up: no continuation is sent while it is down. */
+  linkUp(): boolean;
 }
 
 /** The agent process of the attempt's current start or resume, while the controller follows it. */
@@ -142,6 +147,8 @@ interface LiveAgent {
   pump: EventPump;
   /** Its turns, as stops wait on them. */
   watch: TurnWatch;
+  /** What the runner sends it on its own. */
+  policy: TurnPolicy;
   /** The runner-owned directory of the facts' fingerprint index. */
   factsDir: string;
   /** Settles once the agent's events have ended. */
@@ -321,11 +328,17 @@ export class AttemptController {
     return { ok: true };
   }
 
-  /** interrupt (the Agents view's Interrupt): the plain interrupt; queued messages still run. */
-  async interrupt(command: { fence: Fence }): Promise<LiveOutcome> {
-    const live = this.liveAt(command.fence);
+  /**
+   * The plain interrupt; queued messages still run. With a fence it is the hub's interrupt command (the Agents view's
+   * Interrupt); without one, the runner's own. outage marks a running turn as ended by an outage (needs_login), so
+   * the agent gets the one nudge after the next welcome (X-38).
+   */
+  async interrupt(command: { fence?: Fence; outage?: boolean }): Promise<LiveOutcome> {
+    const live = command.fence === undefined ? this.live : this.liveAt(command.fence);
+    if (live === null) return { ok: false, error: 'not_running' };
     if (!('pump' in live)) return live;
-    await live.session.interrupt();
+    if (command.outage) await live.policy.interruptForOutage();
+    else await live.session.interrupt();
     return { ok: true };
   }
 
@@ -412,8 +425,12 @@ export class AttemptController {
     return this.enqueue(() => this.wipJob());
   }
 
-  /** After each welcome: a harvest held back while canPushWip failed is pushed now. */
-  onWelcome(): Promise<void> {
+  /**
+   * After each welcome: an agent whose turn ended because of the outage gets its one nudge at once, and a harvest
+   * held back while canPushWip failed is pushed.
+   */
+  async onWelcome(): Promise<void> {
+    await this.live?.policy.onWelcome();
     return this.enqueue(async () => {
       const held = this.heldWork;
       const spec = this.current;
@@ -570,6 +587,7 @@ export class AttemptController {
       setPhase: (phase) => this.setPhase(phase),
       root: () => registration.recorded(),
     });
+    const watch = new TurnWatch();
     const live: LiveAgent = {
       spec,
       workspace,
@@ -578,7 +596,21 @@ export class AttemptController {
       registration,
       facts,
       pump,
-      watch: new TurnWatch(),
+      watch,
+      policy: new TurnPolicy({
+        attemptId: spec.attemptId,
+        spec: () => this.current ?? spec,
+        session,
+        inTurn: () => watch.inTurn,
+        stopping: () => live.stopping,
+        linkUp: () => this.deps.linkUp(),
+        allowPaidUsage: () => config().allowPaidUsage[spec.vendor],
+        timings: () => config().timings,
+        setPhase: (phase) => this.setPhase(phase),
+        report: (event) => this.report(this.currentFence ?? spec.fence, event),
+        continuationSent: () => facts.continuationSent(),
+        logger,
+      }),
       factsDir,
       events: Promise.resolve(),
       done: Promise.resolve(),
@@ -842,6 +874,7 @@ export class AttemptController {
         await this.guarded(event, () => live.facts.observe(event));
         await this.guarded(event, () => (event.type === 'started' ? this.spawned(live, event) : live.pump.handle(event)));
         await this.guarded(event, () => live.watch.observe(event));
+        await this.guarded(event, () => live.policy.observe(event));
       }
     } finally {
       live.watch.end();
@@ -913,6 +946,7 @@ export class AttemptController {
   private async finishExit(live: LiveAgent, exit: ExitInfo, context: ExitContext): Promise<number | null> {
     if (live.finished) return null;
     live.finished = true;
+    live.policy.close();
     const { logger } = this.deps;
     this.stopWipTimer();
     if (!context.requested) {
