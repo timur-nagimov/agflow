@@ -8,6 +8,7 @@ export * from './env';
 export * from './git/clone';
 export * from './git/harvest';
 export * from './git/run';
+export * from './git/snapshot';
 export * from './git/vault';
 export * from './hub-http';
 export * from './journal';

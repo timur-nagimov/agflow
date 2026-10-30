@@ -69,6 +69,12 @@ export const LOCAL_GIT_PINS = [
   'gc.auto=0',
 ] as const;
 
+/**
+ * The bound of each local git that reads an agent's work tree (snapshot, restore): 2 minutes. A FIFO planted where
+ * git probes for a nested repository (<dir>/.git/HEAD) would otherwise block it, and every job after it, for good.
+ */
+export const WORKTREE_GIT_TIMEOUT_MS = 120_000;
+
 /** Runner commands that take paths add this, so a clone's runner-owned .agflow/run/ never takes part. */
 export const RUN_DIR_EXCLUDE = ':(exclude,top).agflow/run';
 

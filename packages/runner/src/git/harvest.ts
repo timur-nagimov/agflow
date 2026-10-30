@@ -125,7 +125,8 @@ const PACK_FILE = /^pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.(?:pack|idx)$/;
  * together with O_NOFOLLOW, so it takes O_NOFOLLOW's place there.
  */
 const O_NOFOLLOW_ANY = process.platform === 'darwin' ? 0x20000000 : 0;
-const NO_LINKS = O_NOFOLLOW_ANY !== 0 ? O_NOFOLLOW_ANY : constants.O_NOFOLLOW;
+/** The open flag that refuses links: anywhere in the path on macOS, the last component elsewhere. */
+export const NO_LINKS = O_NOFOLLOW_ANY !== 0 ? O_NOFOLLOW_ANY : constants.O_NOFOLLOW;
 
 /** A directory, never through a link. */
 async function realDirectory(path: string): Promise<boolean> {
