@@ -8,6 +8,7 @@ import { markSent, pendingCommands, recordResult, toWireCommand } from './comman
 import { type HubContext, type RunnerLink, afterCommit, tx } from './context';
 import { acknowledgePosition, applyRunnerEvents } from './events-in';
 import { hubEpoch } from './hub-state';
+import { recordQuotaReports } from './quota';
 import { reconcileOnHello } from './recovery';
 import {
   type HelloMessage,
@@ -277,6 +278,7 @@ export class Gateway implements RunnerLink {
         const welcome: { message: Welcome | null } = { message: null };
         afterCommit(ctx, () => this.attach(connection, runnerId, hello, welcome.message as Welcome));
         recordHelloInfo(ctx, runnerId, hello);
+        recordQuotaReports(ctx, emit, runnerId, hello.quota);
         reconcileHelloSettings(ctx, runnerId, hello.settings);
         // Facts count only from the runner's current link.
         markFactsStale(ctx, runnerId);

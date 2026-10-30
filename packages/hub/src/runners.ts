@@ -168,13 +168,17 @@ export function getRunner(ctx: HubContext, id: string): Runner {
   return runner;
 }
 
-/** Runners in id order; retired ones only when asked for. */
-export function listRunners(ctx: HubContext, options: { retired?: boolean } = {}): Runner[] {
-  const rows = ctx.db
+/** Runner rows in id order; retired ones only when asked for. */
+export function findRunnerRows(ctx: HubContext, options: { retired?: boolean } = {}): RunnerRow[] {
+  return ctx.db
     .query(`${RUNNER_SELECT} ${options.retired ? '' : 'WHERE runners.retired_at IS NULL'} ORDER BY runners.seq`)
     .all() as RunnerRow[];
+}
+
+/** Runners in id order; retired ones only when asked for. */
+export function listRunners(ctx: HubContext, options: { retired?: boolean } = {}): Runner[] {
   const now = ctx.now();
-  return rows.map((row) => rowToRunner(row, now));
+  return findRunnerRows(ctx, options).map((row) => rowToRunner(row, now));
 }
 
 // ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ import {
 } from './attempts';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
+import { recordQuotaReports } from './quota';
 import { resumeDeferred } from './recovery';
 import { applyRunnerSettings, applyVendorReport, markGitPushed, setReportedState } from './runners';
 import { clip } from './text';
@@ -129,7 +130,15 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   'runner.settings': (ctx, event, { runnerId, emit }) => {
     applyRunnerSettings(ctx, emit, runnerId, event.data.settings);
   },
-  'runner.vendors': (ctx, event, { runnerId }) => applyVendorReport(ctx, runnerId, event.data.vendors),
+  'runner.vendors': (ctx, event, { runnerId, emit }) => {
+    applyVendorReport(ctx, runnerId, event.data.vendors);
+    recordQuotaReports(ctx, emit, runnerId, event.data.quota);
+  },
+  // A runner that does not know the account reports none, and no account changes (X-21).
+  'attempt.quota': (ctx, event, { runnerId, emit }) => {
+    const { vendor, accountId, quota } = event.data;
+    if (accountId !== null) recordQuotaReports(ctx, emit, runnerId, [{ vendor, accountId, quota }]);
+  },
 };
 
 /**
