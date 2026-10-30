@@ -64,7 +64,7 @@ export async function setup(overrides: Partial<AgentLaunch> = {}): Promise<{ lau
     projectConfigVerified: true,
     tmpDir: runDir.tmp,
     env,
-    bridge: { command: '/bin/false', args: [], env: {} },
+    bridge: { command: '/bin/false', args: [], env: {}, tools: [] },
     profile: standardProfile,
     brief: 'brief',
     firstPrompt: 'start working',

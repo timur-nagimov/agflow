@@ -6,18 +6,27 @@
 // and verifies the clone's project config last. Any failure after admission, a clone that cannot be prepared or a
 // failed preparation say, releases what the start took and is one attempt.failed_to_start with refused null (X-40),
 // its texts clipped.
-import type { AttemptPhase, AttemptSpec, Fence, StartRefusal, Vendor } from '@agflow/core';
-import type { VendorAdapter } from '../adapters/types';
+// The agent then starts (launch.ts): its group is recorded before any of its events is read, the facts tracker
+// starts, and its started event becomes attempt.spawned with the start tip the clone was made at.
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { AttemptFacts, AttemptPhase, AttemptSpec, Fence, StartRefusal, Vendor } from '@agflow/core';
+import type { AgentEvent, AgentLaunch, AgentSession, AgflowCommand, VendorAdapter } from '../adapters/types';
 import type { AttemptStore } from '../attempt-store';
+import type { AwakeClock } from '../clock';
 import type { RunnerConfig } from '../config';
 import { buildAgentEnv } from '../env';
+import { diffFingerprint, FactsTracker } from '../facts';
 import type { GitEnvironment } from '../git/run';
 import type { Vault } from '../git/vault';
 import type { Logger } from '../log';
 import type { NewEvent, Outbox } from '../outbox';
 import type { RunnerPaths } from '../paths';
 import type { SerialQueue } from '../queue';
+import type { ProcessIdentity } from '../processes';
 import type { DependencyPreparer, Notifier, RunnerHealth } from '../seams';
+import { buildLaunch, ProcessRegistration } from './launch';
 import {
   clipStartError,
   clipViolationPaths,
@@ -51,6 +60,32 @@ export interface ControllerDeps {
   wipRefPrefix(): string;
   /** Where Claude attempts' private temporary directories go: /tmp. */
   tmpRoot: string;
+  /** How the runner runs agflow: the bridge is `<agflow> mcp --vendor <v> --runner`. */
+  agflow: AgflowCommand;
+  /**
+   * The CLI version a new attempt of the vendor starts with: the runtime gives pinnedCliVersion for this platform,
+   * which throws for a platform with no pin, so the start fails as any other.
+   */
+  cliVersion(vendor: Vendor): string;
+  /** How the agent's process is identified for the registry: processIdentity by default. */
+  identify?: (pid: number) => Promise<ProcessIdentity | null>;
+  /** The awake clock, which every age the facts report is read on. */
+  clock: Pick<AwakeClock, 'awakeNow'>;
+}
+
+/** The agent process of the attempt's current start or resume, while the controller follows it. */
+interface LiveAgent {
+  /** The command's spec, agent token included: it lives only here, in memory. */
+  spec: AttemptSpec;
+  workspace: PreparedWorkspace;
+  launch: AgentLaunch;
+  session: AgentSession;
+  registration: ProcessRegistration;
+  facts: FactsTracker;
+  /** The runner-owned directory of the facts' fingerprint index. */
+  factsDir: string;
+  /** Settles once the agent's events have ended. */
+  done: Promise<void>;
 }
 
 export type StartOutcome = { started: true } | { started: false; refused: StartRefusal | null; error: string };
@@ -72,6 +107,7 @@ export class AttemptController {
   private currentFence: Fence | null = null;
   private currentPhase: AttemptPhase | null = null;
   private prepared: PreparedWorkspace | null = null;
+  private live: LiveAgent | null = null;
 
   constructor(
     readonly attemptId: string,
@@ -101,9 +137,30 @@ export class AttemptController {
     return this.prepared;
   }
 
+  /** The live agent's session; null when no process runs. */
+  get session(): AgentSession | null {
+    return this.live?.session ?? null;
+  }
+
+  /** The facts the next heartbeat carries; null when no process runs. */
+  facts(): AttemptFacts | null {
+    return this.live?.facts.facts() ?? null;
+  }
+
   /** Runs a job on this attempt's serial queue. */
   enqueue<T>(job: () => Promise<T>): Promise<T> {
     return this.deps.queue.run(this.attemptId, job);
+  }
+
+  /** Resolves once the queued jobs and the live agent's events have all been dealt with. */
+  async settled(): Promise<void> {
+    for (;;) {
+      await this.deps.queue.idle(this.attemptId);
+      const live = this.live;
+      if (live === null) return;
+      await live.done;
+      if (this.live === live) return;
+    }
   }
 
   /** start_attempt: admission first; a refused start reports attempt.failed_to_start and starts nothing. */
@@ -138,7 +195,7 @@ export class AttemptController {
     }
   }
 
-  /** An admitted start's work: the clone, the dependencies and the project config; throws on a failure. */
+  /** An admitted start's work: the clone, the dependencies, the project config and the agent; throws on a failure. */
   private async startAdmitted(spec: AttemptSpec): Promise<void> {
     const { store, paths, vault } = this.deps;
     if (store.get(spec.attemptId) === null) {
@@ -158,6 +215,99 @@ export class AttemptController {
     await startStep('cannot verify the clone', () =>
       finishWorkspace(this.deps, spec, workspace, { prepared: prep.ran }),
     );
+    const cliVersion = this.deps.cliVersion(spec.vendor);
+    store.update(spec.attemptId, { cliVersion });
+    await startStep('cannot start the agent', () => this.launchAgent(spec, workspace, { cliVersion, resume: null }));
+  }
+
+  /**
+   * Starts the agent through its vendor's adapter, then follows its events. The facts tracker runs from the launch
+   * on, and the process is recorded before the first event is read.
+   */
+  private async launchAgent(
+    spec: AttemptSpec,
+    workspace: PreparedWorkspace,
+    options: { cliVersion: string; resume: AgentLaunch['resume'] },
+  ): Promise<void> {
+    const { store, logger, config, paths, agflow, local, vault } = this.deps;
+    const adapter = this.deps.adapters.get(spec.vendor);
+    if (!adapter) throw new Error(`no ${spec.vendor} adapter on this runner`);
+    const registration = new ProcessRegistration(store, spec.attemptId, workspace.clone, logger, this.deps.identify);
+    const launch = buildLaunch({
+      spec,
+      workspace,
+      config: config(),
+      paths,
+      agflow,
+      cliVersion: options.cliVersion,
+      resume: options.resume,
+      registration,
+    });
+    const factsDir = await mkdtemp(join(tmpdir(), 'agflow-facts-'));
+    let session: AgentSession;
+    try {
+      session = await adapter.start(launch);
+    } catch (error) {
+      await rm(factsDir, { recursive: true, force: true });
+      throw error;
+    }
+    const facts = new FactsTracker({
+      attemptId: spec.attemptId,
+      fence: spec.fence,
+      clone: workspace.clone,
+      toolCaps: spec.toolCaps,
+      clock: this.deps.clock,
+      phase: 'starting',
+      fingerprint: () =>
+        diffFingerprint({
+          vault,
+          local,
+          clone: workspace.clone,
+          startSha: workspace.startSha,
+          index: join(factsDir, 'index'),
+        }),
+    });
+    await facts.start();
+    const live: LiveAgent = { spec, workspace, launch, session, registration, facts, factsDir, done: Promise.resolve() };
+    this.live = live;
+    live.done = this.follow(live).catch((error) => {
+      logger.error('following the agent failed', { attemptId: this.attemptId, error: describe(error) });
+    });
+  }
+
+  /** Reads the agent's events, once its process is recorded, until they end. */
+  private async follow(live: LiveAgent): Promise<void> {
+    await live.registration.recorded();
+    for await (const event of live.session.events) {
+      live.facts.observe(event);
+      this.onEvent(live, event);
+    }
+    await live.session.exited;
+    live.facts.close();
+    await rm(live.factsDir, { recursive: true, force: true });
+    if (this.live === live) this.live = null;
+    this.currentPhase = null;
+  }
+
+  private onEvent(live: LiveAgent, event: AgentEvent): void {
+    if (event.type === 'started') this.spawned(live, event);
+  }
+
+  /** The agent's started event: attempt.spawned with the start tip the clone was made at. */
+  private spawned(live: LiveAgent, event: Extract<AgentEvent, { type: 'started' }>): void {
+    const { spec, launch, session, workspace } = live;
+    this.deps.store.update(spec.attemptId, { state: 'running', sessionRef: event.sessionRef });
+    this.report(spec.fence, {
+      type: 'attempt.spawned',
+      data: {
+        sessionRef: event.sessionRef,
+        pid: session.pid,
+        model: launch.model,
+        cliVersion: launch.cliVersion,
+        permissionMode: event.permissionMode,
+        startSha: workspace.startSha,
+      },
+    });
   }
 
   /**

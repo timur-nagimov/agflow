@@ -101,7 +101,7 @@ async function startAgent(script: FakeScript) {
     projectConfigVerified: true,
     tmpDir: dir,
     env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: dir },
-    bridge: { command: '/bin/false', args: [], env: {} },
+    bridge: { command: '/bin/false', args: [], env: {}, tools: [] },
     profile: standardProfile,
     brief: 'brief',
     firstPrompt: 'start working',

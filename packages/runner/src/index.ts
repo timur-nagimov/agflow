@@ -1,5 +1,7 @@
+export * from './adapters/bridge-tools';
 export * from './adapters/types';
 export * from './attempt/controller';
+export * from './attempt/launch';
 export * from './attempt/workspace';
 export * from './attempt-store';
 export * from './backoff';

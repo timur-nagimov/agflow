@@ -122,7 +122,7 @@ describe('AttemptController: preparing the clone for a start', () => {
     expect(brief.trimEnd().endsWith(`Your working directory: ${realpathSync(clone)}`)).toBe(true);
     expect(workspace?.brief).toBe(brief.trimEnd());
     expect(readdirSync(join(run, 'config'))).toEqual([]);
-    expect(f.store.get('T-4-a1')).toMatchObject({ state: 'starting', clone: realpathSync(clone) });
+    expect(f.store.get('T-4-a1')).toMatchObject({ clone: realpathSync(clone) });
 
     // A kept clone may hold the Claude CLI's staging directory from an earlier run.
     mkdirSync(join(clone, '.claude', '.cc-writes'), { recursive: true });
@@ -264,6 +264,7 @@ describe('AttemptController: preparing the clone for a start', () => {
       { phase: 'start', paths: ['.codex/config.toml'] },
     ]);
     expect(controller.workspace?.projectConfigVerified).toBe(true);
+    expect(f.fakes.codex?.launches[0]?.projectConfigVerified).toBe(true);
   });
 
   test("the project config is verified after the dependency preparation, which is followed by a restore", async () => {
@@ -297,6 +298,7 @@ describe('AttemptController: preparing the clone for a start', () => {
     const unrestored = f.controller('T-5-a1', { preparer });
     expect(await unrestored.start(spec)).toEqual({ started: true });
     expect(unrestored.workspace?.projectConfigVerified).toBe(false);
+    expect(f.fakes.codex?.launches.at(-1)?.projectConfigVerified).toBe(false);
   });
 
   test("never runs git with the clone's own git configuration", async () => {

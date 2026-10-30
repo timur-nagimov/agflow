@@ -67,8 +67,11 @@ export interface AgentLaunch {
   tmpDir: string;
   /** The agent environment (design 7.6). */
   env: Record<string, string>;
-  /** `<agflow> mcp --vendor <v> --runner` with the bridge's own environment. */
-  bridge: { command: string; args: string[]; env: Record<string, string> };
+  /**
+   * `<agflow> mcp --vendor <v> --runner` with the bridge's own environment, and the names of the tools it serves for
+   * the role its AGFLOW_ROLE names (BRIDGE_TOOL_NAMES), without the MCP prefix.
+   */
+  bridge: { command: string; args: string[]; env: Record<string, string>; tools: readonly string[] };
   profile: PermissionProfile;
   /** spec.brief plus "Your working directory: <clone>" (design 10). */
   brief: string;

@@ -165,13 +165,17 @@ describe('AttemptController admission', () => {
     }
   });
 
-  test('an admitted start is recorded as starting, with its fence', async () => {
+  test('an admitted start is recorded with its fence', async () => {
     const f = await createRunnerFixture();
     const controller = f.controller();
     expect(controller.fence).toBeNull();
     expect(await controller.start(f.spec({ fence: { epoch: 1, counter: 7 } }))).toEqual({ started: true });
     expect(controller.fence).toEqual({ epoch: 1, counter: 7 });
-    expect(f.store.get('T-4-a1')).toMatchObject({ state: 'starting', fence: { epoch: 1, counter: 7 } });
+    // Starting until the agent's started event makes it running.
+    expect(f.store.get('T-4-a1')).toMatchObject({
+      state: expect.stringMatching(/^(starting|running)$/),
+      fence: { epoch: 1, counter: 7 },
+    });
     expect(f.events('attempt.failed_to_start')).toEqual([]);
   });
 });

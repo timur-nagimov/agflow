@@ -1,16 +1,19 @@
 // The runner test fixture: everything an AttemptController needs, on local files only. A temporary AGFLOW_HOME
 // with runner.db and the runner's git files, a local bare origin and the project's vault, a fake adapter per
 // vendor, an outbox reader, a hub HTTP that records what the runner posts, and a spec builder. Each test file calls
-// cleanupRunnerFixtures from afterEach. M2d's tests reuse it.
+// cleanupRunnerFixtures from afterEach, which kills every agent the fixture's controllers started and waits for
+// their work to settle. M2d's tests reuse it.
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type AttemptSpec, restoreSet, type RunnerEvent, type Vendor } from '@agflow/core';
 import { FakeAdapter, type FakeScript, type OriginRepo, originRepo } from '@agflow/testkit';
-import type { VendorAdapter } from '../src/adapters/types';
+import type { AgflowCommand, VendorAdapter } from '../src/adapters/types';
 import { AttemptController, type ControllerDeps } from '../src/attempt/controller';
+import { pinnedCliVersion } from '../src/attempt/launch';
 import { AttemptStore } from '../src/attempt-store';
+import { AwakeClock } from '../src/clock';
 import { type RunnerConfig, type RunnerConfigInput, RunnerConfigSchema } from '../src/config';
 import { openRunnerDb, type RunnerDb } from '../src/db';
 import { ensureRunnerGitFiles, type GitEnvironment, localGitEnv, remoteGitEnv } from '../src/git/run';
@@ -18,12 +21,34 @@ import { Vault } from '../src/git/vault';
 import { memoryLogger } from '../src/log';
 import { Outbox } from '../src/outbox';
 import { type RunnerPaths, runnerPaths } from '../src/paths';
+import { killGroup } from '../src/processes';
 import { SerialQueue } from '../src/queue';
 import { removeAgentTools } from '../src/run-dir';
 import { defaultHealth, silentNotifier, skipDependencyPreparer } from '../src/seams';
 
 export const FIXTURE_PROJECT = 'demo-0123456789';
 export const FIXTURE_WIP_PREFIX = 'refs/agflow/';
+/** How the fixture's runner runs agflow: the bridge is `<this> mcp --vendor <v> --runner`. */
+export const FIXTURE_AGFLOW: AgflowCommand = { command: '/opt/agflow/bin/agflow', args: ['--profile', 'test'] };
+
+/**
+ * The CLI version the fixture's attempts start with: darwin-arm64's pin, whatever platform the tests run on, so the
+ * suites pass where agflow pins no CLI (CI's linux-x64).
+ */
+export function fixtureCliVersion(vendor: Vendor): string {
+  return pinnedCliVersion(vendor, 'darwin-arm64');
+}
+
+/** Polls until check gives a value, or fails after timeoutMs. */
+export async function waitFor<T>(check: () => T | null | undefined | false, timeoutMs = 15_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = check();
+    if (value !== null && value !== undefined && value !== false) return value;
+    if (Date.now() > deadline) throw new Error(`waited ${timeoutMs} ms in vain`);
+    await Bun.sleep(10);
+  }
+}
 
 /** The fixture's agent token of an attempt: well-formed (agt_ and 43 base64url characters), and one per attempt. */
 export function fixtureAgentToken(attemptId: string): string {
@@ -79,6 +104,8 @@ export interface RunnerFixture {
   fakes: Partial<Record<Vendor, FakeAdapter>>;
   hub: RecordingHubHttp;
   logger: ReturnType<typeof memoryLogger>;
+  /** The awake clock the controllers read; never started, so it advances with wall time. */
+  clock: AwakeClock;
   /** Where Claude attempts' private temporary directories go: a short directory under /tmp. */
   tmpRoot: string;
   /** What deps.liveAttempts() answers. */
@@ -156,6 +183,12 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
   }
   const store = new AttemptStore(db);
   const outbox = new Outbox(db);
+  const controllers: AttemptController[] = [];
+  // Every agent still running is killed, and its controller's work waited for, before the files go.
+  cleanups.push(async () => {
+    for (const record of store.processes()) await killGroup(record, 'SIGKILL');
+    await Promise.all(controllers.map((controller) => controller.settled()));
+  });
   const fixture: RunnerFixture = {
     home,
     paths,
@@ -171,6 +204,7 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
     fakes,
     hub: new RecordingHubHttp(),
     logger: memoryLogger(),
+    clock: new AwakeClock({ gapMs: 5_000 }),
     tmpRoot,
     liveAttempts: 0,
     ready: { claude: true, codex: true },
@@ -218,9 +252,16 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
       vendorReady: (vendor) => fixture.ready[vendor],
       wipRefPrefix: () => FIXTURE_WIP_PREFIX,
       tmpRoot: fixture.tmpRoot,
+      agflow: FIXTURE_AGFLOW,
+      cliVersion: fixtureCliVersion,
+      clock: fixture.clock,
       ...overrides,
     }),
-    controller: (attemptId = 'T-4-a1', overrides = {}) => new AttemptController(attemptId, fixture.deps(overrides)),
+    controller: (attemptId = 'T-4-a1', overrides = {}) => {
+      const controller = new AttemptController(attemptId, fixture.deps(overrides));
+      controllers.push(controller);
+      return controller;
+    },
   };
   return fixture;
 }
