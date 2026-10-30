@@ -299,7 +299,8 @@ describe('the holder test for agent tokens', () => {
     expect((await withToken(hub, token, 'POST', path('handoff'), { note: 'x' })).status).toBe(403);
     writeTask(hub.ctx, held.task.id, { currentAttempt: held.attempt.id });
     const submitted = await withToken(hub, token, 'POST', path('submit'), { summary: 'done', evidence: ['bun test'] });
-    expect([submitted.status, submitted.json.task.status]).toEqual([200, 'submitted']);
+    // A runner agent's submit is a request its runner pushes (design 6.13).
+    expect([submitted.status, submitted.json.submission.status]).toEqual([202, 'pending']);
   });
 });
 

@@ -1,6 +1,7 @@
 import { AttemptsQuerySchema } from '@agflow/core';
 import { attemptLog, getAttempt, listAttempts } from '../attempt-store';
 import type { HubContext } from '../context';
+import { getSubmission } from '../submissions';
 import type { App } from './app';
 import { principal, readQuery } from './util';
 
@@ -23,5 +24,11 @@ export function mountAttemptRoutes(app: App, ctx: HubContext): void {
     principal(c);
     const attempt = getAttempt(ctx, c.req.param('id'));
     return c.json({ attempt, log: attemptLog(ctx, attempt.id) });
+  });
+
+  // The submitting agent polls its submission; people read any (design 6.16).
+  app.get('/api/submissions/:id', (c) => {
+    const p = principal(c);
+    return c.json({ submission: getSubmission(ctx, c.req.param('id'), p.agent?.id ?? null) });
   });
 }

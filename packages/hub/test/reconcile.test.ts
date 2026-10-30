@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { type LiveAttempt, type RunnerCommand, compareFence } from '@agflow/core';
+import { getAgent } from '../src/agents';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, expireRunnerLeases, recentResumes, requestStop, startRunnerAttempt } from '../src/attempts';
 import { createSession, resolveAgentToken } from '../src/auth';
@@ -9,6 +10,8 @@ import { listEvents } from '../src/events';
 import { Gateway } from '../src/gateway';
 import { RESTART_PROMPT, reconcileOnHello } from '../src/recovery';
 import { getRunner } from '../src/runners';
+import { findSubmission } from '../src/submission-store';
+import { requestSubmission } from '../src/submissions';
 import { getTask, listTaskNotes } from '../src/task-store';
 import { createTasks } from '../src/tasks';
 import { type FakeConnection, type FakeRunner, connectFakeRunner, settle } from './fake-runner';
@@ -140,6 +143,30 @@ describe('reconciliation on hello', () => {
     await hello(runner);
     expect(getTask(ctx, one.id)).toMatchObject({ status: 'ready', workRef: finalWip.ref, workSha: FINAL_SHA });
     expect(dispatchHold(ctx, one.id)).toBeNull();
+  });
+
+  test('a stop deferred for a pending submission completes at hello, with the replay pending or not', async () => {
+    const { ctx, runnerId, tasks, runner, live } = await setup();
+    const [one] = tasks;
+    if (!one) throw new Error('no task');
+    const attempt = await running(ctx, runner, runnerId, one.id);
+    const agent = getAgent(ctx, attempt.agentId);
+    const submission = requestSubmission(ctx, one.id, agent, { summary: 'Done.', evidence: [] });
+    requestStop(ctx, { attemptId: attempt.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    expect(getAttempt(ctx, attempt.id).stopRequested).toMatchObject({ deferred: true });
+    await settle();
+    runner.disconnect();
+    await settle();
+    const at = { attemptId: attempt.id, fence: attempt.fence };
+    runner.emit('attempt.activity', { kind: 'note', summary: 'pushing the submission' }, at);
+    live.push(reported(ctx, attempt.id, 'stopped'));
+
+    // One reconnect, whose replay brings no outcome: the stop completes with its cause, and the submission fails.
+    await hello(runner);
+    expect(runner.outbox).toEqual([]);
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'ended', endReason: 'stopped' });
+    expect(getTask(ctx, one.id)).toMatchObject({ status: 'ready', assignee: null });
+    expect(findSubmission(ctx, submission.id)).toMatchObject({ status: 'failed', error: 'attempt ended: stopped' });
   });
 
   test('a take-over in flight with a clone keeps going: its pending prepare_takeover is sent again', async () => {

@@ -37,6 +37,7 @@ import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
+import { listSubmissions } from './submission-store';
 import {
   RUNNER_HELD_SQL,
   TASK_SELECT,
@@ -86,7 +87,7 @@ export function getTaskDetail(ctx: HubContext, id: string): TaskDetail {
     events: listEvents(ctx.db, { subject: id, latest: true, limit: 500 }).reverse(),
     messages: listMessages(ctx, { taskId: id }),
     attempts: listAttempts(ctx, { task: id }),
-    submissions: [],
+    submissions: listSubmissions(ctx, id),
   };
 }
 

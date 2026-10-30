@@ -20,7 +20,10 @@ export type ReconcileAction =
   | 'ended'
   /** A take-over in flight with a clone: its pending prepare_takeover goes out again after welcome. */
   | 'takeover'
-  /** The runner still runs it, or it stays holding: its pending commands go out again after welcome. */
+  /**
+   * The runner still runs it, it stays holding, or its stop waits for a submission the replay may decide: its pending
+   * commands go out again after welcome.
+   */
   | 'kept'
   /** Stopped or suspended with a clone: resumed at a new fence. */
   | 'resumed'
@@ -113,6 +116,8 @@ function decide(
   const stop = attempt.stopRequested;
   if (gone(live) && stop) {
     if (stop.cause === 'takeover' && live.clone) return 'takeover';
+    // A deferred stop completes too: the ending fails its submission and applies it, and a success the replay still
+    // holds records only the branch head (design 6.13).
     return completeStop(ctx, attempt, options.replayPending);
   }
   if (live && !gone(live)) return 'kept';

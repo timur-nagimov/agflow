@@ -9,11 +9,13 @@ import {
   NoteInputSchema,
   ProgressInputSchema,
   ReasonInputSchema,
+  RunnerSubmitInputSchema,
   SubmitInputSchema,
   TaskPatchSchema,
   type TaskStatus,
 } from '@agflow/core';
 import type { HubContext } from '../context';
+import { requestSubmission } from '../submissions';
 import {
   acceptTask,
   blockTask,
@@ -117,8 +119,13 @@ export function mountTaskRoutes(app: App, ctx: HubContext): void {
     return c.json({ task: reportProgress(ctx, c.req.param('id'), agent, note, token) });
   });
 
+  // A runner agent's submit is a request the runner pushes (design 6.13); a live chat's records its branch at once.
   app.post('/api/tasks/:id/submit', async (c) => {
     const { agent, token } = holderOf(c);
+    if (agent.origin === 'runner') {
+      const input = await readBody(c, RunnerSubmitInputSchema);
+      return c.json({ submission: requestSubmission(ctx, c.req.param('id'), agent, input, token) }, 202);
+    }
     const input = await readBody(c, SubmitInputSchema);
     return c.json({ task: submitTask(ctx, c.req.param('id'), agent, input, token) });
   });

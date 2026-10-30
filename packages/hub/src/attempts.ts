@@ -90,6 +90,7 @@ import {
   recordStartRefusal,
   resetFailedStarts,
 } from './runners';
+import { failPendingSubmission, pendingSubmissionOf } from './submission-store';
 import {
   addNote,
   findTask,
@@ -507,8 +508,9 @@ export function stopCommand(attempt: Attempt): StoredCommand {
  * Resumes an open runner attempt with a new fence (design 6.4, Resume). In one transaction: the attempt goes to
  * starting with a fresh runner lease, its tokens are revoked, its old fence's commands cancelled (a pending resume's
  * prompt and messages carried into this one), the cause logged, and resume_attempt queued with a recomputed task
- * pack, restore set and acceptance ids. A recorded stop is queued again at the new fence, after the resume, so the
- * re-fence does not drop it, and its grace starts again. A deferred stop stays held back. A take-over in flight is the take-over's to finish, so it cannot be resumed.
+ * pack, restore set and acceptance ids. A push owed to a pending submission and a recorded stop are queued again at
+ * the new fence, after the resume, so the re-fence drops neither, and the stop's grace starts again. A deferred stop
+ * stays held back. A take-over in flight is the take-over's to finish, so it cannot be resumed.
  */
 export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttempt {
   return tx(ctx, (emit) => {
@@ -519,7 +521,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
     if (before.runnerId === null) throw conflict(`attempt ${before.id} runs in a live chat, not on a runner`);
     if (before.stopRequested?.cause === 'takeover') throw conflict(`a take-over is in flight for attempt ${before.id}`);
     const pending = pendingResumeOf(ctx, before.id);
-    cancelPendingCommands(ctx, before.id);
+    const cancelled = cancelPendingCommands(ctx, before.id);
     revokeAgentTokens(ctx, before.id);
     const fence = issueFence(ctx);
     const now = ctx.now();
@@ -544,6 +546,14 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
       restore: restoreFor(ctx, task),
       acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     });
+    // A push still owed to a pending submission goes again at the new fence: nothing else would push it. A runner that
+    // already had it maps it to its first run by the submission id (design 6.13).
+    const submission = pendingSubmissionOf(ctx, attempt.id);
+    for (const row of cancelled) {
+      if (row.command.kind === 'push_submission' && row.command.submissionId === submission?.id) {
+        enqueueCommand(ctx, attempt.runnerId as string, { ...row.command, fence });
+      }
+    }
     if (attempt.stopRequested && !attempt.stopRequested.deferred) {
       // The new process gets the whole grace for its stop: the old one's may have run out before the re-fence.
       updateAttempt(ctx, attempt.id, { stopRequested: { ...attempt.stopRequested, at: now } });
@@ -590,12 +600,13 @@ const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted'];
 
 /**
  * Ends an attempt, whatever triggered it (design 6.4): the one path every ending takes, in the caller's transaction or
- * its own. It sets the end reason, class and failure signature from the trigger's row, revokes the tokens, cancels the
- * pending commands (cleanup, transcript uploads and hand-backs stay) and queues cleanup_attempt, except for a take-over,
- * whose cleanup follows its hand-back. It clears the holder fields (invariant e) and makes the row's on-exit move, only
- * while the task is claimed or working and names this attempt (X-34). It stores an assembled handoff note, with the
- * attempt's id, when the row asks and the agent wrote none, and empties the seat its lead held. A live chat's attempt
- * only ends: M1's operations move its task. Null when the attempt had already ended.
+ * its own. It sets the end reason, class and failure signature from the trigger's row, revokes the tokens, fails a
+ * pending submission (design 6.13), cancels the pending commands (cleanup, transcript uploads and hand-backs stay)
+ * and queues cleanup_attempt, except for a take-over, whose cleanup follows its hand-back. It clears the holder fields
+ * (invariant e) and makes the row's on-exit move, only while the task is claimed or working and names this attempt
+ * (X-34); a stop held back for the submission makes its at-once move first. It stores an assembled handoff note,
+ * with the attempt's id, when the row asks and the agent wrote none, and empties the seat its lead held. A live
+ * chat's attempt only ends: M1's operations move its task. Null when the attempt had already ended.
  */
 export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | null {
   return tx(ctx, (emit) => {
@@ -619,6 +630,7 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
     });
     revokeAgentTokens(ctx, before.id);
     const attempt = getAttempt(ctx, before.id);
+    failPendingSubmission(ctx, emit, attempt, actor);
     let task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
     let moved: TaskStatus[] = [];
     let noteAdded = false;
@@ -630,7 +642,12 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
       }
       setAgentTask(ctx, attempt.agentId, null);
       if (task) {
+        // A stop held back for the submission applies with the ending that fails it (design 6.13): a stop and hold
+        // pauses the task whatever ended the attempt.
+        const held = stop?.deferred ? moveAtRequest(ctx, emit, attempt, { ...stop, attemptId: attempt.id }) : [];
+        if (held.length > 0) task = getTask(ctx, task.id);
         ({ task, moved } = moveOnEnd(ctx, emit, task, attempt, input.trigger, actor));
+        moved = [...held, ...moved];
         if (moved[0] === 'stale') tellLeadStale(ctx, emit, task, attempt);
         noteAdded = addAssembledNote(ctx, attempt, input.trigger);
         // The ladder and the failure-signature rule run only when a move to ready actually happened (design 6.4).
@@ -942,6 +959,7 @@ export interface StopRequestInput {
    * has no process, when it applies at once. A successful submission drops it. A failed one applies it by requesting
    * the same stop again without deferred, which replaces it (X-34), makes the move, sends it and starts its stop
    * timeout; flipping deferred alone would keep the old time, and expireStops would end the attempt at its next tick.
+   * Left out, a stop, a stop and hold or a replace is held back while the attempt has a submission pending.
    */
   deferred?: boolean | undefined;
 }
@@ -981,6 +999,9 @@ const REPLACEABLE: ReadonlySet<StopCause> = new Set<StopCause>([
   'stall_no_progress',
   'stall_budget',
 ]);
+
+/** The causes held back while a submission is pending: a person's or the lead's stop or replace (design 6.13). */
+const DEFERRABLE: ReadonlySet<StopCause> = new Set<StopCause>(['stop', 'stop_hold', 'replace']);
 
 /** Whether the cause moves the task when it is requested; a take-over does, but never replaces another stop. */
 const movesAtOnce = (cause: StopCause): boolean => ENDING_MOVES[cause].task?.when === 'at_once';
@@ -1024,7 +1045,8 @@ export function requestStop(ctx: HubContext, input: StopRequestInput): StopReque
       throw new HubError(409, 'not_running', `attempt ${attempt.id} is already stopping (${recorded.cause})`);
     }
     if (recorded && !replaces(recorded, input.cause)) return { attempt, outcome: 'kept', ending: null };
-    const deferred = (input.deferred ?? false) && hasLiveProcess(attempt);
+    const held = input.deferred ?? (DEFERRABLE.has(input.cause) && pendingSubmissionOf(ctx, attempt.id) !== null);
+    const deferred = held && hasLiveProcess(attempt);
     updateAttempt(ctx, attempt.id, {
       stopRequested: {
         cause: input.cause,
@@ -1057,14 +1079,15 @@ export function requestStop(ctx: HubContext, input: StopRequestInput): StopReque
 }
 
 /**
- * The cause's at-once move: cancelled, or blocked with its kind and the request's reason. Its event is the one M1's
- * blockTask and cancelTask make for the same move, with the reason, so readers tell it from a dependency wait.
+ * The cause's at-once move, and the statuses it passed through: cancelled, or blocked with its kind and the request's
+ * reason. Its event is the one M1's blockTask and cancelTask make for the same move, with the reason, so readers tell
+ * it from a dependency wait.
  */
-function moveAtRequest(ctx: HubContext, emit: Emit, attempt: Attempt, input: StopRequestInput): void {
-  if (attempt.taskId === null) return;
+function moveAtRequest(ctx: HubContext, emit: Emit, attempt: Attempt, input: StopRequestInput): TaskStatus[] {
+  if (attempt.taskId === null) return [];
   const task = getTask(ctx, attempt.taskId);
   const planned = plannedTaskMove(input.cause, 'at_once', task, attempt.id);
-  if (!planned) return;
+  if (!planned) return [];
   let current = task;
   for (const status of planned.path) {
     const changes = status === 'blocked' ? { blockedKind: planned.blockedKind, blockedReason: input.reason } : {};
@@ -1074,6 +1097,7 @@ function moveAtRequest(ctx: HubContext, emit: Emit, attempt: Attempt, input: Sto
       data: { attemptId: attempt.id, reason: clip(input.reason, 500) },
     });
   }
+  return [...planned.path];
 }
 
 /**
