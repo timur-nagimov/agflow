@@ -7,11 +7,22 @@
 // failed preparation say, releases what the start took and is one attempt.failed_to_start with refused null (X-40),
 // its texts clipped.
 // The agent then starts (launch.ts): its group is recorded before any of its events is read, the facts tracker
-// starts, and its started event becomes attempt.spawned with the start tip the clone was made at.
+// starts, and its started event becomes attempt.spawned with the start tip the clone was made at. Its other events go
+// through the event pump (pump.ts); deliver, interrupt and decide_approval act on the live session at once, never
+// behind the serial queue, so an approval raised during a handoff turn does not wait for the stop.
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { AttemptFacts, AttemptPhase, AttemptSpec, Fence, StartRefusal, Vendor } from '@agflow/core';
+import {
+  type AttemptFacts,
+  type AttemptPhase,
+  type AttemptSpec,
+  compareFence,
+  type Fence,
+  type InjectedMessage,
+  type StartRefusal,
+  type Vendor,
+} from '@agflow/core';
 import type { AgentEvent, AgentLaunch, AgentSession, AgflowCommand, VendorAdapter } from '../adapters/types';
 import type { AttemptStore } from '../attempt-store';
 import type { AwakeClock } from '../clock';
@@ -27,6 +38,7 @@ import type { SerialQueue } from '../queue';
 import type { ProcessIdentity } from '../processes';
 import type { DependencyPreparer, Notifier, RunnerHealth } from '../seams';
 import { buildLaunch, ProcessRegistration } from './launch';
+import { EventPump, type PumpEvent } from './pump';
 import {
   clipStartError,
   clipViolationPaths,
@@ -82,6 +94,7 @@ interface LiveAgent {
   session: AgentSession;
   registration: ProcessRegistration;
   facts: FactsTracker;
+  pump: EventPump;
   /** The runner-owned directory of the facts' fingerprint index. */
   factsDir: string;
   /** Settles once the agent's events have ended. */
@@ -89,6 +102,9 @@ interface LiveAgent {
 }
 
 export type StartOutcome = { started: true } | { started: false; refused: StartRefusal | null; error: string };
+
+/** What deliver and interrupt give: done, or why not (a fence that is not the attempt's, or no live agent). */
+export type LiveOutcome = { ok: true } | { ok: false; error: 'stale_fence' | 'not_running' };
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -161,6 +177,45 @@ export class AttemptController {
       await live.done;
       if (this.live === live) return;
     }
+  }
+
+  /** deliver: the messages go to the live agent at once, in order, with one line about `more` (X-4). */
+  async deliver(command: { fence: Fence; messages: InjectedMessage[]; more: number }): Promise<LiveOutcome> {
+    const live = this.liveAt(command.fence);
+    if (!('pump' in live)) return live;
+    await live.pump.deliver(command.messages, command.more);
+    return { ok: true };
+  }
+
+  /** interrupt (the Agents view's Interrupt): the plain interrupt; queued messages still run. */
+  async interrupt(command: { fence: Fence }): Promise<LiveOutcome> {
+    const live = this.liveAt(command.fence);
+    if (!('pump' in live)) return live;
+    await live.session.interrupt();
+    return { ok: true };
+  }
+
+  /**
+   * decide_approval, answered at once: applied is false for a fence that is not the attempt's, an agent that is
+   * gone, or a request that was answered or voided.
+   */
+  async decideApproval(command: {
+    fence: Fence;
+    approvalId: string;
+    decision: 'approve' | 'decline';
+    reason: string | null;
+  }): Promise<{ applied: boolean }> {
+    const live = this.liveAt(command.fence);
+    if (!('pump' in live)) return { applied: false };
+    return { applied: await live.pump.answer(command.approvalId, command.decision, command.reason) };
+  }
+
+  /** The live agent, when the fence is the attempt's current one. */
+  private liveAt(fence: Fence): LiveAgent | Extract<LiveOutcome, { ok: false }> {
+    if (this.currentFence === null || compareFence(fence, this.currentFence) !== 0) {
+      return { ok: false, error: 'stale_fence' };
+    }
+    return this.live ?? { ok: false, error: 'not_running' };
   }
 
   /** start_attempt: admission first; a refused start reports attempt.failed_to_start and starts nothing. */
@@ -268,29 +323,80 @@ export class AttemptController {
         }),
     });
     await facts.start();
-    const live: LiveAgent = { spec, workspace, launch, session, registration, facts, factsDir, done: Promise.resolve() };
+    const pump = new EventPump({
+      spec,
+      session,
+      adapter,
+      store,
+      notifier: this.deps.notifier,
+      logger,
+      clone: workspace.clone,
+      vault: vault.path,
+      startSha: workspace.startSha,
+      report: (event) => this.report(this.currentFence ?? spec.fence, event),
+      setPhase: (phase) => this.setPhase(phase),
+      root: () => registration.recorded(),
+    });
+    const live: LiveAgent = {
+      spec,
+      workspace,
+      launch,
+      session,
+      registration,
+      facts,
+      pump,
+      factsDir,
+      done: Promise.resolve(),
+    };
     this.live = live;
     live.done = this.follow(live).catch((error) => {
       logger.error('following the agent failed', { attemptId: this.attemptId, error: describe(error) });
     });
   }
 
-  /** Reads the agent's events, once its process is recorded, until they end. */
+  /**
+   * Reads the agent's events, once its process is recorded, until they end. An event the runner fails to handle is
+   * logged and the next one read, so one bad event never ends supervision; events that fail to arrive have ended.
+   */
   private async follow(live: LiveAgent): Promise<void> {
     await live.registration.recorded();
-    for await (const event of live.session.events) {
-      live.facts.observe(event);
-      this.onEvent(live, event);
+    const iterator = live.session.events[Symbol.asyncIterator]();
+    for (;;) {
+      let next: IteratorResult<AgentEvent>;
+      try {
+        next = await iterator.next();
+      } catch (error) {
+        this.deps.logger.error("the agent's events failed", { attemptId: this.attemptId, error: describe(error) });
+        break;
+      }
+      if (next.done) break;
+      const event = next.value;
+      await this.guarded(event, () => live.facts.observe(event));
+      await this.guarded(event, () => (event.type === 'started' ? this.spawned(live, event) : live.pump.handle(event)));
     }
     await live.session.exited;
+    live.pump.close();
+    await live.pump.settled();
     live.facts.close();
     await rm(live.factsDir, { recursive: true, force: true });
     if (this.live === live) this.live = null;
     this.currentPhase = null;
   }
 
-  private onEvent(live: LiveAgent, event: AgentEvent): void {
-    if (event.type === 'started') this.spawned(live, event);
+  /** Runs one step of an event's handling; a failure is logged, never thrown. */
+  private async guarded(event: AgentEvent, step: () => void | Promise<void>): Promise<void> {
+    try {
+      await step();
+    } catch (error) {
+      const fields = { attemptId: this.attemptId, type: event.type, error: describe(error) };
+      this.deps.logger.error('cannot handle an agent event', fields);
+    }
+  }
+
+  /** The phase the controller and the facts report. */
+  private setPhase(phase: AttemptPhase): void {
+    this.currentPhase = phase;
+    this.live?.facts.setPhase(phase);
   }
 
   /** The agent's started event: attempt.spawned with the start tip the clone was made at. */
@@ -387,10 +493,7 @@ export class AttemptController {
   }
 
   /** Appends one of this attempt's events with the fence it belongs to. */
-  private report(fence: Fence, event: DistributiveOmit<AttemptEvent, 'attemptId' | 'fence'>): void {
+  private report(fence: Fence, event: PumpEvent): void {
     this.deps.outbox.append({ ...event, attemptId: this.attemptId, fence } as NewEvent);
   }
 }
-
-type AttemptEvent = Extract<NewEvent, { attemptId: string }>;
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;

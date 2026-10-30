@@ -25,7 +25,7 @@ import {
 } from '../src/attempt/workspace';
 import { resolveRestoreBase } from '../src/git/protect';
 import type { DependencyPreparer, PrepareInput } from '../src/seams';
-import { cleanupRunnerFixtures, createRunnerFixture, FIXTURE_PROJECT } from './fixture';
+import { cleanupRunnerFixtures, createRunnerFixture, FIXTURE_PROJECT, waitFor } from './fixture';
 import { PLANTED_ATTRIBUTES, plantCloneConfig, touchLater } from './planted-config';
 
 // Every test here runs git or agent processes, which take several times as long on a machine loaded by other suites.
@@ -144,6 +144,8 @@ describe('AttemptController: preparing the clone for a start', () => {
   test('a link planted at the clone path fails the start, and nothing is done through it', async () => {
     const f = await createRunnerFixture({ files: FILES });
     await f.controller().start(f.spec());
+    // The first agent's turn is over, so none of its events lands among the second start's.
+    await waitFor(() => f.events('attempt.activity').length > 0);
     const clone = f.paths.clone(FIXTURE_PROJECT, 'T-4-a1');
     // The owner's files, where the agent's link points.
     const home = tempDir('agflow-owner-home-');
@@ -338,7 +340,8 @@ describe('AttemptController: preparing the clone for a start', () => {
       requestId: null,
     });
     expect(call?.input.env.AGFLOW_ATTEMPT_ID).toBe('T-4-a1');
-    expect(controller.phase).toBe('starting');
+    // Out of preparing: starting, or already in the agent's first turn.
+    expect(controller.phase).not.toBe('preparing');
     expect(f.events('attempt.prepared').map((event) => event.data)).toEqual([
       { requestId: null, ok: true, error: null, logTail: null },
     ]);
