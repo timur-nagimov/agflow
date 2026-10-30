@@ -227,6 +227,15 @@ export function recordResult(
 export const KEPT_ON_CANCEL: readonly RunnerCommandKind[] = ['cleanup_attempt', 'upload_transcript', 'hand_back'];
 
 /**
+ * Frees the pending_deliveries rows of cancelled commands: their messages are unread again (design 6.7, In flight). A
+ * re-fence that carries them on reads them before it cancels.
+ */
+function freeDeliveries(ctx: HubContext, commandIds: readonly string[]): void {
+  const drop = ctx.db.query('DELETE FROM pending_deliveries WHERE command_id = $commandId');
+  for (const commandId of commandIds) drop.run({ commandId });
+}
+
+/**
  * Cancels the attempt's pending commands, in the transaction that ends it or gives it a new fence. Cancelled commands
  * are never sent again. Returns them, oldest first.
  */
@@ -238,17 +247,21 @@ export function cancelPendingCommands(ctx: HubContext, attemptId: string): Comma
        RETURNING *`,
     )
     .all({ attemptId, now: ctx.now() }) as StoredRow[];
+  freeDeliveries(ctx, rows.map((row) => row.id));
   return rows.map(toRow).sort((a, b) => a.hubEpoch - b.hubEpoch || a.seq - b.seq);
 }
 
 /** Cancels the attempt's pending commands of one kind, such as the stop_attempt a newer stop request replaces. */
 export function cancelPendingOfKind(ctx: HubContext, attemptId: string, kind: RunnerCommandKind): number {
-  return ctx.db
+  const rows = ctx.db
     .query(
       `UPDATE runner_commands SET status = 'cancelled', done_at = $now
-       WHERE attempt_id = $attemptId AND kind = $kind AND status = 'pending'`,
+       WHERE attempt_id = $attemptId AND kind = $kind AND status = 'pending'
+       RETURNING id`,
     )
-    .run({ attemptId, kind, now: ctx.now() }).changes;
+    .all({ attemptId, kind, now: ctx.now() }) as { id: string }[];
+  freeDeliveries(ctx, rows.map((row) => row.id));
+  return rows.length;
 }
 
 /**

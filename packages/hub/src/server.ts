@@ -3,6 +3,7 @@
 import type { Server, ServerWebSocket } from 'bun';
 import { sweepAuth } from './auth';
 import { type HubContext, NO_RUNNER_LINK } from './context';
+import { flushDeliveries, watchDeliveries } from './delivery';
 import { Gateway, type LinkSession, type LinkSocket, type RunnerConnection } from './gateway';
 import { createApp } from './http/app';
 import { refreshNeedsLogin } from './runners';
@@ -20,9 +21,9 @@ export interface StartHubOptions {
   /** Keep a lock file next to the database while the hub runs; false by default. This version takes no lock yet. */
   dbLock?: boolean | undefined;
   /**
-   * The hub's own housekeeping, once per heartbeatMs: dead links are terminated, expired sign-ins removed, and
-   * offline runners whose session no longer verifies marked needs_login. True by default; tests that drive the
-   * clock themselves turn it off.
+   * The hub's own housekeeping, once per heartbeatMs: dead links are terminated, expired sign-ins removed, offline
+   * runners whose session no longer verifies marked needs_login, and due deliveries flushed. Sent messages also flush
+   * once their batch is due (watchDeliveries). True by default; tests that drive the clock themselves turn it off.
    */
   timers?: boolean | undefined;
 }
@@ -76,6 +77,7 @@ function housekeeping(ctx: HubContext, gateway: Gateway): void {
     ['the dead-link sweep', () => gateway.sweepDeadLinks()],
     ['the auth sweep', () => sweepAuth(ctx)],
     ['the needs_login refresh', () => refreshNeedsLogin(ctx)],
+    ['the delivery flush', () => flushDeliveries(ctx)],
   ];
   for (const [name, duty] of duties) {
     try {
@@ -112,13 +114,16 @@ export function startHub(ctx: HubContext, options: StartHubOptions = {}): HubSer
     },
   });
   upgrader = server;
-  const timer = (options.timers ?? true) ? setInterval(() => housekeeping(ctx, gateway), ctx.config.heartbeatMs) : null;
+  const timers = options.timers ?? true;
+  const timer = timers ? setInterval(() => housekeeping(ctx, gateway), ctx.config.heartbeatMs) : null;
+  const stopDeliveries = timers ? watchDeliveries(ctx) : null;
   return {
     url: server.url.origin,
     gateway,
     scheduler: null,
     async stop() {
       if (timer) clearInterval(timer);
+      stopDeliveries?.();
       gateway.closeAll();
       if (ctx.link === gateway) ctx.link = NO_RUNNER_LINK;
       // The port closes at once. Its promise is not awaited: in Bun 1.3.11 it never settles once the server has

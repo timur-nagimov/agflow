@@ -3,6 +3,7 @@ import { WhoamiResponseSchema } from '@agflow/core';
 import { SESSION_TTL, createSession, deleteSession, mintAgentToken, sessionHashOf } from '../src/auth';
 import { findCommand } from '../src/commands';
 import { BAD_MESSAGE_CLOSE } from '../src/gateway';
+import { sendMessage } from '../src/messages';
 import { getRunner } from '../src/runners';
 import { type HubServer, startHub } from '../src/server';
 import { FakeRunner, connectFakeRunnerWs } from './fake-runner';
@@ -173,5 +174,42 @@ describe('timers', () => {
     expect(getRunner(ctx, 'R-1').state).toBe('offline');
     expect(sessionRow(ctx, web)).not.toBeNull();
     expect(hub.gateway.sweepDeadLinks()).toBe(0);
+  });
+
+  /** Whether a deliver is queued for the attempt. */
+  const delivered = (ctx: Ctx, attemptId: string) =>
+    ctx.db
+      .query("SELECT 1 FROM runner_commands WHERE kind = 'deliver' AND attempt_id = $attemptId")
+      .get({ attemptId }) !== null;
+
+  test('with timers on a sent message reaches a runner agent once its batch is due', async () => {
+    const { ctx, clock } = serve({ heartbeatMs: 60_000, deliveryBatchMs: 20 }, { timers: true });
+    const { agent, attempt } = addRunnerAttempt(ctx);
+    sendMessage(ctx, { from: 'user:alice', to: `agent:${agent.id}`, body: 'one' });
+    clock.advance(20);
+    await until(() => delivered(ctx, attempt.id));
+  });
+
+  test('with timers on the housekeeping flushes a message no event announced', async () => {
+    const { ctx, clock } = serve({ heartbeatMs: 20, deliveryBatchMs: 60_000 }, { timers: true });
+    const { agent, attempt } = addRunnerAttempt(ctx);
+    ctx.db
+      .query("INSERT INTO messages (sender, target, body, created_at) VALUES ('user:alice', $target, 'one', $now)")
+      .run({ target: `agent:${agent.id}`, now: ctx.now() });
+    clock.advance(60_000);
+    await until(() => delivered(ctx, attempt.id));
+  });
+
+  test('with timers off, or once the hub has stopped, nothing is delivered by itself', async () => {
+    const off = serve({ heartbeatMs: 20, deliveryBatchMs: 20 });
+    const stopped = serve({ heartbeatMs: 20, deliveryBatchMs: 20 }, { timers: true });
+    await stopped.hub.stop();
+    for (const { ctx, clock } of [off, stopped]) {
+      const { agent, attempt } = addRunnerAttempt(ctx);
+      sendMessage(ctx, { from: 'user:alice', to: `agent:${agent.id}`, body: 'one' });
+      clock.advance(20);
+      await Bun.sleep(100);
+      expect(delivered(ctx, attempt.id)).toBe(false);
+    }
   });
 });

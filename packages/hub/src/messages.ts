@@ -79,9 +79,15 @@ export function sendMessage(ctx: HubContext, message: NewMessage): Message {
   return tx(ctx, (emit) => insertMessage(ctx, emit, message));
 }
 
+// A message in flight to one of the agent's runner attempts (pending_deliveries, design 6.7) is not unread for it.
 const UNREAD_SQL = `
 SELECT m.* FROM messages m
-WHERE m.sender != $self AND (
+WHERE m.sender != $self
+AND NOT EXISTS (
+  SELECT 1 FROM pending_deliveries p JOIN attempts a ON a.id = p.attempt_id
+  WHERE p.message_id = m.id AND a.agent_id = $id
+)
+AND (
   (m.target = $self AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.agent_id = $id))
   OR ($isLead = 1 AND m.target = 'lead' AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id))
   OR ($taskTarget IS NOT NULL AND m.target = $taskTarget

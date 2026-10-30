@@ -74,6 +74,7 @@ import {
 } from './commands';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
+import { deliverBacklog, messagesInFlight, retargetDeliveries } from './delivery';
 import { HubError, badRequest, conflict, notFound } from './errors';
 import type { Emit } from './events';
 import { assembleHandoffNote, handoffWritten } from './handoff';
@@ -507,10 +508,11 @@ export function stopCommand(attempt: Attempt): StoredCommand {
 /**
  * Resumes an open runner attempt with a new fence (design 6.4, Resume). In one transaction: the attempt goes to
  * starting with a fresh runner lease, its tokens are revoked, its old fence's commands cancelled (a pending resume's
- * prompt and messages carried into this one), the cause logged, and resume_attempt queued with a recomputed task
- * pack, restore set and acceptance ids. A push owed to a pending submission and a recorded stop are queued again at
- * the new fence, after the resume, so the re-fence drops neither, and the stop's grace starts again. A deferred stop
- * stays held back. A take-over in flight is the take-over's to finish, so it cannot be resumed.
+ * prompt and messages carried into this one, with the messages in flight), the cause logged, and resume_attempt
+ * queued with a recomputed task pack, restore set and acceptance ids; the rows of the messages it carries name it.
+ * A push owed to a pending submission and a recorded stop are queued again at the new fence, after the resume, so the
+ * re-fence drops neither, and the stop's grace starts again. A deferred stop stays held back. A take-over in flight
+ * is the take-over's to finish, so it cannot be resumed.
  */
 export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttempt {
   return tx(ctx, (emit) => {
@@ -521,6 +523,8 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
     if (before.runnerId === null) throw conflict(`attempt ${before.id} runs in a live chat, not on a runner`);
     if (before.stopRequested?.cause === 'takeover') throw conflict(`a take-over is in flight for attempt ${before.id}`);
     const pending = pendingResumeOf(ctx, before.id);
+    // Read before the cancel frees their rows: the resume carries them to the new fence (design 6.7, Backlog).
+    const inFlight = messagesInFlight(ctx, before.id);
     const cancelled = cancelPendingCommands(ctx, before.id);
     revokeAgentTokens(ctx, before.id);
     const fence = issueFence(ctx);
@@ -535,7 +539,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
     appendAttemptLog(ctx, before.id, 'note', `resumed at fence ${formatFence(fence)}: ${RESUME_CAUSES[input.cause]}`);
     const attempt = getAttempt(ctx, before.id);
     const task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
-    const { prompt, messages } = carriedOver(pending, input);
+    const { prompt, messages } = carriedOver(pending, { ...input, messages: [...inFlight, ...(input.messages ?? [])] });
     const command = enqueueCommand(ctx, attempt.runnerId as string, {
       kind: 'resume_attempt',
       attemptId: attempt.id,
@@ -546,6 +550,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
       restore: restoreFor(ctx, task),
       acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     });
+    retargetDeliveries(ctx, attempt.id, command.id, messages);
     // A push still owed to a pending submission goes again at the new fence: nothing else would push it. A runner that
     // already had it maps it to its first run by the submission id (design 6.13).
     const submission = pendingSubmissionOf(ctx, attempt.id);
@@ -1173,6 +1178,8 @@ export function onSpawned(
   if (attempt.runnerId !== null) resetFailedStarts(ctx, attempt.runnerId, attempt.vendor);
   if (starting) {
     emit({ type: 'attempt.running', actor: byRunner(attempt), subject: attemptSubject(attempt), data: attemptData(attempt) });
+    // Messages for a starting attempt waited for its session (design 6.7, Pushing).
+    deliverBacklog(ctx, getAttempt(ctx, attempt.id));
   }
 }
 

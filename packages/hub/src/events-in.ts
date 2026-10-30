@@ -29,6 +29,7 @@ import {
   recordLateWork,
 } from './attempts';
 import { type HubContext, tx } from './context';
+import { onAcknowledged, onDelivered } from './delivery';
 import type { Emit } from './events';
 import { onPrepared } from './prepare';
 import { recordQuotaReports } from './quota';
@@ -125,6 +126,10 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   'attempt.submitted': (ctx, event, context) =>
     onSubmitted(ctx, context.emit, context.runnerId, context.attempt, event),
   'attempt.prepared': (ctx, event, context) => onPrepared(ctx, context.emit, attemptOf(context), event.data),
+  'attempt.delivered': (ctx, event, context) =>
+    onDelivered(ctx, context.emit, attemptOf(context), event.data.messageIds),
+  'attempt.acknowledged': (ctx, event, context) =>
+    onAcknowledged(ctx, context.emit, attemptOf(context), event.data.messageIds),
   'runner.state': (ctx, event, { runnerId, helloLastSeq }) => {
     // The hello reported the runner's state after this event, so a replayed one must not undo it, nor resume what
     // the hello deferred (X-36).
