@@ -1,5 +1,6 @@
 export * from './adapters/types';
 export * from './attempt/controller';
+export * from './attempt/workspace';
 export * from './attempt-store';
 export * from './backoff';
 export * from './clock';

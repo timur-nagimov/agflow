@@ -3,7 +3,7 @@
 // vendor, an outbox reader, a hub HTTP that records what the runner posts, and a spec builder. Each test file calls
 // cleanupRunnerFixtures from afterEach. M2d's tests reuse it.
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type AttemptSpec, restoreSet, type RunnerEvent, type Vendor } from '@agflow/core';
@@ -19,6 +19,7 @@ import { memoryLogger } from '../src/log';
 import { Outbox } from '../src/outbox';
 import { type RunnerPaths, runnerPaths } from '../src/paths';
 import { SerialQueue } from '../src/queue';
+import { removeAgentTools } from '../src/run-dir';
 import { defaultHealth, silentNotifier, skipDependencyPreparer } from '../src/seams';
 
 export const FIXTURE_PROJECT = 'demo-0123456789';
@@ -78,6 +79,8 @@ export interface RunnerFixture {
   fakes: Partial<Record<Vendor, FakeAdapter>>;
   hub: RecordingHubHttp;
   logger: ReturnType<typeof memoryLogger>;
+  /** Where Claude attempts' private temporary directories go: a short directory under /tmp. */
+  tmpRoot: string;
   /** What deps.liveAttempts() answers. */
   liveAttempts: number;
   /** What deps.vendorReady(vendor) answers. */
@@ -110,6 +113,15 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
   const home = tempDir('agflow-fixture-home-');
   const paths = runnerPaths(home);
   ensureRunnerGitFiles(paths);
+  // The attempts' tools directories are read-only: they must be made writable before the home can go.
+  cleanups.push(() => {
+    const tools = join(paths.vaults, `${FIXTURE_PROJECT}.agent`);
+    if (!existsSync(tools)) return;
+    for (const attempt of readdirSync(tools)) removeAgentTools(join(tools, attempt));
+  });
+  // Short, as Claude's private temporary directories must be (makeAttemptTmpDir).
+  const tmpRoot = mkdtempSync('/tmp/ag');
+  cleanups.push(() => rmSync(tmpRoot, { recursive: true, force: true }));
   const config = RunnerConfigSchema.parse({
     runnerKey: 'runner-key-test',
     machineId: 'machine-test',
@@ -159,6 +171,7 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
     fakes,
     hub: new RecordingHubHttp(),
     logger: memoryLogger(),
+    tmpRoot,
     liveAttempts: 0,
     ready: { claude: true, codex: true },
     events: <T extends RunnerEvent['type']>(type?: T) =>
@@ -203,6 +216,8 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
       logger: fixture.logger,
       liveAttempts: () => fixture.liveAttempts,
       vendorReady: (vendor) => fixture.ready[vendor],
+      wipRefPrefix: () => FIXTURE_WIP_PREFIX,
+      tmpRoot: fixture.tmpRoot,
       ...overrides,
     }),
     controller: (attemptId = 'T-4-a1', overrides = {}) => new AttemptController(attemptId, fixture.deps(overrides)),
