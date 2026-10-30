@@ -143,6 +143,74 @@ export function accountViews(ctx: HubContext): AccountView[] {
 }
 
 // ---------------------------------------------------------------------------
+// Owner away (design 6.10)
+// ---------------------------------------------------------------------------
+
+/** The reading of an account no runner has reported yet: older than any report, so the first one replaces it. */
+const UNREPORTED: VendorQuota = {
+  state: 'unknown',
+  resetsAt: null,
+  windows: { fiveHour: null, weekly: null },
+  paidUsage: 'unknown',
+  updatedAt: 0,
+};
+
+export interface OwnerAwayInput {
+  owner: string;
+  vendor: Vendor;
+  /** The account the approval's runner reports for the vendor; null marks every account of the owner on the vendor. */
+  accountId: string | null;
+  /** The approval whose expiry marks the owner away. */
+  approvalId: string;
+}
+
+/**
+ * Marks the owner's account for the vendor away after an approval expired (design 6.10, Owner away; X-39): core's
+ * usableVendors then places no new attempts of that vendor on any of the owner's runners logged in to it. An account
+ * without a quota report is stored with an unknown reading to carry the mark. account.owner_away goes out for each
+ * account newly marked. Returns how many.
+ */
+export function setOwnerAway(ctx: HubContext, emit: Emit, input: OwnerAwayInput): number {
+  const { owner, vendor, accountId, approvalId } = input;
+  const marked = (
+    accountId === null
+      ? ctx.db
+          .query(
+            `UPDATE vendor_accounts SET owner_away = 1 WHERE owner = $owner AND vendor = $vendor AND owner_away = 0
+             RETURNING account_id`,
+          )
+          .all({ owner, vendor })
+      : ctx.db
+          .query(
+            `INSERT INTO vendor_accounts (owner, vendor, account_id, quota, owner_away, updated_at)
+             VALUES ($owner, $vendor, $accountId, $quota, 1, $now)
+             ON CONFLICT (owner, vendor, account_id) DO UPDATE SET owner_away = 1 WHERE vendor_accounts.owner_away = 0
+             RETURNING account_id`,
+          )
+          .all({ owner, vendor, accountId, quota: JSON.stringify(UNREPORTED), now: ctx.now() })
+  ) as { account_id: string }[];
+  for (const row of marked) {
+    emit({
+      type: 'account.owner_away',
+      actor: 'system',
+      subject: owner,
+      data: { vendor, accountId: row.account_id, approvalId },
+    });
+  }
+  return marked.length;
+}
+
+/**
+ * Clears every owner-away mark of the owner, when they act (X-39): any approval decision of theirs, or a PATCH of one
+ * of their runners (task 52). Returns how many accounts it cleared.
+ */
+export function clearOwnerAway(ctx: HubContext, owner: string): number {
+  return ctx.db
+    .query('UPDATE vendor_accounts SET owner_away = 0 WHERE owner = $owner AND owner_away = 1')
+    .run({ owner }).changes;
+}
+
+// ---------------------------------------------------------------------------
 // Unknown reset times (design 6.10)
 // ---------------------------------------------------------------------------
 

@@ -1,13 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import type { Fence, RawRunnerEvent, RunnerEventData } from '@agflow/core';
-import { findApproval } from '../src/approvals';
+import { type Fence, type RawRunnerEvent, type RunnerEventData, TEST_ACCOUNT_ID, usableVendors } from '@agflow/core';
+import { expireApprovals, findApproval } from '../src/approvals';
 import { attemptLog, getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, requestStop, resumeAttempt } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
 import { pendingCommands } from '../src/commands';
+import { tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
-import { type RunnerAttempt, addRunnerAttempt } from './helpers';
+import { placementSnapshot } from '../src/placement';
+import { accountFor, accountViews, clearOwnerAway, listAccounts, upsertAccountQuota } from '../src/quota';
+import { type RunnerAttempt, addRunner, addRunnerAttempt } from './helpers';
 import { createTestHub } from './http-helpers';
 
 type Hub = ReturnType<typeof createTestHub>;
@@ -266,5 +269,154 @@ describe('GET /api/approvals', () => {
     expect(some.json.approvals.map((one: { id: string }) => one.id)).toEqual([second]);
     expect((await list('bob')).json).toEqual({ approvals: [] });
     expect((await list('alice', '?status=maybe')).status).toBe(400);
+  });
+});
+
+describe('expiry and owner away', () => {
+  /** setup() with alice's Codex account reported, as a runner's hello reports it. */
+  function reported() {
+    const { hub, held } = setup();
+    const windows = { fiveHour: 0.1, weekly: 0.1 };
+    const quota = { state: 'ok', resetsAt: null, windows, paidUsage: 'disabled' } as const;
+    tx(hub.ctx, (emit) =>
+      upsertAccountQuota(hub.ctx, emit, {
+        owner: 'alice',
+        runnerId: held.runner.id,
+        report: { vendor: 'codex', accountId: TEST_ACCOUNT_ID, quota: { ...quota, updatedAt: hub.ctx.now() } },
+      }),
+    );
+    return { hub, held };
+  }
+
+  const away = (hub: Hub) => accountFor(hub.ctx, 'alice', 'codex', TEST_ACCOUNT_ID)?.ownerAway;
+
+  test('one not answered within approvalMs is declined with the reason, and approval.expired is emitted', () => {
+    const { hub, held } = reported();
+    const id = requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs - 1);
+    expect(expireApprovals(hub.ctx)).toBe(0);
+    hub.clock.advance(1);
+    expect(expireApprovals(hub.ctx)).toBe(1);
+    expect(findApproval(hub.ctx, id)).toMatchObject({ status: 'expired', decidedBy: null, decidedAt: hub.ctx.now() });
+    expect(decisions(hub, held)).toEqual([
+      {
+        kind: 'decide_approval',
+        attemptId: held.attempt.id,
+        fence: held.attempt.fence,
+        approvalId: id,
+        decision: 'decline',
+        reason: 'the owner did not answer; continue without it or declare_blocked',
+      },
+    ]);
+    expect(eventsOf(hub, 'approval.expired').map((event) => [event.subject, event.data.approvalId])).toEqual([
+      [held.task.id, id],
+    ]);
+    expect(expireApprovals(hub.ctx)).toBe(0);
+  });
+
+  test("an expiry marks the owner's account for the vendor away, on every runner of theirs on it", () => {
+    const { hub, held } = reported();
+    const other = addRunner(hub.ctx, { vendors: ['codex'] });
+    const id = requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs);
+    expireApprovals(hub.ctx);
+    expect(away(hub)).toBe(true);
+    expect(eventsOf(hub, 'account.owner_away').map((event) => [event.subject, event.data])).toEqual([
+      ['alice', { vendor: 'codex', accountId: TEST_ACCOUNT_ID, approvalId: id }],
+    ]);
+    expect(accountViews(hub.ctx).find((view) => view.vendor === 'codex')?.ownerAway).toBe(true);
+    const snapshot = placementSnapshot(hub.ctx);
+    for (const runnerId of [held.runner.id, other]) {
+      const runner = snapshot.runners.find((slot) => slot.id === runnerId);
+      if (!runner) throw new Error(`no slot for ${runnerId}`);
+      const refusal = { runnerId, vendor: 'codex', refusal: 'owner_away' } as const;
+      expect(usableVendors(snapshot, runner).refused).toContainEqual(refusal);
+    }
+    // A second expiry while the owner is away marks nothing new.
+    requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs);
+    expireApprovals(hub.ctx);
+    expect(eventsOf(hub, 'account.owner_away')).toHaveLength(1);
+  });
+
+  test('an account with no quota report yet is stored, marked away', () => {
+    const { hub, held } = setup();
+    requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs);
+    expireApprovals(hub.ctx);
+    expect(accountFor(hub.ctx, 'alice', 'codex', TEST_ACCOUNT_ID)).toMatchObject({
+      ownerAway: true,
+      quota: { state: 'unknown', resetsAt: null },
+    });
+  });
+
+  test('any approval decision by the owner clears it, and so does clearOwnerAway', async () => {
+    const { hub, held } = reported();
+    requested(hub, held);
+    const later = requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs - 1_000);
+    const latest = requested(hub, held);
+    hub.clock.advance(1_000);
+    expireApprovals(hub.ctx);
+    expect(away(hub)).toBe(true);
+    expect(findApproval(hub.ctx, later)?.status).toBe('expired');
+    const declined = await hub.call('POST', `/api/approvals/${latest}`, {
+      user: 'alice',
+      via: 'web',
+      body: { decision: 'decline' },
+    });
+    expect(declined.status).toBe(200);
+    expect(away(hub)).toBe(false);
+
+    requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs);
+    expireApprovals(hub.ctx);
+    expect(away(hub)).toBe(true);
+    expect(clearOwnerAway(hub.ctx, 'alice')).toBe(1);
+    expect(away(hub)).toBe(false);
+  });
+
+  test('a decision between an expiry and the tick that processes it leaves the owner not away', async () => {
+    const { hub, held } = reported();
+    const first = requested(hub, held);
+    hub.clock.advance(1_000);
+    const second = requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs);
+    // The first expired a second ago; alice answers the second before the tick sees it.
+    expect((await decide(hub, second, { user: 'alice', via: 'web' })).status).toBe(200);
+    expect(expireApprovals(hub.ctx)).toBe(1);
+    expect(statusOf(hub, first)).toBe('expired');
+    expect(away(hub)).toBe(false);
+    expect(eventsOf(hub, 'account.owner_away')).toEqual([]);
+  });
+
+  test("a runner that reports no account marks the owner's stored accounts for the vendor, and only those", () => {
+    const { hub, held } = reported();
+    hub.ctx.db
+      .query(`UPDATE runners SET info = json_set(info, '$.vendors[0].accountId', NULL) WHERE id = $id`)
+      .run({ id: held.runner.id });
+    const id = requested(hub, held);
+    hub.clock.advance(hub.ctx.config.approvalMs);
+    expireApprovals(hub.ctx);
+    expect(away(hub)).toBe(true);
+    expect(eventsOf(hub, 'account.owner_away').map((event) => event.data)).toEqual([
+      { vendor: 'codex', accountId: TEST_ACCOUNT_ID, approvalId: id },
+    ]);
+    // The runner itself has no account, so no account rule applies to it there (X-21).
+    const snapshot = placementSnapshot(hub.ctx);
+    const runner = snapshot.runners.find((slot) => slot.id === held.runner.id);
+    if (!runner) throw new Error(`no slot for ${held.runner.id}`);
+    expect(usableVendors(snapshot, runner).usable.map((one) => one.slot.vendor)).toEqual(['codex']);
+
+    // With no stored account, nothing is marked.
+    const bare = setup();
+    bare.hub.ctx.db
+      .query(`UPDATE runners SET info = json_set(info, '$.vendors[0].accountId', NULL) WHERE id = $id`)
+      .run({ id: bare.held.runner.id });
+    requested(bare.hub, bare.held);
+    bare.hub.clock.advance(bare.hub.ctx.config.approvalMs);
+    expect(expireApprovals(bare.hub.ctx)).toBe(1);
+    expect(listAccounts(bare.hub.ctx)).toEqual([]);
+    expect(eventsOf(bare.hub, 'account.owner_away')).toEqual([]);
   });
 });

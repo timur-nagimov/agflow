@@ -1,15 +1,16 @@
 // Approvals (design 6.10, Approvals): the Codex escalations a runner relays to the agent's owner, who alone answers
 // them, in a browser. The hub stores each request, sends the owner's decision back as decide_approval at the
-// approval's fence, and voids what no process can take any more: when the runner says so or the process exits, and
-// when the attempt is resumed, re-fenced, ended or asked to stop. attempts.ts voids through this module, so it imports
-// nothing that ends attempts.
+// approval's fence, declines one left unanswered and marks the owner away, and voids what no process can take any
+// more: when the runner says so or the process exits, and when the attempt is resumed, re-fenced, ended or asked to
+// stop. attempts.ts voids through this module, so it imports nothing that ends attempts.
 import type { Approval, Attempt, Fence, RunnerEventData } from '@agflow/core';
-import { appendAttemptLog, attemptSubject } from './attempt-store';
+import { appendAttemptLog, attemptSubject, findAttempt } from './attempt-store';
 import { enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import { conflict, forbidden, notFound } from './errors';
 import type { Emit } from './events';
-import { findRunnerRow } from './runners';
+import { type OwnerAwayInput, clearOwnerAway, setOwnerAway } from './quota';
+import { findRunnerRow, runnerInfo } from './runners';
 
 interface ApprovalRow {
   id: string;
@@ -197,7 +198,7 @@ export function voidApprovals(ctx: HubContext, emit: Emit, attemptId: string, ac
 /**
  * POST /api/approvals/:id (design 6.10, Who may answer): only the owner decides, once, and the decision goes to the
  * runner as decide_approval at the approval's fence. Approve maps only to the vendor's one-time accept, which the
- * runner applies. user is the login of the person in the browser.
+ * runner applies. Any decision clears the owner's away marks (X-39). user is the login of the person in the browser.
  */
 export function decideApproval(
   ctx: HubContext,
@@ -215,6 +216,65 @@ export function decideApproval(
     sendDecision(ctx, decided, decision, null);
     const { subject, data } = approvalEvent(decided);
     emit({ type: 'approval.decided', actor: by, subject, data: { ...data, decision } });
+    // The owner is back (X-39).
+    clearOwnerAway(ctx, user);
     return decided;
   });
+}
+
+/** What the agent is told when its owner let an approval expire (design 6.10, Expiry). */
+const EXPIRY_REASON = 'the owner did not answer; continue without it or declare_blocked';
+
+/** The owner's account an approval's attempt draws on, as its runner reports it; null when the runner names none. */
+function accountOf(ctx: HubContext, approval: Approval): Pick<OwnerAwayInput, 'vendor' | 'accountId'> | null {
+  const attempt = findAttempt(ctx, approval.attemptId);
+  const runner = findRunnerRow(ctx, approval.runnerId);
+  if (!attempt || !runner) return null;
+  const slot = runnerInfo(runner).vendors.find((vendor) => vendor.vendor === attempt.vendor);
+  return { vendor: attempt.vendor, accountId: slot?.accountId ?? null };
+}
+
+/**
+ * Whether the owner decided an approval at or after the time, as one between an approval's expiry and the tick that
+ * processes it: that decision is acting after the timeout, so the expiry marks no one away (X-39).
+ */
+function actedSince(ctx: HubContext, owner: string, since: number): boolean {
+  return (
+    ctx.db
+      .query('SELECT 1 FROM approvals WHERE owner = $owner AND decided_by = $by AND decided_at >= $since LIMIT 1')
+      .get({ owner, by: `user:${owner}`, since }) !== null
+  );
+}
+
+/**
+ * Declines every approval still pending approvalMs after the hub received it (design 6.10, Expiry), each in its own
+ * transaction: it reads expired, the runner gets the decline with the reason the agent sees, approval.expired goes
+ * out, and the owner's account for that vendor is marked away (setOwnerAway), unless the owner decided another one
+ * since the expiry. Returns how many expired.
+ */
+export function expireApprovals(ctx: HubContext): number {
+  const rows = ctx.db
+    .query("SELECT * FROM approvals WHERE status = 'pending' AND expires_at <= $now ORDER BY expires_at, rowid")
+    .all({ now: ctx.now() }) as ApprovalRow[];
+  let expired = 0;
+  for (const row of rows) {
+    try {
+      const done = tx(ctx, (emit) => {
+        const approval = settle(ctx, rowToApproval(row), 'expired', null);
+        if (!approval) return false;
+        sendDecision(ctx, approval, 'decline', EXPIRY_REASON);
+        const { subject, data } = approvalEvent(approval);
+        emit({ type: 'approval.expired', actor: 'system', subject, data });
+        const account = accountOf(ctx, approval);
+        if (account && !actedSince(ctx, approval.owner, row.expires_at)) {
+          setOwnerAway(ctx, emit, { owner: approval.owner, ...account, approvalId: approval.id });
+        }
+        return true;
+      });
+      if (done) expired += 1;
+    } catch (error) {
+      console.error(`expiring approval ${row.id} failed`, error);
+    }
+  }
+  return expired;
 }
