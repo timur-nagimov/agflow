@@ -6,6 +6,7 @@ export * from './config';
 export * from './db';
 export * from './env';
 export * from './git/clone';
+export * from './git/harvest';
 export * from './git/run';
 export * from './git/vault';
 export * from './hub-http';

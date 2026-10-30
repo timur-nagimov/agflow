@@ -27,6 +27,7 @@ import {
   readCloneRef,
   readSized,
 } from '../src/git/clone';
+import { harvestCommits } from '../src/git/harvest';
 import { ensureRunnerGitFiles, localGitEnv, remoteGitEnv, runGit } from '../src/git/run';
 import { Vault } from '../src/git/vault';
 import { runnerPaths } from '../src/paths';
@@ -438,6 +439,36 @@ describe("the clone's own git configuration", () => {
     expect(await isWorktreeClean({ vault: s.vault, local: s.local, clone })).toBe(true);
     const result = await fastForwardLeadClone({ vault: s.vault, local: s.local, attemptId: 'lead-a1', clone });
     expect(result.moved).toBe(true);
+  });
+
+  test("a committed gitlink over a nested repository runs none of the nested repository's config", async () => {
+    const s = await setup();
+    const clone = await taskClone(s);
+    const marker = join(tempDir('agflow-nested-'), 'fired');
+    const sub = join(clone, 'sub');
+    mkdirSync(sub);
+    await gitIn(sub, ['init', '--quiet']);
+    writeFileSync(join(sub, 'f.txt'), 'nested\n');
+    writeFileSync(join(sub, '.gitattributes'), '* filter=x\n');
+    await gitIn(sub, ['add', '-A']);
+    await gitIn(sub, ['commit', '--quiet', '-m', 'nested']);
+    await gitIn(clone, ['add', 'sub']);
+    await gitIn(clone, ['commit', '--quiet', '-m', 'a gitlink']);
+    appendFileSync(join(sub, '.git', 'config'), `[filter "x"]\n\tclean = "cat; echo clean >> '${marker}'"\n`);
+    await harvestCommits({
+      vault: s.vault,
+      local: s.local,
+      paths: s.paths,
+      clone,
+      attemptId: 'T-4-a1',
+      branch: BRANCH,
+    });
+    touchLater(join(sub, 'f.txt'));
+    expect(await isWorktreeClean({ vault: s.vault, local: s.local, clone })).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    // The plant is live: git status in the clone looks into the nested repository and runs its filter.
+    await gitIn(clone, ['status']);
+    expect(existsSync(marker)).toBe(true);
   });
 
   test("a gitlink on main over a repository the lead faked runs none of that repository's config", async () => {
