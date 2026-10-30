@@ -1,31 +1,40 @@
 // Runner attempts (design 6.4): the one transaction that starts one, the AttemptSpec its start_attempt carries, the
-// re-fence that resumes one, stop requests and their timeout, and endAttempt, the one path every ending takes.
+// re-fence that resumes one, stop requests and their timeout, endAttempt, the one path every ending takes, and the
+// retry ladder that follows an ending (design 6.9).
 import {
   type Agent,
   type AgentRole,
   type Attempt,
   type AttemptSpec,
+  COUNTED_CLASSES,
   ENDING_MOVES,
   type EndingTrigger,
   type InjectedMessage,
+  type LadderStep,
   STOP_CAUSES,
   type StopCause,
   type Task,
   type TaskStatus,
   type Vendor,
+  type VendorRequirement,
   attemptId,
+  backoffApplies,
   branchEpoch,
   computeToolCaps,
+  countedAttempts,
   endingClass,
   failureSignature,
   formatFence,
+  infraBackoffMs,
   isTaskBranch,
+  ladderStep,
   leadAttemptId,
   plannedTaskMove,
   quoteLines,
   restoreSet,
   signatureApplies,
   taskBranchName,
+  vendorRequirement,
   wipRef,
 } from '@agflow/core';
 import { getAgent } from './agents';
@@ -57,6 +66,7 @@ import { HubError, badRequest, conflict, notFound } from './errors';
 import type { Emit } from './events';
 import { assembleHandoffNote, handoffWritten } from './handoff';
 import { emptySeat, seatHolderId, takeSeat } from './hub-state';
+import { insertMessage } from './messages';
 import { getProject } from './project';
 import { findRunnerRow } from './runners';
 import { addNote, findTask, getTask, move, setAgentTask, writeTask } from './task-store';
@@ -426,6 +436,8 @@ export interface Ending {
   moved: TaskStatus[];
   /** Whether the hub stored an assembled handoff note for the task. */
   noteAdded: boolean;
+  /** What the retry ladder did, when the ending moved the task to ready; null when it did not run. */
+  ladder: LadderOutcome | null;
 }
 
 /** A task in these statuses keeps its assignee when the attempt ends: it names whose work is in review or merged. */
@@ -461,6 +473,7 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
     let task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
     let moved: TaskStatus[] = [];
     let noteAdded = false;
+    let ladder: LadderOutcome | null = null;
     if (attempt.runnerId !== null) {
       cancelPendingCommands(ctx, attempt.id);
       if (row.endReason !== 'taken_over') {
@@ -470,6 +483,11 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
       if (task) {
         ({ task, moved } = moveOnEnd(ctx, emit, task, attempt, input.trigger, actor));
         noteAdded = addAssembledNote(ctx, attempt, input.trigger);
+        // The ladder and the failure-signature rule run only when a move to ready actually happened (design 6.4).
+        if (moved.at(-1) === 'ready') {
+          ladder = applyLadder(ctx, emit, { task, attempt, trigger: input.trigger });
+          task = ladder.task;
+        }
       }
     }
     // Only a lead attempt with no task holds the seat; a live lead's task attempt leaves it alone.
@@ -480,7 +498,7 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
       subject: attemptSubject(attempt),
       data: { ...attemptData(attempt), endReason: attempt.endReason, failureClass },
     });
-    return { attempt, task, moved, noteAdded };
+    return { attempt, task, moved, noteAdded, ladder };
   });
 }
 
@@ -519,6 +537,162 @@ function addAssembledNote(ctx: HubContext, attempt: Attempt, trigger: EndingTrig
   if (note === null || (note === 'if_none_written' && handoffWritten(ctx, attempt))) return false;
   addNote(ctx, attempt.taskId as string, 'handoff', assembleHandoffNote(ctx, attempt).body, 'system', attempt.id);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// The retry ladder (design 6.9, 6.15 Attempt limit)
+// ---------------------------------------------------------------------------
+
+/** What the ladder asks of the vendor of a task's next attempt: core's requirement, for the scheduler. */
+export type LadderRequirement = VendorRequirement;
+
+export interface LadderInput {
+  /** The task after the ending: ready, or rejected after a rejection without a resume. */
+  task: Task;
+  /** The attempt as ended. */
+  attempt: Attempt;
+  trigger: EndingTrigger;
+}
+
+/** What the ladder did after an ending. */
+export interface LadderOutcome {
+  /** The step a counted failure reached, or 4 for a repeated failure signature; null for anything else. */
+  step: LadderStep | null;
+  /** When an infra ending lets the task be dispatched again; null without a backoff. */
+  nextDispatchAt: number | null;
+  /** The task afterwards: ready, blocked for a re-plan, or failed. */
+  task: Task;
+}
+
+/** Infra endings with one failure signature that send the task to step 4 (design 6.9). */
+const SIGNATURE_REPEATS = 3;
+
+function ladderFloor(ctx: HubContext, taskId: string): number {
+  const row = ctx.db.query('SELECT ladder_floor FROM tasks WHERE id = $taskId').get({ taskId }) as {
+    ladder_floor: number;
+  } | null;
+  return row?.ladder_floor ?? 0;
+}
+
+/** The task's attempts by number, oldest first. */
+const attemptsOf = (ctx: HubContext, taskId: string): Attempt[] =>
+  listAttempts(ctx, { task: taskId }).sort((a, b) => a.number - b.number);
+
+/**
+ * A runner's own stop and a refused start say nothing about the task, so the backoff passes over them, and live-chat
+ * attempts are never on the ladder (design 6.4).
+ */
+const passedOver = (attempt: Attempt): boolean =>
+  attempt.runnerId === null ||
+  (attempt.endReason === 'stopped' && attempt.failureClass === 'infra') ||
+  (attempt.endReason === 'failed_to_start' && attempt.failureClass === null);
+
+/** The task's consecutive infra endings, newest back: the infra backoff's index (design 6.9). */
+function consecutiveInfra(attempts: readonly Attempt[]): number {
+  let count = 0;
+  for (const attempt of [...attempts].reverse()) {
+    if (attempt.status !== 'ended' || passedOver(attempt)) continue;
+    if (attempt.failureClass !== 'infra') break;
+    count += 1;
+  }
+  return count;
+}
+
+const named = (task: Task): string => `${task.id} ("${clip(task.title, 120)}")`;
+
+/** The step-4 move: the task is blocked for a re-plan, with the reason the lead and people read. */
+function blockForReplan(ctx: HubContext, emit: Emit, task: Task, attempt: Attempt, reason: string): Task {
+  return move(ctx, emit, task, 'blocked', 'system', {
+    changes: { blockedKind: 'replan', blockedReason: reason },
+    data: { attemptId: attempt.id, ladderStep: 4 },
+  });
+}
+
+/**
+ * The retry ladder after an ending (design 6.9), in the ending's transaction. Call it once the ending moved the task
+ * to ready, or once a rejection without a resume marked it rejected. A counted failure takes its step: 2 and 3 leave
+ * the task ready (ladderRequirement then steers the vendor), 4 blocks it for a re-plan and tells the lead, 5 fails it
+ * and tells people. An infra ending delays the task's next dispatch by the infra backoff, and the third with one
+ * failure signature since the last re-plan blocks it for a re-plan and tells the lead and people. A rejected task
+ * that stays on the ladder goes back to ready.
+ */
+export function applyLadder(ctx: HubContext, emit: Emit, input: LadderInput): LadderOutcome {
+  const { attempt, trigger } = input;
+  let task = input.task;
+  if (task.status !== 'ready' && task.status !== 'rejected') {
+    throw new Error(`the ladder runs on a ready or rejected task, not on ${task.id}, which is ${task.status}`);
+  }
+  const attempts = attemptsOf(ctx, task.id);
+  const floor = ladderFloor(ctx, task.id);
+  let step: LadderStep | null = null;
+  let nextDispatchAt: number | null = null;
+  if (backoffApplies(trigger)) {
+    nextDispatchAt = ctx.now() + infraBackoffMs(Math.max(1, consecutiveInfra(attempts)), ctx.config.infraBackoffMs);
+  }
+  // Only this ending's backoff holds: one an earlier ending set must not delay the task now.
+  writeTask(ctx, task.id, { nextDispatchAt });
+  task = getTask(ctx, task.id);
+  if (attempt.failureClass !== null && COUNTED_CLASSES.includes(attempt.failureClass)) {
+    const counted = countedAttempts(attempts, floor);
+    step = ladderStep({ counted, ladderFloor: floor, maxAttempts: ctx.config.maxAttempts });
+    if (step === 4) {
+      const reason =
+        `${counted} attempts at ${task.id} failed; it needs a re-plan: split it, clarify or amend it, or cancel it.`;
+      task = blockForReplan(ctx, emit, task, attempt, reason);
+      insertMessage(ctx, emit, {
+        from: 'system',
+        to: 'lead',
+        taskId: task.id,
+        body:
+          `${named(task)} is blocked for a re-plan: ${counted} of its attempts failed.\n` +
+          'Split it, clarify or amend it with update_task, or cancel it with cancel_task. Unblocking it with ' +
+          `unblock_task gives it ${ctx.config.maxAttempts} more attempts.`,
+      });
+    } else if (step === 5) {
+      task = move(ctx, emit, task, 'failed', 'system', { data: { attemptId: attempt.id, ladderStep: 5 } });
+      insertMessage(ctx, emit, {
+        from: 'system',
+        to: 'humans',
+        taskId: task.id,
+        body:
+          `${named(task)} failed: ${counted} more of its attempts failed after its re-plan, so agflow will not try it ` +
+          'again. Look at its attempts and decide what to do with the work.',
+      });
+    }
+  } else if (attempt.failureSignature !== null) {
+    const signature = attempt.failureSignature;
+    const repeats = attempts.filter((other) => other.number > floor && other.failureSignature === signature).length;
+    if (repeats >= SIGNATURE_REPEATS) {
+      step = 4;
+      const reason =
+        `${repeats} attempts at ${task.id} ended the same way (${clip(signature, 300)}); ` +
+        'fix the cause, then unblock it.';
+      task = blockForReplan(ctx, emit, task, attempt, reason);
+      const body =
+        `${named(task)} is blocked for a re-plan: ${repeats} of its attempts ended the same way on runners:\n` +
+        `${quoteLines(clip(signature, 300))}\n` +
+        'This points at the runners or the setup more than at the task. Fix the cause, then unblock it with ' +
+        'unblock_task.';
+      for (const to of ['lead', 'humans']) insertMessage(ctx, emit, { from: 'system', to, taskId: task.id, body });
+    }
+  }
+  if (task.status === 'rejected') {
+    task = move(ctx, emit, task, 'ready', 'system', { data: { attemptId: attempt.id, ladderStep: step } });
+  }
+  return { step, nextDispatchAt, task: getTask(ctx, task.id) };
+}
+
+/**
+ * The ladder's vendor requirement for the task's next attempt (design 6.6 step 5, 6.9 steps 2 and 3): from its
+ * counted attempts since the last re-plan, until it has been ready for vendorRequirementMs since its last attempt
+ * ended. Null when any vendor will do.
+ */
+export function ladderRequirement(ctx: HubContext, taskId: string): LadderRequirement | null {
+  return vendorRequirement(listAttempts(ctx, { task: taskId }), {
+    ladderFloor: ladderFloor(ctx, taskId),
+    now: ctx.now(),
+    vendorRequirementMs: ctx.config.vendorRequirementMs,
+  });
 }
 
 // ---------------------------------------------------------------------------
