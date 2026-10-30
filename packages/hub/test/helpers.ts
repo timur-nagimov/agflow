@@ -1,4 +1,4 @@
-import type { Agent, AgentRole, Attempt, RunnerCommandKind, RunnerVendor, Task, Vendor } from '@agflow/core';
+import type { Agent, AgentRole, Attempt, LeadNote, RunnerCommandKind, RunnerVendor, Task, Vendor } from '@agflow/core';
 import {
   AGFLOW_VERSION,
   type NewTask,
@@ -6,6 +6,7 @@ import {
   NewTaskSchema,
   TEST_ACCOUNT_ID,
   attemptId,
+  leadAttemptId,
   taskBranchName,
   wipRef,
 } from '@agflow/core';
@@ -14,6 +15,7 @@ import { insertAttempt, issueFence, nextAttemptNumber } from '../src/attempt-sto
 import type { StoredCommand } from '../src/commands';
 import { type FetchFn, HUB_RUNNER_DEFAULTS, type HubConfig, type HubContext, createContext, tx } from '../src/context';
 import { nextId } from '../src/db';
+import { takeSeat } from '../src/hub-state';
 import { getTask, move, setAgentTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
 
@@ -182,6 +184,55 @@ export function addRunnerAttempt(ctx: HubContext, options: RunnerAttemptOptions 
     setAgentTask(ctx, agentId, taskId);
     return { runner: { id: runnerId }, agent: getAgent(ctx, agentId), attempt, task: claimed };
   });
+}
+
+/**
+ * A runner lead holding the seat, as the scheduler starts one: an agent and a running lead attempt on a new runner of
+ * alice's (made with a worker attempt of its own); lead attempts number from 1 per hub.
+ */
+export function addRunnerLead(ctx: HubContext): { agent: Agent; attempt: Attempt } {
+  const { runner } = addRunnerAttempt(ctx);
+  return tx(ctx, (emit) => {
+    const seq = nextId(ctx.db, 'agent');
+    const agentId = `A-${seq}`;
+    const number = nextAttemptNumber(ctx, null);
+    const fence = issueFence(ctx);
+    const id = leadAttemptId(number, fence.epoch);
+    ctx.db
+      .query(
+        `INSERT INTO agents (id, seq, login, vendor, role, origin, label, current_task, last_seen_at, created_at,
+           runner_id, attempt_id)
+         VALUES ($id, $seq, 'alice', 'claude', 'lead', 'runner', $label, NULL, $now, $now, $runnerId, $attemptId)`,
+      )
+      .run({ id: agentId, seq, label: id, now: ctx.now(), runnerId: runner.id, attemptId: id });
+    const attempt = insertAttempt(ctx, {
+      id,
+      taskId: null,
+      number,
+      role: 'lead',
+      agentId,
+      runnerId: runner.id,
+      vendor: 'claude',
+      fence,
+      status: 'running',
+      leaseExpiresAt: ctx.now() + ctx.config.runnerLeaseMs,
+    });
+    takeSeat(ctx, emit, agentId, 'runner', 'system');
+    return { agent: getAgent(ctx, agentId), attempt };
+  });
+}
+
+/** A lead_notes row, as POST /api/lead/handoff or the hub's failover stores one, written now. */
+export function addLeadNote(
+  ctx: HubContext,
+  note: { body: string; author: string; attemptId: string | null; kind?: LeadNote['kind'] },
+): void {
+  ctx.db
+    .query(
+      `INSERT INTO lead_notes (attempt_id, kind, body, author, created_at)
+       VALUES ($attemptId, $kind, $body, $author, $now)`,
+    )
+    .run({ attemptId: note.attemptId, kind: note.kind ?? 'handoff', body: note.body, author: note.author, now: ctx.now() });
 }
 
 /** One tokenless command of each kind for the attempt; the mapped type makes the compiler insist on all 17. */

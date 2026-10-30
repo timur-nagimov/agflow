@@ -16,7 +16,7 @@ import { holdsSeat } from './hub-state';
 import { listStandingRules, unreadFor } from './messages';
 import { getProject } from './project';
 import { findTask, listTaskNotes, listTasks } from './task-store';
-import { clip } from './text';
+import { clip, quotedWithin } from './text';
 
 export const BRIEF_LIMIT = 8000;
 /** The most a worker's task section may take. The full contract is a `get_task` call away. */
@@ -341,9 +341,6 @@ function standingRules(ctx: HubContext): string {
  * rule of the hub's, such as "## Standing rules from people".
  */
 const quoted = (text: string, max: number): string => quoteLines(clip(text, max));
-
-/** Like quoted, but the quote marks count toward max: a note of many short lines would otherwise double in size. */
-const quotedWithin = (text: string, max: number): string => clip(quoteLines(clip(text, max)), max);
 
 /**
  * The task the worker holds, in at most `budget` characters. When any of it is cut, the section ends
