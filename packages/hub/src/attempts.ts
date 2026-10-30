@@ -1,21 +1,28 @@
-// Runner attempts (design 6.4): the one transaction that starts one, the AttemptSpec its start_attempt carries, and
-// the re-fence that resumes one.
+// Runner attempts (design 6.4): the one transaction that starts one, the AttemptSpec its start_attempt carries, the
+// re-fence that resumes one, and endAttempt, the one path every ending takes.
 import {
   type Agent,
   type AgentRole,
   type Attempt,
   type AttemptSpec,
+  ENDING_MOVES,
+  type EndingTrigger,
   type InjectedMessage,
   STOP_CAUSES,
   type Task,
+  type TaskStatus,
   type Vendor,
   attemptId,
   branchEpoch,
   computeToolCaps,
+  endingClass,
+  failureSignature,
   formatFence,
   isTaskBranch,
   leadAttemptId,
+  plannedTaskMove,
   restoreSet,
+  signatureApplies,
   taskBranchName,
   wipRef,
 } from '@agflow/core';
@@ -38,10 +45,11 @@ import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { badRequest, conflict, notFound } from './errors';
 import type { Emit } from './events';
-import { seatHolderId, takeSeat } from './hub-state';
+import { assembleHandoffNote, handoffWritten } from './handoff';
+import { emptySeat, seatHolderId, takeSeat } from './hub-state';
 import { getProject } from './project';
 import { findRunnerRow } from './runners';
-import { findTask, getTask, move, setAgentTask } from './task-store';
+import { addNote, findTask, getTask, move, setAgentTask, writeTask } from './task-store';
 
 export interface StartAttemptInput {
   runnerId: string;
@@ -380,4 +388,121 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
     });
     return { attempt: getAttempt(ctx, attempt.id), command };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Endings (design 6.4, Every way an attempt ends)
+// ---------------------------------------------------------------------------
+
+export interface EndAttemptInput {
+  attemptId: string;
+  /** The row of the trigger table: the recorded stop cause, or the event, timeout or decision that ends it. */
+  trigger: EndingTrigger;
+  /** What failed, for an infra ending's failure signature. */
+  error?: string | null | undefined;
+  actor?: string | undefined;
+}
+
+/** What an ending did. */
+export interface Ending {
+  attempt: Attempt;
+  /** The attempt's task after the ending; null for a lead. */
+  task: Task | null;
+  /** The statuses the task passed through, in order; empty when it kept its status. */
+  moved: TaskStatus[];
+  /** Whether the hub stored an assembled handoff note for the task. */
+  noteAdded: boolean;
+}
+
+/** A task in these statuses keeps its assignee when the attempt ends: it names whose work is in review or merged. */
+const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted'];
+
+/**
+ * Ends an attempt, whatever triggered it (design 6.4): the one path every ending takes, in the caller's transaction or
+ * its own. It sets the end reason, class and failure signature from the trigger's row, revokes the tokens, cancels the
+ * pending commands (cleanup, transcript uploads and hand-backs stay) and queues cleanup_attempt, except for a take-over,
+ * whose cleanup follows its hand-back. It clears the holder fields (invariant e) and makes the row's on-exit move, only
+ * while the task is claimed or working and names this attempt (X-34). It stores an assembled handoff note, with the
+ * attempt's id, when the row asks and the agent wrote none, and empties the seat its lead held. A live chat's attempt
+ * only ends: M1's operations move its task. Null when the attempt had already ended.
+ */
+export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | null {
+  return tx(ctx, (emit) => {
+    const row = ENDING_MOVES[input.trigger];
+    if (row.endReason === null) throw new Error(`${input.trigger} does not end an attempt`);
+    const before = getAttempt(ctx, input.attemptId);
+    if (before.status === 'ended') return null;
+    const actor = input.actor ?? 'system';
+    const failureClass = endingClass(input.trigger);
+    updateAttempt(ctx, before.id, {
+      status: 'ended',
+      endReason: row.endReason,
+      failureClass,
+      failureSignature: signatureApplies(input.trigger) ? failureSignature(row.endReason, input.error ?? null) : null,
+      leaseExpiresAt: null,
+      endedAt: ctx.now(),
+    });
+    revokeAgentTokens(ctx, before.id);
+    const attempt = getAttempt(ctx, before.id);
+    let task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
+    let moved: TaskStatus[] = [];
+    let noteAdded = false;
+    if (attempt.runnerId !== null) {
+      cancelPendingCommands(ctx, attempt.id);
+      if (row.endReason !== 'taken_over') {
+        enqueueCommand(ctx, attempt.runnerId, { kind: 'cleanup_attempt', attemptId: attempt.id });
+      }
+      setAgentTask(ctx, attempt.agentId, null);
+      if (task) {
+        ({ task, moved } = moveOnEnd(ctx, emit, task, attempt, input.trigger, actor));
+        noteAdded = addAssembledNote(ctx, attempt, input.trigger);
+      }
+    }
+    // Only a lead attempt with no task holds the seat; a live lead's task attempt leaves it alone.
+    if (attempt.taskId === null) emptySeat(ctx, emit, actor, attempt.agentId);
+    emit({
+      type: 'attempt.ended',
+      actor,
+      subject: attemptSubject(attempt),
+      data: { ...attemptData(attempt), endReason: attempt.endReason, failureClass },
+    });
+    return { attempt, task, moved, noteAdded };
+  });
+}
+
+/**
+ * The row's on-exit move, and the task's holder cleared unless its status keeps it. A task that names another attempt
+ * by now has another holder, so it keeps its assignee.
+ */
+function moveOnEnd(
+  ctx: HubContext,
+  emit: Emit,
+  task: Task,
+  attempt: Attempt,
+  trigger: EndingTrigger,
+  actor: string,
+): { task: Task; moved: TaskStatus[] } {
+  const planned = plannedTaskMove(trigger, 'on_end', task, attempt.id);
+  const path = planned ? [...planned.path] : [];
+  const final = path.at(-1) ?? task.status;
+  const clear =
+    task.currentAttempt === attempt.id && task.assignee === attempt.agentId && !KEEPS_ASSIGNEE.includes(final);
+  if (path.length === 0) {
+    if (clear) writeTask(ctx, task.id, { assignee: null });
+    return { task: getTask(ctx, task.id), moved: [] };
+  }
+  let current = task;
+  for (const [index, status] of path.entries()) {
+    const changes = index === 0 && clear ? { assignee: null } : {};
+    current = move(ctx, emit, current, status, actor, { changes, data: { attemptId: attempt.id } });
+  }
+  return { task: current, moved: path };
+}
+
+/** Stores the assembled handoff note when the trigger's row asks for one (design 6.8). */
+function addAssembledNote(ctx: HubContext, attempt: Attempt, trigger: EndingTrigger): boolean {
+  const { note } = ENDING_MOVES[trigger];
+  if (note === null || (note === 'if_none_written' && handoffWritten(ctx, attempt))) return false;
+  addNote(ctx, attempt.taskId as string, 'handoff', assembleHandoffNote(ctx, attempt).body, 'system', attempt.id);
+  return true;
 }
