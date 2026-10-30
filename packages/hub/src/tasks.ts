@@ -15,8 +15,8 @@ import {
   restoreSet,
 } from '@agflow/core';
 import { statusFor } from './agents';
-import { findAttempt, listAttempts } from './attempt-store';
-import { openRunnerAttempt, requestStop } from './attempts';
+import { findAttempt, listAttempts, openAttemptOf } from './attempt-store';
+import { endAttempt, openRunnerAttempt, rejectRunnerAttempt, requestStop } from './attempts';
 import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
@@ -375,6 +375,8 @@ export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: st
     if (held) throw conflict(`you already hold ${held.id}; submit, release or hand it off first`);
     const task = getTask(ctx, id);
     if (task.status !== 'ready') throw conflict(`${id} is ${task.status}, not ready`);
+    // An unblocked task is ready while its last attempt still stops; its successor starts from that one's final WIP.
+    if (openAttemptOf(ctx, id)) throw conflict('the previous attempt is still stopping');
     // A dependency added while the task was held does not stop it from coming back to the pool ready.
     // So the claim checks again, and moves the task to blocked, where the board shows it waiting.
     const waiting = unmetDependencies(ctx, task.dependsOn);
@@ -400,6 +402,7 @@ export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: st
 export function resumeClaim(ctx: HubContext, id: string, agent: Agent): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
+    if (openRunnerAttempt(ctx, task)) throw conflict('held by a runner agent; take it over in the browser');
     if (!isHeld(task.status) || !task.assignee) throw conflict(`${id} is not held by anyone`);
     if (task.assignee === agent.id) return task;
     const previous = ctx.db.query('SELECT login FROM agents WHERE id = $id').get({ id: task.assignee }) as {
@@ -577,8 +580,12 @@ export function acceptTask(ctx: HubContext, id: string, actor: string, note?: st
     if (author && actor === `agent:${author}`) {
       throw forbidden(`${id} was submitted by you; an agent cannot accept its own work`);
     }
+    const attempt = openRunnerAttempt(ctx, task);
     const accepted = move(ctx, emit, task, 'accepted', actor, { changes: { feedback: null }, data: { note: note ?? null } });
-    if (task.assignee) {
+    if (attempt) {
+      // The accepted row: the holding attempt ends at once and its cleanup is queued; nobody would read a message.
+      endAttempt(ctx, { attemptId: attempt.id, trigger: 'accepted', actor });
+    } else if (task.assignee) {
       insertMessage(ctx, emit, {
         from: actor,
         to: `agent:${task.assignee}`,
@@ -599,15 +606,21 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
       changes: { feedback },
       data: { feedback: clip(feedback, 500) },
     });
+    const attempt = openRunnerAttempt(ctx, task);
+    if (attempt) return rejectRunnerAttempt(ctx, emit, rejected, attempt, { actor, feedback });
     const author = task.assignee
-      ? (ctx.db.query('SELECT id, last_seen_at FROM agents WHERE id = $id').get({ id: task.assignee }) as {
+      ? (ctx.db.query('SELECT id, origin, last_seen_at FROM agents WHERE id = $id').get({ id: task.assignee }) as {
           id: string;
+          origin: string;
           last_seen_at: number;
         } | null)
       : null;
-    // Returning the task makes its author hold it again, so the owned-path overlap rule applies here too.
+    // Only a live chat gets its task back here. A runner agent whose attempt has already ended (a stop of a holding
+    // attempt with no process) is gone, however recently its heartbeats renewed it. Returning the task makes its
+    // author hold it again, so the owned-path overlap rule applies here too.
     if (
       author &&
+      author.origin !== 'runner' &&
       statusFor(author.last_seen_at, ctx.now()) === 'active' &&
       !heldTaskOf(ctx, author.id) &&
       !overlappingPathHolder(ctx, task)
@@ -672,11 +685,43 @@ export function declareImpossible(
   return blockTask(ctx, id, agent, evidence, 'impossible', token);
 }
 
+/** The remote head of the task's newest submission that reported one: what a branch_moved block shows people. */
+function shownRemoteHead(ctx: HubContext, taskId: string): string | null {
+  const row = ctx.db
+    .query(
+      `SELECT remote_head FROM submissions WHERE task_id = $taskId AND remote_head IS NOT NULL
+       ORDER BY requested_at DESC, rowid DESC LIMIT 1`,
+    )
+    .get({ taskId }) as { remote_head: string } | null;
+  return row?.remote_head ?? null;
+}
+
+/**
+ * Unblocks the task under the M2 rules (design 6.4). A take-over is handed back, never unblocked; a person's hold and a
+ * moved branch are for people to clear. A re-plan sets ladder_floor to the highest attempt number, so the ladder counts
+ * afresh, and neither it nor a take-over becomes a dependency wait. Clearing a moved branch adopts the remote head the
+ * task shows as its branch head. A task whose last attempt still stops moves to ready, and waits for that attempt to
+ * end before anything takes it.
+ */
 export function unblockTask(ctx: HubContext, id: string, actor: string, note?: string): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
     if (task.status !== 'blocked') throw conflict(`${id} is not blocked`);
-    const waiting = unmetDependencies(ctx, task.dependsOn);
+    if (task.blockedKind === 'takeover') throw conflict(`a person took over ${id}; hand it back instead`);
+    if ((task.blockedKind === 'paused' || task.blockedKind === 'branch_moved') && actor.startsWith('agent:')) {
+      throw forbidden(`${id} is blocked (${task.blockedKind}) for people; only a person can unblock it`);
+    }
+    if (task.blockedKind === 'replan') {
+      const row = ctx.db.query('SELECT MAX(number) AS n FROM attempts WHERE task_id = $id').get({ id }) as {
+        n: number | null;
+      };
+      writeTask(ctx, id, { ladderFloor: row.n ?? 0 });
+    }
+    if (task.blockedKind === 'branch_moved') {
+      const head = shownRemoteHead(ctx, id);
+      if (head !== null) writeTask(ctx, id, { branchHead: head });
+    }
+    const waiting = task.blockedKind === 'replan' ? [] : unmetDependencies(ctx, task.dependsOn);
     if (waiting.length > 0) {
       writeTask(ctx, id, { blockedKind: 'deps', blockedReason: dependencyReason(ctx, waiting) });
       emit({ type: 'task.updated', actor, subject: id, data: { fields: ['blocked'] } });

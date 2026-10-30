@@ -30,6 +30,7 @@ import {
   endingClass,
   failureSignature,
   formatFence,
+  freeSlots,
   infraBackoffMs,
   isTaskBranch,
   ladderStep,
@@ -40,6 +41,7 @@ import {
   restoreSet,
   signatureApplies,
   taskBranchName,
+  usableVendors,
   vendorRequirement,
   wipRef,
 } from '@agflow/core';
@@ -77,6 +79,7 @@ import type { Emit } from './events';
 import { assembleHandoffNote, handoffWritten } from './handoff';
 import { emptySeat, insertLeadNote, seatHolderId, takeSeat } from './hub-state';
 import { insertMessage } from './messages';
+import { placementSnapshot } from './placement';
 import { getProject } from './project';
 import {
   findRunnerRow,
@@ -87,7 +90,15 @@ import {
   recordStartRefusal,
   resetFailedStarts,
 } from './runners';
-import { addNote, findTask, getTask, move, setAgentTask, writeTask } from './task-store';
+import {
+  addNote,
+  findTask,
+  getTask,
+  move,
+  overlappingPathHolder,
+  setAgentTask,
+  writeTask,
+} from './task-store';
 import { clip } from './text';
 
 export interface StartAttemptInput {
@@ -758,6 +769,72 @@ export function ladderRequirement(ctx: HubContext, taskId: string): LadderRequir
     now: ctx.now(),
     vendorRequirementMs: ctx.config.vendorRequirementMs,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Rejecting a runner submission (design 6.4 rejected rows, 6.9 step 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a rejection can go back to its author (design 6.9, step 1): the author's attempt is holding and resumable, on
+ * an online runner with a free slot where its vendor is usable, by core's freeSlots and usableVendors over the
+ * placement snapshot (X-46), and no other task holds paths that overlap the task's. Review rounds are the ladder's.
+ */
+export function authorCanResume(ctx: HubContext, task: Task, attempt: Attempt): boolean {
+  if (attempt.status !== 'holding' || !attempt.resumable || attempt.runnerId === null) return false;
+  const snapshot = placementSnapshot(ctx);
+  const runner = snapshot.runners.find((slot) => slot.id === attempt.runnerId);
+  if (!runner || runner.state !== 'online' || freeSlots(runner) < 1) return false;
+  if (!usableVendors(snapshot, runner).usable.some(({ slot }) => slot.vendor === attempt.vendor)) return false;
+  return overlappingPathHolder(ctx, task) === null;
+}
+
+export interface RejectionInput {
+  /** Who rejected it: the lead or a person. */
+  actor: string;
+  feedback: string;
+}
+
+/**
+ * A rejection of a runner attempt's submission, in the transaction that moved the task to rejected with its feedback
+ * (design 6.9). At ladder step 1 the task goes back to claimed for its author (current_attempt unchanged), the attempt
+ * gets one more review round and resumes at a new fence with the quoted feedback as its prompt. Otherwise the attempt
+ * ends rejected (review) and the ladder moves the task on. Returns the task afterwards.
+ */
+export function rejectRunnerAttempt(
+  ctx: HubContext,
+  emit: Emit,
+  task: Task,
+  attempt: Attempt,
+  input: RejectionInput,
+): Task {
+  const step = ladderStep({
+    counted: 0,
+    ladderFloor: ladderFloor(ctx, task.id),
+    maxAttempts: ctx.config.maxAttempts,
+    rejection: { authorCanResume: authorCanResume(ctx, task, attempt), reviewRounds: attempt.reviewRounds },
+  });
+  if (step !== 1) {
+    const ending = endAttempt(ctx, { attemptId: attempt.id, trigger: 'rejected', actor: input.actor });
+    if (!ending) return getTask(ctx, task.id);
+    return applyLadder(ctx, emit, { task: getTask(ctx, task.id), attempt: ending.attempt, trigger: 'rejected' }).task;
+  }
+  move(ctx, emit, task, 'claimed', 'system', {
+    changes: { assignee: attempt.agentId, leaseExpiresAt: null },
+    event: 'task.returned',
+    data: { to: attempt.agentId, attemptId: attempt.id, ladderStep: 1 },
+  });
+  setAgentTask(ctx, attempt.agentId, task.id);
+  updateAttempt(ctx, attempt.id, { reviewRounds: attempt.reviewRounds + 1 });
+  resumeAttempt(ctx, {
+    attemptId: attempt.id,
+    cause: 'review',
+    prompt:
+      `${task.id} was rejected and is back with you. Address the review feedback below, then submit again.\n` +
+      `[agflow review feedback from ${input.actor}]\n${quoteLines(input.feedback)}`,
+    actor: input.actor,
+  });
+  return getTask(ctx, task.id);
 }
 
 // ---------------------------------------------------------------------------
