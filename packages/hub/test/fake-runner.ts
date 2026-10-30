@@ -95,6 +95,19 @@ export interface FakeRunnerOptions {
 
 type CommandMessage = Extract<HubMessage, { t: 'command' }>;
 type Welcome = Extract<HubMessage, { t: 'welcome' }>;
+type Spawned = RunnerEventData['attempt.spawned'];
+
+/** What the last start or resume of an attempt told the runner: what its attempt.spawned reports. */
+interface Launch {
+  fence: Fence;
+  sessionRef: string;
+  model: string;
+  /** The commit a start used; a resume reports none. */
+  startSha: string | null;
+}
+
+/** The commit a start from main reports, when the spec named none: the fake runner has no vault to resolve it in. */
+export const FAKE_MAIN_SHA = 'f'.repeat(40);
 
 /** The answers a runner gives when nothing goes wrong. decide_approval reports the decision applied. */
 function defaultAnswer(command: RunnerCommand, runner: FakeRunner): CommandResult {
@@ -141,6 +154,8 @@ export class FakeRunner<T extends FakeRunnerTransport = FakeRunnerTransport> {
   readonly tokens = new Map<string, string>();
   /** Attempts welcome.stop named: their commands are answered attempt_ended, but for the kinds that outlive one. */
   readonly stopped = new Set<string>();
+  /** Each attempt's last start or resume, by attempt id. */
+  readonly launches = new Map<string, Launch>();
   /** How the last link closed. */
   closedWith: { code: number; reason: string } | null = null;
   private link = 0;
@@ -269,6 +284,25 @@ export class FakeRunner<T extends FakeRunnerTransport = FakeRunnerTransport> {
     return event;
   }
 
+  /**
+   * Reports attempt.spawned for an attempt it was told to start or resume, at that command's fence, as a runner does
+   * once the agent's session is live: a start with the commit it started from, a resume with none.
+   */
+  startRunning(attemptId: string, overrides: Partial<Spawned> = {}): RawRunnerEvent {
+    const launch = this.launches.get(attemptId);
+    if (!launch) throw new Error(`no start or resume of ${attemptId} reached the fake runner`);
+    const data: Spawned = {
+      sessionRef: launch.sessionRef,
+      pid: 4242,
+      model: launch.model,
+      cliVersion: '0.0.0-test',
+      permissionMode: null,
+      startSha: launch.startSha,
+      ...overrides,
+    };
+    return this.emit('attempt.spawned', data, { attemptId, fence: launch.fence });
+  }
+
   heartbeat(): void {
     this.sendMessage({
       t: 'heartbeat',
@@ -324,8 +358,15 @@ export class FakeRunner<T extends FakeRunnerTransport = FakeRunnerTransport> {
     const command = message.command;
     let result = this.journal.get(message.id);
     if (!result) {
-      if (command.kind === 'start_attempt') this.keepToken(command.attempt.attemptId, command.attempt.agentToken);
-      if (command.kind === 'resume_attempt') this.keepToken(command.attemptId, command.agentToken);
+      if (command.kind === 'start_attempt') {
+        this.keepToken(command.attempt.attemptId, command.attempt.agentToken);
+        this.launched(command.attempt);
+      }
+      if (command.kind === 'resume_attempt') {
+        this.keepToken(command.attemptId, command.agentToken);
+        const launch = this.launches.get(command.attemptId);
+        if (launch) this.launches.set(command.attemptId, { ...launch, fence: command.fence, startSha: null });
+      }
       const attemptId = attemptOf(command);
       // welcome.stop ends the fenced lifecycle commands; cleanup, transcript uploads and hand-backs come after an
       // attempt's end on purpose, as the hub keeps them when it cancels the rest.
@@ -338,6 +379,16 @@ export class FakeRunner<T extends FakeRunnerTransport = FakeRunnerTransport> {
       this.journal.set(message.id, result);
     }
     this.sendMessage({ t: 'result', commandId: message.id, ...result });
+  }
+
+  private launched(spec: Extract<RunnerCommand, { kind: 'start_attempt' }>['attempt']): void {
+    const vendor = this.hello().vendors.find((entry) => entry.vendor === spec.vendor);
+    this.launches.set(spec.attemptId, {
+      fence: spec.fence,
+      sessionRef: `session-${spec.attemptId}`,
+      model: spec.model ?? vendor?.models[spec.role] ?? `${spec.vendor}-test-model`,
+      startSha: spec.start.sha ?? FAKE_MAIN_SHA,
+    });
   }
 
   private keepToken(attemptId: string, token: string): void {

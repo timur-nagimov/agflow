@@ -1,6 +1,6 @@
 // Runner attempts (design 6.4): the one transaction that starts one, the AttemptSpec its start_attempt carries, the
-// re-fence that resumes one, stop requests and their timeout, endAttempt, the one path every ending takes, and the
-// retry ladder that follows an ending (design 6.9).
+// re-fence that resumes one, stop requests and their timeout, endAttempt, the one path every ending takes, the retry
+// ladder that follows an ending (design 6.9), and what the attempt events a runner reports do (design 6.3).
 import {
   type Agent,
   type AgentRole,
@@ -11,6 +11,7 @@ import {
   type EndingTrigger,
   type InjectedMessage,
   type LadderStep,
+  type RunnerEventData,
   STOP_CAUSES,
   type StopCause,
   type Task,
@@ -65,10 +66,16 @@ import { nextId } from './db';
 import { HubError, badRequest, conflict, notFound } from './errors';
 import type { Emit } from './events';
 import { assembleHandoffNote, handoffWritten } from './handoff';
-import { emptySeat, seatHolderId, takeSeat } from './hub-state';
+import { emptySeat, insertLeadNote, seatHolderId, takeSeat } from './hub-state';
 import { insertMessage } from './messages';
 import { getProject } from './project';
-import { findRunnerRow } from './runners';
+import {
+  findRunnerRow,
+  markVendorNotReady,
+  recordFailedStart,
+  recordStartRefusal,
+  resetFailedStarts,
+} from './runners';
 import { addNote, findTask, getTask, move, setAgentTask, writeTask } from './task-store';
 import { clip } from './text';
 
@@ -856,4 +863,110 @@ export function expireStops(ctx: HubContext): number {
     }
   }
   return ended;
+}
+
+// ---------------------------------------------------------------------------
+// Attempt events (design 6.3): spawned, failed to start, activity and first output
+// ---------------------------------------------------------------------------
+
+/** Consecutive failed starts of one vendor on one runner, refusals excluded, that mark it not ready (design 6.9). */
+const FAILED_STARTS_LIMIT = 2;
+
+/** A restatement is a few lines; a first output longer than a progress note is cut to one. */
+const RESTATEMENT_LIMIT = 4000;
+
+const byRunner = (attempt: Attempt): string => `runner:${attempt.runnerId ?? 'unknown'}`;
+
+/**
+ * attempt.spawned: the agent's session is live, for a new session or a resumed one. A starting attempt goes to
+ * running; its session, model and start commit are recorded, and so is its agent's session id; the run of failed starts
+ * of its vendor on the runner ends. A start commit that differs from the recorded one is work pushed before the
+ * attempt's fence that the hub had not heard of: it is logged, and the attempt goes on (design 7.3).
+ */
+export function onSpawned(
+  ctx: HubContext,
+  emit: Emit,
+  attempt: Attempt,
+  data: RunnerEventData['attempt.spawned'],
+): void {
+  const recorded = attempt.startSha;
+  if (data.startSha !== null && recorded !== null && data.startSha !== recorded) {
+    appendAttemptLog(
+      ctx,
+      attempt.id,
+      'note',
+      `started from ${data.startSha}, not the recorded ${recorded}: work pushed before its fence`,
+    );
+  }
+  const starting = attempt.status === 'starting';
+  updateAttempt(ctx, attempt.id, {
+    status: starting ? 'running' : undefined,
+    sessionRef: data.sessionRef,
+    model: data.model,
+    startSha: data.startSha ?? undefined,
+    lastActivityAt: ctx.now(),
+  });
+  // A session id another agent holds stays theirs: the unique index would refuse it, and the event with it.
+  ctx.db
+    .query(
+      `UPDATE agents SET session_id = $sessionId WHERE id = $agentId AND NOT EXISTS (
+         SELECT 1 FROM agents WHERE vendor = $vendor AND session_id = $sessionId AND id != $agentId)`,
+    )
+    .run({ sessionId: data.sessionRef, agentId: attempt.agentId, vendor: attempt.vendor });
+  if (attempt.runnerId !== null) resetFailedStarts(ctx, attempt.runnerId, attempt.vendor);
+  if (starting) {
+    emit({ type: 'attempt.running', actor: byRunner(attempt), subject: attemptSubject(attempt), data: attemptData(attempt) });
+  }
+}
+
+/**
+ * attempt.failed_to_start: the start or resume never got a live session, and the attempt ends failed_to_start. A
+ * failure is infra, with the backoff and a failure signature, and the second in a row of its vendor on the runner marks
+ * the vendor not ready there and asks for a preflight. A refusal (refused set) has no class: no backoff, no signature,
+ * no count; it shows on the runner's card and keeps placement off the runner until its next heartbeat (X-3). Either way
+ * the task goes back to ready under the conditional moves.
+ */
+export function onFailedToStart(
+  ctx: HubContext,
+  attempt: Attempt,
+  data: RunnerEventData['attempt.failed_to_start'],
+): Ending | null {
+  const runnerId = attempt.runnerId as string;
+  const actor = byRunner(attempt);
+  if (data.refused !== null) {
+    appendAttemptLog(ctx, attempt.id, 'note', `the runner refused the start (${data.refused}): ${data.error}`);
+    recordStartRefusal(ctx, runnerId, data.refused);
+    return endAttempt(ctx, { attemptId: attempt.id, trigger: 'refused_start', error: data.error, actor });
+  }
+  appendAttemptLog(ctx, attempt.id, 'note', `failed to start: ${data.error}`);
+  const ending = endAttempt(ctx, { attemptId: attempt.id, trigger: 'failed_to_start', error: data.error, actor });
+  if (recordFailedStart(ctx, runnerId, attempt.vendor) >= FAILED_STARTS_LIMIT) {
+    markVendorNotReady(ctx, runnerId, attempt.vendor);
+  }
+  return ending;
+}
+
+/** attempt.activity: an entry in the attempt's log and its last activity; a compaction also keeps its summary. */
+export function onActivity(ctx: HubContext, attempt: Attempt, data: RunnerEventData['attempt.activity']): void {
+  appendAttemptLog(ctx, attempt.id, data.kind, data.summary);
+  updateAttempt(ctx, attempt.id, {
+    lastActivityAt: ctx.now(),
+    compactionSummary: data.kind === 'compaction' ? data.summary : undefined,
+  });
+}
+
+/**
+ * attempt.first_output: a successor's restatement of the state and its next step (design 6.8), kept with its attempt
+ * id as a restatement note on the task, or for a lead in lead_notes. It is stored as the agent wrote it, under the
+ * agent's name, so every reader quotes it. A first attempt has nothing to restate: its first output is only logged.
+ */
+export function onFirstOutput(ctx: HubContext, attempt: Attempt, data: RunnerEventData['attempt.first_output']): void {
+  const text = clip(data.text, RESTATEMENT_LIMIT);
+  if (!isSuccessor(attempt)) {
+    appendAttemptLog(ctx, attempt.id, 'text', text);
+    return;
+  }
+  const author = `agent:${attempt.agentId}`;
+  if (attempt.taskId === null) insertLeadNote(ctx, { attemptId: attempt.id, kind: 'restatement', body: text, author });
+  else addNote(ctx, attempt.taskId, 'restatement', text, author, attempt.id);
 }

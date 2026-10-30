@@ -1,4 +1,4 @@
-import type { AttemptStatus, LeadSeat } from '@agflow/core';
+import type { AttemptStatus, LeadNote, LeadSeat } from '@agflow/core';
 import type { HubContext } from './context';
 import type { Emit } from './events';
 
@@ -162,4 +162,17 @@ export function emptySeat(ctx: HubContext, emit: Emit, actor: string, holderId?:
   updateHubState(ctx, { leadAgentId: null, leadKind: null, leadSince: null });
   emitSeat(ctx, emit, actor);
   return true;
+}
+
+/**
+ * Stores a lead note (design 6.11): a lead handoff, or a successor lead's restatement, kept as written. It is agent
+ * text, so every reader quotes it.
+ */
+export function insertLeadNote(ctx: HubContext, note: Pick<LeadNote, 'attemptId' | 'kind' | 'body' | 'author'>): void {
+  ctx.db
+    .query(
+      `INSERT INTO lead_notes (attempt_id, kind, body, author, created_at)
+       VALUES ($attemptId, $kind, $body, $author, $now)`,
+    )
+    .run({ attemptId: note.attemptId, kind: note.kind, body: note.body, author: note.author, now: ctx.now() });
 }

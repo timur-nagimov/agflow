@@ -15,6 +15,7 @@ import {
   parseRunnerEvent,
 } from '@agflow/core';
 import { appendAttemptLog, findAttempt } from './attempt-store';
+import { onActivity, onFailedToStart, onFirstOutput, onSpawned } from './attempts';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
 import { applyRunnerSettings, applyVendorReport, setReportedState } from './runners';
@@ -63,8 +64,20 @@ export const STALE_EVENT_TYPES: ReadonlyMap<RunnerEventType, StaleRule> = new Ma
   ['attempt.handed_back', () => true],
 ]);
 
+/** The attempt of an attempt event: dispatch passes it for every event that reaches a handler but unknown ones. */
+function attemptOf(context: EventContext): Attempt {
+  if (!context.attempt) throw new Error('the event names an attempt the hub does not know');
+  return context.attempt;
+}
+
 /** What each event type does once it passed the checks; a type with no entry is acknowledged and has no effect. */
 export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
+  'attempt.spawned': (ctx, event, context) => onSpawned(ctx, context.emit, attemptOf(context), event.data),
+  'attempt.failed_to_start': (ctx, event, context) => {
+    onFailedToStart(ctx, attemptOf(context), event.data);
+  },
+  'attempt.activity': (ctx, event, context) => onActivity(ctx, attemptOf(context), event.data),
+  'attempt.first_output': (ctx, event, context) => onFirstOutput(ctx, attemptOf(context), event.data),
   'runner.state': (ctx, event, { runnerId }) => setReportedState(ctx, runnerId, event.data.state, event.data.detail),
   'runner.settings': (ctx, event, { runnerId, emit }) => {
     applyRunnerSettings(ctx, emit, runnerId, event.data.settings);

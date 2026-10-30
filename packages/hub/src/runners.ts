@@ -9,6 +9,7 @@ import {
   type RunnerSettings,
   type RunnerState,
   type RunnerVendor,
+  type StartRefusal,
   type Vendor,
 } from '@agflow/core';
 import { verifySessionHash } from './auth';
@@ -34,6 +35,17 @@ export interface RunnerInfo {
   disk: Runner['disk'];
   ceilings: RunnerSettings['ceilings'];
   allowPaidUsage: RunnerSettings['allowPaidUsage'];
+  /**
+   * The runner's last refused start since its last heartbeat (X-3): placement passes the runner over until the next
+   * heartbeat clears it. Rows written before it existed have none.
+   */
+  startRefusal?: StartRefusalMark | null;
+}
+
+/** A refused start: the runner's code for it, and when the hub heard of it. */
+export interface StartRefusalMark {
+  code: StartRefusal;
+  at: number;
 }
 
 /** A vendor's hub-owned marks on one runner; runner messages never set them (design 6.3). */
@@ -102,12 +114,15 @@ function vendorsOf(info: RunnerInfo, holds: VendorHolds, now: number): RunnerVen
 
 export function rowToRunner(row: RunnerRow, now: number): Runner {
   const info = runnerInfo(row);
+  // A refused start is why the runner takes no attempt until its next heartbeat, so the card says so (X-49); the
+  // link's own detail stays in state_detail and shows again once the heartbeat clears the refusal.
+  const refusal = info.startRefusal ?? null;
   return {
     id: row.id,
     owner: row.owner,
     name: row.name,
     state: row.state,
-    stateDetail: row.state_detail,
+    stateDetail: refusal ? `refused a start: ${refusal.code}` : row.state_detail,
     lastError: row.last_error,
     capacity: row.capacity,
     keepAwake: row.keep_awake,
@@ -241,6 +256,7 @@ export function identifyRunner(ctx: HubContext, user: string, hello: HelloMessag
       disk: null,
       ceilings: hello.settings.ceilings,
       allowPaidUsage: hello.settings.allowPaidUsage,
+      startRefusal: null,
     };
     const now = ctx.now();
     ctx.db
@@ -293,13 +309,14 @@ export type HeartbeatInfo = Pick<Extract<RunnerMessage, { t: 'heartbeat' }>, 'po
 
 /**
  * Records a heartbeat: power, disk and the time it was seen. acceptingUntil comes as ms from now, so clocks need
- * not agree, and is stored as epoch ms; null clears it.
+ * not agree, and is stored as epoch ms; null clears it. A heartbeat also clears the last refused start: the runner
+ * may take attempts again (X-3).
  */
 export function recordHeartbeatInfo(ctx: HubContext, runnerId: string, heartbeat: HeartbeatInfo): void {
   const row = findRunnerRow(ctx, runnerId);
   if (!row) throw notFound(`runner ${runnerId}`);
   const now = ctx.now();
-  const info: RunnerInfo = { ...runnerInfo(row), power: heartbeat.power, disk: heartbeat.disk };
+  const info: RunnerInfo = { ...runnerInfo(row), power: heartbeat.power, disk: heartbeat.disk, startRefusal: null };
   ctx.db
     .query('UPDATE runners SET info = $info, accepting_until = $acceptingUntil, last_seen_at = $now WHERE id = $id')
     .run({
@@ -308,6 +325,18 @@ export function recordHeartbeatInfo(ctx: HubContext, runnerId: string, heartbeat
       acceptingUntil: heartbeat.acceptingUntil === null ? null : now + heartbeat.acceptingUntil,
       now,
     });
+}
+
+/**
+ * A refused start (attempt.failed_to_start with refused set): it shows on the runner's card as its last error, and
+ * no attempt is placed on the runner until its next heartbeat (design 6.3, X-3).
+ */
+export function recordStartRefusal(ctx: HubContext, runnerId: string, code: StartRefusal): void {
+  const row = existingRow(ctx, runnerId);
+  const info: RunnerInfo = { ...runnerInfo(row), startRefusal: { code, at: ctx.now() } };
+  ctx.db
+    .query('UPDATE runners SET info = $info, last_error = $error WHERE id = $id')
+    .run({ id: runnerId, info: JSON.stringify(info), error: `refused a start: ${code}` });
 }
 
 // ---------------------------------------------------------------------------
