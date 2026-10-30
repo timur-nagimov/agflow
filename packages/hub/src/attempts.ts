@@ -1,5 +1,5 @@
 // Runner attempts (design 6.4): the one transaction that starts one, the AttemptSpec its start_attempt carries, the
-// re-fence that resumes one, and endAttempt, the one path every ending takes.
+// re-fence that resumes one, stop requests and their timeout, and endAttempt, the one path every ending takes.
 import {
   type Agent,
   type AgentRole,
@@ -9,6 +9,7 @@ import {
   type EndingTrigger,
   type InjectedMessage,
   STOP_CAUSES,
+  type StopCause,
   type Task,
   type TaskStatus,
   type Vendor,
@@ -21,6 +22,7 @@ import {
   isTaskBranch,
   leadAttemptId,
   plannedTaskMove,
+  quoteLines,
   restoreSet,
   signatureApplies,
   taskBranchName,
@@ -34,22 +36,31 @@ import {
   getAttempt,
   insertAttempt,
   issueFence,
+  listAttempts,
   nextAttemptNumber,
   openAttemptOf,
   updateAttempt,
 } from './attempt-store';
 import { revokeAgentTokens } from './auth';
 import { buildBrief, composeTaskPack, firstPrompt, isSuccessor } from './brief';
-import { type CommandRow, type StoredCommand, cancelPendingCommands, enqueueCommand, pendingResumeOf } from './commands';
+import {
+  type CommandRow,
+  type StoredCommand,
+  cancelPendingCommands,
+  cancelPendingOfKind,
+  enqueueCommand,
+  pendingResumeOf,
+} from './commands';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
-import { badRequest, conflict, notFound } from './errors';
+import { HubError, badRequest, conflict, notFound } from './errors';
 import type { Emit } from './events';
 import { assembleHandoffNote, handoffWritten } from './handoff';
 import { emptySeat, seatHolderId, takeSeat } from './hub-state';
 import { getProject } from './project';
 import { findRunnerRow } from './runners';
 import { addNote, findTask, getTask, move, setAgentTask, writeTask } from './task-store';
+import { clip } from './text';
 
 export interface StartAttemptInput {
   runnerId: string;
@@ -318,7 +329,10 @@ function carriedOver(pending: CommandRow | null, input: ResumeInput): { prompt: 
   return { prompt, messages: unique };
 }
 
-/** The stop_attempt for a recorded stop request, at the attempt's current fence. */
+/**
+ * The stop_attempt for a recorded stop request, at the attempt's current fence. The reason is the text the agent is
+ * given: the hub's own goes as it is, anyone else's, a lead's included, quoted under who asked (design 5).
+ */
 export function stopCommand(attempt: Attempt): StoredCommand {
   const stop = attempt.stopRequested;
   if (!stop) throw new Error(`attempt ${attempt.id} has no stop request`);
@@ -327,7 +341,7 @@ export function stopCommand(attempt: Attempt): StoredCommand {
     attemptId: attempt.id,
     fence: attempt.fence,
     cause: stop.cause,
-    reason: stop.reason,
+    reason: stop.by === 'system' ? stop.reason : `[agflow stop requested by ${stop.by}]\n${quoteLines(stop.reason)}`,
     handoff: stop.handoff,
     interruptFirst: STOP_CAUSES[stop.cause].interruptFirst,
     keepClone: stop.cause === 'stop_hold',
@@ -505,4 +519,167 @@ function addAssembledNote(ctx: HubContext, attempt: Attempt, trigger: EndingTrig
   if (note === null || (note === 'if_none_written' && handoffWritten(ctx, attempt))) return false;
   addNote(ctx, attempt.taskId as string, 'handoff', assembleHandoffNote(ctx, attempt).body, 'system', attempt.id);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Stop requests (design 6.4, 6.8 Replacement steps 1 and 2)
+// ---------------------------------------------------------------------------
+
+export interface StopRequestInput {
+  attemptId: string;
+  cause: StopCause;
+  /** The text the agent is given, and a blocked task's reason. */
+  reason: string;
+  /** Who asked: user:<login>, agent:<id> or system. */
+  by: string;
+  /**
+   * Held back while a submission is pending (design 6.13): recorded, with no move and nothing sent, unless the attempt
+   * has no process, when it applies at once. A successful submission drops it. A failed one applies it by requesting
+   * the same stop again without deferred, which replaces it (X-34), makes the move, sends it and starts its stop
+   * timeout; flipping deferred alone would keep the old time, and expireStops would end the attempt at its next tick.
+   */
+  deferred?: boolean | undefined;
+}
+
+export interface StopRequestResult {
+  attempt: Attempt;
+  /** requested: recorded; replaced: it replaced a recorded stop; kept: a recorded stop stands; none: it had ended. */
+  outcome: 'requested' | 'replaced' | 'kept' | 'none';
+  /** The ending, when the attempt had no process and ended at once. */
+  ending: Ending | null;
+}
+
+/** Whether the attempt has an agent process on its runner: holding attempts and live chats have none. */
+export function hasLiveProcess(attempt: Pick<Attempt, 'runnerId' | 'status'>): boolean {
+  return (
+    attempt.runnerId !== null &&
+    (attempt.status === 'starting' || attempt.status === 'running' || attempt.status === 'quota_wait')
+  );
+}
+
+/** Causes a later request with an at-once move replaces (X-34). */
+const REPLACEABLE: ReadonlySet<StopCause> = new Set<StopCause>([
+  'stop',
+  'replace',
+  'stall_silent',
+  'stall_hung_tool',
+  'stall_loop',
+  'stall_no_progress',
+  'stall_budget',
+]);
+
+/** Whether the cause moves the task when it is requested; a take-over does, but never replaces another stop. */
+const movesAtOnce = (cause: StopCause): boolean => ENDING_MOVES[cause].task?.when === 'at_once';
+
+/** Whether a new request takes the place of the recorded one (design 6.4, A second stop request). */
+function replaces(recorded: NonNullable<Attempt['stopRequested']>, cause: StopCause): boolean {
+  if (recorded.cause === 'takeover') return false;
+  if (recorded.deferred) return true;
+  return cause !== 'takeover' && movesAtOnce(cause) && REPLACEABLE.has(recorded.cause);
+}
+
+/** The event a stop request makes, by what the attempt ends as. */
+function stopEventType(cause: StopCause): string {
+  const { endReason } = STOP_CAUSES[cause];
+  if (endReason === 'stalled') return 'agent.stalled';
+  return endReason === 'replaced' ? 'agent.replaced' : 'agent.stopped';
+}
+
+/**
+ * Requests a stop (design 6.4, 6.8 steps 1 and 2). It records stop_requested, makes the cause's at-once move while
+ * the task is claimed or working and names the attempt, keeping the holder fields (invariant e), and sends
+ * stop_attempt with the cause's flags. The attempt ends when its runner reports the exit, or at the stop timeout
+ * (invariant a); one with no live process ends at once. A take-over records its stop and moves the task, but its
+ * prepare_takeover, which names the person, is the take-over's to send; it needs a live process, and only a lead is
+ * rotated. A deferred request is only recorded (see StopRequestInput.deferred). A second request follows X-34.
+ */
+export function requestStop(ctx: HubContext, input: StopRequestInput): StopRequestResult {
+  return tx(ctx, (emit): StopRequestResult => {
+    const attempt = getAttempt(ctx, input.attemptId);
+    if (attempt.status === 'ended') return { attempt, outcome: 'none', ending: null };
+    if (input.cause === 'stop_hold' && attempt.role === 'lead') {
+      throw conflict('a lead cannot be held; stop or replace it');
+    }
+    if (input.cause === 'rotation' && attempt.role !== 'lead') throw conflict('only a lead is rotated');
+    // A take-over moves a running agent's work to a person (design 6.12); with no process there is nothing to take.
+    if (input.cause === 'takeover' && !hasLiveProcess(attempt)) {
+      throw new HubError(409, 'not_running', `attempt ${attempt.id} has no running agent to take over`);
+    }
+    const recorded = attempt.stopRequested;
+    if (recorded && input.cause === 'takeover') {
+      throw new HubError(409, 'not_running', `attempt ${attempt.id} is already stopping (${recorded.cause})`);
+    }
+    if (recorded && !replaces(recorded, input.cause)) return { attempt, outcome: 'kept', ending: null };
+    const deferred = (input.deferred ?? false) && hasLiveProcess(attempt);
+    updateAttempt(ctx, attempt.id, {
+      stopRequested: {
+        cause: input.cause,
+        reason: input.reason,
+        by: input.by,
+        handoff: STOP_CAUSES[input.cause].handoff,
+        deferred,
+        at: ctx.now(),
+      },
+    });
+    // A deferred stop may still be dropped, and a move made now could not be.
+    if (!deferred) moveAtRequest(ctx, emit, attempt, input);
+    const stopping = getAttempt(ctx, attempt.id);
+    emit({
+      type: stopEventType(input.cause),
+      actor: input.by,
+      subject: attemptSubject(stopping),
+      data: { ...attemptData(stopping), cause: input.cause, reason: input.reason },
+    });
+    const outcome = recorded ? 'replaced' : 'requested';
+    if (!hasLiveProcess(stopping)) {
+      const ending = endAttempt(ctx, { attemptId: attempt.id, trigger: input.cause, actor: input.by });
+      return { attempt: getAttempt(ctx, attempt.id), outcome, ending };
+    }
+    // The runner keys a stop on the fence, so only one that has not reached it yet can be replaced.
+    if (recorded) cancelPendingOfKind(ctx, attempt.id, 'stop_attempt');
+    if (!deferred && input.cause !== 'takeover') enqueueCommand(ctx, attempt.runnerId as string, stopCommand(stopping));
+    return { attempt: stopping, outcome, ending: null };
+  });
+}
+
+/**
+ * The cause's at-once move: cancelled, or blocked with its kind and the request's reason. Its event is the one M1's
+ * blockTask and cancelTask make for the same move, with the reason, so readers tell it from a dependency wait.
+ */
+function moveAtRequest(ctx: HubContext, emit: Emit, attempt: Attempt, input: StopRequestInput): void {
+  if (attempt.taskId === null) return;
+  const task = getTask(ctx, attempt.taskId);
+  const planned = plannedTaskMove(input.cause, 'at_once', task, attempt.id);
+  if (!planned) return;
+  let current = task;
+  for (const status of planned.path) {
+    const changes = status === 'blocked' ? { blockedKind: planned.blockedKind, blockedReason: input.reason } : {};
+    current = move(ctx, emit, current, status, input.by, {
+      changes,
+      event: input.cause === 'impossible' ? 'task.impossible' : undefined,
+      data: { attemptId: attempt.id, reason: clip(input.reason, 500) },
+    });
+  }
+}
+
+/**
+ * Ends every stop not completed within stopGraceMs with its requested reason (invariant d), each in its own
+ * transaction; the runner stops the process at its next hello, through welcome.stop. Deferred stops wait for their
+ * submission. Returns how many ended.
+ */
+export function expireStops(ctx: HubContext): number {
+  const cutoff = ctx.now() - ctx.config.stopGraceMs;
+  const due = listAttempts(ctx, { status: ['starting', 'running', 'quota_wait', 'holding'] }).filter(
+    (attempt) => attempt.stopRequested && !attempt.stopRequested.deferred && attempt.stopRequested.at <= cutoff,
+  );
+  let ended = 0;
+  for (const attempt of due) {
+    try {
+      const cause = (attempt.stopRequested as NonNullable<Attempt['stopRequested']>).cause;
+      if (endAttempt(ctx, { attemptId: attempt.id, trigger: cause })) ended += 1;
+    } catch (error) {
+      console.error(`ending attempt ${attempt.id} at its stop timeout failed`, error);
+    }
+  }
+  return ended;
 }

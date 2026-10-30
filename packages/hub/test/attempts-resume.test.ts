@@ -146,7 +146,7 @@ describe('resuming an attempt', () => {
       attemptId: attempt.id,
       fence: attempt.fence,
       cause: 'stop',
-      reason: 'a person stopped it',
+      reason: '[agflow stop requested by user:alice]\n> a person stopped it',
       handoff: true,
       interruptFirst: false,
       keepClone: false,

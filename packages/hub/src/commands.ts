@@ -236,6 +236,16 @@ export function cancelPendingCommands(ctx: HubContext, attemptId: string): Comma
   return rows.map(toRow).sort((a, b) => a.hubEpoch - b.hubEpoch || a.seq - b.seq);
 }
 
+/** Cancels the attempt's pending commands of one kind, such as the stop_attempt a newer stop request replaces. */
+export function cancelPendingOfKind(ctx: HubContext, attemptId: string, kind: RunnerCommandKind): number {
+  return ctx.db
+    .query(
+      `UPDATE runner_commands SET status = 'cancelled', done_at = $now
+       WHERE attempt_id = $attemptId AND kind = $kind AND status = 'pending'`,
+    )
+    .run({ attemptId, kind, now: ctx.now() }).changes;
+}
+
 /**
  * Cancels the runner's pending update_settings, when the hub adopts a newer snapshot from its hello: every one of them
  * carries an older version, which would undo the adopted settings on the runner. Returns how many.
