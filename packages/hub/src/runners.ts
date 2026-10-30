@@ -341,7 +341,7 @@ export function recordStartRefusal(ctx: HubContext, runnerId: string, code: Star
 
 /**
  * Failed WIP pushes (attempt.wip_failed with 3 or more in a row, X-3): the runner's git is not ready, with the error,
- * until a later WIP push or a hello with git.ready.
+ * until a later push goes through or a hello with git.ready.
  */
 export function markGitNotReady(ctx: HubContext, runnerId: string, problem: string): void {
   const info = runnerInfo(existingRow(ctx, runnerId));
@@ -349,7 +349,7 @@ export function markGitNotReady(ctx: HubContext, runnerId: string, problem: stri
   ctx.db.query('UPDATE runners SET info = $info WHERE id = $id').run({ id: runnerId, info: JSON.stringify(info) });
 }
 
-/** A WIP push went through (attempt.wip): the runner's git is ready, and pushed last now. */
+/** A push went through (attempt.wip, or late work): the runner's git is ready, and pushed last now. */
 export function markGitPushed(ctx: HubContext, runnerId: string): void {
   const info = runnerInfo(existingRow(ctx, runnerId));
   info.git = { ready: true, problem: null, lastPushAt: ctx.now() };

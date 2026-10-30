@@ -12,6 +12,7 @@ import {
   type RunnerEventType,
   compareFence,
   formatFence,
+  parseAttemptId,
   parseRunnerEvent,
 } from '@agflow/core';
 import { appendAttemptLog, findAttempt } from './attempt-store';
@@ -20,14 +21,16 @@ import {
   onExited,
   onFailedToStart,
   onFirstOutput,
+  onLateWork,
   onSpawned,
   onViolation,
   onWip,
   onWipFailed,
+  recordLateWork,
 } from './attempts';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
-import { applyRunnerSettings, applyVendorReport, setReportedState } from './runners';
+import { applyRunnerSettings, applyVendorReport, markGitPushed, setReportedState } from './runners';
 import { clip } from './text';
 
 /**
@@ -88,13 +91,31 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   'attempt.activity': (ctx, event, context) => onActivity(ctx, attemptOf(context), event.data),
   'attempt.first_output': (ctx, event, context) => onFirstOutput(ctx, attemptOf(context), event.data),
   'attempt.wip': (ctx, event, context) => {
-    if (context.standing === 'current') onWip(ctx, context.emit, attemptOf(context), event.data);
+    if (context.standing === 'current') {
+      onWip(ctx, context.emit, attemptOf(context), event.data);
+      return;
+    }
+    // Whatever it is about, the push went through: the runner's git works again (X-3).
+    markGitPushed(ctx, context.runnerId);
+    // A WIP push the hub did not expect is late work; a lead has no WIP, so its id names no task.
+    const taskId = context.attempt?.taskId ?? parseAttemptId(event.attemptId)?.taskId ?? null;
+    if (taskId === null) return;
+    const { ref, sha } = event.data;
+    recordLateWork(ctx, context.emit, context.attempt, {
+      attemptId: event.attemptId,
+      taskId,
+      ref,
+      sha,
+      runnerId: context.runnerId,
+    });
   },
   'attempt.wip_failed': (ctx, event, context) => onWipFailed(ctx, attemptOf(context), event.data),
   'attempt.violation': (ctx, event, context) => onViolation(ctx, context.emit, attemptOf(context), event.data),
   'attempt.exited': (ctx, event, context) => {
     onExited(ctx, context.emit, attemptOf(context), event.data);
   },
+  'attempt.late_work': (ctx, event, context) =>
+    onLateWork(ctx, context.emit, context.runnerId, context.attempt, event),
   'runner.state': (ctx, event, { runnerId }) => setReportedState(ctx, runnerId, event.data.state, event.data.detail),
   'runner.settings': (ctx, event, { runnerId, emit }) => {
     applyRunnerSettings(ctx, emit, runnerId, event.data.settings);

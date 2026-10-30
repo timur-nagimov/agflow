@@ -1070,7 +1070,8 @@ export function onWip(ctx: HubContext, emit: Emit, attempt: Attempt, data: Runne
 
 /**
  * attempt.wip_failed: logged on the attempt. The event carries the runner's own count of failed pushes in a row, over
- * all its attempts; from the third the runner's git is not ready, until a WIP push or a hello with git.ready (X-3).
+ * all its attempts; from the third the runner's git is not ready, until a push goes through, late work included, or a
+ * hello with git.ready (X-3).
  */
 export function onWipFailed(ctx: HubContext, attempt: Attempt, data: RunnerEventData['attempt.wip_failed']): void {
   const inRow = `${data.failures} in a row on the runner`;
@@ -1116,7 +1117,8 @@ function holdForUnpushed(ctx: HubContext, attempt: Attempt, data: RunnerEventDat
   if (attempt.taskId === null || !isUnpushed(sha, attempt)) return;
   appendAttemptLog(ctx, attempt.id, 'note', `the final push of ${sha} failed: ${data.pushError ?? 'no error given'}`);
   const task = getTask(ctx, attempt.taskId);
-  if (task.currentAttempt !== attempt.id) return;
+  // Late work of the same push may have landed first.
+  if (task.currentAttempt !== attempt.id || task.workSha === sha) return;
   writeTask(ctx, task.id, { dispatchHoldUntil: ctx.now() + ctx.config.dispatchHoldMs });
   const runner = attempt.runnerId as string;
   const position = task.workRef ? `${task.workRef} at ${task.workSha ?? 'its tip'}` : ctx.config.mainBranch;
@@ -1130,6 +1132,135 @@ function holdForUnpushed(ctx: HubContext, attempt: Attempt, data: RunnerEventDat
     'system',
     attempt.id,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Late work (design 6.3 stale events, 6.4 Work position, 7.3 Late work)
+// ---------------------------------------------------------------------------
+
+/** Work a runner pushed after the hub ended its attempt, or for an attempt the hub does not know. */
+export interface LateWork {
+  attemptId: string;
+  taskId: string;
+  ref: string;
+  sha: string;
+  /** The runner that pushed it. */
+  runnerId: string;
+}
+
+/** attempt.late_work of a pushed ref, which keeps the ref, at its sha, for its cleanup (design 6.18). */
+function emitLateWork(emit: Emit, attempt: Attempt | null, work: LateWork): void {
+  emit({
+    type: 'attempt.late_work',
+    actor: `runner:${work.runnerId}`,
+    subject: work.taskId,
+    data: {
+      attemptId: work.attemptId,
+      taskId: work.taskId,
+      agentId: attempt?.agentId ?? null,
+      runnerId: work.runnerId,
+      ref: work.ref,
+      sha: work.sha,
+    },
+  });
+}
+
+/**
+ * A push of the attempt's recorded submission head after it ended (a person accepted it before the runner reported
+ * its final WIP, say): no late work, as its submission put that commit on the task branch, so no late_work note, no
+ * message to a holder and no change of the work position; it is logged on the attempt. Pushed to the attempt's WIP
+ * ref, it is the attempt's WIP sha, which the ref's cleanup expects there; to another ref, a late-work or hand-back
+ * one, attempt.late_work still records that ref, so its cleanup deletes it too.
+ */
+function recordSubmittedHeadPush(ctx: HubContext, emit: Emit, attempt: Attempt, work: LateWork): void {
+  if (work.ref === attempt.wipRef) updateAttempt(ctx, attempt.id, { wipSha: work.sha });
+  else emitLateWork(emit, attempt, work);
+  const pushed = `runner ${work.runnerId} pushed the submitted head ${work.sha} to ${work.ref}`;
+  appendAttemptLog(ctx, attempt.id, 'note', `${pushed}: it is on the task branch, not late work`);
+}
+
+/**
+ * Records late work (design 6.4). It becomes the task's work position only while the task has no open attempt and
+ * its position is still the late attempt's own (positionIsOwn), which also ends a dispatch hold waiting for it.
+ * Otherwise a late_work note with the attempt's id names the ref for the next attempt to merge, and a holder, the
+ * task's open attempt, is told how to merge it, after refresh_vault brings the ref to its runner's vault (design
+ * 7.3). Late work for a task the hub does not have goes to people. attempt.late_work keeps the ref for its cleanup.
+ * The attempt's recorded submission head is no late work (recordSubmittedHeadPush).
+ */
+export function recordLateWork(ctx: HubContext, emit: Emit, attempt: Attempt | null, work: LateWork): void {
+  if (attempt !== null && work.sha === attempt.submittedSha) {
+    recordSubmittedHeadPush(ctx, emit, attempt, work);
+    return;
+  }
+  emitLateWork(emit, attempt, work);
+  const pushed = `runner ${work.runnerId} pushed ${work.sha} to ${work.ref}`;
+  const task = findTask(ctx, work.taskId);
+  if (!task) {
+    insertMessage(ctx, emit, {
+      from: 'system',
+      to: 'humans',
+      taskId: null,
+      body:
+        `Late work of attempt ${work.attemptId}: ${pushed}, but this hub has no task ${work.taskId}. Look at the ref ` +
+        'and keep what is worth keeping.',
+    });
+    return;
+  }
+  const holder = openAttemptOf(ctx, task.id);
+  if (attempt && holder === null && positionIsOwn(task, attempt)) {
+    writeTask(ctx, task.id, { workRef: work.ref, workSha: work.sha, dispatchHoldUntil: null });
+    appendAttemptLog(ctx, attempt.id, 'note', `late work became the work position: ${work.ref} at ${work.sha}`);
+    return;
+  }
+  const merge = `git fetch origin ${work.ref} && git merge FETCH_HEAD`;
+  addNote(
+    ctx,
+    task.id,
+    'late_work',
+    `Late work of attempt ${work.attemptId}: ${pushed} after the attempt ended. Merge it before going on: ${merge}`,
+    'system',
+    work.attemptId,
+  );
+  if (!holder) return;
+  if (holder.runnerId !== null) {
+    enqueueCommand(ctx, holder.runnerId, { kind: 'refresh_vault', taskId: task.id, refs: [work.ref] });
+  }
+  insertMessage(ctx, emit, {
+    from: 'system',
+    to: `agent:${holder.agentId}`,
+    taskId: task.id,
+    body:
+      `Late work for ${task.id}: attempt ${work.attemptId} pushed ${work.sha} to ${work.ref} after it ended. Merge ` +
+      `it into your branch before you go on: ${merge}`,
+  });
+}
+
+/**
+ * attempt.late_work, of an ended attempt or one the hub does not know: late work. One of an open attempt at its
+ * fence, a final push that went to a late-work ref, is the attempt's own (invariant a): its task's work position,
+ * while the task names it. Either way the push went through, so the runner's git is ready again (X-3).
+ */
+export function onLateWork(
+  ctx: HubContext,
+  emit: Emit,
+  runnerId: string,
+  attempt: Attempt | null,
+  event: { attemptId: string; data: RunnerEventData['attempt.late_work'] },
+): void {
+  const { taskId, ref, sha } = event.data;
+  markGitPushed(ctx, runnerId);
+  if (attempt && attempt.status !== 'ended') {
+    const task = getTask(ctx, taskId);
+    if (task.currentAttempt === attempt.id) writeTask(ctx, task.id, { workRef: ref, workSha: sha });
+    emit({
+      type: 'attempt.late_work',
+      actor: byRunner(attempt),
+      subject: attemptSubject(attempt),
+      data: { ...attemptData(attempt), ref, sha },
+    });
+    return;
+  }
+  recordLateWork(ctx, emit, attempt, { attemptId: event.attemptId, taskId, ref, sha, runnerId });
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,6 +1315,13 @@ export function onExited(
   const how = `${exitError(data)}, stopped by ${data.stoppedBy}${data.cause ? ` (${data.cause})` : ''}`;
   if (attempt.status === 'ended') {
     appendAttemptLog(ctx, attempt.id, 'note', `${how}, after it ended ${attempt.endReason ?? ''}`.trimEnd());
+    // A final WIP the hub had not recorded was pushed after the end: late work (design 6.3), unless it is the
+    // submitted head (recordLateWork).
+    const final = data.finalWip;
+    if (final !== null && final.sha !== attempt.wipSha && attempt.taskId !== null && attempt.runnerId !== null) {
+      const { taskId, runnerId } = attempt;
+      recordLateWork(ctx, emit, attempt, { attemptId: attempt.id, taskId, ref: final.ref, sha: final.sha, runnerId });
+    }
     return null;
   }
   appendAttemptLog(ctx, attempt.id, 'note', how);
