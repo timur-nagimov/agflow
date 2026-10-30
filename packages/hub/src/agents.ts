@@ -3,6 +3,7 @@ import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { conflict, forbidden, notFound } from './errors';
 import { emptySeat, getHubState, seatHolderId, takeSeat } from './hub-state';
+import { RUNNER_HELD_SQL } from './task-store';
 
 export const ACTIVE_MS = 10 * 60_000;
 export const IDLE_MS = 2 * 60 * 60_000;
@@ -169,11 +170,14 @@ export function helloAgent(ctx: HubContext, user: string, code: string): Agent {
   return getAgent(ctx, row.id);
 }
 
-/** Records that the agent is alive and renews the lease of the task it holds. */
+/** Records that the agent is alive and renews the lease of the task it holds, unless a runner attempt holds it. */
 export function touchAgent(ctx: HubContext, id: string): void {
   const now = ctx.now();
   ctx.db.query('UPDATE agents SET last_seen_at = $now WHERE id = $id').run({ now, id });
   ctx.db
-    .query("UPDATE tasks SET lease_expires_at = $lease WHERE assignee = $id AND status IN ('claimed', 'working')")
+    .query(
+      `UPDATE tasks SET lease_expires_at = $lease
+       WHERE assignee = $id AND status IN ('claimed', 'working') AND NOT ${RUNNER_HELD_SQL}`,
+    )
     .run({ lease: now + ctx.config.leaseMs, id });
 }

@@ -1,5 +1,6 @@
 import {
   type Agent,
+  type Attempt,
   type NewTask,
   type Submission,
   type Task,
@@ -15,6 +16,7 @@ import {
 } from '@agflow/core';
 import { statusFor } from './agents';
 import { findAttempt, listAttempts } from './attempt-store';
+import { openRunnerAttempt, requestStop } from './attempts';
 import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
@@ -24,6 +26,7 @@ import { currentGoalVersion } from './goal';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
 import {
+  RUNNER_HELD_SQL,
   TASK_SELECT,
   type TaskRow,
   addNote,
@@ -254,14 +257,23 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
   });
 }
 
+/**
+ * Cancels the task from whatever status M1 allows (X-34). A runner attempt that holds it gets the cancel row's stop
+ * instead of M1's message (design 6.4): it keeps its holder fields until it ends, on its exit, or at once when it has no
+ * process, as the holding attempt of a submitted task.
+ */
 export function cancelTask(ctx: HubContext, id: string, reason: string, actor: string): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    const holder = isHeld(task.status) ? task.assignee : null;
-    const cancelled = move(ctx, emit, task, 'cancelled', actor, {
-      changes: { assignee: null, leaseExpiresAt: null, blockedKind: null, blockedReason: null },
-      data: { reason },
+    const attempt = openRunnerAttempt(ctx, task);
+    const holder = !attempt && isHeld(task.status) ? task.assignee : null;
+    move(ctx, emit, task, 'cancelled', actor, {
+      changes: attempt
+        ? { blockedKind: null, blockedReason: null }
+        : { assignee: null, leaseExpiresAt: null, blockedKind: null, blockedReason: null },
+      data: attempt ? { reason, attemptId: attempt.id } : { reason },
     });
+    if (attempt) requestStop(ctx, { attemptId: attempt.id, cause: 'cancel', reason, by: actor });
     if (holder) {
       setAgentTask(ctx, holder, null);
       insertMessage(ctx, emit, {
@@ -292,7 +304,7 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
         ].join('\n'),
       });
     }
-    return cancelled;
+    return getTask(ctx, id);
   });
 }
 
@@ -328,7 +340,8 @@ export type HolderTest = 'attempt' | 'claim';
  * The holder test, run inside the action's transaction. A route passes the agent token the request came with: the
  * auth middleware resolved it before the body arrived, and a re-fence or revocation can land in between, so the
  * token is resolved again here and its attempt is the one tested (401 attempt_ended or attempt_refenced otherwise).
- * Without a token, the hub's own callers vouch for the runner agent's current attempt.
+ * Without a token, the hub's own callers vouch for the runner agent's current attempt. Returns the runner attempt it
+ * tested, whose id the notes the agent writes carry (X-22); null for a live agent.
  */
 export function requireHolder(
   ctx: HubContext,
@@ -336,10 +349,10 @@ export function requireHolder(
   agent: Agent,
   test: HolderTest,
   token: string | null = null,
-): void {
+): Attempt | null {
   if (agent.origin !== 'runner') {
     if (task.assignee !== agent.id || !isHeld(task.status)) throw forbidden(`you do not hold ${task.id}`);
-    return;
+    return null;
   }
   const grant = token === null ? null : resolveAgentToken(ctx, token);
   if (grant && grant.agent.id !== agent.id) throw forbidden(`you do not hold ${task.id}`);
@@ -347,11 +360,12 @@ export function requireHolder(
   if (!attempt || attempt.status === 'ended' || task.currentAttempt !== attempt.id) {
     throw forbidden(`you do not hold ${task.id}`);
   }
-  if (test === 'attempt') return;
+  if (test === 'attempt') return attempt;
   if (!isHeld(task.status)) throw conflict(`${task.id} is ${task.status}; write a handoff note if you have not, and stop`);
   if (attempt.stopRequested) {
     throw conflict(`your attempt on ${task.id} is being stopped; write a handoff note if you have not, and stop`);
   }
+  return attempt;
 }
 
 export function claimTask(ctx: HubContext, id: string, agent: Agent, branch?: string): Task {
@@ -410,8 +424,8 @@ export function resumeClaim(ctx: HubContext, id: string, agent: Agent): Task {
 export function reportProgress(ctx: HubContext, id: string, agent: Agent, note: string, token: string | null = null): Task {
   return tx(ctx, (emit) => {
     let task = getTask(ctx, id);
-    requireHolder(ctx, task, agent, 'attempt', token);
-    addNote(ctx, id, 'progress', note, `agent:${agent.id}`, agent.attemptId);
+    const attempt = requireHolder(ctx, task, agent, 'attempt', token);
+    addNote(ctx, id, 'progress', note, `agent:${agent.id}`, attempt?.id ?? null);
     if (task.status === 'claimed') task = move(ctx, emit, task, 'working', `agent:${agent.id}`);
     // A runner attempt holds a runner lease instead; the task's M1 lease stays NULL for it (design 6.4).
     if (agent.origin !== 'runner') writeTask(ctx, id, { leaseExpiresAt: ctx.now() + ctx.config.leaseMs });
@@ -422,8 +436,8 @@ export function reportProgress(ctx: HubContext, id: string, agent: Agent, note: 
 
 export function writeHandoff(ctx: HubContext, id: string, agent: Agent, note: string, token: string | null = null): void {
   tx(ctx, (emit) => {
-    requireHolder(ctx, getTask(ctx, id), agent, 'attempt', token);
-    addNote(ctx, id, 'handoff', note, `agent:${agent.id}`, agent.attemptId);
+    const attempt = requireHolder(ctx, getTask(ctx, id), agent, 'attempt', token);
+    addNote(ctx, id, 'handoff', note, `agent:${agent.id}`, attempt?.id ?? null);
     emit({ type: 'task.handoff_written', actor: `agent:${agent.id}`, subject: id });
   });
 }
@@ -431,8 +445,13 @@ export function writeHandoff(ctx: HubContext, id: string, agent: Agent, note: st
 export function releaseTask(ctx: HubContext, id: string, agent: Agent, reason: string, token: string | null = null): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    requireHolder(ctx, task, agent, 'claim', token);
-    addNote(ctx, id, 'release', reason, `agent:${agent.id}`, agent.attemptId);
+    const attempt = requireHolder(ctx, task, agent, 'claim', token);
+    addNote(ctx, id, 'release', reason, `agent:${agent.id}`, attempt?.id ?? null);
+    if (attempt) {
+      // The released row: the agent stops without a handoff turn, and the task goes ready on its exit (design 6.4).
+      requestStop(ctx, { attemptId: attempt.id, cause: 'released', reason, by: `agent:${agent.id}` });
+      return getTask(ctx, id);
+    }
     const released = move(ctx, emit, task, 'ready', `agent:${agent.id}`, {
       changes: { assignee: null, leaseExpiresAt: null },
       event: 'task.released',
@@ -449,6 +468,12 @@ export function forceRelease(ctx: HubContext, id: string, actor: string, reason:
     if (!isHeld(task.status) || !task.assignee) throw conflict(`${id} is not claimed`);
     const holder = task.assignee;
     addNote(ctx, id, 'release', reason, actor);
+    const attempt = openRunnerAttempt(ctx, task);
+    if (attempt) {
+      // The stop flow replaces M1's message: the agent writes a handoff, and the task goes ready on its exit.
+      requestStop(ctx, { attemptId: attempt.id, cause: 'stop', reason, by: actor });
+      return getTask(ctx, id);
+    }
     const released = move(ctx, emit, task, 'ready', actor, {
       changes: { assignee: null, leaseExpiresAt: null },
       event: 'task.released',
@@ -465,12 +490,16 @@ export function forceRelease(ctx: HubContext, id: string, actor: string, reason:
   });
 }
 
-/** Returns tasks whose lease expired to the pool. Called periodically by the server. */
+/**
+ * Returns tasks whose lease expired to the pool. Called periodically by the server. A task a runner attempt holds is
+ * left to its runner lease (design 6.4).
+ */
 export function sweepLeases(ctx: HubContext): string[] {
   return tx(ctx, (emit) => {
     const rows = ctx.db
       .query(
-        `${TASK_SELECT} WHERE status IN ('claimed', 'working') AND lease_expires_at IS NOT NULL AND lease_expires_at <= $now`,
+        `${TASK_SELECT} WHERE status IN ('claimed', 'working') AND lease_expires_at IS NOT NULL AND lease_expires_at <= $now
+           AND NOT ${RUNNER_HELD_SQL}`,
       )
       .all({ now: ctx.now() }) as TaskRow[];
     for (const row of rows) {
@@ -611,19 +640,25 @@ export function blockTask(
 ): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    requireHolder(ctx, task, agent, 'claim', token);
-    const blocked = move(ctx, emit, task, 'blocked', `agent:${agent.id}`, {
-      changes: { assignee: null, leaseExpiresAt: null, blockedKind: kind, blockedReason: reason },
-      event: kind === 'impossible' ? 'task.impossible' : 'task.blocked',
-      data: { reason: clip(reason, 500) },
-    });
-    setAgentTask(ctx, agent.id, null);
+    const attempt = requireHolder(ctx, task, agent, 'claim', token);
+    if (attempt) {
+      // The blocked and impossible rows: blocked at once, and the agent stopped without a handoff turn (design 6.4).
+      const cause = kind === 'impossible' ? 'impossible' : 'blocked';
+      requestStop(ctx, { attemptId: attempt.id, cause, reason, by: `agent:${agent.id}` });
+    } else {
+      move(ctx, emit, task, 'blocked', `agent:${agent.id}`, {
+        changes: { assignee: null, leaseExpiresAt: null, blockedKind: kind, blockedReason: reason },
+        event: kind === 'impossible' ? 'task.impossible' : 'task.blocked',
+        data: { reason: clip(reason, 500) },
+      });
+      setAgentTask(ctx, agent.id, null);
+    }
     const body =
       kind === 'impossible'
         ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified.\n${wrote(agent.id, reason)}\nDecide: amend it with update_task and then unblock_task, split it, or cancel it.`
         : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}.\n${wrote(agent.id, reason)}\nUnblock it with unblock_task once this is resolved.`;
     insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: id, body });
-    return blocked;
+    return getTask(ctx, id);
   });
 }
 

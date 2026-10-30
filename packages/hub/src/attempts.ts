@@ -788,6 +788,15 @@ export interface StopRequestResult {
   ending: Ending | null;
 }
 
+/**
+ * The task's current attempt while it is open on a runner, or null. M1's operations on such a task take the stop flow
+ * (design 6.4, M1 operations on runner-held tasks).
+ */
+export function openRunnerAttempt(ctx: HubContext, task: Pick<Task, 'currentAttempt'>): Attempt | null {
+  const attempt = task.currentAttempt === null ? null : findAttempt(ctx, task.currentAttempt);
+  return attempt && attempt.status !== 'ended' && attempt.runnerId !== null ? attempt : null;
+}
+
 /** Whether the attempt has an agent process on its runner: holding attempts and live chats have none. */
 export function hasLiveProcess(attempt: Pick<Attempt, 'runnerId' | 'status'>): boolean {
   return (

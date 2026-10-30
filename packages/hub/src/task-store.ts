@@ -203,6 +203,15 @@ export function move(
   return getTask(ctx, task.id);
 }
 
+/**
+ * SQL that holds for a task whose current attempt is open on a runner: its runner lease stands in for the task's M1
+ * lease, which stays NULL (design 6.4). Once that attempt has ended, M1's lease rules apply again, as they do for
+ * openRunnerAttempt.
+ */
+export const RUNNER_HELD_SQL =
+  'EXISTS (SELECT 1 FROM attempts WHERE attempts.id = tasks.current_attempt AND attempts.runner_id IS NOT NULL' +
+  " AND attempts.status != 'ended')";
+
 export function setAgentTask(ctx: HubContext, agentId: string, taskId: string | null): void {
   ctx.db.query('UPDATE agents SET current_task = $taskId WHERE id = $agentId').run({ taskId, agentId });
 }
