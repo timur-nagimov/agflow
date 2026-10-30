@@ -88,7 +88,9 @@ function signal(target: number, name: NodeJS.Signals): boolean {
     process.kill(target, name);
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    // EPERM: on macOS, a group whose members are all zombies, exited but not yet reaped; there is nothing to signal.
+    if (code === 'ESRCH' || code === 'EPERM') return false;
     throw error;
   }
 }

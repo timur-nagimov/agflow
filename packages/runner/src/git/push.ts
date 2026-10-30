@@ -125,7 +125,7 @@ export async function pushLateWork(
 }
 
 /** The remote's shas for the refs, read with ls-remote; a ref the remote lacks is absent from the map. */
-async function lsRemote(git: PushGit, refs: string[]): Promise<Map<string, string>> {
+export async function lsRemote(git: PushGit, refs: string[]): Promise<Map<string, string>> {
   const result = await runGit(git.remote, [`--git-dir=${git.vault.path}`, 'ls-remote', 'origin', ...refs]);
   const heads = new Map<string, string>();
   for (const line of result.stdout.split('\n')) {

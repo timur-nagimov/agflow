@@ -1,10 +1,11 @@
 // A start's work before the agent runs (design 7.3, "Attempt clone", "Starting point", "Protected paths at a
-// start", "Base checkouts"). The vault is fetched, the clone made at the start tip the vault actually holds (an
-// existing clone is kept, at the start it was made at), the Claude CLI's staging directory removed, .agflow/run/
-// written with the brief extended by the clone's path (X-17), and the protected paths restored from the restore base
-// (X-16). A Claude attempt also gets a base checkout of main and a private temporary directory (X-5). Right before
-// the agent starts, after any dependency preparation, finishWorkspace restores the protected paths once more and
-// verifies the clone's .codex/ (design 9.2).
+// start", "Base checkouts"). The vault is fetched and the clone made at the start tip the vault actually holds, or
+// an existing clone kept at the start it was made at (openWorkspace, so the controller can push a kept clone's work
+// before anything in it changes). Then the Claude CLI's staging directory is removed, .agflow/run/ written with the
+// brief extended by the clone's path (X-17), and the protected paths restored from the restore base (X-16). A Claude
+// attempt also gets a base checkout of main and a private temporary directory (X-5). Right before the agent starts,
+// after any dependency preparation, finishWorkspace restores the protected paths once more and verifies the clone's
+// .codex/ (design 9.2).
 // The clone and the recorded temporary directory belong to the agent, which can replace either with a link: the
 // runner never follows their last component, and refuses the start when anything but a directory stands there.
 import { lstat, mkdtemp, realpath, rm } from 'node:fs/promises';
@@ -183,18 +184,42 @@ export async function verifyProjectConfig(input: {
   }
 }
 
+/** The clone a start or resume works in, once the vault was fetched: before anything in it is written. */
+export interface OpenedClone {
+  /** The clone's real path. */
+  clone: string;
+  /** False when the clone existed and was kept. */
+  created: boolean;
+  /** The commit the clone was made at, the attempt's start pin. */
+  startSha: string;
+}
+
 /**
- * Steps 1-3 of the attempt clone, and the base checkout and temporary directory of a Claude attempt. The
- * preparation of dependencies (step 4) is the controller's, through its seam, and finishWorkspace follows it.
+ * Step 1 of the attempt clone: the vault fetched, then the clone made, or the one there kept. Nothing in a kept
+ * clone is changed yet, so the controller can harvest and push its work as the agent left it (design 7.4).
  */
-export async function prepareWorkspace(deps: WorkspaceDeps, spec: AttemptSpec): Promise<PreparedWorkspace> {
-  const { vault, local, paths } = deps;
+export async function openWorkspace(deps: WorkspaceDeps, spec: AttemptSpec): Promise<OpenedClone> {
+  const { vault, paths } = deps;
   const path = paths.clone(vault.project, spec.attemptId);
   // A link left at the clone path stays there for forensics; nothing is done through it.
   await assertCloneDirectory(path);
   await vault.fetchForAttempt({ taskId: spec.taskId, start: spec.start }, deps.wipRefPrefix());
   const { created, startSha } = await ensureClone(deps, spec, path);
-  const clone = await realClonePath(path);
+  return { clone: await realClonePath(path), created, startSha };
+}
+
+/**
+ * Steps 2 and 3 of the attempt clone in an opened clone, and the base checkout and temporary directory of a Claude
+ * attempt. The preparation of dependencies (step 4) is the controller's, through its seam, and finishWorkspace
+ * follows it.
+ */
+export async function prepareOpened(
+  deps: WorkspaceDeps,
+  spec: AttemptSpec,
+  opened: OpenedClone,
+): Promise<PreparedWorkspace> {
+  const { vault, local, paths } = deps;
+  const { clone, created, startSha } = opened;
   await removeStaging(clone);
   const brief = withWorkingDirectory(spec.brief, clone);
   const runDir = writeRunDir({
@@ -232,6 +257,11 @@ export async function prepareWorkspace(deps: WorkspaceDeps, spec: AttemptSpec): 
     tmpDir,
     projectConfigVerified: false,
   };
+}
+
+/** openWorkspace and prepareOpened together. */
+export async function prepareWorkspace(deps: WorkspaceDeps, spec: AttemptSpec): Promise<PreparedWorkspace> {
+  return prepareOpened(deps, spec, await openWorkspace(deps, spec));
 }
 
 /**

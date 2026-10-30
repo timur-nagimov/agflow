@@ -12,6 +12,7 @@ import { FakeAdapter, type FakeScript, type OriginRepo, originRepo } from '@agfl
 import type { AgflowCommand, VendorAdapter } from '../src/adapters/types';
 import { AttemptController, type ControllerDeps } from '../src/attempt/controller';
 import { pinnedCliVersion } from '../src/attempt/launch';
+import { WipFailures } from '../src/attempt/work';
 import { AttemptStore } from '../src/attempt-store';
 import { AwakeClock } from '../src/clock';
 import { type RunnerConfig, type RunnerConfigInput, RunnerConfigSchema } from '../src/config';
@@ -106,6 +107,10 @@ export interface RunnerFixture {
   logger: ReturnType<typeof memoryLogger>;
   /** The awake clock the controllers read; never started, so it advances with wall time. */
   clock: AwakeClock;
+  /** What the controllers' canPushWip reads; by default a welcome since the last gap and a fresh ack. */
+  gate: { welcomeSinceGap: boolean; ackAgeMs: number; wipGraceMs: number };
+  /** The consecutive failed WIP pushes, shared by the fixture's controllers. */
+  wipFailures: WipFailures;
   /** Where Claude attempts' private temporary directories go: a short directory under /tmp. */
   tmpRoot: string;
   /** What deps.liveAttempts() answers. */
@@ -163,11 +168,12 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
   cleanups.push(() => origin.remove());
   // The owner's git configuration never reaches the vault's fetches: an empty HOME stands in for theirs.
   const ownerHome = tempDir('agflow-fixture-owner-');
+  const ownerEnv = { ...process.env, HOME: ownerHome, XDG_CONFIG_HOME: undefined };
   const vault = new Vault({
     paths,
     project: FIXTURE_PROJECT,
     repo: { url: origin.path, mainBranch: 'main' },
-    remote: () => remoteGitEnv({ base: { ...process.env, HOME: ownerHome, XDG_CONFIG_HOME: undefined } }),
+    remote: () => remoteGitEnv({ base: ownerEnv }),
   });
   await vault.ensure();
   const fakes: Partial<Record<Vendor, FakeAdapter>> = {};
@@ -205,6 +211,8 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
     hub: new RecordingHubHttp(),
     logger: memoryLogger(),
     clock: new AwakeClock({ gapMs: 5_000 }),
+    gate: { welcomeSinceGap: true, ackAgeMs: 0, wipGraceMs: 300_000 },
+    wipFailures: new WipFailures(),
     tmpRoot,
     liveAttempts: 0,
     ready: { claude: true, codex: true },
@@ -255,6 +263,13 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
       agflow: FIXTURE_AGFLOW,
       cliVersion: fixtureCliVersion,
       clock: fixture.clock,
+      remote: () => remoteGitEnv({ base: ownerEnv, gitDir: vault.path }),
+      wipGate: {
+        welcomeSinceGap: () => fixture.gate.welcomeSinceGap,
+        ackAgeMs: () => fixture.gate.ackAgeMs,
+        wipGraceMs: () => fixture.gate.wipGraceMs,
+      },
+      wipFailures: fixture.wipFailures,
       ...overrides,
     }),
     controller: (attemptId = 'T-4-a1', overrides = {}) => {
