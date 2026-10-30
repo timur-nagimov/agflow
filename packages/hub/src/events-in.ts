@@ -15,6 +15,7 @@ import {
   parseAttemptId,
   parseRunnerEvent,
 } from '@agflow/core';
+import { onApprovalRequested, onApprovalVoided } from './approvals';
 import { appendAttemptLog, findAttempt } from './attempt-store';
 import {
   onActivity,
@@ -147,6 +148,9 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   },
   'attempt.quota': (ctx, event, context) =>
     onAttemptQuota(ctx, context.emit, context.runnerId, attemptOf(context), event.data),
+  'approval.requested': (ctx, event, context) =>
+    onApprovalRequested(ctx, context.emit, context.runnerId, attemptOf(context), event),
+  'approval.voided': (ctx, event, context) => onApprovalVoided(ctx, context.emit, attemptOf(context), event.data),
 };
 
 /**

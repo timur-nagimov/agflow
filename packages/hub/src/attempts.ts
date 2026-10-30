@@ -46,6 +46,7 @@ import {
   wipRef,
 } from '@agflow/core';
 import { getAgent } from './agents';
+import { voidApprovals } from './approvals';
 import {
   type ResumeLogEntry,
   appendAttemptLog,
@@ -509,9 +510,10 @@ export function stopCommand(attempt: Attempt): StoredCommand {
 
 /**
  * Resumes an open runner attempt with a new fence (design 6.4, Resume). In one transaction: the attempt goes to
- * starting with a fresh runner lease, its tokens are revoked, its old fence's commands cancelled (a pending resume's
- * prompt and messages carried into this one, with the messages in flight), the cause logged, and resume_attempt
- * queued with a recomputed task pack, restore set and acceptance ids; the rows of the messages it carries name it.
+ * starting with a fresh runner lease, its tokens are revoked and its pending approvals voided, its old fence's
+ * commands cancelled (a pending resume's prompt and messages carried into this one, with the messages in flight), the
+ * cause logged, and resume_attempt queued with a recomputed task pack, restore set and acceptance ids; the rows of the
+ * messages it carries name it.
  * A push owed to a pending submission and a recorded stop are queued again at the new fence, after the resume, so the
  * re-fence drops neither, and the stop's grace starts again. A deferred stop stays held back. A take-over in flight
  * is the take-over's to finish, so it cannot be resumed.
@@ -529,6 +531,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
     const inFlight = messagesInFlight(ctx, before.id);
     const cancelled = cancelPendingCommands(ctx, before.id);
     revokeAgentTokens(ctx, before.id);
+    voidApprovals(ctx, emit, before.id, input.actor);
     const fence = issueFence(ctx);
     const now = ctx.now();
     updateAttempt(ctx, before.id, {
@@ -607,14 +610,15 @@ const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted'];
 
 /**
  * Ends an attempt, whatever triggered it (design 6.4): the one path every ending takes, in the caller's transaction or
- * its own. It sets the end reason, class and failure signature from the trigger's row, revokes the tokens, fails a
- * pending submission (design 6.13), cancels the pending commands (cleanup, transcript uploads and hand-backs stay)
- * and queues cleanup_attempt, except for a take-over, whose cleanup follows its hand-back. It clears the holder fields
- * (invariant e) and makes the row's on-exit move, only while the task is claimed or working and names this attempt
- * (X-34); a stop held back for the submission makes its at-once move first. It stores an assembled handoff note,
- * with the attempt's id, when the row asks and the agent wrote none, and empties the seat its lead held. A runner
- * attempt's deliveries are settled (settleDeliveriesOnEnd) before its pending commands are cancelled. A live chat's
- * attempt only ends: M1's operations move its task. Null when the attempt had already ended.
+ * its own. It sets the end reason, class and failure signature from the trigger's row, revokes the tokens, voids
+ * the pending approvals, fails a pending submission (design 6.13), cancels the pending commands (cleanup, transcript
+ * uploads and hand-backs stay) and queues cleanup_attempt, except for a take-over, whose cleanup follows its
+ * hand-back. It clears the holder fields (invariant e) and makes the row's on-exit move, only while the task is
+ * claimed or working and names this attempt (X-34); a stop held back for the submission makes its at-once move first.
+ * It stores an assembled handoff note, with the attempt's id, when the row asks and the agent wrote none, and empties
+ * the seat its lead held. A runner attempt's deliveries are settled (settleDeliveriesOnEnd) before its pending
+ * commands are cancelled. A live chat's attempt only ends: M1's operations move its task. Null when the attempt had
+ * already ended.
  */
 export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | null {
   return tx(ctx, (emit) => {
@@ -637,6 +641,7 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
       endedAt: ctx.now(),
     });
     revokeAgentTokens(ctx, before.id);
+    voidApprovals(ctx, emit, before.id, actor);
     const attempt = getAttempt(ctx, before.id);
     failPendingSubmission(ctx, emit, attempt, actor);
     let task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
@@ -1030,12 +1035,13 @@ function stopEventType(cause: StopCause): string {
 }
 
 /**
- * Requests a stop (design 6.4, 6.8 steps 1 and 2). It records stop_requested, makes the cause's at-once move while
- * the task is claimed or working and names the attempt, keeping the holder fields (invariant e), and sends
- * stop_attempt with the cause's flags. The attempt ends when its runner reports the exit, or at the stop timeout
- * (invariant a); one with no live process ends at once. A take-over records its stop and moves the task, but its
- * prepare_takeover, which names the person, is the take-over's to send; it needs a live process, and only a lead is
- * rotated. A deferred request is only recorded (see StopRequestInput.deferred). A second request follows X-34.
+ * Requests a stop (design 6.4, 6.8 steps 1 and 2). It records stop_requested, makes the cause's at-once move while the
+ * task is claimed or working and names the attempt, keeping the holder fields (invariant e), voids the approvals
+ * pending then (design 6.10), and sends stop_attempt with the cause's flags. The attempt ends when its runner reports
+ * the exit, or at the stop timeout (invariant a); one with no live process ends at once. A take-over records its stop
+ * and moves the task, but its prepare_takeover, which names the person, is the take-over's to send; it needs a live
+ * process, and only a lead is rotated. A deferred request is only recorded (see StopRequestInput.deferred). A second
+ * request follows X-34.
  */
 export function requestStop(ctx: HubContext, input: StopRequestInput): StopRequestResult {
   return tx(ctx, (emit): StopRequestResult => {
@@ -1068,8 +1074,11 @@ export function requestStop(ctx: HubContext, input: StopRequestInput): StopReque
     });
     // From stop_requested on nothing more is pushed to the attempt, and a deliver still pending would be (design 6.7).
     cancelPendingDeliveries(ctx, attempt.id);
-    // A deferred stop may still be dropped, and a move made now could not be.
-    if (!deferred) moveAtRequest(ctx, emit, attempt, input);
+    // A deferred stop may still be dropped, and a move made now could not be, nor approvals voided now be answered.
+    if (!deferred) {
+      moveAtRequest(ctx, emit, attempt, input);
+      voidApprovals(ctx, emit, attempt.id, input.by);
+    }
     const stopping = getAttempt(ctx, attempt.id);
     emit({
       type: stopEventType(input.cause),
@@ -1504,10 +1513,10 @@ export function exitedInTurn(ctx: HubContext, attempt: Attempt): boolean {
 
 /**
  * attempt.exited: the agent's process is gone, and the trigger table decides what follows (design 6.4). The harvested
- * head is recorded in every case. An attempt that ended already keeps its ending (design 6.3). Otherwise its final WIP
- * becomes its WIP and the work position, and a failed final push of an attempt the exit ends holds the task's dispatch
- * for the runner's late work (design 6.8, Replacement step 4). A holding attempt stays holding, and one being taken
- * over waits for attempt.taken_over (invariant c). Otherwise:
+ * head is recorded and the attempt's pending approvals voided in every case. An attempt that ended already keeps its
+ * ending (design 6.3). Otherwise its final WIP becomes its WIP and the work position, and a failed final push of an
+ * attempt the exit ends holds the task's dispatch for the runner's late work (design 6.8, Replacement step 4). A
+ * holding attempt stays holding, and one being taken over waits for attempt.taken_over (invariant c). Otherwise:
  * - a stop the hub asked for ends it with that cause, whatever the runner says caused the exit;
  * - the runner's own stop ends it stopped (infra, with no backoff or signature);
  * - a suspend keeps it open: its lease runs without renewal until the runner says hello again;
@@ -1524,6 +1533,8 @@ export function onExited(
   data: RunnerEventData['attempt.exited'],
 ): Ending | null {
   if (data.finalSha !== null) updateAttempt(ctx, attempt.id, { finalSha: data.finalSha });
+  // Nothing takes the answers of a process that exited.
+  voidApprovals(ctx, emit, attempt.id, byRunner(attempt));
   const how = `${exitError(data)}, stopped by ${data.stoppedBy}${data.cause ? ` (${data.cause})` : ''}`;
   if (attempt.status === 'ended') {
     appendAttemptLog(ctx, attempt.id, 'note', `${how}, after it ended ${attempt.endReason ?? ''}`.trimEnd());

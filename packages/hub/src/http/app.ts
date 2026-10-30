@@ -7,6 +7,7 @@ import type { HubContext } from '../context';
 import { HubError, agentNotAllowed, forbidden } from '../errors';
 import { mountAgentRoutes } from './agent-routes';
 import { isAgentRouteAllowed } from './agent-routes-allowed';
+import { mountApprovalRoutes } from './approval-routes';
 import { mountAttemptRoutes } from './attempt-routes';
 import { mountAuthRoutes } from './auth-routes';
 import { mountCliLoginPage } from './cli-login-page';
@@ -140,6 +141,7 @@ export function createApp(ctx: HubContext, options: AppOptions = {}): App {
   mountTaskRoutes(app, ctx);
   mountAgentRoutes(app, ctx);
   mountAttemptRoutes(app, ctx);
+  mountApprovalRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
   mountEventRoutes(app, ctx);
   mountRunnerRoutes(app, ctx, options.upgradeRunnerLink);
