@@ -8,6 +8,7 @@ import { markSent, pendingCommands, recordResult, toWireCommand } from './comman
 import { type HubContext, type RunnerLink, afterCommit, tx } from './context';
 import { acknowledgePosition, applyRunnerEvents } from './events-in';
 import { hubEpoch } from './hub-state';
+import { reconcileOnHello } from './recovery';
 import {
   type HelloMessage,
   checkRunnerIdentity,
@@ -260,8 +261,9 @@ export class Gateway implements RunnerLink {
   }
 
   /**
-   * Identifies the runner and records the hello in one transaction. The welcome goes out once it commits, before any
-   * command that transaction queued: the attach step is queued first, so it runs before their flush.
+   * Identifies the runner, records the hello and reconciles its attempts in one transaction. The welcome goes out once
+   * it commits, before any command that transaction queued: the attach step is queued first, so it runs before their
+   * flush.
    */
   private hello(connection: RunnerConnection, hello: HelloMessage): void {
     const { ctx } = this;
@@ -278,8 +280,10 @@ export class Gateway implements RunnerLink {
         reconcileHelloSettings(ctx, runnerId, hello.settings);
         // Facts count only from the runner's current link.
         markFactsStale(ctx, runnerId);
-        slideSession(ctx, sessionHash);
         const ackedSeq = acknowledgePosition(ctx, runnerId, hello.outboxEpoch, hello.firstSeq);
+        const replayPending = hello.lastSeq > ackedSeq;
+        const { stop } = reconcileOnHello(ctx, runnerId, hello.attempts, { replayPending });
+        slideSession(ctx, sessionHash);
         markLinked(ctx, emit, runnerId, {
           connectionId: connection.id,
           sessionHash,
@@ -293,7 +297,7 @@ export class Gateway implements RunnerLink {
           hubTime: ctx.now(),
           ackedSeq,
           wipRefPrefix: ctx.config.wipRefPrefix,
-          stop: [],
+          stop,
           timings: {
             heartbeatMs: ctx.config.heartbeatMs,
             deadLinkMs: ctx.config.deadLinkMs,

@@ -481,7 +481,14 @@ describe('FakeRunner', () => {
         return { ok: false, error: 'binary missing' };
       },
     };
-    const runner = await connectFakeRunner(ctx, gateway, { token, answers, settings: { version: 1 } });
+    // The runner still runs the attempt, so its hello keeps it open.
+    const live = { attemptId: attempt.id, fence: attempt.fence, state: 'running', sessionRef: null, clone: true } as const;
+    const runner = await connectFakeRunner(ctx, gateway, {
+      token,
+      answers,
+      settings: { version: 1 },
+      attempts: () => [live],
+    });
     const commands = sampleCommands(attempt);
     tx(ctx, () => {
       for (const kind of RUNNER_COMMAND_KINDS) enqueueCommand(ctx, owner.id, commands[kind] as StoredCommand);

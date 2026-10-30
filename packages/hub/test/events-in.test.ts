@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { type Fence, type RawRunnerEvent, type RunnerEventType, formatFence } from '@agflow/core';
+import { type Fence, type LiveAttempt, type RawRunnerEvent, type RunnerEventType, formatFence } from '@agflow/core';
 import { appendAttemptLog, attemptLog, updateAttempt } from '../src/attempt-store';
 import { createSession, sessionHashOf } from '../src/auth';
 import { findCommand, pendingCommands } from '../src/commands';
@@ -51,6 +51,15 @@ function setup() {
 }
 
 const activity = (summary: string) => ({ kind: 'note', summary }) as const;
+
+/** What a hello reports about an attempt whose process runs. */
+const running = (attempt: { id: string; fence: Fence }): LiveAttempt => ({
+  attemptId: attempt.id,
+  fence: attempt.fence,
+  state: 'running',
+  sessionRef: null,
+  clone: true,
+});
 const at = (attempt: { id: string; fence: Fence }) => ({ attemptId: attempt.id, fence: attempt.fence });
 
 const rejects = (ctx: Ctx) =>
@@ -87,6 +96,8 @@ describe('applying a batch', () => {
     const session = { user: 'alice', sessionHash: sessionHashOf(token) };
     const linked = new FakeRunner<FakeConnection>((endpoint) => new FakeConnection(gateway, session, endpoint), {
       now: ctx.now,
+      // The runner still runs the attempt, so its hello keeps it open.
+      attempts: () => [running(held.attempt)],
     });
     // The outbox fills while offline; the replay after welcome sends it as one batch.
     const stale = { attemptId: held.attempt.id, fence: { epoch: 1, counter: held.attempt.fence.counter + 5 } };
@@ -315,7 +326,12 @@ describe('the replay after hello', () => {
     return { sent, send: (text) => sent.push(JSON.parse(text)), close: () => {}, terminate: () => {} };
   }
 
-  function helloOf(overrides: { firstSeq: number; lastSeq: number; lastHubEpoch?: number | null }) {
+  function helloOf(overrides: {
+    firstSeq: number;
+    lastSeq: number;
+    lastHubEpoch?: number | null;
+    attempts?: LiveAttempt[];
+  }) {
     const fake = new FakeRunner(() => {
       throw new Error('unused');
     });
@@ -381,7 +397,10 @@ describe('the replay after hello', () => {
     // Sent after the backup: the attempt had a newer fence then than the restored hub knows.
     const newer = { id: held.attempt.id, fence: { epoch: 1, counter: counter + 3 } };
     const restored = gateway.open(socket(), { user: 'alice', sessionHash: sessionHashOf(token) });
-    gateway.message(restored, helloOf({ firstSeq: 1, lastSeq: 3, lastHubEpoch: 1 }));
+    gateway.message(
+      restored,
+      helloOf({ firstSeq: 1, lastSeq: 3, lastHubEpoch: 1, attempts: [running(newer)] }),
+    );
     expect(restored.afterRestore).toBe(true);
     gateway.message(restored, events(newer, [1, 2]));
     // Only a newer fence counts as current during the replay; an older one stays stale.
