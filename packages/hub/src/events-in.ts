@@ -15,7 +15,7 @@ import {
   parseRunnerEvent,
 } from '@agflow/core';
 import { appendAttemptLog, findAttempt } from './attempt-store';
-import { onActivity, onFailedToStart, onFirstOutput, onSpawned } from './attempts';
+import { onActivity, onExited, onFailedToStart, onFirstOutput, onSpawned } from './attempts';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
 import { applyRunnerSettings, applyVendorReport, setReportedState } from './runners';
@@ -78,6 +78,9 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   },
   'attempt.activity': (ctx, event, context) => onActivity(ctx, attemptOf(context), event.data),
   'attempt.first_output': (ctx, event, context) => onFirstOutput(ctx, attemptOf(context), event.data),
+  'attempt.exited': (ctx, event, context) => {
+    onExited(ctx, context.emit, attemptOf(context), event.data);
+  },
   'runner.state': (ctx, event, { runnerId }) => setReportedState(ctx, runnerId, event.data.state, event.data.detail),
   'runner.settings': (ctx, event, { runnerId, emit }) => {
     applyRunnerSettings(ctx, emit, runnerId, event.data.settings);

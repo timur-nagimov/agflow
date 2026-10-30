@@ -19,7 +19,10 @@ import { hubEpoch } from './hub-state';
 import { writeTask } from './task-store';
 import { clip } from './text';
 
-/** A resume after a runner restart or a lead's exit; repeated ones within resumeWindowMs or leadExitWindowMs end it. */
+/**
+ * A resume after a runner restart, or an unrequested exit of a lead; repeated ones within resumeWindowMs or
+ * leadExitWindowMs end the attempt.
+ */
 export interface ResumeLogEntry {
   at: number;
   cause: 'runner_restart' | 'lead_exit';

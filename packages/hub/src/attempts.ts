@@ -284,9 +284,11 @@ const RESUME_CAUSES: Readonly<Record<ResumeCause, string>> = {
   restore: 'the hub was restored from a backup',
 };
 
-/** The resumes resume_log keeps, which end an attempt when they repeat within their window (design 6.3, 6.11). */
-const isLogged = (cause: ResumeCause): cause is ResumeLogEntry['cause'] =>
-  cause === 'runner_restart' || cause === 'lead_exit';
+/**
+ * The resumes resume_log keeps, which end an attempt when they repeat within their window (design 6.3). A lead's
+ * exits are logged when they happen (onExited), not when the lead is resumed, which may be much later.
+ */
+const isLogged = (cause: ResumeCause): cause is ResumeLogEntry['cause'] => cause === 'runner_restart';
 
 export interface ResumeInput {
   attemptId: string;
@@ -316,13 +318,16 @@ export function recentResumes(ctx: HubContext, attemptId: string, cause: ResumeC
   return resumeLog(ctx, attemptId).filter((entry) => entry.cause === cause && entry.at > since).length;
 }
 
-/** The log with this resume added, keeping only entries a window can still count. */
-function loggedResume(ctx: HubContext, attemptId: string, cause: ResumeCause): ResumeLogEntry[] | undefined {
-  if (!isLogged(cause)) return undefined;
+/** The log with an entry of this cause added now, keeping only entries a window can still count. */
+function withLogEntry(ctx: HubContext, attemptId: string, cause: ResumeLogEntry['cause']): ResumeLogEntry[] {
   const now = ctx.now();
   const kept = Math.max(ctx.config.resumeWindowMs, ctx.config.leadExitWindowMs);
   return [...resumeLog(ctx, attemptId).filter((entry) => entry.at > now - kept), { at: now, cause }];
 }
+
+/** The log with this resume added, for a resume it keeps. */
+const loggedResume = (ctx: HubContext, attemptId: string, cause: ResumeCause): ResumeLogEntry[] | undefined =>
+  isLogged(cause) ? withLogEntry(ctx, attemptId, cause) : undefined;
 
 /** The prompts and messages of a resume that a re-fence replaced, then this one's; a message once only. */
 function carriedOver(pending: CommandRow | null, input: ResumeInput): { prompt: string; messages: InjectedMessage[] } {
@@ -467,11 +472,15 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
     if (before.status === 'ended') return null;
     const actor = input.actor ?? 'system';
     const failureClass = endingClass(input.trigger);
+    // A requested stop names what failed by its cause: a quota, a vendor-error and a context replacement all end
+    // replaced, and must not read as one repeated failure (design 6.9).
+    const stop = before.stopRequested;
+    const error = input.error ?? (stop?.cause === input.trigger ? stop.cause : null);
     updateAttempt(ctx, before.id, {
       status: 'ended',
       endReason: row.endReason,
       failureClass,
-      failureSignature: signatureApplies(input.trigger) ? failureSignature(row.endReason, input.error ?? null) : null,
+      failureSignature: signatureApplies(input.trigger) ? failureSignature(row.endReason, error) : null,
       leaseExpiresAt: null,
       endedAt: ctx.now(),
     });
@@ -969,4 +978,81 @@ export function onFirstOutput(ctx: HubContext, attempt: Attempt, data: RunnerEve
   const author = `agent:${attempt.agentId}`;
   if (attempt.taskId === null) insertLeadNote(ctx, { attemptId: attempt.id, kind: 'restatement', body: text, author });
   else addNote(ctx, attempt.taskId, 'restatement', text, author, attempt.id);
+}
+
+// ---------------------------------------------------------------------------
+// Process exits (design 6.4 exit rows, invariant c; 6.11 Process exits)
+// ---------------------------------------------------------------------------
+
+/** Unrequested lead exits within leadExitWindowMs: the one that reaches this count ends the attempt crashed. */
+const LEAD_EXITS_LIMIT = 3;
+
+/** How the process went, as the error of an unrequested exit's failure signature. */
+function exitError(data: RunnerEventData['attempt.exited']): string {
+  if (data.signal !== null) return `the agent was killed by ${data.signal}`;
+  return data.code === null ? 'the agent exited' : `the agent exited with code ${data.code}`;
+}
+
+/**
+ * Whether a lead was in a turn when its process exited (X-35): its last reported phase was turn, or a message
+ * delivered to it is still unacknowledged. Such a lead resumes at once with its unacknowledged deliveries; an idle one
+ * waits for its next delivery (design 6.11).
+ */
+export function exitedInTurn(ctx: HubContext, attempt: Attempt): boolean {
+  if (attempt.phase === 'turn') return true;
+  return (
+    ctx.db.query('SELECT 1 FROM deliveries WHERE agent_id = $agentId AND acked_at IS NULL LIMIT 1').get({
+      agentId: attempt.agentId,
+    }) !== null
+  );
+}
+
+/**
+ * attempt.exited: the agent's process is gone, and the trigger table decides what follows (design 6.4). The harvested
+ * head is recorded in every case. An attempt that ended already keeps its ending (design 6.3). A holding attempt stays
+ * holding, and one being taken over waits for attempt.taken_over (invariant c). Otherwise:
+ * - a stop the hub asked for ends it with that cause, whatever the runner says caused the exit;
+ * - the runner's own stop ends it stopped (infra, with no backoff or signature);
+ * - a suspend keeps it open: its lease runs without renewal until the runner says hello again;
+ * - an unrequested worker exit ends it crashed (infra, with a backoff and a signature);
+ * - an unrequested lead exit moves it to holding, with its seat and no lease, unless it is the third within
+ *   leadExitWindowMs, which ends it crashed. Each such exit is logged in resume_log when it happens; the resume
+ *   that follows it, at once for an exit in a turn (exitedInTurn) and on the next delivery otherwise, is not.
+ * Returns the ending, or null when the attempt stays open or had ended.
+ */
+export function onExited(
+  ctx: HubContext,
+  emit: Emit,
+  attempt: Attempt,
+  data: RunnerEventData['attempt.exited'],
+): Ending | null {
+  if (data.finalSha !== null) updateAttempt(ctx, attempt.id, { finalSha: data.finalSha });
+  const how = `${exitError(data)}, stopped by ${data.stoppedBy}${data.cause ? ` (${data.cause})` : ''}`;
+  if (attempt.status === 'ended') {
+    appendAttemptLog(ctx, attempt.id, 'note', `${how}, after it ended ${attempt.endReason ?? ''}`.trimEnd());
+    return null;
+  }
+  appendAttemptLog(ctx, attempt.id, 'note', how);
+  const stop = attempt.stopRequested;
+  if (attempt.status === 'holding' || stop?.cause === 'takeover') return null;
+  const actor = byRunner(attempt);
+  if (stop) return endAttempt(ctx, { attemptId: attempt.id, trigger: stop.cause, actor });
+  if (data.cause === 'runner_stop') return endAttempt(ctx, { attemptId: attempt.id, trigger: 'runner_stop', actor });
+  if (data.cause === 'suspend') return null;
+  const error = exitError(data);
+  if (attempt.role === 'lead') {
+    // The exit is logged as it happens: an idle lead is resumed only on its next delivery, maybe an hour later.
+    updateAttempt(ctx, attempt.id, { resumeLog: withLogEntry(ctx, attempt.id, 'lead_exit') });
+    if (recentResumes(ctx, attempt.id, 'lead_exit', ctx.config.leadExitWindowMs) < LEAD_EXITS_LIMIT) {
+      updateAttempt(ctx, attempt.id, { status: 'holding', leaseExpiresAt: null });
+      emit({
+        type: 'attempt.holding',
+        actor,
+        subject: attemptSubject(attempt),
+        data: { ...attemptData(attempt), submissionId: null },
+      });
+      return null;
+    }
+  }
+  return endAttempt(ctx, { attemptId: attempt.id, trigger: 'crashed', error, actor });
 }

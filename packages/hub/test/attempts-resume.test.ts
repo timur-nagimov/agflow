@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import { type InjectedMessage, compareFence, restoreSet } from '@agflow/core';
 import { attemptLog, getAttempt, updateAttempt } from '../src/attempt-store';
-import { recentResumes, resumeAttempt, startRunnerAttempt } from '../src/attempts';
+import { recentResumes, resumeAttempt } from '../src/attempts';
 import { mintAgentToken, resolveAgentToken } from '../src/auth';
 import { composeTaskPack } from '../src/brief';
 import { enqueueCommand, findCommand, pendingCommands, toWireCommand } from '../src/commands';
 import { listEvents } from '../src/events';
 import { getTask, writeTask } from '../src/task-store';
-import { addRunner, addRunnerAttempt, createTestContext } from './helpers';
+import { addRunnerAttempt, createTestContext } from './helpers';
 
 function setup() {
   const { ctx, clock } = createTestContext();
@@ -177,42 +177,26 @@ describe('resuming an attempt', () => {
 });
 
 describe('the resume log', () => {
-  test('records runner_restart and lead_exit resumes, which recentResumes counts in a window', () => {
+  test('records runner_restart resumes, which recentResumes counts in a window', () => {
     const { ctx, clock, held } = setup();
     const resume = (cause: 'runner_restart' | 'lead_exit' | 'review') =>
       resumeAttempt(ctx, { attemptId: held.attempt.id, cause, prompt: 'continue' });
     resume('runner_restart');
     clock.advance(10 * 60_000);
+    // A lead's exit is logged when it happens (onExited), so the resume that follows it adds nothing.
     resume('lead_exit');
     resume('review');
     clock.advance(10 * 60_000);
     resume('runner_restart');
     const hour = 60 * 60_000;
     expect(recentResumes(ctx, held.attempt.id, 'runner_restart', hour)).toBe(2);
-    expect(recentResumes(ctx, held.attempt.id, 'lead_exit', hour)).toBe(1);
+    expect(recentResumes(ctx, held.attempt.id, 'lead_exit', hour)).toBe(0);
     expect(recentResumes(ctx, held.attempt.id, 'runner_restart', 15 * 60_000)).toBe(1);
     clock.advance(hour);
     expect(recentResumes(ctx, held.attempt.id, 'runner_restart', hour)).toBe(0);
     const { resume_log: log } = ctx.db.query('SELECT resume_log FROM attempts WHERE id = $id').get({
       id: held.attempt.id,
     }) as { resume_log: string };
-    expect(JSON.parse(log).map((entry: { cause: string }) => entry.cause)).toEqual([
-      'runner_restart',
-      'lead_exit',
-      'runner_restart',
-    ]);
-  });
-
-  test("a holding lead's resume on its next delivery counts as a lead exit, as one in a turn does", () => {
-    const { ctx } = createTestContext();
-    const runnerId = addRunner(ctx);
-    const { attempt } = startRunnerAttempt(ctx, { runnerId, taskId: null, role: 'lead', vendor: 'claude' });
-    // Exited in a turn: resumed at once.
-    updateAttempt(ctx, attempt.id, { status: 'holding', leaseExpiresAt: null });
-    resumeAttempt(ctx, { attemptId: attempt.id, cause: 'lead_exit', prompt: 'You exited; continue.' });
-    // Exited while idle: resumed when its next message is delivered.
-    updateAttempt(ctx, attempt.id, { status: 'holding', leaseExpiresAt: null });
-    resumeAttempt(ctx, { attemptId: attempt.id, cause: 'lead_exit', prompt: 'You have new messages.' });
-    expect(recentResumes(ctx, attempt.id, 'lead_exit', ctx.config.leadExitWindowMs)).toBe(2);
+    expect(JSON.parse(log).map((entry: { cause: string }) => entry.cause)).toEqual(['runner_restart', 'runner_restart']);
   });
 });
