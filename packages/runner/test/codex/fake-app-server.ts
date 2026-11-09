@@ -235,8 +235,9 @@ function step(next: ScriptedStep): Promise<void> | undefined {
     send({ id, ...request });
   } else if ('stderr' in next) writeAll(2, `${next.stderr}\n`);
   else if ('spawnPipeHolder' in next) {
-    // Not detached, so it stays in the peer's process group.
-    const holder = Bun.spawn(['/bin/sleep', '600'], { stdio: ['ignore', 'inherit', 'inherit'] });
+    // Unless detached, it stays in the peer's process group.
+    const detached = next.spawnPipeHolder !== true && next.spawnPipeHolder.detached;
+    const holder = Bun.spawn(['/bin/sleep', '600'], { stdio: ['ignore', 'inherit', 'inherit'], detached });
     holder.unref();
     record({ type: 'pipeHolder', pid: holder.pid });
   } else exit('crash', next.crash);
