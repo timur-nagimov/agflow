@@ -340,7 +340,8 @@ async function main(argv: string[]): Promise<void> {
     process.exit(2);
   }
   const fake = new FakeClaude(loadRecording(recordingPath), process.env.FAKE_CLAUDE_LOG || null, argv);
-  fake.log({ kind: 'argv', argv });
+  // Names only: the values may hold secrets, and the tests ask only what reached the process.
+  fake.log({ kind: 'argv', argv, env: Object.keys(process.env).sort() });
   process.on('SIGTERM', () => void fake.exit(143));
   // One line at a time, in order: an answer can depend on what an earlier line set up.
   let buffer = '';

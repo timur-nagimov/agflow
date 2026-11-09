@@ -22,9 +22,12 @@ import {
   assertFullModelId,
   briefHookCommand,
   buildQueryOptions,
+  CLAUDE_BRIEF_HOOK_TIMEOUT_S,
   CLAUDE_BUILTIN_TOOLS,
   CLAUDE_SHELL,
+  claudeBinary,
   claudeEmptyDir,
+  claudeTools,
   type ClaudeOptionDeps,
   effectivePermissionMode,
   ensureClaudeEmptyDir,
@@ -56,7 +59,6 @@ function scratchDir(): string {
   scratch.push(dir);
   return dir;
 }
-
 
 const preCompact: HookCallback = async () => ({});
 const postCompact: HookCallback = async () => ({});
@@ -240,7 +242,15 @@ describe('buildQueryOptions', () => {
       permissions: { allow: rules.allow, deny: rules.deny },
       hooks: {
         SessionStart: [
-          { hooks: [{ type: 'command', command: `cd ${EMPTY} && exec '/opt/agflow bin/agflow' hook brief --runner` }] },
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: `cd ${EMPTY} && exec '/opt/agflow bin/agflow' hook brief --runner`,
+                timeout: CLAUDE_BRIEF_HOOK_TIMEOUT_S,
+              },
+            ],
+          },
         ],
       },
       autoMemoryEnabled: false,
@@ -430,5 +440,21 @@ describe('the empty directory', () => {
     rmSync(empty);
     writeFileSync(empty, '');
     expect(() => ensureClaudeEmptyDir(home)).toThrow();
+  });
+});
+
+describe('claudeTools and claudeBinary', () => {
+  test('the tools are the built-ins, plus WebFetch and WebSearch with profile.webTools', () => {
+    expect(claudeTools(standardProfile)).toEqual([...CLAUDE_BUILTIN_TOOLS]);
+    expect(claudeTools({ ...standardProfile, webTools: true })).toEqual([
+      ...CLAUDE_BUILTIN_TOOLS,
+      'WebFetch',
+      'WebSearch',
+    ]);
+  });
+
+  test("the binary of a version lies under the runner's vendor directory", () => {
+    expect(claudeBinary(paths, '2.1.285')).toBe(join(paths.runner, 'vendor', 'claude', '2.1.285', 'claude'));
+    expect(() => claudeBinary(paths, '../2.1.285')).toThrow(/not a vendor version/);
   });
 });

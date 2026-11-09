@@ -509,6 +509,10 @@ describe('fake-claude', () => {
       expect(log[0]).toMatchObject({
         argv: ['--resume=aaaaaaaa-0000-4000-8000-000000000000', '--model=claude-opus-5-5'],
       });
+      // The names of the variables the process got, never their values.
+      const names = log[0]?.kind === 'argv' ? log[0].env : [];
+      expect(names).toContain('FAKE_CLAUDE_RECORDING');
+      expect(JSON.stringify(log[0])).not.toContain(proc.log);
       expect(log[1]).toMatchObject({ requestId: 'init-1', request: { subtype: 'initialize' } });
       expect(log[2]).toMatchObject({ message: { uuid: 'user-1', message: { content: 'go' } } });
     },

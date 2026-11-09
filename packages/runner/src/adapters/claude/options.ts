@@ -108,6 +108,16 @@ export function inDirectory(dir: string, command: string, args: string[]): { com
   return { command: '/bin/sh', args: ['-c', 'cd -- "$1" && shift && exec "$@"', 'agflow', dir, command, ...args] };
 }
 
+/** The built-in tools a session asks for: system/init must list exactly these, plus the bridge's (8.1). */
+export function claudeTools(profile: PermissionProfile): string[] {
+  return [...CLAUDE_BUILTIN_TOOLS, ...(profile.webTools ? WEB_TOOLS : [])];
+}
+
+/** The pinned claude of a version, under the runner's own directory (design 7.1, 7.4). */
+export function claudeBinary(paths: Pick<RunnerPaths, 'runner'>, version: string): string {
+  return join(paths.runner, vendorBinary('claude', version));
+}
+
 /** acceptEdits, or auto for the auto profile on an account that offers it (7.6, X-29). */
 export function effectivePermissionMode(profile: PermissionProfile, autoOffered: boolean): PermissionMode {
   return profile.name === 'auto' && autoOffered ? 'auto' : 'acceptEdits';
@@ -122,6 +132,12 @@ export function assertFullModelId(model: string): void {
     throw new Error(`the model ${JSON.stringify(model)} is not a full model id such as claude-sonnet-5-5`);
   }
 }
+
+/**
+ * The brief hook's timeout, in seconds. The CLI's default is 600; a start waits for the first turn a bounded time
+ * above this one (CLAUDE_START_TIMEOUT_MS), so a stuck hook fails the start instead of holding the attempt.
+ */
+export const CLAUDE_BRIEF_HOOK_TIMEOUT_S = 60;
 
 /**
  * The SessionStart command hook: `cd <dir> && exec <agflow> hook brief --runner`, quoted for the /bin/sh the CLI runs
@@ -170,7 +186,7 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
     ? { resume: launch.resume.sessionRef }
     : { sessionId: (deps.newSessionId ?? randomUUID)() };
   return {
-    pathToClaudeCodeExecutable: join(deps.paths.runner, vendorBinary('claude', launch.cliVersion)),
+    pathToClaudeCodeExecutable: claudeBinary(deps.paths, launch.cliVersion),
     spawnClaudeCodeProcess: deps.spawnClaudeCodeProcess,
     cwd: launch.clone,
     // Whole: the SDK gives the child exactly this environment.
@@ -188,7 +204,7 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
         env: launch.bridge.env,
       },
     },
-    tools: [...CLAUDE_BUILTIN_TOOLS, ...(launch.profile.webTools ? WEB_TOOLS : [])],
+    tools: claudeTools(launch.profile),
     permissionMode: effectivePermissionMode(launch.profile, deps.autoOffered),
     // No canUseTool: a call the rules do not allow is denied at once instead of waiting for an answer.
     permissionPrompts: 'none',
@@ -196,7 +212,19 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
     sandbox: claudeSandboxSettings(scope),
     settings: {
       permissions: { allow: rules.allow, deny: rules.deny },
-      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: briefHookCommand(deps.agflow, emptyDir) }] }] },
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: briefHookCommand(deps.agflow, emptyDir),
+                timeout: CLAUDE_BRIEF_HOOK_TIMEOUT_S,
+              },
+            ],
+          },
+        ],
+      },
       autoMemoryEnabled: false,
       crossSessionInbound: 'refuse',
       cleanupPeriodDays: 30,

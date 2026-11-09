@@ -41,7 +41,8 @@ export function fakeClaudeEnv(options: FakeClaudeEnvOptions): Record<string, str
 
 /** What one line of FAKE_CLAUDE_LOG records. */
 export type FakeClaudeLogRecord =
-  | { kind: 'argv'; argv: string[] }
+  /** The arguments, and the names of the environment variables the process got. */
+  | { kind: 'argv'; argv: string[]; env: string[] }
   /** Every control request the SDK sent, as it came. */
   | { kind: 'control'; requestId: string; request: Record<string, unknown> }
   /** Every user message, as it came. */

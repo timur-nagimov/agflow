@@ -65,6 +65,8 @@ export class ClaudeSession implements AgentSession {
   private initSeen = false;
   /** The first-turn check failed: the session is being ended, and its frames are not mapped. */
   private refused = false;
+  /** What frames before the first system/init gave; they follow its started. */
+  private readonly early: AgentEvent[] = [];
   /**
    * The first prompt was pushed and no turn has started yet: the CLI may be starting one. A message sent later is
    * the mapper's to track, until the CLI starts or cancels it.
@@ -164,6 +166,11 @@ export class ClaudeSession implements AgentSession {
     void this.proc?.signalGroup('SIGTERM');
   }
 
+  /** SIGKILLs the CLI's process group: for a CLI that outlived terminate(). */
+  kill(): void {
+    void this.proc?.signalGroup('SIGKILL');
+  }
+
   private pushUser(text: string, uuid: ReturnType<typeof randomUUID>): void {
     // No priority: the default folds it into a running turn at the next tool boundary (8.3).
     this.inbox.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, uuid });
@@ -199,13 +206,20 @@ export class ClaudeSession implements AgentSession {
     const exit = await this.exited;
     await this.stderrRead();
     this.first.resolve(null);
+    if (!this.refused) for (const event of this.early.splice(0)) this.emit(event);
     for (const event of this.mapper.ended(crashError(this.stderrTail(), exit))) this.emit(event);
     this.queue.end();
   }
 
   private take(frame: unknown): void {
     if (this.refused) return;
-    if (!this.initSeen && isRecord(frame) && frame.type === 'system' && frame.subtype === 'init') {
+    const isInit = isRecord(frame) && frame.type === 'system' && frame.subtype === 'init';
+    if (!this.initSeen && !isInit) {
+      // Before the first system/init, such as a resumed session's first message starting: started comes first.
+      this.early.push(...this.mapper.map(frame));
+      return;
+    }
+    if (!this.initSeen) {
       this.initSeen = true;
       const init = frame as unknown as SDKSystemMessage;
       const problems = this.checkInit(init);
@@ -217,6 +231,8 @@ export class ClaudeSession implements AgentSession {
         this.terminate();
         return;
       }
+      for (const event of [...this.mapper.map(frame), ...this.early.splice(0)]) this.emit(event);
+      return;
     }
     for (const event of this.mapper.map(frame)) this.emit(event);
   }
