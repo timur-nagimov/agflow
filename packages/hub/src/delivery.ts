@@ -94,16 +94,25 @@ export interface FlushResult {
 }
 
 /**
+ * Wakes a holding runner lead for its unread messages (lead.ts's wakeHoldingLead): it resumes the lead with them, or
+ * ends it lost when it cannot be resumed. Returns the resume_attempt, or null. delivery.ts takes it as an argument,
+ * since lead.ts resumes through attempts.ts, which imports this module.
+ */
+export type HoldingLeadWaker = (attempt: Attempt, unread: readonly Message[]) => CommandRow | null;
+
+/**
  * Pushes unread messages to every runner attempt that takes deliveries, batched (design 6.7, Batching): an attempt's
  * messages wait until the oldest of them is deliveryBatchMs old, and then go together, so a burst is one command.
- * Each attempt's delivery is its own transaction.
+ * With wake, a holding runner lead's batch wakes it instead (design 6.11): its delivery is its resume. Each attempt's
+ * delivery is its own transaction.
  */
-export function flushDeliveries(ctx: HubContext): FlushResult {
+export function flushDeliveries(ctx: HubContext, wake?: HoldingLeadWaker): FlushResult {
   const statuses = DELIVERABLE.map((status) => `'${status}'`).join(', ');
+  const holding = wake ? "OR (status = 'holding' AND role = 'lead')" : '';
   const ids = ctx.db
     .query(
       `SELECT id FROM attempts
-       WHERE runner_id IS NOT NULL AND status IN (${statuses}) AND stop_requested IS NULL ORDER BY rowid`,
+       WHERE runner_id IS NOT NULL AND (status IN (${statuses}) ${holding}) AND stop_requested IS NULL ORDER BY rowid`,
     )
     .all() as { id: string }[];
   const commands: CommandRow[] = [];
@@ -113,7 +122,8 @@ export function flushDeliveries(ctx: HubContext): FlushResult {
     try {
       const command = tx(ctx, () => {
         const attempt = getAttempt(ctx, id);
-        if (!deliverable(attempt)) return null;
+        const wakes = wake !== undefined && attempt.status === 'holding' && attempt.stopRequested === null;
+        if (!wakes && !deliverable(attempt)) return null;
         const unread = unreadFor(ctx, getAgent(ctx, attempt.agentId));
         if (unread.length === 0) return null;
         const due = Math.min(...unread.map((message) => message.createdAt)) + ctx.config.deliveryBatchMs;
@@ -121,7 +131,7 @@ export function flushDeliveries(ctx: HubContext): FlushResult {
           dueAt = dueAt === null ? due : Math.min(dueAt, due);
           return null;
         }
-        return deliver(ctx, attempt, unread);
+        return wakes ? wake(attempt, unread) : deliver(ctx, attempt, unread);
       });
       if (command) commands.push(command);
     } catch (error) {
@@ -155,6 +165,20 @@ export function messagesInFlight(ctx: HubContext, attemptId: string): InjectedMe
        WHERE p.attempt_id = $attemptId ORDER BY m.id`,
     )
     .all({ attemptId }) as MessageRow[];
+  return rows.map((row) => injectedMessage(rowToMessage(row)));
+}
+
+/**
+ * The messages delivered to the agent that it has not acknowledged, formatted, oldest first: a lead whose process
+ * exited in a turn is resumed with them (design 6.11, Process exits).
+ */
+export function unacknowledgedDeliveries(ctx: HubContext, agentId: string): InjectedMessage[] {
+  const rows = ctx.db
+    .query(
+      `SELECT m.* FROM messages m JOIN deliveries d ON d.message_id = m.id
+       WHERE d.agent_id = $agentId AND d.acked_at IS NULL ORDER BY m.id`,
+    )
+    .all({ agentId }) as MessageRow[];
   return rows.map((row) => injectedMessage(rowToMessage(row)));
 }
 
@@ -249,10 +273,11 @@ export function settleDeliveriesOnEnd(ctx: HubContext, emit: Emit, attempt: Atte
 }
 
 /**
- * Runs flushDeliveries when a sent message's batch is due, and again for as long as batches wait. Returns the stop
- * function. startHub runs it with its timers; the hub's housekeeping also flushes, in case a timer's run failed.
+ * Runs flushDeliveries when a sent message's batch is due, and again for as long as batches wait, waking holding
+ * leads with wake. Returns the stop function. startHub runs it with its timers; the hub's housekeeping also flushes,
+ * in case a timer's run failed.
  */
-export function watchDeliveries(ctx: HubContext): () => void {
+export function watchDeliveries(ctx: HubContext, wake?: HoldingLeadWaker): () => void {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
   const schedule = (delayMs: number) => {
@@ -262,7 +287,7 @@ export function watchDeliveries(ctx: HubContext): () => void {
   function run(): void {
     timer = null;
     try {
-      const { dueAt } = flushDeliveries(ctx);
+      const { dueAt } = flushDeliveries(ctx, wake);
       if (dueAt !== null) schedule(dueAt - ctx.now());
     } catch (error) {
       console.error('the delivery flush failed', error);

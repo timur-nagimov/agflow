@@ -1,5 +1,6 @@
 // The scheduler (design 6.6). Each tick first reconciles (step 1: leases, approvals, stalls, stop and submission
-// timeouts, the Codex reset probe and quota_wait replacements), then reads the database into core's terms and leaves
+// timeouts, holding leads, the Codex reset probe and quota_wait replacements), fills an empty lead seat (step 2,
+// lead.ts), then reads the database into core's terms and leaves
 // the rules to core's scheduling.ts (X-46): which ready tasks qualify and in what order, how many workers may start,
 // and where each one goes. Every claim and start is its own transaction, so one that fails rolls back only itself,
 // and the tick's placement snapshot is updated after each start, so a runner's slots and an account's probing start
@@ -26,6 +27,7 @@ import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
+import { checkHoldingLeads, ensureLead } from './lead';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
@@ -309,6 +311,8 @@ export interface ReconcileResult {
   stops: number;
   /** Submissions failed at their timeout (expireSubmissions). */
   submissions: number;
+  /** Holding runner leads ended lost because they can no longer be resumed (checkHoldingLeads). */
+  holdingLeads: string[];
   /** Codex preflights sent for unknown resets (probeUnknownResets). */
   probes: number;
   /** quota_wait attempts asked to stop for a replacement (replaceQuotaWaits). */
@@ -338,6 +342,7 @@ export function reconcile(ctx: HubContext): ReconcileResult {
     stalls: duty('the stall decisions', () => judgeStalls(ctx), { suspected: [], stopped: [] }),
     stops: duty('the stop timeouts', () => expireStops(ctx), 0),
     submissions: duty('the submission timeouts', () => expireSubmissions(ctx), 0),
+    holdingLeads: duty('the holding lead check', () => checkHoldingLeads(ctx), []),
     probes: duty('the Codex reset probe', () => probeUnknownResets(ctx), 0),
     quotaWaits: duty('the quota_wait replacement', () => replaceQuotaWaits(ctx), []),
   };
@@ -345,18 +350,22 @@ export function reconcile(ctx: HubContext): ReconcileResult {
 
 export interface TickResult {
   reconciled: ReconcileResult;
+  /** The runner lead the tick started for an empty seat, or null. */
+  lead: Attempt | null;
   /** The worker attempts the tick started. */
   started: Attempt[];
 }
 
 /**
- * One scheduler tick (design 6.6): reconcile, then dispatch. A paused project skips the lead seat and dispatch
- * (steps 2 to 6); the agents already running go on under every stall, budget and lease rule.
+ * One scheduler tick (design 6.6): reconcile, the lead seat, then dispatch. The lead starts first, so that dispatch
+ * sees the slot it takes. A paused project skips the lead seat and dispatch (steps 2 to 6); the agents already running
+ * go on under every stall, budget and lease rule.
  */
 export function runTick(ctx: HubContext): TickResult {
   const reconciled = reconcile(ctx);
-  if (getProject(ctx).paused) return { reconciled, started: [] };
-  return { reconciled, started: dispatch(ctx).started };
+  if (getProject(ctx).paused) return { reconciled, lead: null, started: [] };
+  const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
+  return { reconciled, lead, started: dispatch(ctx).started };
 }
 
 /** How long the scheduler waits after an event that frees a slot or readies a task before its extra tick. */

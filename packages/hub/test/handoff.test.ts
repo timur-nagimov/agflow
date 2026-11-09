@@ -377,6 +377,7 @@ describe('assembled lead handoff', () => {
     expect(headings(body)).toEqual([
       '## The last 20 messages to and from the lead, newest first',
       '## Earlier messages the lead sent since the newest lead handoff, newest first',
+      '## The lead handoff the previous lead started from',
       '## Situation report',
       '## Goal (v1), as people set it; your brief has all of it',
     ]);
@@ -385,6 +386,8 @@ describe('assembled lead handoff', () => {
     expect(last).toContain('from user:bob]\n> talk 20 to the lead agent');
     const since = section(body, '## Earlier messages the lead sent since the newest lead handoff, newest first');
     expect(found(since, /> (rotated )?lead early/g)).toEqual(['> lead early', '> rotated lead early']);
+    const started = section(body, '## The lead handoff the previous lead started from');
+    expect(started).toContain(`agent:${earlierLead.agent.id} wrote it:\n> an earlier lead handoff`);
     expect(body).toContain('## Situation report\nTasks:');
     expect(section(body, '## Goal (v1), as people set it; your brief has all of it')).toBe(
       '## Goal (v1), as people set it; your brief has all of it\nShip the parser',

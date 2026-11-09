@@ -1,11 +1,13 @@
 // startHub (design 13): the HTTP API, the web UI and the runner link on one port, the link through Bun's own
 // WebSocket handlers. main.ts serves the hub with it; tests and the demo pass their own context.
+import type { Attempt, Message } from '@agflow/core';
 import type { Server, ServerWebSocket } from 'bun';
 import { sweepAuth } from './auth';
 import { type HubContext, NO_RUNNER_LINK } from './context';
 import { flushDeliveries, watchDeliveries } from './delivery';
 import { Gateway, type LinkSession, type LinkSocket, type RunnerConnection } from './gateway';
 import { createApp } from './http/app';
+import { wakeHoldingLead } from './lead';
 import { refreshNeedsLogin } from './runners';
 import { Scheduler } from './scheduler';
 
@@ -72,13 +74,17 @@ function linkSocket(ws: ServerWebSocket<LinkData>): LinkSocket {
   };
 }
 
+/** A holding runner lead's delivery is its wake-up (design 6.11). */
+const leadWaker = (ctx: HubContext) => (attempt: Attempt, unread: readonly Message[]) =>
+  wakeHoldingLead(ctx, attempt, unread);
+
 /** Each duty in its own try, so one failing does not skip the others; the next round runs them all again. */
 function housekeeping(ctx: HubContext, gateway: Gateway): void {
   const duties: [string, () => unknown][] = [
     ['the dead-link sweep', () => gateway.sweepDeadLinks()],
     ['the auth sweep', () => sweepAuth(ctx)],
     ['the needs_login refresh', () => refreshNeedsLogin(ctx)],
-    ['the delivery flush', () => flushDeliveries(ctx)],
+    ['the delivery flush', () => flushDeliveries(ctx, leadWaker(ctx))],
   ];
   for (const [name, duty] of duties) {
     try {
@@ -117,7 +123,7 @@ export function startHub(ctx: HubContext, options: StartHubOptions = {}): HubSer
   upgrader = server;
   const timers = options.timers ?? true;
   const timer = timers ? setInterval(() => housekeeping(ctx, gateway), ctx.config.heartbeatMs) : null;
-  const stopDeliveries = timers ? watchDeliveries(ctx) : null;
+  const stopDeliveries = timers ? watchDeliveries(ctx, leadWaker(ctx)) : null;
   const scheduler = options.scheduler ? new Scheduler(ctx) : null;
   if (options.scheduler === 'auto') scheduler?.start();
   return {

@@ -76,10 +76,16 @@ import {
 } from './commands';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
-import { deliverBacklog, messagesInFlight, retargetDeliveries, settleDeliveriesOnEnd } from './delivery';
+import {
+  deliverBacklog,
+  messagesInFlight,
+  retargetDeliveries,
+  settleDeliveriesOnEnd,
+  unacknowledgedDeliveries,
+} from './delivery';
 import { HubError, badRequest, conflict, forbidden, notFound } from './errors';
 import type { Emit } from './events';
-import { assembleHandoffNote, handoffWritten } from './handoff';
+import { assembleHandoffNote, failoverNote, handoffWritten } from './handoff';
 import { emptySeat, insertLeadNote, seatHolderId, takeSeat } from './hub-state';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
@@ -671,8 +677,12 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
         }
       }
     }
-    // Only a lead attempt with no task holds the seat; a live lead's task attempt leaves it alone.
-    if (attempt.taskId === null) emptySeat(ctx, emit, actor, attempt.agentId);
+    // Only a lead attempt with no task holds the seat; a live lead's task attempt leaves it alone. The next lead starts
+    // from a lead handoff, assembled if this one wrote none (design 6.11).
+    if (attempt.taskId === null) {
+      emptySeat(ctx, emit, actor, attempt.agentId);
+      failoverNote(ctx, attempt);
+    }
     emit({
       type: 'attempt.ended',
       actor,
@@ -1577,6 +1587,11 @@ export function onLateWork(
 /** Unrequested lead exits within leadExitWindowMs: the one that reaches this count ends the attempt crashed. */
 const LEAD_EXITS_LIMIT = 3;
 
+/** The prompt of a lead resumed at once after its process exited in a turn (design 6.11, Process exits). */
+const LEAD_TURN_PROMPT =
+  'Your process exited during a turn, and agflow started it again. Carry on with what you were doing; the messages ' +
+  'you had not acknowledged follow.';
+
 /** How the process went, as the error of an unrequested exit's failure signature. */
 function exitError(data: RunnerEventData['attempt.exited']): string {
   if (data.signal !== null) return `the agent was killed by ${data.signal}`;
@@ -1659,6 +1674,7 @@ function endOnExit(
     // The exit is logged as it happens: an idle lead is resumed only on its next delivery, maybe an hour later.
     updateAttempt(ctx, attempt.id, { resumeLog: withLogEntry(ctx, attempt.id, 'lead_exit') });
     if (recentResumes(ctx, attempt.id, 'lead_exit', ctx.config.leadExitWindowMs) < LEAD_EXITS_LIMIT) {
+      const inTurn = exitedInTurn(ctx, attempt);
       updateAttempt(ctx, attempt.id, { status: 'holding', leaseExpiresAt: null });
       emit({
         type: 'attempt.holding',
@@ -1666,6 +1682,16 @@ function endOnExit(
         subject: attemptSubject(attempt),
         data: { ...attemptData(attempt), submissionId: null },
       });
+      // A turn cut short goes on at once, with what it had not acknowledged; an idle lead waits for its next delivery.
+      if (inTurn) {
+        resumeAttempt(ctx, {
+          attemptId: attempt.id,
+          cause: 'lead_exit',
+          prompt: LEAD_TURN_PROMPT,
+          messages: unacknowledgedDeliveries(ctx, attempt.agentId),
+          actor,
+        });
+      }
       return null;
     }
   }

@@ -20,6 +20,16 @@ import { createTestHub } from './http-helpers';
 
 const MINUTE = 60_000;
 
+/**
+ * A test context with runner leads off: a runner lead would take a runner slot in every tick, and the lead seat is
+ * lead-runner.test.ts's to test.
+ */
+function schedulerContext(overrides: Parameters<typeof createTestContext>[0] = {}) {
+  const made = createTestContext(overrides);
+  made.ctx.db.run('UPDATE project SET runner_leads = 0 WHERE id = 1');
+  return made;
+}
+
 type NewTaskInput = Parameters<typeof newTask>[0];
 
 /** Creates ready tasks, by alice; returns their ids. */
@@ -83,7 +93,7 @@ const leadMessages = (ctx: HubContext) => listMessages(ctx, {}).filter((message)
 
 describe('dispatch', () => {
   test('a ready task with a free slot and a usable runner gets an attempt, by priority then age', () => {
-    const { ctx, clock } = createTestContext();
+    const { ctx, clock } = schedulerContext();
     const runnerId = addRunner(ctx);
     const [older] = tasks(ctx, { title: 'Older', priority: 5 });
     clock.advance(1_000);
@@ -105,7 +115,7 @@ describe('dispatch', () => {
   });
 
   test('one failing start does not roll back the others', () => {
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     addRunner(ctx);
     const [first, second] = tasks(ctx, { title: 'First', priority: 1 }, { title: 'Second', priority: 2 });
     ctx.db.run(
@@ -125,7 +135,7 @@ describe('dispatch', () => {
   });
 
   test('a task whose paths overlap one started in the same tick waits for the next', () => {
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     const runnerId = addRunner(ctx);
     const [first, second] = tasks(
       ctx,
@@ -140,7 +150,7 @@ describe('dispatch', () => {
   });
 
   test("request_agents' vendor steers placement until vendorPrefMs has passed", () => {
-    const { ctx, clock } = createTestContext();
+    const { ctx, clock } = schedulerContext();
     const runnerId = addRunner(ctx, { vendors: ['claude', 'codex'] });
     const [first, second] = tasks(ctx, { title: 'First', priority: 1 }, { title: 'Second', priority: 2 });
     requestAgents(ctx, { count: 1, vendor: 'codex' });
@@ -152,7 +162,7 @@ describe('dispatch', () => {
   });
 
   test('workers stay below maxWorkers; leads and live chats do not count', () => {
-    const { ctx } = createTestContext({ maxWorkers: 1 });
+    const { ctx } = schedulerContext({ maxWorkers: 1 });
     const runnerId = addRunner(ctx);
     const other = addRunner(ctx);
     // A runner lead and a live chat's attempt hold no worker slot.
@@ -167,7 +177,7 @@ describe('dispatch', () => {
   });
 
   test('workers stay below worker_target; a target of 0 dispatches nothing without pausing', () => {
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     const runnerId = addRunner(ctx);
     const [a, b, c] = tasks(ctx, { title: 'A', priority: 1 }, { title: 'B', priority: 2 }, { title: 'C', priority: 3 });
     tx(ctx, () => setWorkerTarget(ctx, 1));
@@ -184,7 +194,7 @@ describe('dispatch', () => {
   });
 
   test('a paused project dispatches nothing', () => {
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     const runnerId = addRunner(ctx);
     const [taskId] = tasks(ctx, { title: 'Parser' });
     setPaused(ctx, true, 'user:alice');
@@ -194,7 +204,7 @@ describe('dispatch', () => {
   });
 
   test('live-chat-only tasks stay ready, and future next_dispatch_at or dispatch_hold_until waits', () => {
-    const { ctx, clock } = createTestContext();
+    const { ctx, clock } = schedulerContext();
     const runnerId = addRunner(ctx);
     const [config] = tasks(ctx, { title: 'Hooks', ownedPaths: ['.claude/settings.json'] });
     const [backoff, hold] = tasks(ctx, { title: 'Backoff' }, { title: 'Hold' });
@@ -212,7 +222,7 @@ describe('dispatch', () => {
   });
 
   test('the ladder requirement and vendorHint steer the vendor', () => {
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     const runnerId = addRunner(ctx, { vendors: ['claude', 'codex'] });
     // Both vendors are at the same level, so without a hint Claude, first on a tie, would be chosen.
     const [hinted] = tasks(ctx, { title: 'Hinted', priority: 1, vendorHint: 'codex' });
@@ -228,7 +238,7 @@ describe('dispatch', () => {
   });
 
   test('a runner that refused a start gets nothing until its next heartbeat', () => {
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     const runnerId = addRunner(ctx);
     const [taskId] = tasks(ctx, { title: 'Parser' });
     recordStartRefusal(ctx, runnerId, 'at_capacity');
@@ -242,7 +252,7 @@ describe('dispatch', () => {
   });
 
   test('a Claude account with an unknown reset gets one probing start, the next waiting while it is open', () => {
-    const { ctx, clock } = createTestContext();
+    const { ctx, clock } = schedulerContext();
     const runnerId = addRunner(ctx);
     const [first, second] = tasks(ctx, { title: 'First', priority: 1 }, { title: 'Second', priority: 2 });
     exhaust(ctx, 'claude', { resetsAt: null });
@@ -256,7 +266,7 @@ describe('dispatch', () => {
 
 describe('owner away', () => {
   test('an owner_away refusal tells the lead once per away period', () => {
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     addRunner(ctx, { vendors: ['codex'] });
     const [taskId] = tasks(ctx, { title: 'Parser' });
     const away = () =>
@@ -319,7 +329,7 @@ describe('POST /api/staffing', () => {
 
 describe('the reconcile step', () => {
   test('runs every reconcile duty before dispatch, and nothing else', () => {
-    const { ctx, clock } = createTestContext({ leaseMs: 20 * MINUTE, maxWorkers: 8 });
+    const { ctx, clock } = schedulerContext({ leaseMs: 20 * MINUTE, maxWorkers: 8 });
     const runnerId = addRunner(ctx, { vendors: ['claude', 'codex'] });
     // A live claim whose M1 lease runs out: the sweep makes it ready, and the same tick dispatches it.
     const [swept] = tasks(ctx, { title: 'Swept' });
@@ -379,6 +389,7 @@ describe('the reconcile step', () => {
       stalls: { suspected: [], stopped: [erring.attempt.id] },
       stops: 1,
       submissions: 1,
+      holdingLeads: [],
       probes: 1,
       quotaWaits: [],
     });
@@ -387,7 +398,7 @@ describe('the reconcile step', () => {
   });
 
   test('a duty that fails is logged and leaves the other duties and dispatch to run', () => {
-    const { ctx, clock } = createTestContext({ leaseMs: 20 * MINUTE });
+    const { ctx, clock } = schedulerContext({ leaseMs: 20 * MINUTE });
     // A live claim whose M1 lease runs out, which the lease sweep cannot move.
     const [stuck] = tasks(ctx, { title: 'Stuck' });
     claimTask(ctx, stuck as string, addAgent(ctx));
@@ -416,7 +427,7 @@ describe('the reconcile step', () => {
 describe('replaceQuotaWaits', () => {
   /** A Codex worker on R-1 in quota_wait, its account exhausted until resetIn from now, or with no known reset. */
   function waiting(resetIn: ((ctx: HubContext) => number) | null) {
-    const { ctx, clock } = createTestContext();
+    const { ctx, clock } = schedulerContext();
     const resetsAt = resetIn === null ? null : ctx.now() + resetIn(ctx);
     const held = addRunnerAttempt(ctx, { vendor: 'codex' });
     exhaust(ctx, 'codex', { resetsAt });
@@ -541,7 +552,7 @@ describe('the Scheduler', () => {
   }
 
   test("'auto' ticks every tickMs", async () => {
-    const { ctx } = createTestContext({ tickMs: 20 });
+    const { ctx } = schedulerContext({ tickMs: 20 });
     addRunner(ctx);
     const [taskId] = tasks(ctx, { title: 'Parser' });
     const scheduler = new Scheduler(ctx);
@@ -556,7 +567,7 @@ describe('the Scheduler', () => {
   });
 
   test('ticks once more, debounced, after a task gets ready or an attempt ends', async () => {
-    const { ctx } = createTestContext({ tickMs: 60 * MINUTE });
+    const { ctx } = schedulerContext({ tickMs: 60 * MINUTE });
     addRunner(ctx);
     tx(ctx, () => setWorkerTarget(ctx, 1));
     const scheduler = new Scheduler(ctx, { debounceMs: 10 });
@@ -577,7 +588,7 @@ describe('the Scheduler', () => {
   });
 
   test('ticks after a worker goes holding, and after a task is unblocked or released', async () => {
-    const { ctx } = createTestContext({ tickMs: 60 * MINUTE });
+    const { ctx } = schedulerContext({ tickMs: 60 * MINUTE });
     // A running worker on R-1 holds the one worker slot.
     const held = addRunnerAttempt(ctx);
     tx(ctx, () => setWorkerTarget(ctx, 1));
@@ -618,7 +629,7 @@ describe('the Scheduler', () => {
   });
 
   test('a burst of events makes one extra tick, debounceMs after the first', async () => {
-    const { ctx } = createTestContext({ tickMs: 60 * MINUTE });
+    const { ctx } = schedulerContext({ tickMs: 60 * MINUTE });
     addRunner(ctx);
     const scheduler = new Scheduler(ctx, { debounceMs: 30 });
     let ticks = 0;
@@ -642,7 +653,7 @@ describe('the Scheduler', () => {
   });
 
   test("'manual' starts stopped: tick() runs one tick and start() begins the timer; stop() stops it", async () => {
-    const { ctx } = createTestContext({ tickMs: 20 });
+    const { ctx } = schedulerContext({ tickMs: 20 });
     addRunner(ctx);
     const scheduler = new Scheduler(ctx, { debounceMs: 10 });
     const [one] = tasks(ctx, { title: 'One' });
@@ -662,13 +673,13 @@ describe('the Scheduler', () => {
       ['auto', true],
       ['manual', false],
     ] as const) {
-      const { ctx } = createTestContext();
+      const { ctx } = schedulerContext();
       const hub = startHub(ctx, { scheduler: option, timers: false });
       expect(hub.scheduler?.running).toBe(running);
       await hub.stop();
       expect(hub.scheduler?.running).toBe(false);
     }
-    const { ctx } = createTestContext();
+    const { ctx } = schedulerContext();
     const hub = startHub(ctx, { scheduler: false, timers: false });
     expect(hub.scheduler).toBeNull();
     await hub.stop();

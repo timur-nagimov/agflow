@@ -4,9 +4,10 @@
 // unquoted; every other part an agent or a person wrote is quoted under a line naming where it came from.
 import { type Attempt, type Message, type TaskNote, formatMessage, quoteLines } from '@agflow/core';
 import { unpushedHead } from './attempt-store';
-import { newestLeadHandoff, situationReport } from './brief';
+import { BRIEF_HANDOFF_LIMIT, newestLeadHandoff, situationReport } from './brief';
 import type { HubContext } from './context';
 import { getCurrentGoal } from './goal';
+import { insertLeadNote } from './hub-state';
 import { type MessageRow, listMessages, rowToMessage } from './messages';
 import { getTask, listTaskNotes } from './task-store';
 import { clip, quotedWithin } from './text';
@@ -233,9 +234,10 @@ function leadAgents(ctx: HubContext, attempt: Attempt): string[] {
 
 /**
  * The next lead's note when a lead ended without a lead handoff (design 6.11, failover): the last 20 messages to and
- * from the lead, the lead's earlier messages since the newest lead handoff, the situation report and the goal. What
- * only this note carries comes first, newest first: the next lead's brief quotes only the note's start, and also
- * shows the situation report and the whole goal, so a cut falls on what the brief has anyway.
+ * from the lead, the lead's earlier messages since the newest lead handoff, that handoff itself, the situation report
+ * and the goal. What only this note carries comes first, newest first: the next lead's brief quotes only the newest
+ * lead handoff, which this note becomes, and only its start, and also shows the situation report and the whole goal,
+ * so a cut falls on the oldest material and then on what the brief has anyway.
  */
 export function assembleLeadHandoff(ctx: HubContext, attempt: Attempt): AssembledNote {
   const leads = JSON.stringify(leadAgents(ctx, attempt));
@@ -262,7 +264,8 @@ export function assembleLeadHandoff(ctx: HubContext, attempt: Attempt): Assemble
     );
   }
   // With no lead handoff to start from, everything the leads sent counts.
-  const since = newestLeadHandoff(ctx)?.createdAt ?? 0;
+  const handoff = newestLeadHandoff(ctx);
+  const since = handoff?.createdAt ?? 0;
   const earlier = (
     ctx.db
       .query(
@@ -283,6 +286,14 @@ export function assembleLeadHandoff(ctx: HubContext, attempt: Attempt): Assemble
         earlier.map((message) => shownMessage(message, LIMITS.leadMessage)).join('\n\n'),
     );
   }
+  // This note becomes the newest lead handoff, so the one before it would no longer reach the next lead's brief.
+  if (handoff) {
+    const source = `${handoff.author} wrote it${handoff.attemptId ? ` in attempt ${handoff.attemptId}` : ''}:`;
+    sections.push(
+      `## The lead handoff the previous lead started from\n${source}\n` +
+        quotedWithin(handoff.body, BRIEF_HANDOFF_LIMIT),
+    );
+  }
   sections.push(situationReport(ctx));
   const goal = getCurrentGoal(ctx);
   sections.push(
@@ -291,4 +302,35 @@ export function assembleLeadHandoff(ctx: HubContext, attempt: Attempt): Assemble
       : '## Goal\nNo goal has been set yet.',
   );
   return closeNote(sections, null, LEAD_CLOSING);
+}
+
+/** The lead endings that leave the next lead a note: failover (lost, crashed), stops, replacements and rotations. */
+const LEAD_NOTE_ENDINGS: readonly NonNullable<Attempt['endReason']>[] = [
+  'lost',
+  'crashed',
+  'stopped',
+  'replaced',
+  'rotated',
+];
+
+/** Whether the lead's ending leaves the next lead a note: a failed start does only when it was a resume that failed. */
+function leavesLeadNote(attempt: Attempt): boolean {
+  if (attempt.endReason === 'failed_to_start') return attempt.sessionRef !== null;
+  return attempt.endReason !== null && LEAD_NOTE_ENDINGS.includes(attempt.endReason);
+}
+
+/**
+ * Stores an assembled lead handoff for a runner lead that ended without writing one (design 6.11, Failover; X-34), in
+ * the ending's transaction: the next lead's brief quotes the newest lead handoff, so it starts from this one. A lead
+ * whose resume failed had a session and gets one too; one that never spawned has nothing to hand on. It lives here
+ * rather than in lead.ts because endAttempt calls it, and lead.ts starts and resumes leads through attempts.ts. Pass
+ * the attempt as ended. Returns whether it stored one.
+ */
+export function failoverNote(ctx: HubContext, attempt: Attempt): boolean {
+  if (attempt.role !== 'lead' || attempt.taskId !== null || attempt.runnerId === null) return false;
+  if (!leavesLeadNote(attempt)) return false;
+  if (handoffWritten(ctx, attempt)) return false;
+  const note = assembleLeadHandoff(ctx, attempt);
+  insertLeadNote(ctx, { attemptId: attempt.id, kind: 'handoff', body: note.body, author: note.author });
+  return true;
 }
