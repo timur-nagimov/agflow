@@ -1,13 +1,20 @@
-// Thread startup, resume and their fail-closed checks (design 9.2, 7.4).
+// Thread startup, resume, fail-closed checks and app-server events (design 9.2, 7.4).
+import { TEST_ACCOUNT_ID } from '@agflow/core';
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import type { RunnerTestBlock } from '../../config';
 import type { Logger } from '../../log';
+import { boundedWait } from '../../processes';
 import { vendorBinary } from '../../vendor/pins';
 import type { AgentEvent, AgentLaunch, ExitInfo } from '../types';
+import { isFinalError, mergeRateLimits, quotaFromRateLimits, turnErrorKind } from './classify';
 import { appServerArgs, appServerEnv, threadOverrides } from './config';
+import { codexToolEnded, codexToolStarted } from './items';
 import type { CodexClientMethod, ParamsOf, ResultOf } from './methods';
+import { codexAccountIdentity } from './policy';
 import { openAppServer, type AppServerProcess } from './process';
+import type { ServerNotification } from './protocol';
+import type { RateLimitSnapshot, Turn, TurnError } from './protocol/v2';
 import { RpcError } from './rpc';
 
 export interface CodexSessionOptions {
@@ -18,9 +25,21 @@ export interface CodexSessionOptions {
   userHome: string;
   /** Passed by the adapter only in test mode. */
   testConfig?: RunnerTestBlock['codexConfig'] | null;
+  /** test.skipAuthChecks, only in test mode: quota is then reported for core's TEST_ACCOUNT_ID, as preflight does. */
+  skipAuthChecks?: boolean;
   logger?: Logger;
   /** Bounds each app-server request; tests pass a short one. */
   requestTimeoutMs?: number;
+}
+
+type TurnEnded = Extract<AgentEvent, { type: 'turn_ended' }>;
+
+/** A started tool item and the main turn it counts for: its own turn on the main thread, else the active one. */
+interface OpenTool {
+  toolId: string;
+  threadId: string;
+  turnId: string;
+  mainTurn: string | null;
 }
 
 export class CodexSession {
@@ -28,15 +47,36 @@ export class CodexSession {
   readonly events: AsyncIterable<AgentEvent>;
   readonly exited: Promise<ExitInfo>;
   private readonly queue = new EventQueue();
+  private activeTurn: string | null = null;
+  private readonly turns = new Map<string, { started: boolean; toolCalls: number; error: TurnError | null }>();
+  /** Started tool items, keyed by thread, turn and item. */
+  private readonly tools = new Map<string, OpenTool>();
+  /** Tools a turn's end ended before their item/completed: a late one is not reported again. */
+  private readonly endedTools = new Set<string>();
+  private rateLimits: RateLimitSnapshot | null = null;
+  /** A quota failure's end, held until account/rateLimits/read settles. */
+  private ending: Promise<void> | null = null;
 
   private constructor(
     private readonly app: AppServerProcess,
     readonly sessionRef: string,
+    private readonly accountId: string | null,
+    unsubscribe: () => void,
   ) {
     this.pid = app.pid;
     this.events = this.queue;
     this.exited = app.exited;
-    void this.exited.then(() => this.queue.end());
+    void this.exited.then(async () => {
+      // An escaped child can hold stdout open after the leader exits.
+      await boundedWait(app.rpc.ended, 1000);
+      unsubscribe();
+      await this.ending;
+      this.queue.end();
+    });
+  }
+
+  get activeTurnId(): string | null {
+    return this.activeTurn;
   }
 
   static async start(launch: AgentLaunch, options: CodexSessionOptions): Promise<CodexSession> {
@@ -57,6 +97,12 @@ export class CodexSession {
       onSpawn: (pid) => launch.registerProcess(pid),
       logger: options.logger,
       requestTimeoutMs: options.requestTimeoutMs,
+    });
+    let session: CodexSession | null = null;
+    const pending: ServerNotification[] = [];
+    const unsubscribeNotifications = app.rpc.onNotification((notification) => {
+      if (session) session.notification(notification);
+      else pending.push(notification);
     });
     let warning: string | null = null;
     const unsubscribeWarning = app.rpc.on('configWarning', ({ summary }) => {
@@ -84,10 +130,17 @@ export class CodexSession {
       );
       if (warning !== null) throw new Error(warning);
       unsubscribe();
+      // Quota is account state: the hub applies an exhaustion to every runner on that account (design 6.10).
+      const accountId = options.skipAuthChecks
+        ? TEST_ACCOUNT_ID
+        : await app.rpc.request('account/read', { refreshToken: false }).then(
+            ({ account }) => codexAccountIdentity(account).accountId,
+            () => null,
+          );
       if (!resumed) {
         await request(app, 'thread/name/set', { threadId: thread.thread.id, name: `agflow ${launch.attemptId}` });
       }
-      const session = new CodexSession(app, thread.thread.id);
+      session = new CodexSession(app, thread.thread.id, accountId, unsubscribeNotifications);
       // The controller starts consuming only after start resolves, so these must already be buffered.
       session.queue.push({
         type: 'started',
@@ -105,15 +158,19 @@ export class CodexSession {
       if (tools.length > 0) {
         session.queue.push({ type: 'warning', text: `codex thread lists extra agflow tools: ${tools.join(', ')}` });
       }
+      for (const notification of pending) session.notification(notification);
+      pending.length = 0;
       if (!resumed) {
         // Both start and resume carry the tools note in developerInstructions.
-        await request(app, 'turn/start', {
+        const { turn } = await request(app, 'turn/start', {
           threadId: session.sessionRef,
           input: [{ type: 'text', text: launch.firstPrompt, text_elements: [] }],
         });
+        session.activeTurn = turn.id;
       }
       return session;
     } catch (error) {
+      unsubscribeNotifications();
       await app.end();
       throw new Error(oneLine(warning ?? error));
     } finally {
@@ -123,6 +180,184 @@ export class CodexSession {
 
   async close(): Promise<void> {
     await this.app.end();
+  }
+
+  private notification(notification: ServerNotification): void {
+    switch (notification.method) {
+      case 'turn/started': {
+        const { threadId, turn } = notification.params;
+        if (threadId !== this.sessionRef) return;
+        this.activeTurn = turn.id;
+        const state = this.turnState(turn.id);
+        if (!state.started) {
+          state.started = true;
+          this.queue.push({ type: 'turn_started' });
+        }
+        return;
+      }
+      case 'turn/completed': {
+        const { threadId, turn } = notification.params;
+        if (threadId === this.sessionRef) {
+          this.turnCompleted(turn);
+        } else if (turn.status !== 'inProgress') {
+          // A child turn interrupted with a command approval pending does not complete that item either, and its tools
+          // may count for no main turn: they end with their own turn.
+          this.endOpenTools((tool) => tool.threadId === threadId && tool.turnId === turn.id);
+        }
+        return;
+      }
+      case 'error': {
+        const params = notification.params;
+        if (params.threadId === this.sessionRef && isFinalError(params)) {
+          this.turnState(params.turnId).error = params.error;
+        }
+        return;
+      }
+      case 'item/started':
+      case 'item/completed': {
+        const { item, threadId, turnId } = notification.params;
+        const start = codexToolStarted(item);
+        if (start) {
+          const key = JSON.stringify([threadId, turnId, item.id]);
+          if (this.endedTools.has(key)) {
+            if (notification.method === 'item/completed') this.endedTools.delete(key);
+            return;
+          }
+          if (!this.tools.has(key)) {
+            // Child tools are progress for the attempt while its main turn runs.
+            const mainTurn = threadId === this.sessionRef ? turnId : this.activeTurn;
+            this.tools.set(key, { toolId: item.id, threadId, turnId, mainTurn });
+            if (mainTurn !== null) this.turnState(mainTurn).toolCalls += 1;
+            this.queue.push(start);
+          }
+          if (notification.method === 'item/completed') {
+            this.queue.push(codexToolEnded(item)!);
+            this.tools.delete(key);
+          }
+        } else if (
+          notification.method === 'item/completed' &&
+          threadId === this.sessionRef &&
+          item.type === 'agentMessage'
+        ) {
+          this.queue.push({ type: 'text', text: item.text });
+        }
+        return;
+      }
+      case 'thread/tokenUsage/updated': {
+        const { threadId, tokenUsage } = notification.params;
+        if (threadId === this.sessionRef && tokenUsage.modelContextWindow) {
+          this.queue.push({ type: 'context', used: tokenUsage.last.inputTokens / tokenUsage.modelContextWindow });
+        }
+        return;
+      }
+      case 'account/rateLimits/updated':
+        this.rateLimits = mergeRateLimits(this.rateLimits, notification.params.rateLimits);
+        if (this.rateLimits)
+          this.queue.push({ type: 'quota', accountId: this.accountId, quota: quotaFromRateLimits(this.rateLimits) });
+        return;
+      case 'warning':
+        this.warn('warning', notification.params.message);
+        return;
+      case 'configWarning':
+        this.warn(
+          'configuration warning',
+          [notification.params.summary, notification.params.details].filter(Boolean).join(': '),
+        );
+        return;
+      case 'deprecationNotice':
+        this.warn('deprecation', [notification.params.summary, notification.params.details].filter(Boolean).join(': '));
+        return;
+      case 'model/rerouted': {
+        const { fromModel, toModel, reason } = notification.params;
+        this.warn('model rerouted', `${fromModel} -> ${toModel} (${reason})`);
+        return;
+      }
+    }
+  }
+
+  private turnState(id: string) {
+    let state = this.turns.get(id);
+    if (!state) {
+      state = { started: false, toolCalls: 0, error: null };
+      this.turns.set(id, state);
+    }
+    return state;
+  }
+
+  private turnCompleted(turn: Turn): void {
+    if (turn.status === 'inProgress') return;
+    this.endOpenTools((tool) => tool.mainTurn === turn.id);
+    const state = this.turnState(turn.id);
+    const error = turn.status === 'failed' ? (state.error ?? turn.error) : null;
+    const errorKind = turn.status === 'failed' ? turnErrorKind(error?.codexErrorInfo ?? null, this.rateLimits) : null;
+    this.turns.delete(turn.id);
+    if (this.activeTurn === turn.id) this.activeTurn = null;
+    this.endTurn(turn.status, state.toolCalls, error, errorKind);
+  }
+
+  /**
+   * Ends the open tools of a turn that has ended: a main turn's end also ends the child tools that count for it. An
+   * interrupt with a command approval pending completes the turn without that command's item/completed.
+   */
+  private endOpenTools(ended: (tool: OpenTool) => boolean): void {
+    for (const [key, tool] of this.tools) {
+      if (!ended(tool)) continue;
+      this.tools.delete(key);
+      this.endedTools.add(key);
+      this.queue.push({
+        type: 'tool_ended',
+        toolId: tool.toolId,
+        ok: false,
+        denied: false,
+        terminal: null,
+        hubUnreachable: false,
+      });
+    }
+  }
+
+  private endTurn(
+    outcome: TurnEnded['outcome'],
+    toolCalls: number,
+    error: TurnError | null,
+    errorKind: TurnEnded['errorKind'],
+  ): void {
+    const end = () => {
+      if (errorKind === 'quota') this.pushExhausted();
+      this.queue.push({ type: 'turn_ended', outcome, toolCalls, error: error?.message ?? null, errorKind });
+    };
+    if (errorKind !== 'quota' || (this.rateLimits && quotaFromRateLimits(this.rateLimits).resetsAt !== null)) {
+      end();
+      return;
+    }
+    // Without a known reset the hub would wait and probe; app-server can tell it now (design 9.2).
+    this.ending = this.app.rpc
+      .request('account/rateLimits/read', undefined)
+      .then(
+        ({ rateLimits }) => {
+          this.rateLimits = mergeRateLimits(this.rateLimits, rateLimits);
+        },
+        () => {},
+      )
+      .then(() => {
+        this.ending = null;
+        end();
+      });
+  }
+
+  private pushExhausted(): void {
+    const quota = this.rateLimits
+      ? quotaFromRateLimits(this.rateLimits)
+      : {
+          resetsAt: null,
+          windows: { fiveHour: null, weekly: null },
+          paidUsage: 'unknown' as const,
+          updatedAt: Date.now(),
+        };
+    this.queue.push({ type: 'quota', accountId: this.accountId, quota: { ...quota, state: 'exhausted' } });
+  }
+
+  private warn(kind: string, text: string): void {
+    this.queue.push({ type: 'warning', text: oneLine(`codex ${kind}: ${text}`) });
   }
 
   private static async openThread(

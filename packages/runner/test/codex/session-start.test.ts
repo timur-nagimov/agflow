@@ -76,6 +76,7 @@ describe('CodexSession.start', () => {
         'thread/start',
         'mcpServerStatus/list',
         'skills/list',
+        'account/read',
         'thread/name/set',
         'turn/start',
       ]);
@@ -83,6 +84,7 @@ describe('CodexSession.start', () => {
         threadOverrides(f.launch, f.options.userHome),
         { threadId: session.sessionRef },
         { cwds: [f.launch.clone] },
+        { refreshToken: false },
         { threadId: session.sessionRef, name: 'agflow T-42-a3' },
         { threadId: session.sessionRef, input: firstInput(f.launch.firstPrompt) },
       ]);

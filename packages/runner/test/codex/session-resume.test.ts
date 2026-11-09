@@ -65,11 +65,13 @@ describe('CodexSession resume', () => {
       'thread/resume',
       'mcpServerStatus/list',
       'skills/list',
+      'account/read',
     ]);
     expect(run.requests.slice(1).map((request) => request.params)).toEqual([
       { threadId: SESSION_REF, ...threadOverrides(f.launch, f.options.userHome), excludeTurns: true },
       { threadId: SESSION_REF },
       { cwds: [f.launch.clone] },
+      { refreshToken: false },
     ]);
     expect(session.sessionRef).toBe(SESSION_REF);
     expect(await collect(session.events)).toEqual([
@@ -141,6 +143,7 @@ describe('CodexSession resume', () => {
       'thread/resume',
       'mcpServerStatus/list',
       'skills/list',
+      'account/read',
     ]);
   });
 
@@ -223,6 +226,7 @@ describe('CodexSession resume', () => {
         'thread/start',
         'mcpServerStatus/list',
         'skills/list',
+        'account/read',
         'thread/name/set',
         'turn/start',
       ]);
@@ -231,6 +235,7 @@ describe('CodexSession resume', () => {
         threadOverrides(f.launch, f.options.userHome),
         { threadId: FAKE_THREAD_ID },
         { cwds: [f.launch.clone] },
+        { refreshToken: false },
         { threadId: FAKE_THREAD_ID, name: `agflow ${f.launch.attemptId}` },
         { threadId: FAKE_THREAD_ID, input: firstInput(f.launch.firstPrompt) },
       ]);

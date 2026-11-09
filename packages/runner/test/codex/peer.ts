@@ -73,14 +73,15 @@ export type CrashSignal = 'SIGKILL' | 'SIGTERM' | 'SIGINT' | 'SIGHUP' | 'SIGQUIT
  * withdrawal (resolved before any answer, as after turn/interrupt) is an explicit notify step. spawnPipeHolder starts
  * `sleep 600` in the peer's process group with its stdout and stderr, so the pipes stay open after the peer exits
  * and only a group kill ends it; { detached: true } starts it in a group of its own, as an escaped process, so not
- * even that ends it.
+ * even that ends it. Its notify lines are written to that stdout 100 ms after it starts, so a crash step right after
+ * it delivers them after the peer's exit.
  */
 export type ScriptedStep =
   | { notify: ServerNotification }
   | { request: ScriptedServerRequest; afterAnswer?: ScriptedStep[] }
   | { delayMs: number }
   | { stderr: string }
-  | { spawnPipeHolder: true | { detached: true } }
+  | { spawnPipeHolder: true | { detached?: true; notify?: ServerNotification[] } }
   | { crash: { code: number } | { signal: CrashSignal } };
 
 /**
