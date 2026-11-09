@@ -101,7 +101,7 @@ describe('ending an attempt', () => {
 });
 
 describe('cleanup', () => {
-  test('is queued for every runner attempt but taken_over ones; live attempts queue nothing', () => {
+  test('is queued for every runner attempt but taken_over ones awaiting a hand-back; live ones queue nothing', () => {
     const { ctx, held } = setup();
     endAttempt(ctx, { attemptId: held.attempt.id, trigger: 'stop' });
     expect(kinds(ctx, held.runner.id)).toEqual(['cleanup_attempt']);
@@ -110,9 +110,16 @@ describe('cleanup', () => {
       attemptId: held.attempt.id,
     });
 
+    // The clone of a take-over waits for the hand-back while its task is still blocked as taken over.
     const taken = addRunnerAttempt(ctx, { runnerId: held.runner.id });
+    writeTask(ctx, taken.task.id, { status: 'blocked', blockedKind: 'takeover', blockedReason: 'taken over by alice' });
     endAttempt(ctx, { attemptId: taken.attempt.id, trigger: 'takeover' });
     expect(kinds(ctx, held.runner.id)).toEqual(['cleanup_attempt']);
+    // One whose task was cancelled meanwhile can have no hand-back: its clone goes.
+    const cancelled = addRunnerAttempt(ctx, { runnerId: held.runner.id });
+    writeTask(ctx, cancelled.task.id, { status: 'cancelled' });
+    endAttempt(ctx, { attemptId: cancelled.attempt.id, trigger: 'takeover' });
+    expect(kinds(ctx, held.runner.id)).toEqual(['cleanup_attempt', 'cleanup_attempt']);
 
     // A live chat's attempt has no runner, so nothing is queued and its task is M1's to move.
     const live = addAgent(ctx, 'bob');

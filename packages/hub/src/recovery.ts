@@ -120,6 +120,8 @@ function decide(
     // holds records only the branch head (design 6.13).
     return completeStop(ctx, attempt, options.replayPending);
   }
+  // A take-over the runner no longer has ends as the take-over it was: its task waits for a hand-back from a ref.
+  if (!live && stop?.cause === 'takeover') return completeStop(ctx, attempt, options.replayPending);
   if (live && !gone(live)) return 'kept';
   if (gone(live) && live.clone) {
     if (attempt.status === 'holding') return 'kept';

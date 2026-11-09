@@ -30,6 +30,7 @@ import {
   startLiveAttempt,
 } from './attempts';
 import { resolveAgentToken } from './auth';
+import { enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
@@ -271,6 +272,16 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
 }
 
 /**
+ * The clone of a taken-over task's ended attempt waited for a hand-back that can no longer come once the task is
+ * cancelled: it is cleaned up now (design 6.12). The runner keeps any unpushed work in it as late work first.
+ */
+function cleanUpTakenOver(ctx: HubContext, task: Task): void {
+  const taken = task.currentAttempt === null ? null : findAttempt(ctx, task.currentAttempt);
+  if (taken?.status !== 'ended' || !taken.takeover || taken.runnerId === null) return;
+  enqueueCommand(ctx, taken.runnerId, { kind: 'cleanup_attempt', attemptId: taken.id });
+}
+
+/**
  * Cancels the task from whatever status M1 allows (X-34). A runner attempt that holds it gets the cancel row's stop
  * instead of M1's message (design 6.4): it keeps its holder fields until it ends, on its exit, or at once when it has no
  * process, as the holding attempt of a submitted task.
@@ -288,6 +299,7 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
     });
     if (attempt) requestStop(ctx, { attemptId: attempt.id, cause: 'cancel', reason, by: actor });
     else endLiveAttempt(ctx, task, 'cancel', actor);
+    if (!attempt && task.status === 'blocked' && task.blockedKind === 'takeover') cleanUpTakenOver(ctx, task);
     if (holder) {
       setAgentTask(ctx, holder, null);
       insertMessage(ctx, emit, {

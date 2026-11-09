@@ -41,6 +41,8 @@ import {
   restoreSet,
   signatureApplies,
   taskBranchName,
+  takeoverAnywhereCommand,
+  takeoverRef,
   usableVendors,
   vendorRequirement,
   wipRef,
@@ -616,15 +618,16 @@ const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted'];
 
 /**
  * Ends an attempt, whatever triggered it (design 6.4): the one path every ending takes, in the caller's transaction or
- * its own. It sets the end reason, class and failure signature from the trigger's row, revokes the tokens, voids
- * the pending approvals, fails a pending submission (design 6.13), cancels the pending commands (cleanup, transcript
- * uploads and hand-backs stay) and queues cleanup_attempt, except for a take-over, whose cleanup follows its
- * hand-back. It clears the holder fields (invariant e) and makes the row's on-exit move, only while the task is
- * claimed or working and names this attempt (X-34); a stop held back for the submission makes its at-once move first.
- * It stores an assembled handoff note, with the attempt's id, when the row asks and the agent wrote none, and empties
- * the seat its lead held. A runner attempt's deliveries are settled (settleDeliveriesOnEnd) before its pending
- * commands are cancelled. A live chat's attempt only ends: M1's operations move its task. Null when the attempt had
- * already ended.
+ * its own. It sets the end reason, class and failure signature from the trigger's row, revokes the tokens, voids the
+ * pending approvals, fails a pending submission (design 6.13), cancels the pending commands (cleanup, transcript
+ * uploads and hand-backs stay) and queues cleanup_attempt, except for a take-over whose task still waits for the
+ * hand-back, which the cleanup follows; such an ending records its commands when the runner reported none
+ * (endTakeover). It clears the holder fields
+ * (invariant e) and makes the row's on-exit move, only while the task is claimed or working and names this attempt
+ * (X-34); a stop held back for the submission makes its at-once move first. It stores an assembled handoff note, with
+ * the attempt's id, when the row asks and the agent wrote none, and empties the seat its lead held. A runner attempt's
+ * deliveries are settled (settleDeliveriesOnEnd) before its pending commands are cancelled. A live chat's attempt only
+ * ends: M1's operations move its task. Null when the attempt had already ended.
  */
 export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | null {
   return tx(ctx, (emit) => {
@@ -651,15 +654,16 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
     const attempt = getAttempt(ctx, before.id);
     failPendingSubmission(ctx, emit, attempt, actor);
     let task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
+    // A take-over's clone waits for the hand-back while the task is still taken over by this attempt. A task cancelled
+    // meanwhile gets no hand-back, so its clone is cleaned up like any other (design 6.12).
+    const waitsForHandBack = row.endReason === 'taken_over' && task !== null && takenOverBy(task, attempt);
     let moved: TaskStatus[] = [];
     let noteAdded = false;
     let ladder: LadderOutcome | null = null;
     if (attempt.runnerId !== null) {
       settleDeliveriesOnEnd(ctx, emit, attempt);
       cancelPendingCommands(ctx, attempt.id);
-      if (row.endReason !== 'taken_over') {
-        enqueueCommand(ctx, attempt.runnerId, { kind: 'cleanup_attempt', attemptId: attempt.id });
-      }
+      if (!waitsForHandBack) enqueueCommand(ctx, attempt.runnerId, { kind: 'cleanup_attempt', attemptId: attempt.id });
       setAgentTask(ctx, attempt.agentId, null);
       if (task) {
         // A stop held back for the submission applies with the ending that fails it (design 6.13): a stop and hold
@@ -677,6 +681,7 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
         }
       }
     }
+    if (waitsForHandBack && task) endTakeover(ctx, emit, attempt, task, actor);
     // Only a lead attempt with no task holds the seat; a live lead's task attempt leaves it alone. The next lead starts
     // from a lead handoff, assembled if this one wrote none (design 6.11).
     if (attempt.taskId === null) {
@@ -743,6 +748,44 @@ function addAssembledNote(ctx: HubContext, attempt: Attempt, trigger: EndingTrig
   if (note === null || (note === 'if_none_written' && handoffWritten(ctx, attempt))) return false;
   addNote(ctx, attempt.taskId as string, 'handoff', assembleHandoffNote(ctx, attempt).body, 'system', attempt.id);
   return true;
+}
+
+/** Whether the task is still blocked as taken over by this attempt: nobody has handed it back or cancelled it. */
+export function takenOverBy(task: Task, attempt: Pick<Attempt, 'id'>): boolean {
+  return task.status === 'blocked' && task.blockedKind === 'takeover' && task.currentAttempt === attempt.id;
+}
+
+/** The login of the person who took the attempt over, its take-over's requester 'user:<login>' (X-49); else null. */
+export function takeoverPerson(attempt: Pick<Attempt, 'stopRequested'>): string | null {
+  const by = attempt.stopRequested?.cause === 'takeover' ? attempt.stopRequested.by : null;
+  return by?.startsWith('user:') ? by.slice('user:'.length) : null;
+}
+
+/**
+ * A take-over's ending (design 6.12) while its task waits for the hand-back, and task.taken_over for the pages.
+ * Without the runner's attempt.taken_over (the lease expiry or the stop timeout) the hub builds the command that works
+ * anywhere itself, with core's takeoverAnywhereCommand, the one builder the runner's take-over also calls: from the
+ * task's work position onto its branch, and pushed to the person's take-over ref. There is no local command then.
+ */
+function endTakeover(ctx: HubContext, emit: Emit, attempt: Attempt, task: Task, actor: string): void {
+  const person = takeoverPerson(attempt);
+  // Only a person's take-over request leads here; an ending must not fail, so anything else records nothing.
+  if (person === null) return;
+  let takeover = attempt.takeover;
+  if (!takeover) {
+    const ref = takeoverRef(ctx.config.wipRefPrefix, task.id, person);
+    const branch = task.branch ?? taskBranchName(task.id, task.title, attempt.fence.epoch);
+    const work = task.workRef ?? attempt.startRef ?? ctx.config.mainBranch;
+    const anywhere = takeoverAnywhereCommand({ ref: work, branch, takeoverRef: ref });
+    takeover = { local: null, anywhere, ref, error: null };
+    updateAttempt(ctx, attempt.id, { takeover });
+  }
+  emit({
+    type: 'task.taken_over',
+    actor,
+    subject: task.id,
+    data: { ...attemptData(attempt), person, ref: takeover.ref },
+  });
 }
 
 // ---------------------------------------------------------------------------

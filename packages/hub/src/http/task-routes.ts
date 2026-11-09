@@ -16,6 +16,7 @@ import {
 } from '@agflow/core';
 import type { HubContext } from '../context';
 import { requestSubmission } from '../submissions';
+import { requestTakeover } from '../takeover';
 import {
   acceptTask,
   blockTask,
@@ -97,6 +98,12 @@ export function mountTaskRoutes(app: App, ctx: HubContext): void {
     const p = human(c);
     const { reason } = await readBody(c, ReasonInputSchema);
     return c.json({ task: forceRelease(ctx, c.req.param('id'), actor(p), reason) });
+  });
+
+  // A person in the browser takes a runner agent's work over (design 6.12).
+  app.post('/api/tasks/:id/takeover', (c) => {
+    const p = human(c);
+    return c.json(requestTakeover(ctx, c.req.param('id'), p.user), 202);
   });
 
   // The agent doing the work.
