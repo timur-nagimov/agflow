@@ -174,7 +174,7 @@ async function main(): Promise<void> {
       await page.fill('.new-task textarea >> nth=0', 'Finance can export a month of invoices as CSV.');
       await page.fill('.new-task textarea >> nth=2', '- One row per invoice\n- Totals match the PDF');
       await page.click('.new-task button.primary');
-      await page.waitForURL(/#\/task\/T-11$/);
+      await page.waitForURL(/#\/task\/T-13$/);
       await waitForCount(page.locator('.criteria li'), 2);
     });
     await shot(page, 'new-task');
