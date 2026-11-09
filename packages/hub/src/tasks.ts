@@ -36,6 +36,7 @@ import { nextId } from './db';
 import { type Emit, listEvents } from './events';
 import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
+import { getHubState, updateHubState } from './hub-state';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
 import { listSubmissions } from './submission-store';
@@ -148,6 +149,52 @@ function tripGuard(ctx: HubContext, reason: string, actor: string): never {
   throw conflict(reason);
 }
 
+/** The agent calls that change the plan, as the churn budget counts them (design 6.15). */
+export type PlanChangeCall = 'create_tasks' | 'update_task' | 'cancel_task';
+
+/**
+ * The churn budget (design 6.15, X-39), in the transaction of an agent's plan change: the call counts once, however
+ * many tasks it touches, as guard.plan_change; people's calls do not count. The call that brings the sliding hour to
+ * maxPlanChangesPerHour pauses worker dispatch (churnPaused) until enough counted calls leave the hour to go below the
+ * budget: when the oldest one does, for the call that reaches it. A later call while paused can move the end of the
+ * pause; people are told only when a pause starts. The M1 creation limits stay as they are.
+ */
+export function countPlanChange(
+  ctx: HubContext,
+  emit: Emit,
+  actor: string,
+  call: PlanChangeCall,
+  taskIds: readonly string[],
+): void {
+  if (!actor.startsWith('agent:')) return;
+  const agentId = actor.slice('agent:'.length);
+  const now = ctx.now();
+  const earlier = ctx.db
+    .query("SELECT ts FROM events WHERE type = 'guard.plan_change' AND ts > $since ORDER BY ts, id")
+    .all({ since: now - HOUR }) as { ts: number }[];
+  const times = [...earlier.map((row) => row.ts), now];
+  const count = times.length;
+  emit({ type: 'guard.plan_change', actor, data: { agentId, call, taskIds: [...taskIds], count } });
+  const budget = ctx.config.maxPlanChangesPerHour;
+  if (count < budget) return;
+  // Below the budget again once the call `budget` places from the newest leaves the hour.
+  const until = (times[count - budget] as number) + HOUR;
+  const pausedUntil = getHubState(ctx).dispatchPausedUntil;
+  const starts = pausedUntil === null || pausedUntil <= now;
+  if (!starts && pausedUntil >= until) return;
+  updateHubState(ctx, { dispatchPausedUntil: until });
+  emit({ type: 'guard.dispatch_paused', actor, data: { agentId, until, count } });
+  if (!starts) return;
+  insertMessage(ctx, emit, {
+    from: 'system',
+    to: 'humans',
+    body:
+      `The churn guard paused worker dispatch until ${new Date(until).toISOString()}: agents changed the plan ` +
+      `${count} times within an hour, and the budget is ${budget} (the last call was ${agentId}'s ${call}). Running ` +
+      'agents and the lead go on. Check the plan; if this is expected, raise AGFLOW_MAX_PLAN_CHANGES_PER_HOUR.',
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
@@ -210,6 +257,7 @@ export function createTasks(ctx: HubContext, inputs: NewTask[], actor: string): 
       emit({ type: 'task.created', actor, subject: id, data: { title: contract.title, status } });
       created.push(getTask(ctx, id));
     });
+    countPlanChange(ctx, emit, actor, 'create_tasks', created.map((task) => task.id));
     return created;
   });
 }
@@ -241,6 +289,7 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
     }
     writeTask(ctx, id, { contract });
     emit({ type: 'task.updated', actor, subject: id, data: { fields: Object.keys(patch) } });
+    countPlanChange(ctx, emit, actor, 'update_task', [id]);
     const fresh = getTask(ctx, id);
     const dependencyBlocked = fresh.status === 'blocked' && fresh.blockedKind === 'deps';
     if (patch.dependsOn && (fresh.status === 'ready' || dependencyBlocked)) {
@@ -300,6 +349,7 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
     if (attempt) requestStop(ctx, { attemptId: attempt.id, cause: 'cancel', reason, by: actor });
     else endLiveAttempt(ctx, task, 'cancel', actor);
     if (!attempt && task.status === 'blocked' && task.blockedKind === 'takeover') cleanUpTakenOver(ctx, task);
+    countPlanChange(ctx, emit, actor, 'cancel_task', [id]);
     if (holder) {
       setAgentTask(ctx, holder, null);
       insertMessage(ctx, emit, {

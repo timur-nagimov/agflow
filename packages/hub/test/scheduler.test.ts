@@ -6,7 +6,7 @@ import { pendingCommands } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
 import { applyRunnerEvents } from '../src/events-in';
 import { listMessages } from '../src/messages';
-import { seatHolderId } from '../src/hub-state';
+import { seatHolderId, updateHubState } from '../src/hub-state';
 import { getProject, getStaffing, setPaused, setWorkerTarget } from '../src/project';
 import { clearOwnerAway, setOwnerAway, upsertAccountQuota } from '../src/quota';
 import { recordHeartbeatInfo, recordStartRefusal } from '../src/runners';
@@ -490,12 +490,12 @@ describe('replaceQuotaWaits', () => {
 describe('replaceQuotaWaits, when the successor cannot start', () => {
   /** A Codex worker on R-1 waiting with no known reset, and a Claude runner, R-2, with room. */
   function replaceable() {
-    const { ctx } = createTestContext();
+    const { ctx, clock } = createTestContext();
     const held = addRunnerAttempt(ctx, { vendor: 'codex' });
     exhaust(ctx, 'codex', { resetsAt: null });
     updateAttempt(ctx, held.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
     addRunner(ctx, { vendors: ['claude'] });
-    return { ctx, held };
+    return { ctx, clock, held };
   }
 
   test('nothing is replaced while the project is paused; a lead keeps the seat', () => {
@@ -512,6 +512,18 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     expect(seatHolderId(ctx)).toBe(lead.agent.id);
     setPaused(ctx, false, 'user:alice');
     expect(replaceQuotaWaits(ctx).sort()).toEqual([held.attempt.id, lead.attempt.id].sort());
+  });
+
+  test('while the churn guard holds dispatch a worker is not replaced, and a lead still is', () => {
+    const { ctx, clock, held } = replaceable();
+    const lead = addRunnerLead(ctx);
+    updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
+    addRunner(ctx, { vendors: ['claude'] });
+    updateHubState(ctx, { dispatchPausedUntil: ctx.now() + 60 * MINUTE });
+    expect(replaceQuotaWaits(ctx)).toEqual([lead.attempt.id]);
+    expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
+    clock.advance(60 * MINUTE);
+    expect(replaceQuotaWaits(ctx)).toEqual([held.attempt.id]);
   });
 
   test('a worker is not replaced while the worker target leaves its successor no slot', () => {

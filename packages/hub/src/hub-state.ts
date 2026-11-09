@@ -76,6 +76,15 @@ export function inRecovery(ctx: HubContext): boolean {
   return recoveryUntil !== null && ctx.now() < recoveryUntil;
 }
 
+/**
+ * Whether the churn guard holds worker dispatch (design 6.15): agents changed the plan maxPlanChangesPerHour times
+ * within an hour, and dispatch_paused_until has not come yet. The lead seat and the running agents go on.
+ */
+export function churnPaused(ctx: HubContext): boolean {
+  const { dispatchPausedUntil } = getHubState(ctx);
+  return dispatchPausedUntil !== null && ctx.now() < dispatchPausedUntil;
+}
+
 /** The hub epoch, 1 until the first restore raises it (design 6.14). It goes into fences, attempt ids and branches. */
 export function hubEpoch(ctx: HubContext): number {
   return (ctx.db.query('SELECT epoch FROM project WHERE id = 1').get() as { epoch: number }).epoch;

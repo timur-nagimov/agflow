@@ -28,7 +28,7 @@ import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
-import { inRecovery } from './hub-state';
+import { churnPaused, inRecovery } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
@@ -254,9 +254,9 @@ const isProbe = (placement: Placement): boolean =>
  * The quota_wait replacement (design 6.10): an attempt waiting for a reset more than quotaWaitMaxMs away, or unknown,
  * is replaced (cause quota: class infra, no handoff turn), but only while its successor can start now: a placement
  * with quota exists for its task, or for a lead, and is not an account's probing start, which would only wait in turn.
- * A worker's successor needs the slot the wait frees to be within the worker target, and a lead's needs runner leads
- * on. While the project is paused nothing starts, so nothing is replaced and the agents in quota_wait resume at their
- * reset (design 6.6, Pause). Otherwise it keeps waiting, and the runner retries its turn every quotaUnknownMs. The
+ * A worker's successor needs the slot the wait frees to be within the worker target, and no churn pause holding worker
+ * dispatch (design 6.15); a lead's needs runner leads on. While the project is paused nothing starts, so nothing is
+ * replaced and the agents in quota_wait resume at their reset (design 6.6, Pause). Otherwise it keeps waiting, and the runner retries its turn every quotaUnknownMs. The
  * oldest wait goes first, and each replacement holds its placement in the snapshot, so two waits do not count on one
  * free slot. Returns the attempts it asked to stop.
  */
@@ -273,8 +273,10 @@ export function replaceQuotaWaits(ctx: HubContext): string[] {
   if (due.length === 0) return [];
   const snapshot = placementSnapshot(ctx);
   const { workerTarget, vendorPref } = getStaffing(ctx);
-  // The wait holds a slot; its successor takes that slot, so it may start only when the slot is within the target.
+  // The wait holds a slot; its successor takes that slot, so it may start only when the slot is within the target,
+  // and no worker starts while the churn guard holds dispatch.
   const workerRoom =
+    !churnPaused(ctx) &&
     workerSlotsFree({ workerTarget, maxWorkers: ctx.config.maxWorkers, runningWorkers: runningWorkers(ctx) - 1 }) > 0;
   const replaced: string[] = [];
   // listAttempts answers newest first.
@@ -379,7 +381,8 @@ export interface TickResult {
  * window after downtime the tick stops after the clock check: no lease expires, no stall is judged and nothing
  * starts, while runners reconnect and replay (design 6.14); agents' bridge calls work meanwhile. The lead starts
  * before dispatch, so that dispatch sees the slot it takes. A paused project skips the lead seat and dispatch (steps
- * 2 to 6); the agents already running go on under every stall, budget and lease rule.
+ * 2 to 6); the agents already running go on under every stall, budget and lease rule. While the churn guard holds
+ * dispatch (churnPaused), the lead seat step still runs and no worker starts.
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
@@ -387,6 +390,8 @@ export function runTick(ctx: HubContext): TickResult {
   const reconciled = reconcile(ctx);
   if (getProject(ctx).paused) return { clock, recovering: false, reconciled, lead: null, started: [] };
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
+  // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).
+  if (churnPaused(ctx)) return { clock, recovering: false, reconciled, lead, started: [] };
   return { clock, recovering: false, reconciled, lead, started: dispatch(ctx).started };
 }
 
