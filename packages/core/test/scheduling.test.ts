@@ -1,17 +1,27 @@
 import { describe, expect, test } from 'bun:test';
 import { TEST_ACCOUNT_ID } from '../src/runner-protocol';
+import { vendorRequirement } from '../src/ladder';
 import {
   type AccountView,
   PLACEMENT_REFUSALS,
   type PlacementRefusal,
   type PlacementSnapshot,
   type RunnerSlot,
+  type TaskCandidate,
   type VendorSlot,
   candidateRunners,
   freeSlots,
+  isDispatchable,
+  orderReady,
+  orderRunners,
+  place,
+  placeLead,
+  preferredVendors,
   reportHolds,
+  runnerToAvoid,
   usableVendors,
   utilization,
+  workerSlotsFree,
 } from '../src/scheduling';
 import type { Vendor, VendorQuota } from '../src/types';
 
@@ -331,4 +341,268 @@ test('refusals are named', () => {
     'owner_away',
     'ceiling',
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// The ready set, preferences and placement (design 6.6 steps 3 to 5, 6.11)
+// ---------------------------------------------------------------------------
+
+function candidate(overrides: Partial<TaskCandidate> = {}): TaskCandidate {
+  return {
+    id: 'T-1',
+    status: 'ready',
+    priority: 5,
+    createdAt: NOW - HOUR,
+    ownedPaths: ['src/parser/**'],
+    kind: 'code',
+    createdBy: 'user:ann',
+    nextDispatchAt: null,
+    vendorHint: null,
+    dependenciesDone: true,
+    openAttempt: false,
+    dispatchHoldUntil: null,
+    counted: 0,
+    requirement: null,
+    avoidRunner: null,
+    ...overrides,
+  };
+}
+
+const dispatch = { now: NOW, maxAttempts: 3, pathHolders: [] };
+
+describe('isDispatchable', () => {
+  test('a ready task with its dependencies done, no open attempt and nothing holding it back qualifies', () => {
+    expect(isDispatchable(candidate(), dispatch)).toBe(true);
+  });
+
+  test('each condition of the ready set keeps a task out', () => {
+    const out: Partial<TaskCandidate>[] = [
+      { status: 'claimed' },
+      { status: 'blocked' },
+      { dependenciesDone: false },
+      { openAttempt: true },
+      // An agent-config path is for live chats only.
+      { ownedPaths: ['.claude/settings.json'] },
+      { nextDispatchAt: NOW + 1 },
+      { dispatchHoldUntil: NOW + 1 },
+      { counted: 3 },
+    ];
+    for (const overrides of out) {
+      expect([overrides, isDispatchable(candidate(overrides), dispatch)]).toEqual([overrides, false]);
+    }
+    // Times that have come qualify.
+    expect(isDispatchable(candidate({ nextDispatchAt: NOW, dispatchHoldUntil: NOW - 1 }), dispatch)).toBe(true);
+    expect(isDispatchable(candidate({ counted: 2 }), dispatch)).toBe(true);
+  });
+
+  test('a path holder with overlapping paths keeps the task out; the task itself and other paths do not', () => {
+    const holders = [{ id: 'T-2', ownedPaths: ['src/parser/lexer.ts'] }];
+    expect(isDispatchable(candidate(), { ...dispatch, pathHolders: holders })).toBe(false);
+    const others = [
+      { id: 'T-1', ownedPaths: ['src/parser/**'] },
+      { id: 'T-3', ownedPaths: ['docs/**'] },
+    ];
+    expect(isDispatchable(candidate(), { ...dispatch, pathHolders: others })).toBe(true);
+  });
+});
+
+test('orderReady orders by priority, then age', () => {
+  const tasks = [
+    candidate({ id: 'T-1', priority: 5, createdAt: NOW - HOUR }),
+    candidate({ id: 'T-2', priority: 1, createdAt: NOW - MINUTE }),
+    candidate({ id: 'T-3', priority: 5, createdAt: NOW - 2 * HOUR }),
+    candidate({ id: 'T-4', priority: 1, createdAt: NOW - HOUR }),
+  ];
+  expect(orderReady(tasks).map((task) => task.id)).toEqual(['T-4', 'T-2', 'T-3', 'T-1']);
+  // The input stays as it was.
+  expect(tasks.map((task) => task.id)).toEqual(['T-1', 'T-2', 'T-3', 'T-4']);
+});
+
+describe('preferredVendors', () => {
+  const base = {
+    requirement: null,
+    vendorHint: null,
+    projectPref: null,
+    now: NOW,
+    offered: ['claude', 'codex'] as Vendor[],
+    utilization: { claude: 0.5, codex: 0.2 },
+  };
+
+  test('with no preference the vendor with the lower account utilization comes first', () => {
+    expect(preferredVendors(base)).toEqual(['codex', 'claude']);
+    expect(preferredVendors({ ...base, utilization: { claude: 0.1, codex: 0.2 } })).toEqual(['claude', 'codex']);
+    // A vendor usable nowhere now comes last.
+    expect(preferredVendors({ ...base, utilization: { claude: 0.9 } })).toEqual(['claude', 'codex']);
+  });
+
+  test('the project preference counts until it expires, and vendorHint counts before it', () => {
+    const projectPref = { vendor: 'claude' as const, until: NOW + 1 };
+    expect(preferredVendors({ ...base, projectPref })).toEqual(['claude', 'codex']);
+    expect(preferredVendors({ ...base, projectPref: { ...projectPref, until: NOW } })).toEqual(['codex', 'claude']);
+    expect(preferredVendors({ ...base, projectPref, vendorHint: 'codex' })).toEqual(['codex', 'claude']);
+  });
+
+  test('the ladder requirement binds before any preference, step 3 only while a runner offers the vendor', () => {
+    const step2 = { step: 2 as const, vendor: 'claude' as const };
+    expect(preferredVendors({ ...base, vendorHint: 'codex', requirement: step2 })).toEqual(['claude']);
+    expect(preferredVendors({ ...base, requirement: step2, offered: ['codex'] })).toEqual(['claude']);
+    const step3 = { step: 3 as const, vendor: 'claude' as const };
+    expect(preferredVendors({ ...base, requirement: step3 })).toEqual(['claude']);
+    expect(preferredVendors({ ...base, requirement: step3, offered: ['codex'] })).toEqual(['codex', 'claude']);
+  });
+
+  test('the requirement lapses vendorRequirementMs after the last attempt ended', () => {
+    const ended = { number: 1, runnerId: 'R-1', failureClass: 'agent' as const, vendor: 'claude' as const };
+    const options = { ladderFloor: 0, vendorRequirementMs: 10 * MINUTE };
+    const requirementAt = (now: number) =>
+      vendorRequirement([{ ...ended, endedAt: NOW - 10 * MINUTE + 1 }], { ...options, now });
+    expect(preferredVendors({ ...base, requirement: requirementAt(NOW) })).toEqual(['claude']);
+    expect(preferredVendors({ ...base, requirement: requirementAt(NOW + 1) })).toEqual(['codex', 'claude']);
+  });
+});
+
+describe('runner preference', () => {
+  const view = (overrides: Partial<Parameters<typeof runnerToAvoid>[0][number]> = {}) => ({
+    number: 1,
+    runnerId: 'R-1',
+    failureClass: 'agent' as const,
+    finalPushFailed: false,
+    ...overrides,
+  });
+
+  test("the runner of the task's last agent, review or infra ending is avoided, unless its final push failed", () => {
+    expect(runnerToAvoid([])).toBeNull();
+    for (const failureClass of ['agent', 'review', 'infra'] as const) {
+      expect(runnerToAvoid([view({ failureClass })])).toBe('R-1');
+    }
+    expect(runnerToAvoid([view({ finalPushFailed: true })])).toBeNull();
+    // The last such ending counts; endings of no class are passed over.
+    const attempts = [
+      view({ number: 1, runnerId: 'R-1' }),
+      view({ number: 2, runnerId: 'R-2', failureClass: 'infra' }),
+      view({ number: 3, runnerId: 'R-3', failureClass: null }),
+    ];
+    expect(runnerToAvoid(attempts)).toBe('R-2');
+    expect(runnerToAvoid([...attempts, view({ number: 4, runnerId: null })])).toBeNull();
+  });
+
+  test('orderRunners: not the avoided runner, then AC power, then most free slots, then lowest id', () => {
+    const battery = { source: 'battery' as const, batteryPercent: 80, lowPowerMode: false };
+    const runners = [
+      runner({ id: 'R-10', openAttempts: 1 }),
+      runner({ id: 'R-2', openAttempts: 1 }),
+      runner({ id: 'R-3', capacity: 4 }),
+      runner({ id: 'R-4', capacity: 8, power: battery }),
+      runner({ id: 'R-5', capacity: 8 }),
+    ];
+    expect(orderRunners(runners, null).map((one) => one.id)).toEqual(['R-5', 'R-3', 'R-2', 'R-10', 'R-4']);
+    expect(orderRunners(runners, 'R-5').map((one) => one.id)).toEqual(['R-3', 'R-2', 'R-10', 'R-4', 'R-5']);
+  });
+
+  test('workerSlotsFree keeps running workers below worker_target, or maxWorkers without one', () => {
+    expect(workerSlotsFree({ workerTarget: null, maxWorkers: 4, runningWorkers: 1 })).toBe(3);
+    expect(workerSlotsFree({ workerTarget: 2, maxWorkers: 4, runningWorkers: 1 })).toBe(1);
+    expect(workerSlotsFree({ workerTarget: 0, maxWorkers: 4, runningWorkers: 0 })).toBe(0);
+    expect(workerSlotsFree({ workerTarget: 1, maxWorkers: 4, runningWorkers: 3 })).toBe(0);
+  });
+});
+
+describe('place', () => {
+  const codexSlot = vendorSlot({ vendor: 'codex', accountId: CODEX_ACCOUNT });
+  const codexQuota = quota({ windows: { fiveHour: 0.1, weekly: 0.1 } });
+  const codexAccount = account({ vendor: 'codex', accountId: CODEX_ACCOUNT, quota: codexQuota });
+  const both = (overrides: Partial<RunnerSlot> = {}) => runner({ vendors: [vendorSlot(), codexSlot], ...overrides });
+  const noPref = { projectPref: null };
+
+  test('places the task on the preferred vendor and the best runner for it', () => {
+    const view = snapshot([both({ id: 'R-1' }), both({ id: 'R-2', capacity: 4 })], [account(), codexAccount]);
+    // Codex has the lower utilization (0.1 against 0.2).
+    const placement = { runnerId: 'R-2', vendor: 'codex' as const, account: codexAccount };
+    expect(place(view, candidate(), noPref).placement).toEqual(placement);
+    const hinted = place(view, candidate({ vendorHint: 'claude' }), noPref).placement;
+    expect([hinted?.runnerId, hinted?.vendor]).toEqual(['R-2', 'claude']);
+    const avoided = place(view, candidate({ avoidRunner: 'R-2' }), noPref).placement;
+    expect([avoided?.runnerId, avoided?.vendor]).toEqual(['R-1', 'codex']);
+    const preferred = place(view, candidate(), { projectPref: { vendor: 'claude', until: NOW + HOUR } }).placement;
+    expect(preferred?.vendor).toBe('claude');
+  });
+
+  test('falls back to the next vendor when the preferred one is usable nowhere', () => {
+    const view = snapshot([both()], [account(), { ...codexAccount, ownerAway: true }]);
+    const { placement, refused } = place(view, candidate(), noPref);
+    expect([placement?.runnerId, placement?.vendor]).toEqual(['R-1', 'claude']);
+    expect(refused).toEqual([{ runnerId: 'R-1', vendor: 'codex', refusal: 'owner_away' }]);
+  });
+
+  test('a binding requirement places nothing when its vendor is usable nowhere, and names every refusal', () => {
+    const away = { ...codexAccount, ownerAway: true };
+    const view = snapshot([both(), runner({ id: 'R-2', state: 'offline' })], [account(), away]);
+    const required = candidate({ requirement: { step: 2, vendor: 'codex' } });
+    expect(place(view, required, noPref)).toEqual({
+      placement: null,
+      refused: [
+        { runnerId: 'R-2', vendor: null, refusal: 'offline' },
+        { runnerId: 'R-1', vendor: 'codex', refusal: 'owner_away' },
+      ],
+    });
+  });
+
+  test('step 3 does not bind when no online runner offers its vendor', () => {
+    const view = snapshot([runner()], [account()]);
+    const required = candidate({ requirement: { step: 3, vendor: 'codex' } });
+    expect(place(view, required, noPref).placement?.vendor).toBe('claude');
+  });
+
+  test('no candidate runner: no placement', () => {
+    const view = snapshot([runner({ openAttempts: 2 })], [account()]);
+    expect(place(view, candidate(), noPref)).toEqual({
+      placement: null,
+      refused: [{ runnerId: 'R-1', vendor: null, refusal: 'full' }],
+    });
+  });
+});
+
+describe('placeLead', () => {
+  const codexSlot = vendorSlot({ vendor: 'codex', accountId: CODEX_ACCOUNT });
+  const battery = { source: 'battery' as const, batteryPercent: 80, lowPowerMode: false };
+
+  test('prefers Claude, then AC power, then free slots', () => {
+    const view = snapshot(
+      [
+        runner({ id: 'R-1', vendors: [codexSlot], capacity: 8 }),
+        runner({ id: 'R-2', power: battery, capacity: 8 }),
+        runner({ id: 'R-3' }),
+        runner({ id: 'R-4', capacity: 4 }),
+      ],
+      [account()],
+    );
+    expect(placeLead(view, { rotatingFrom: null }).placement).toMatchObject({ runnerId: 'R-4', vendor: 'claude' });
+    // Without Claude anywhere, Codex.
+    const codexOnly = snapshot([runner({ vendors: [codexSlot] })]);
+    expect(placeLead(codexOnly, { rotatingFrom: null }).placement).toMatchObject({ runnerId: 'R-1', vendor: 'codex' });
+  });
+
+  test('a rotation prefers the runner the lead ran on', () => {
+    const view = snapshot([runner({ id: 'R-1', capacity: 8 }), runner({ id: 'R-2', power: battery })], [account()]);
+    expect(placeLead(view, { rotatingFrom: 'R-2' }).placement?.runnerId).toBe('R-2');
+    expect(placeLead(view, { rotatingFrom: null }).placement?.runnerId).toBe('R-1');
+  });
+
+  test('Claude comes before the runner the lead ran on', () => {
+    const view = snapshot([runner({ id: 'R-1', vendors: [codexSlot] }), runner({ id: 'R-2' })], [account()]);
+    expect(placeLead(view, { rotatingFrom: 'R-1' }).placement).toMatchObject({ runnerId: 'R-2', vendor: 'claude' });
+  });
+
+  test('a tie goes to the lowest runner id', () => {
+    const view = snapshot([runner({ id: 'R-10' }), runner({ id: 'R-2' })], [account()]);
+    expect(placeLead(view, { rotatingFrom: null }).placement?.runnerId).toBe('R-2');
+  });
+
+  test('every refusal is named when no runner can take the lead', () => {
+    const view = snapshot([runner({ draining: true })], [account()]);
+    expect(placeLead(view, { rotatingFrom: null })).toEqual({
+      placement: null,
+      refused: [{ runnerId: 'R-1', vendor: null, refusal: 'draining' }],
+    });
+  });
 });

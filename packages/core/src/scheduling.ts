@@ -1,9 +1,13 @@
-// Placement, the first half of design 6.6's step 5: which runners may take an attempt, how many slots they have free,
-// and which of their vendors are usable, with a named refusal for each one that is not. This is the only copy of these
-// rules (X-46): the hub builds the snapshot from its database, and both the scheduler and rejectTask's ladder step 1
-// read it through these functions. Pure, with no zod at run time, so the web UI may import it too (X-48).
+// Placement (design 6.6, steps 3 to 5): which runners may take an attempt, how many slots they have free, and which
+// of their vendors are usable, with a named refusal for each one that is not; then which ready tasks qualify, in what
+// order, and where each goes, and where a runner lead goes (6.11). This is the only copy of these rules (X-46): the
+// hub builds the snapshot from its database, and the scheduler and rejectTask's ladder step 1 read it through these
+// functions. Pure, with no zod at run time, so the web UI may import it too (X-48).
+import type { VendorRequirement } from './ladder';
+import { pathsOverlap } from './paths';
+import { liveChatOnly } from './protected-paths';
 import type { StartRefusal } from './runner-protocol';
-import type { AccountQuota, Runner, RunnerState, Vendor } from './types';
+import type { AccountQuota, FailureClass, Runner, RunnerState, Task, Vendor } from './types';
 
 /**
  * Why placement passes over a runner, then over a vendor on it, in the order they are checked:
@@ -213,4 +217,257 @@ export function usableVendors(
     else refused.push({ runnerId: runner.id, vendor: slot.vendor, refusal });
   }
   return { usable, refused };
+}
+
+// ---------------------------------------------------------------------------
+// The ready set (design 6.6, step 3)
+// ---------------------------------------------------------------------------
+
+/** The task's own fields the ready set and its order read. */
+type CandidateFields = 'id' | 'status' | 'priority' | 'createdAt' | 'ownedPaths' | 'kind' | 'createdBy';
+
+/** A ready task as the scheduler reads it: its own fields and what the hub knows about its attempts. */
+export interface TaskCandidate extends Pick<Task, CandidateFields | 'nextDispatchAt'> {
+  vendorHint: Vendor | null;
+  /** Every task it depends on is done. */
+  dependenciesDone: boolean;
+  /** The attempt tasks.current_attempt names has not ended. */
+  openAttempt: boolean;
+  /** tasks.dispatch_hold_until: dispatch waits for a runner's late work until then (design 6.4, 6.8). */
+  dispatchHoldUntil: number | null;
+  /** Its counted attempts since the last re-plan (countedAttempts). */
+  counted: number;
+  /** The ladder's vendor requirement (vendorRequirement), which lapses vendorRequirementMs after the last ending. */
+  requirement: VendorRequirement | null;
+  /** The runner its next attempt should not use (runnerToAvoid). */
+  avoidRunner: string | null;
+}
+
+export interface DispatchContext {
+  now: number;
+  /** HubConfig.maxAttempts: the ladder's limit of counted attempts. */
+  maxAttempts: number;
+  /** The tasks that hold their paths (task-store's isPathHolder); the candidate itself may be among them. */
+  pathHolders: readonly Pick<Task, 'id' | 'ownedPaths'>[];
+}
+
+/**
+ * Whether a task is in the ready set (design 6.6, step 3): ready with its dependencies done; no open attempt; no path
+ * a runner agent may not change (such a task stays ready for live chats); no overlap with a path holder;
+ * next_dispatch_at and dispatch_hold_until come; and counted attempts below the ladder's limit.
+ */
+export function isDispatchable(task: TaskCandidate, context: DispatchContext): boolean {
+  const { now } = context;
+  return (
+    task.status === 'ready' &&
+    task.dependenciesDone &&
+    !task.openAttempt &&
+    !liveChatOnly(task) &&
+    !context.pathHolders.some((holder) => holder.id !== task.id && pathsOverlap(task.ownedPaths, holder.ownedPaths)) &&
+    (task.nextDispatchAt === null || task.nextDispatchAt <= now) &&
+    (task.dispatchHoldUntil === null || task.dispatchHoldUntil <= now) &&
+    task.counted < context.maxAttempts
+  );
+}
+
+/** The ready set in dispatch order: by priority (0 the most urgent), then age, oldest first. A new array. */
+export function orderReady<T extends Pick<TaskCandidate, 'priority' | 'createdAt'>>(tasks: readonly T[]): T[] {
+  return [...tasks].sort((a, b) => a.priority - b.priority || a.createdAt - b.createdAt);
+}
+
+// ---------------------------------------------------------------------------
+// Slots and preferences (design 6.6, steps 4 and 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * How many more workers may start (design 6.6, step 4): running workers (starting, running and quota_wait) stay below
+ * project.worker_target, or maxWorkers without one. Leads and live chats do not count.
+ */
+export function workerSlotsFree(input: {
+  workerTarget: number | null;
+  maxWorkers: number;
+  runningWorkers: number;
+}): number {
+  return Math.max(0, (input.workerTarget ?? input.maxWorkers) - input.runningWorkers);
+}
+
+/** Both vendors, in the order that settles a tie. */
+const VENDORS: readonly Vendor[] = ['claude', 'codex'];
+
+export interface VendorPreferenceInput {
+  requirement: VendorRequirement | null;
+  vendorHint: Vendor | null;
+  /** project.vendor_pref, which counts until vendor_pref_until. */
+  projectPref: { vendor: Vendor; until: number } | null;
+  now: number;
+  /** The vendors some online runner offers: ready, with no not-ready mark. A step-3 requirement binds only to these. */
+  offered: readonly Vendor[];
+  /** The lowest account utilization of each vendor usable now, 0..1; a vendor usable nowhere has none. */
+  utilization: Partial<Record<Vendor, number>>;
+}
+
+/**
+ * The vendors a task may use, most preferred first (design 6.6, step 5). The ladder's requirement binds first: step 2
+ * to the same vendor, step 3 to the other while a runner offers it. Otherwise vendorHint, then the project's
+ * preference until it expires, then the lower account utilization; a vendor usable nowhere now comes last.
+ */
+export function preferredVendors(input: VendorPreferenceInput): Vendor[] {
+  const { requirement } = input;
+  if (requirement !== null && (requirement.step === 2 || input.offered.includes(requirement.vendor))) {
+    return [requirement.vendor];
+  }
+  const level = (vendor: Vendor) => input.utilization[vendor] ?? Number.POSITIVE_INFINITY;
+  const byUtilization = [...VENDORS].sort((a, b) => level(a) - level(b));
+  const pref = input.projectPref !== null && input.now < input.projectPref.until ? input.projectPref.vendor : null;
+  const first = [input.vendorHint, pref].filter((vendor): vendor is Vendor => vendor !== null);
+  return [...new Set([...first, ...byUtilization])];
+}
+
+/** An ended attempt of the task, as the runner preference reads it. */
+export interface EndedAttemptView {
+  number: number;
+  runnerId: string | null;
+  failureClass: FailureClass | null;
+  /** Its final push failed, so its harvested head is only in that runner's vault (design 6.8, Replacement step 4). */
+  finalPushFailed: boolean;
+}
+
+/** The classes whose ending sends the next attempt elsewhere. */
+const AVOIDING_CLASSES: readonly FailureClass[] = ['agent', 'review', 'infra'];
+
+/**
+ * The runner a task's next attempt should not use (design 6.6, step 5, runner preference 1): that of its last attempt
+ * that ended with class agent, review or infra, unless that attempt's final push failed, when the runner holds the
+ * work. Null for none, or for a live chat's attempt.
+ */
+export function runnerToAvoid(attempts: readonly EndedAttemptView[]): string | null {
+  const last = [...attempts]
+    .sort((a, b) => b.number - a.number)
+    .find((attempt) => attempt.failureClass !== null && AVOIDING_CLASSES.includes(attempt.failureClass));
+  if (last === undefined || last.finalPushFailed) return null;
+  return last.runnerId;
+}
+
+const onAc = (runner: RunnerSlot): number => (runner.power?.source === 'ac' ? 0 : 1);
+
+/** Runner ids by their number, so R-2 comes before R-10. */
+const byId = (a: RunnerSlot, b: RunnerSlot): number => a.id.localeCompare(b.id, 'en', { numeric: true });
+
+/**
+ * Runners in preference order (design 6.6, step 5): not the runner to avoid, then on AC power, then the most free
+ * slots, then the lowest id. A new array.
+ */
+export function orderRunners(runners: readonly RunnerSlot[], avoid: string | null): RunnerSlot[] {
+  const avoided = (runner: RunnerSlot): number => (runner.id === avoid ? 1 : 0);
+  return [...runners].sort(
+    (a, b) => avoided(a) - avoided(b) || onAc(a) - onAc(b) || freeSlots(b) - freeSlots(a) || byId(a, b),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Placement (design 6.6, step 5; 6.11)
+// ---------------------------------------------------------------------------
+
+/** Where an attempt goes: a runner, the vendor on it, and the account it draws on when the hub knows it. */
+export interface Placement {
+  runnerId: string;
+  vendor: Vendor;
+  account: AccountView | null;
+}
+
+export interface PlaceResult {
+  /** Null when no runner can take it now. */
+  placement: Placement | null;
+  /** Every runner passed over, and every vendor on a candidate runner, with its first refusal. */
+  refused: RefusedPlacement[];
+}
+
+/** A usable vendor on a candidate runner. */
+interface Option {
+  runner: RunnerSlot;
+  usable: UsableVendor;
+}
+
+/** Every usable vendor on every candidate runner, and every refusal met on the way. */
+function options(snapshot: PlacementSnapshot): { options: Option[]; refused: RefusedPlacement[] } {
+  const { candidates, refused } = candidateRunners(snapshot);
+  const found: Option[] = [];
+  for (const runner of candidates) {
+    const vendors = usableVendors(snapshot, runner);
+    refused.push(...vendors.refused);
+    for (const usable of vendors.usable) found.push({ runner, usable });
+  }
+  return { options: found, refused };
+}
+
+const toPlacement = (option: Option): Placement => ({
+  runnerId: option.runner.id,
+  vendor: option.usable.slot.vendor,
+  account: option.usable.account,
+});
+
+/** An account's utilization for the vendor preference: its more used window, 0 when unknown. */
+const accountLevel = (account: AccountView | null): number =>
+  Math.max(account?.quota.windows.fiveHour ?? 0, account?.quota.windows.weekly ?? 0);
+
+/** The vendors an online runner offers: ready, with no not-ready mark, whether or not it has room now. */
+function offeredVendors(snapshot: PlacementSnapshot): Vendor[] {
+  const offered = snapshot.runners.flatMap((runner) =>
+    runner.state === 'online'
+      ? runner.vendors.filter((slot) => slot.ready && slot.notReadySince === null).map((slot) => slot.vendor)
+      : [],
+  );
+  return [...new Set(offered)];
+}
+
+/**
+ * Places a ready task (design 6.6, step 5): the most preferred vendor (preferredVendors) usable on some candidate
+ * runner, on the best of those runners (orderRunners, avoiding task.avoidRunner). With no placement, refused names
+ * every runner and vendor passed over, owner_away included, which the scheduler tells the lead about.
+ */
+export function place(
+  snapshot: PlacementSnapshot,
+  task: Pick<TaskCandidate, 'vendorHint' | 'requirement' | 'avoidRunner'>,
+  project: { projectPref: VendorPreferenceInput['projectPref'] },
+): PlaceResult {
+  const found = options(snapshot);
+  const utilization: Partial<Record<Vendor, number>> = {};
+  for (const { usable } of found.options) {
+    const { vendor } = usable.slot;
+    utilization[vendor] = Math.min(utilization[vendor] ?? Number.POSITIVE_INFINITY, accountLevel(usable.account));
+  }
+  const vendors = preferredVendors({
+    requirement: task.requirement,
+    vendorHint: task.vendorHint,
+    projectPref: project.projectPref,
+    now: snapshot.now,
+    offered: offeredVendors(snapshot),
+    utilization,
+  });
+  for (const vendor of vendors) {
+    const onVendor = found.options.filter((option) => option.usable.slot.vendor === vendor);
+    const [best] = orderRunners(onVendor.map((option) => option.runner), task.avoidRunner);
+    const chosen = onVendor.find((option) => option.runner === best);
+    if (chosen) return { placement: toPlacement(chosen), refused: found.refused };
+  }
+  return { placement: null, refused: found.refused };
+}
+
+/**
+ * Places a runner lead (design 6.11): Claude before Codex, then, when rotating, the runner the lead ran on, then
+ * runners on AC power, the most free slots and the lowest id.
+ */
+export function placeLead(snapshot: PlacementSnapshot, rotation: { rotatingFrom: string | null }): PlaceResult {
+  const found = options(snapshot);
+  const same = (option: Option): number => (option.runner.id === rotation.rotatingFrom ? 0 : 1);
+  const claude = (option: Option): number => (option.usable.slot.vendor === 'claude' ? 0 : 1);
+  const [best] = [...found.options].sort(
+    (a, b) =>
+      claude(a) - claude(b) ||
+      same(a) - same(b) ||
+      onAc(a.runner) - onAc(b.runner) ||
+      freeSlots(b.runner) - freeSlots(a.runner) ||
+      byId(a.runner, b.runner),
+  );
+  return { placement: best ? toPlacement(best) : null, refused: found.refused };
 }
