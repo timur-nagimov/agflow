@@ -1,5 +1,6 @@
 // startHub (design 13): the HTTP API, the web UI and the runner link on one port, the link through Bun's own
-// WebSocket handlers. main.ts serves the hub with it; tests and the demo pass their own context.
+// WebSocket handlers. main.ts serves the hub with it; tests and the demo pass their own context. It checks the clock
+// at start, as a tick does (design 6.14), and with dbLock keeps <db>.pid while it runs.
 import type { Attempt, Message } from '@agflow/core';
 import type { Server, ServerWebSocket } from 'bun';
 import { sweepAuth } from './auth';
@@ -8,6 +9,7 @@ import { flushDeliveries, watchDeliveries } from './delivery';
 import { Gateway, type LinkSession, type LinkSocket, type RunnerConnection } from './gateway';
 import { createApp } from './http/app';
 import { wakeHoldingLead } from './lead';
+import { acquireDbLock, checkClock, releaseDbLock } from './recovery';
 import { refreshNeedsLogin } from './runners';
 import { Scheduler } from './scheduler';
 
@@ -21,7 +23,10 @@ export interface StartHubOptions {
    * starts it, false not at all (the default).
    */
   scheduler?: 'auto' | 'manual' | false | undefined;
-  /** Keep a lock file next to the database while the hub runs; false by default. This version takes no lock yet. */
+  /**
+   * Keep <db>.pid next to the database while the hub runs, and refuse to start while it names a live process (design
+   * 6.14): a second hub or a restore would change the database under this one. False by default.
+   */
   dbLock?: boolean | undefined;
   /**
    * The hub's own housekeeping, once per heartbeatMs: dead links are terminated, expired sign-ins removed, offline
@@ -37,8 +42,21 @@ export interface HubServer {
   gateway: Gateway;
   /** The scheduler the options asked for; null for scheduler: false. */
   scheduler: Scheduler | null;
-  /** Closes every runner link, stops the timers and the server. */
-  stop(): Promise<void>;
+  /**
+   * Closes every runner link, stops the timers and the server. closeDatabase also checkpoints the WAL and closes the
+   * database, as the hub process does on SIGTERM and SIGINT; the lock goes last, once nothing writes any more.
+   */
+  stop(options?: StopHubOptions): Promise<void>;
+}
+
+export interface StopHubOptions {
+  closeDatabase?: boolean | undefined;
+}
+
+/** Folds the WAL into the database file and closes it, so that the files on disk are complete without the hub. */
+export function closeDatabase(ctx: HubContext): void {
+  ctx.db.run('PRAGMA wal_checkpoint(TRUNCATE)');
+  ctx.db.close();
 }
 
 /** What each runner link's socket carries: its session from before the upgrade, then its gateway connection. */
@@ -96,6 +114,20 @@ function housekeeping(ctx: HubContext, gateway: Gateway): void {
 }
 
 export function startHub(ctx: HubContext, options: StartHubOptions = {}): HubServer {
+  const dbPath = ctx.db.filename;
+  if (options.dbLock) acquireDbLock(dbPath);
+  try {
+    return serveHub(ctx, options);
+  } catch (error) {
+    if (options.dbLock) releaseDbLock(dbPath);
+    throw error;
+  }
+}
+
+function serveHub(ctx: HubContext, options: StartHubOptions): HubServer {
+  const dbPath = ctx.db.filename;
+  // Downtime before this start extends the leases and opens the recovery window before any runner can say hello.
+  checkClock(ctx);
   const gateway = new Gateway(ctx);
   // The app is made before the server it upgrades links on, so it reaches the server through this binding.
   let upgrader: Server<LinkData> | undefined;
@@ -130,7 +162,7 @@ export function startHub(ctx: HubContext, options: StartHubOptions = {}): HubSer
     url: server.url.origin,
     gateway,
     scheduler,
-    async stop() {
+    async stop(stopOptions = {}) {
       scheduler?.stop();
       if (timer) clearInterval(timer);
       stopDeliveries?.();
@@ -139,6 +171,8 @@ export function startHub(ctx: HubContext, options: StartHubOptions = {}): HubSer
       // The port closes at once. Its promise is not awaited: in Bun 1.3.11 it never settles once the server has
       // closed a WebSocket itself, as closeAll just did.
       void server.stop(true);
+      if (stopOptions.closeDatabase) closeDatabase(ctx);
+      if (options.dbLock) releaseDbLock(dbPath);
     },
   };
 }

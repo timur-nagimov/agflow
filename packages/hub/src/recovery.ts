@@ -2,13 +2,17 @@
 // in the hello transaction, every attempt it believes open on that runner from the state the runner reports, builds
 // the list of attempts the runner must stop before it runs any command, and asks for the transcripts of attempts that
 // ended lost while it was away. Resumes that wait for the runner to be ok, and transcript tails uploaded over HTTP,
-// are here too.
+// are here too. So is what the hub does when it comes back itself (design 6.14): the clock check that finds downtime,
+// and the pid file that keeps two hubs, or a hub and a restore, off one database.
+import { linkSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { uptime } from 'node:os';
 import type { Attempt, HubMessage, LiveAttempt } from '@agflow/core';
 import { findAttempt, getAttempt, listAttempts, updateAttempt } from './attempt-store';
 import { endAttempt, recentResumes, resumeAttempt } from './attempts';
 import { enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import { forbidden } from './errors';
+import { getHubState, updateHubState } from './hub-state';
 import { type HelloMessage, findRunnerRow, setDeferredResumes, takeDeferredResumes } from './runners';
 import { getTask, writeTask } from './task-store';
 
@@ -240,4 +244,196 @@ export function storeTranscriptTail(ctx: HubContext, user: string, attemptId: st
     }
     updateAttempt(ctx, attempt.id, { transcriptTail: tail });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Downtime and clock jumps (design 6.6 step 0, 6.14)
+// ---------------------------------------------------------------------------
+
+/** A gap of more than this many ticks since the last one is downtime: a hub freeze, a stop or a forward clock jump. */
+const DOWNTIME_TICKS = 3;
+
+/** What one clock check found. */
+export interface ClockCheck {
+  /** now − last_alive_at; negative after a backward clock step. */
+  gapMs: number;
+  /** The gap was downtime: the leases were extended by it and a recovery window started. */
+  downtime: boolean;
+  /** The recovery window was over, and this check closed it. */
+  recoveryEnded: boolean;
+}
+
+/**
+ * Extends every runner lease and every M1 task lease of a live claim by the gap, so that nobody loses work for the
+ * time the hub could not hear from them.
+ */
+function extendLeases(ctx: HubContext, gapMs: number): void {
+  ctx.db
+    .query(
+      `UPDATE attempts SET lease_expires_at = lease_expires_at + $gapMs
+       WHERE status IN ('starting', 'running', 'quota_wait') AND lease_expires_at IS NOT NULL`,
+    )
+    .run({ gapMs });
+  ctx.db
+    .query(
+      `UPDATE tasks SET lease_expires_at = lease_expires_at + $gapMs
+       WHERE status IN ('claimed', 'working') AND lease_expires_at IS NOT NULL`,
+    )
+    .run({ gapMs });
+}
+
+/**
+ * Step 0 of every tick, and the hub's start (design 6.6, 6.14): a gap of more than three ticks since last_alive_at is
+ * downtime, so the leases are extended by the gap and a recovery window of recoveryMs starts, for runners to reconnect
+ * and replay; a window that is over is closed (system.recovery_ended). A backward clock step is no downtime, and as
+ * leases are times, it shortens none; an open window is cut back to end within recoveryMs of now, so that the step does
+ * not stretch it. Then last_alive_at becomes now.
+ */
+export function checkClock(ctx: HubContext): ClockCheck {
+  return tx(ctx, (emit) => {
+    const now = ctx.now();
+    const state = getHubState(ctx);
+    const gapMs = now - state.lastAliveAt;
+    const downtime = gapMs > DOWNTIME_TICKS * ctx.config.tickMs;
+    let recoveryEnded = false;
+    if (downtime) {
+      extendLeases(ctx, gapMs);
+      const until = now + ctx.config.recoveryMs;
+      updateHubState(ctx, { recoveryUntil: until });
+      emit({ type: 'system.recovery_started', actor: 'system', data: { gapMs, until } });
+    } else if (state.recoveryUntil !== null && now >= state.recoveryUntil) {
+      updateHubState(ctx, { recoveryUntil: null });
+      emit({ type: 'system.recovery_ended', actor: 'system', data: {} });
+      recoveryEnded = true;
+    } else if (state.recoveryUntil !== null && gapMs < 0) {
+      updateHubState(ctx, { recoveryUntil: Math.min(state.recoveryUntil, now + ctx.config.recoveryMs) });
+    }
+    updateHubState(ctx, { lastAliveAt: now });
+    return { gapMs, downtime, recoveryEnded };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The database lock (design 6.14): Bun has no flock, so a pid file with a liveness check
+// ---------------------------------------------------------------------------
+
+const lockFile = (dbPath: string): string => `${dbPath}.pid`;
+
+/** Boot times that differ by at most this much are one boot: the one computed from the uptime moves by a second. */
+const BOOT_SLACK_SECONDS = 60;
+
+/**
+ * This boot of the machine: Linux's boot id, or else the boot time in seconds, which macOS keeps when the clock is
+ * set. A lock file of an earlier boot is stale whatever its pid names now, as pids start again at a reboot.
+ */
+function currentBoot(): string {
+  try {
+    return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+  } catch {
+    return String(Math.round(Date.now() / 1000 - uptime()));
+  }
+}
+
+function sameBoot(a: string, b: string): boolean {
+  const numeric = /^[0-9]+$/;
+  if (numeric.test(a) && numeric.test(b)) return Math.abs(Number(a) - Number(b)) <= BOOT_SLACK_SECONDS;
+  return a === b;
+}
+
+/** What <db>.pid holds for a process of this boot: its pid and the boot. */
+export function dbLockRecord(pid: number): string {
+  return `${pid} ${currentBoot()}\n`;
+}
+
+/** Whether a process with this pid runs; one of another user's that may not be signalled runs too. */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** A lock file's text, or null when there is none. */
+function readLock(path: string): string | null {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/** The pid a lock file's text names for this boot, or null when it names none or was written in an earlier boot. */
+function lockHolder(text: string | null): number | null {
+  const match = text?.trim().match(/^([1-9][0-9]*) (\S+)$/);
+  if (!match || !sameBoot(match[2] as string, currentBoot())) return null;
+  return Number(match[1]);
+}
+
+/** A breaking file older than this was left by a process that died while it removed a stale lock. */
+const BREAKING_STALE_MS = 10_000;
+
+/**
+ * Removes a lock file judged stale from its text, under <db>.pid.breaking, which one process at a time creates: so of
+ * two processes that judged the same file stale, the later one finds the lock the earlier one put in its place and
+ * leaves it. Nothing else replaces a stale file, so while it reads the same it is the one judged.
+ */
+function removeStale(path: string, text: string): void {
+  const breaking = `${path}.breaking`;
+  try {
+    writeFileSync(breaking, `${process.pid}\n`, { flag: 'wx' });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    try {
+      if (Date.now() - statSync(breaking).mtimeMs > BREAKING_STALE_MS) rmSync(breaking, { force: true });
+    } catch {
+      // It went away meanwhile.
+    }
+    return;
+  }
+  try {
+    if (readLock(path) === text) rmSync(path, { force: true });
+  } finally {
+    rmSync(breaking, { force: true });
+  }
+}
+
+/**
+ * Takes <db>.pid for this process (design 6.14): the hub keeps it while it runs, and a restore while it restores. A
+ * file that names another live process of this boot is a refusal; one left by a process that is gone, by an earlier
+ * boot, or naming no pid, is stale and replaced. One that names this process is its own lock already: main.ts takes it
+ * before it opens the database, and startHub keeps it. The record is written to a file of this process's and linked
+ * into place, so the lock file is never seen half written, and of two starts racing for it one fails.
+ */
+export function acquireDbLock(dbPath: string): void {
+  if (dbPath === '' || dbPath === ':memory:') throw new Error('dbLock needs a database file, not an in-memory database');
+  const path = lockFile(dbPath);
+  const own = `${path}.${process.pid}`;
+  for (let tries = 0; tries < 3; tries++) {
+    writeFileSync(own, dbLockRecord(process.pid));
+    try {
+      linkSync(own, path);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    } finally {
+      rmSync(own, { force: true });
+    }
+    const text = readLock(path);
+    if (text === null) continue;
+    const holder = lockHolder(text);
+    if (holder === process.pid) return;
+    if (holder !== null && processAlive(holder)) {
+      throw new Error(`the database ${dbPath} is in use by process ${holder} (${path}); stop that hub first`);
+    }
+    removeStale(path, text);
+  }
+  throw new Error(`could not take ${path}: another process took it or is replacing a stale one; try again`);
+}
+
+/** Gives up <db>.pid, only while it names this process. */
+export function releaseDbLock(dbPath: string): void {
+  const path = lockFile(dbPath);
+  if (lockHolder(readLock(path)) === process.pid) rmSync(path, { force: true });
 }

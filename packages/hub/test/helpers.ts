@@ -15,7 +15,7 @@ import { insertAttempt, issueFence, nextAttemptNumber } from '../src/attempt-sto
 import type { StoredCommand } from '../src/commands';
 import { type FetchFn, HUB_RUNNER_DEFAULTS, type HubConfig, type HubContext, createContext, tx } from '../src/context';
 import { nextId } from '../src/db';
-import { takeSeat } from '../src/hub-state';
+import { takeSeat, updateHubState } from '../src/hub-state';
 import { getTask, move, setAgentTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
 
@@ -25,6 +25,15 @@ export class TestClock {
   advance(ms: number): void {
     this.t += ms;
   }
+}
+
+/**
+ * The hub ticked all along while the test clock jumped ahead: the next clock check finds no downtime and opens no
+ * recovery window (design 6.14). Tests that skip minutes before a tick call it, as the scheduler's timer would have
+ * ticked every tickMs meanwhile.
+ */
+export function markHubAlive(ctx: HubContext): void {
+  updateHubState(ctx, { lastAliveAt: ctx.now() });
 }
 
 export function makeConfig(overrides: Partial<HubConfig> = {}): HubConfig {

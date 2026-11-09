@@ -15,7 +15,15 @@ import { startHub } from '../src/server';
 import { requestSubmission } from '../src/submissions';
 import { getTask, writeTask } from '../src/task-store';
 import { blockTask, claimTask, createTasks, releaseTask, unblockTask } from '../src/tasks';
-import { addAgent, addRunner, addRunnerAttempt, addRunnerLead, createTestContext, newTask } from './helpers';
+import {
+  addAgent,
+  addRunner,
+  addRunnerAttempt,
+  addRunnerLead,
+  createTestContext,
+  markHubAlive,
+  newTask,
+} from './helpers';
 import { createTestHub } from './http-helpers';
 
 const MINUTE = 60_000;
@@ -157,6 +165,7 @@ describe('dispatch', () => {
     expect(tick(ctx)).toEqual([[first, runnerId, 'codex']]);
     // Expired, the preference no longer counts: Claude wins the tie.
     clock.advance(ctx.config.vendorPrefMs);
+    markHubAlive(ctx);
     requestAgents(ctx, { count: 2 });
     expect(tick(ctx)).toEqual([[second, runnerId, 'claude']]);
   });
@@ -215,8 +224,10 @@ describe('dispatch', () => {
     });
     expect(tick(ctx)).toEqual([]);
     clock.advance(MINUTE);
+    markHubAlive(ctx);
     expect(tick(ctx)).toEqual([[backoff, runnerId, 'claude']]);
     clock.advance(MINUTE);
+    markHubAlive(ctx);
     expect(tick(ctx)).toEqual([[hold, runnerId, 'claude']]);
     expect(statusOf(ctx, config as string)).toBe('ready');
   });
@@ -258,6 +269,7 @@ describe('dispatch', () => {
     exhaust(ctx, 'claude', { resetsAt: null });
     expect(tick(ctx)).toEqual([]);
     clock.advance(ctx.config.quotaUnknownMs);
+    markHubAlive(ctx);
     expect(tick(ctx)).toEqual([[first, runnerId, 'claude']]);
     expect(tick(ctx)).toEqual([]);
     expect(statusOf(ctx, second as string)).toBe('ready');
@@ -372,6 +384,7 @@ describe('the reconcile step', () => {
     updateAttempt(ctx, taken.attempt.id, { takeover: { ...takeover, handingBack: { by, at: ctx.now() } } });
 
     clock.advance(ctx.config.quotaUnknownMs);
+    markHubAlive(ctx);
     const later = ctx.now() + ctx.config.runnerLeaseMs;
     for (const held of [erring, stopping, submitting]) updateAttempt(ctx, held.attempt.id, { leaseExpiresAt: later });
     updateAttempt(ctx, erring.attempt.id, {
@@ -421,6 +434,7 @@ describe('the reconcile step', () => {
     // A runner attempt whose lease runs out, and a ready task.
     const lost = addRunnerAttempt(ctx);
     clock.advance(ctx.config.runnerLeaseMs + 20 * MINUTE);
+    markHubAlive(ctx);
     const [ready] = tasks(ctx, { title: 'Ready' });
     const logged = spyOn(console, 'error').mockImplementation(() => {});
     try {

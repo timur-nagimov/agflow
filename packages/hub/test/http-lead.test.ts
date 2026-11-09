@@ -8,7 +8,7 @@ import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
 import { seatHolderId } from '../src/hub-state';
 import { runTick } from '../src/scheduler';
-import { addAgent, addLeadNote, addRunnerAttempt, addRunnerLead } from './helpers';
+import { addAgent, addLeadNote, addRunnerAttempt, addRunnerLead, markHubAlive } from './helpers';
 import { createTestHub } from './http-helpers';
 
 type Hub = ReturnType<typeof createTestHub>;
@@ -165,6 +165,7 @@ describe('PATCH /api/project', () => {
     // The live lead keeps the seat; once it is empty, the next tick starts a runner lead.
     expect(runTick(hub.ctx).lead).toBeNull();
     hub.clock.advance(hub.ctx.config.liveLeadGraceMs);
+    markHubAlive(hub.ctx);
     expect(runTick(hub.ctx).lead).toMatchObject({ role: 'lead', status: 'starting' });
   });
 

@@ -1,4 +1,5 @@
-// The scheduler (design 6.6). Each tick first reconciles (step 1: leases, approvals, stalls, stop and submission
+// The scheduler (design 6.6). Each tick first checks the clock (step 0: downtime opens a recovery window, in which
+// the tick does nothing more), then reconciles (step 1: leases, approvals, stalls, stop and submission
 // timeouts, holding leads, the Codex reset probe, quota_wait replacements, the lead review and rotation), fills an
 // empty lead seat (step 2, lead.ts), then reads the database into core's terms and leaves the rules to core's
 // scheduling.ts (X-46): which ready tasks qualify and in what order, how many workers may start, and where each one
@@ -27,11 +28,13 @@ import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
+import { inRecovery } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
 import { markOwnerAwayTold, probeUnknownResets } from './quota';
+import { type ClockCheck, checkClock } from './recovery';
 import { expireSubmissions } from './submissions';
 import { type StallDecisions, judgeStalls } from './supervisor';
 import { expireHandbacks } from './takeover';
@@ -359,7 +362,12 @@ export function reconcile(ctx: HubContext): ReconcileResult {
 }
 
 export interface TickResult {
-  reconciled: ReconcileResult;
+  /** What step 0 found. */
+  clock: ClockCheck;
+  /** The recovery window is open, so the tick did nothing after the clock check. */
+  recovering: boolean;
+  /** Null while recovering. */
+  reconciled: ReconcileResult | null;
   /** The runner lead the tick started for an empty seat, or null. */
   lead: Attempt | null;
   /** The worker attempts the tick started. */
@@ -367,15 +375,19 @@ export interface TickResult {
 }
 
 /**
- * One scheduler tick (design 6.6): reconcile, the lead seat, then dispatch. The lead starts first, so that dispatch
- * sees the slot it takes. A paused project skips the lead seat and dispatch (steps 2 to 6); the agents already running
- * go on under every stall, budget and lease rule.
+ * One scheduler tick (design 6.6): the clock check, reconcile, the lead seat, then dispatch. Within the recovery
+ * window after downtime the tick stops after the clock check: no lease expires, no stall is judged and nothing
+ * starts, while runners reconnect and replay (design 6.14); agents' bridge calls work meanwhile. The lead starts
+ * before dispatch, so that dispatch sees the slot it takes. A paused project skips the lead seat and dispatch (steps
+ * 2 to 6); the agents already running go on under every stall, budget and lease rule.
  */
 export function runTick(ctx: HubContext): TickResult {
+  const clock = checkClock(ctx);
+  if (inRecovery(ctx)) return { clock, recovering: true, reconciled: null, lead: null, started: [] };
   const reconciled = reconcile(ctx);
-  if (getProject(ctx).paused) return { reconciled, lead: null, started: [] };
+  if (getProject(ctx).paused) return { clock, recovering: false, reconciled, lead: null, started: [] };
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
-  return { reconciled, lead, started: dispatch(ctx).started };
+  return { clock, recovering: false, reconciled, lead, started: dispatch(ctx).started };
 }
 
 /** How long the scheduler waits after an event that frees a slot or readies a task before its extra tick. */

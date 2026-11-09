@@ -15,7 +15,7 @@ import { runTick } from '../src/scheduler';
 import { startHub } from '../src/server';
 import { getTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
-import { addAgent, addRunner, addRunnerAttempt, createTestContext, newTask } from './helpers';
+import { addAgent, addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
 
 const MINUTE = 60_000;
 
@@ -127,6 +127,7 @@ describe('starting a runner lead', () => {
     // A live lead that has not been seen for liveLeadGraceMs no longer holds the seat.
     const live = addAgent(ctx, 'alice', 'lead');
     clock.advance(ctx.config.liveLeadGraceMs);
+    markHubAlive(ctx);
     expect(seatHolderId(ctx)).toBeNull();
 
     const lead = tickLead(ctx);
@@ -172,7 +173,7 @@ describe('starting a runner lead', () => {
       updateAttempt(ctx, lead.id, { status, quotaResetsAt: status === 'quota_wait' ? ctx.now() + MINUTE : null });
       expect([status, seatHolderId(ctx)]).toEqual([status, lead.agentId]);
       const result = runTick(ctx);
-      expect([status, result.lead, result.reconciled.quotaWaits]).toEqual([status, null, []]);
+      expect([status, result.lead, result.reconciled?.quotaWaits]).toEqual([status, null, []]);
       expect(getAttempt(ctx, lead.id).stopRequested).toBeNull();
     }
   });
@@ -299,7 +300,7 @@ describe('a holding lead', () => {
     const { ctx, runnerId, lead } = holdingLead();
     updateAttempt(ctx, lead.id, { resumable: false });
     const result = runTick(ctx);
-    expect(result.reconciled.holdingLeads).toEqual([lead.id]);
+    expect(result.reconciled?.holdingLeads).toEqual([lead.id]);
     expect(result.lead).toMatchObject({ role: 'lead', runnerId });
     expect(result.lead?.id).not.toBe(lead.id);
     expect(seatHolderId(ctx)).toBe(result.lead?.agentId as string);
@@ -539,7 +540,8 @@ describe('the periodic review', () => {
     const later = ctx.now() + 2 * ctx.config.leadReviewMs;
     ctx.db.query("UPDATE attempts SET lease_expires_at = $later WHERE status != 'ended'").run({ later });
     clock.advance(ctx.config.leadReviewMs);
-    expect(runTick(ctx).reconciled.leadReview).toBe(true);
+    markHubAlive(ctx);
+    expect(runTick(ctx).reconciled?.leadReview).toBe(true);
     expect(reviews(ctx)).toHaveLength(2);
     // Once nothing is held or submitted, the clock stops.
     ctx.db.run("UPDATE tasks SET status = 'done'");
@@ -625,9 +627,9 @@ describe('rotation', () => {
       contextUsed: 0.7,
     };
     updateAttempt(ctx, lead.id, { facts, factsAt: ctx.now() });
-    expect(runTick(ctx).reconciled.rotated).toBeNull();
+    expect(runTick(ctx).reconciled?.rotated).toBeNull();
     updateAttempt(ctx, lead.id, { facts: { ...facts, contextUsed: 0.71 }, factsAt: ctx.now() });
-    expect(runTick(ctx).reconciled.rotated).toBe(lead.id);
+    expect(runTick(ctx).reconciled?.rotated).toBe(lead.id);
     expect(getAttempt(ctx, lead.id).stopRequested?.reason).toContain('71%');
   });
 
@@ -648,11 +650,11 @@ describe('rotation', () => {
     const { ctx, runnerId, lead } = rotationSetup({ leadRotateWakeups: 3 });
     updateAttempt(ctx, lead.id, { wakeups: 3 });
     setPaused(ctx, true, 'user:alice');
-    expect(runTick(ctx).reconciled.rotated).toBeNull();
+    expect(runTick(ctx).reconciled?.rotated).toBeNull();
     expect(getAttempt(ctx, lead.id).stopRequested).toBeNull();
     expect(seatHolderId(ctx)).toBe(lead.agentId);
     setPaused(ctx, false, 'user:alice');
-    expect(runTick(ctx).reconciled.rotated).toBe(lead.id);
+    expect(runTick(ctx).reconciled?.rotated).toBe(lead.id);
     exited(ctx, lead);
     expect(getAttempt(ctx, lead.id).endReason).toBe('rotated');
     expect(runTick(ctx).lead).toMatchObject({ role: 'lead', runnerId });

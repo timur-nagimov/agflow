@@ -6,6 +6,7 @@ import type { Emit } from './events';
 export interface HubStateRow {
   /** The last time the tick ran, to tell downtime from a running hub (design 6.14). */
   lastAliveAt: number;
+  /** The end of the recovery window after downtime; null when none is open. */
   recoveryUntil: number | null;
   restoredAt: number | null;
   /** The churn guard holds dispatch until then. */
@@ -64,6 +65,15 @@ export function updateHubState(ctx: HubContext, changes: Partial<HubStateRow>): 
     params[key] = value;
   }
   if (sets.length > 0) ctx.db.query(`UPDATE hub_state SET ${sets.join(', ')} WHERE id = 1`).run(params);
+}
+
+/**
+ * Whether the recovery window after downtime is open (design 6.14): until recovery_until the tick expires no lease,
+ * judges no stall and dispatches nothing, while runners reconnect and replay.
+ */
+export function inRecovery(ctx: HubContext): boolean {
+  const { recoveryUntil } = getHubState(ctx);
+  return recoveryUntil !== null && ctx.now() < recoveryUntil;
 }
 
 /** The hub epoch, 1 until the first restore raises it (design 6.14). It goes into fences, attempt ids and branches. */
