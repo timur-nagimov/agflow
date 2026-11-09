@@ -1,8 +1,8 @@
 // The scheduler (design 6.6). Each tick first reconciles (step 1: leases, approvals, stalls, stop and submission
-// timeouts, holding leads, the Codex reset probe and quota_wait replacements), fills an empty lead seat (step 2,
-// lead.ts), then reads the database into core's terms and leaves
-// the rules to core's scheduling.ts (X-46): which ready tasks qualify and in what order, how many workers may start,
-// and where each one goes. Every claim and start is its own transaction, so one that fails rolls back only itself,
+// timeouts, holding leads, the Codex reset probe, quota_wait replacements, the lead review and rotation), fills an
+// empty lead seat (step 2, lead.ts), then reads the database into core's terms and leaves the rules to core's
+// scheduling.ts (X-46): which ready tasks qualify and in what order, how many workers may start, and where each one
+// goes. Every claim and start is its own transaction, so one that fails rolls back only itself,
 // and the tick's placement snapshot is updated after each start, so a runner's slots and an account's probing start
 // are not handed out twice. Retention and remote-ref cleanup are not the tick's: they run on a daily timer (X-39).
 import {
@@ -27,7 +27,7 @@ import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
-import { checkHoldingLeads, ensureLead } from './lead';
+import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
@@ -317,6 +317,10 @@ export interface ReconcileResult {
   probes: number;
   /** quota_wait attempts asked to stop for a replacement (replaceQuotaWaits). */
   quotaWaits: string[];
+  /** Whether a periodic review message went to the lead (periodicLeadReview). */
+  leadReview: boolean;
+  /** The runner lead asked to rotate (rotateLeadIfDue), or null. */
+  rotated: string | null;
 }
 
 /** Runs one duty; a failure is logged and leaves the others to run, and the next tick runs it again. */
@@ -345,6 +349,8 @@ export function reconcile(ctx: HubContext): ReconcileResult {
     holdingLeads: duty('the holding lead check', () => checkHoldingLeads(ctx), []),
     probes: duty('the Codex reset probe', () => probeUnknownResets(ctx), 0),
     quotaWaits: duty('the quota_wait replacement', () => replaceQuotaWaits(ctx), []),
+    leadReview: duty('the lead review', () => periodicLeadReview(ctx) !== null, false),
+    rotated: duty('the lead rotation', () => rotateLeadIfDue(ctx), null),
   };
 }
 

@@ -5,6 +5,7 @@
 import { type Attempt, type AttemptStatus, type InjectedMessage, type Message, formatMessage } from '@agflow/core';
 import { getAgent } from './agents';
 import { getAttempt } from './attempt-store';
+import { situationReport } from './brief';
 import { type CommandRow, RESULT_HANDLERS, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
@@ -33,12 +34,25 @@ export function injectedMessage(message: Message): InjectedMessage {
 }
 
 /**
- * The messages that fit in one command, in order, and how many are left over. The first always goes, however long:
- * a message the limit alone cannot hold would otherwise never be pushed.
+ * The hub text that starts every delivery to a runner lead (design 6.11, X-4): the situation report, with message id
+ * 0 and no message row, so it is never in flight nor reported back.
  */
-function fitBatch(messages: readonly Message[]): { batch: InjectedMessage[]; more: number } {
+export function leadReport(ctx: HubContext): InjectedMessage {
+  return { messageId: 0, authority: 'system', text: situationReport(ctx) };
+}
+
+/** A delivery to a runner lead is a wake-up: attempts.wakeups counts them, and rotation reads it (design 6.11). */
+export function countWakeup(ctx: HubContext, attemptId: string): void {
+  ctx.db.query('UPDATE attempts SET wakeups = wakeups + 1 WHERE id = $id').run({ id: attemptId });
+}
+
+/**
+ * The messages that fit in one command after the reserved characters, in order, and how many are left over. The
+ * first always goes, however long: a message the limit alone cannot hold would otherwise never be pushed.
+ */
+function fitBatch(messages: readonly Message[], reserved: number): { batch: InjectedMessage[]; more: number } {
   const batch: InjectedMessage[] = [];
-  let size = 0;
+  let size = reserved;
   for (const message of messages) {
     const injected = injectedMessage(message);
     if (batch.length > 0 && size + injected.text.length > DELIVERY_CHAR_LIMIT) break;
@@ -61,17 +75,22 @@ function addRows(ctx: HubContext, attemptId: string, commandId: string, messages
   }
 }
 
-/** Sends the messages that fit in one deliver command at the attempt's fence; more counts the rest. */
+/**
+ * Sends the messages that fit in one deliver command at the attempt's fence; more counts the rest. A lead's starts
+ * with the situation report, which counts toward the limit, and counts a wake-up.
+ */
 function deliver(ctx: HubContext, attempt: Attempt, unread: readonly Message[]): CommandRow {
-  const { batch, more } = fitBatch(unread);
+  const report = attempt.role === 'lead' ? leadReport(ctx) : null;
+  const { batch, more } = fitBatch(unread, report?.text.length ?? 0);
   const command = enqueueCommand(ctx, attempt.runnerId as string, {
     kind: 'deliver',
     attemptId: attempt.id,
     fence: attempt.fence,
-    messages: batch,
+    messages: report ? [report, ...batch] : batch,
     more,
   });
   addRows(ctx, attempt.id, command.id, batch);
+  if (report) countWakeup(ctx, attempt.id);
   return command;
 }
 

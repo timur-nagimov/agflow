@@ -392,6 +392,8 @@ describe('the reconcile step', () => {
       holdingLeads: [],
       probes: 1,
       quotaWaits: [],
+      leadReview: false,
+      rotated: null,
     });
     expect(getAttempt(ctx, lost.attempt.id).endReason).toBe('lost');
     expect(result.started.map((attempt) => [attempt.taskId, attempt.runnerId])).toContainEqual([swept, runnerId]);

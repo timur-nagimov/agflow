@@ -212,8 +212,9 @@ describe('flushDeliveries', () => {
     const lead = addRunnerLead(ctx);
     const message = send(ctx, { from: 'user:alice', to: 'lead', body: 'Plan the next step.' });
     flush();
+    // The situation report, id 0, starts each delivery to a lead.
     expect(delivers(ctx, lead.attempt).map((row) => row.command.messages.map((m) => m.messageId))).toEqual([
-      [message.id],
+      [0, message.id],
     ]);
     expect(delivers(ctx, held.attempt)).toEqual([]);
   });

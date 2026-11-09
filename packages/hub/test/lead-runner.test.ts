@@ -1,20 +1,21 @@
 import { describe, expect, test } from 'bun:test';
-import type { Attempt, AttemptFacts, RawRunnerEvent, RunnerEventData } from '@agflow/core';
+import type { Attempt, AttemptFacts, Message, RawRunnerEvent, RunnerEventData } from '@agflow/core';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
-import { endAttempt, renewLeases } from '../src/attempts';
+import { endAttempt, renewLeases, requestStop } from '../src/attempts';
 import { type CommandRow, pendingCommands } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
-import { flushDeliveries } from '../src/delivery';
+import { DELIVERY_CHAR_LIMIT, flushDeliveries, injectedMessage } from '../src/delivery';
+import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
-import { insertLeadNote, seatHolderId } from '../src/hub-state';
-import { checkHoldingLeads, ensureLead, wakeHoldingLead } from '../src/lead';
-import { markDelivered, sendMessage } from '../src/messages';
+import { getHubState, insertLeadNote, seatHolderId } from '../src/hub-state';
+import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue, wakeHoldingLead } from '../src/lead';
+import { listMessages, markDelivered, sendMessage } from '../src/messages';
 import { setPaused } from '../src/project';
 import { runTick } from '../src/scheduler';
 import { startHub } from '../src/server';
 import { getTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
-import { addAgent, addRunner, createTestContext, newTask } from './helpers';
+import { addAgent, addRunner, addRunnerAttempt, createTestContext, newTask } from './helpers';
 
 const MINUTE = 60_000;
 
@@ -190,7 +191,8 @@ describe('a holding lead', () => {
     const [resume] = resumes(ctx, lead);
     if (resume?.command.kind !== 'resume_attempt') throw new Error('no resume');
     expect(resume.command.prompt).toContain('new messages');
-    expect(resume.command.messages.map((one) => one.messageId)).toEqual([message.id]);
+    // The situation report goes first (design 6.11).
+    expect(resume.command.messages.map((one) => one.messageId)).toEqual([0, message.id]);
   });
 
   test("startHub's delivery timers wake it", async () => {
@@ -413,5 +415,246 @@ describe('lead endings and liveness', () => {
     expect(ctx.db.query('SELECT last_seen_at FROM agents WHERE id = $id').get({ id: lead.agentId })).toEqual({
       last_seen_at: ctx.now(),
     });
+  });
+});
+
+describe('wake-ups', () => {
+  /** The deliver commands queued for the attempt. */
+  const delivers = (ctx: HubContext, attempt: Attempt) =>
+    pendingCommands(ctx, attempt.runnerId as string, 1).flatMap((row) =>
+      row.command.kind === 'deliver' && row.command.attemptId === attempt.id ? [row.command] : [],
+    );
+
+  const rowsOf = (ctx: HubContext, attemptId: string) =>
+    (
+      ctx.db.query('SELECT message_id FROM pending_deliveries WHERE attempt_id = $attemptId').all({ attemptId }) as {
+        message_id: number;
+      }[]
+    ).map((row) => row.message_id);
+
+  test('every delivery to a runner lead starts with the situation report, hub text, and counts a wake-up', () => {
+    const { ctx, clock, lead } = runningLead();
+    const first = sendMessage(ctx, { from: 'user:alice', to: 'lead', body: 'Plan the parser work.' });
+    clock.advance(ctx.config.deliveryBatchMs);
+    flush(ctx);
+    const [deliver] = delivers(ctx, lead);
+    const [report, message] = deliver?.messages ?? [];
+    expect(report).toMatchObject({ messageId: 0, authority: 'system' });
+    expect(report?.text).toContain('## Situation report');
+    expect(message?.messageId).toBe(first.id);
+    // The report has no message row, so nothing is in flight for it.
+    expect(rowsOf(ctx, lead.id)).toEqual([first.id]);
+    expect(getAttempt(ctx, lead.id).wakeups).toBe(1);
+
+    sendMessage(ctx, { from: 'user:alice', to: 'lead', body: 'And the CLI.' });
+    clock.advance(ctx.config.deliveryBatchMs);
+    flush(ctx);
+    expect(delivers(ctx, lead).map((command) => command.messages[0]?.messageId)).toEqual([0, 0]);
+    expect(getAttempt(ctx, lead.id).wakeups).toBe(2);
+  });
+
+  test("a holding lead's resume is its delivery: the report goes first, and it counts", () => {
+    const { ctx, clock, lead } = holdingLead();
+    const message = sendMessage(ctx, { from: 'user:alice', to: 'lead', body: 'Look at T-7.' });
+    clock.advance(ctx.config.deliveryBatchMs);
+    flush(ctx);
+    const [resume] = resumes(ctx, lead);
+    if (resume?.command.kind !== 'resume_attempt') throw new Error('no resume');
+    expect(resume.command.messages.map((one) => [one.messageId, one.authority])).toEqual([
+      [0, 'system'],
+      [message.id, 'person'],
+    ]);
+    expect(getAttempt(ctx, lead.id).wakeups).toBe(1);
+  });
+
+  /** Two messages to the target whose formatted texts add up to exactly DELIVERY_CHAR_LIMIT. */
+  function filling(ctx: HubContext, to: string): [Message, Message] {
+    const first = sendMessage(ctx, { from: 'user:alice', to, body: 'a'.repeat(DELIVERY_CHAR_LIMIT / 2 - 200) });
+    const header = injectedMessage(first).text.length - first.body.length;
+    const rest = DELIVERY_CHAR_LIMIT - injectedMessage(first).text.length;
+    const second = sendMessage(ctx, { from: 'user:alice', to, body: 'b'.repeat(rest - header) });
+    expect(injectedMessage(first).text.length + injectedMessage(second).text.length).toBe(DELIVERY_CHAR_LIMIT);
+    return [first, second];
+  }
+
+  test('the situation report counts toward the limit of a lead delivery', () => {
+    const { ctx, clock, lead } = runningLead();
+    const [first] = filling(ctx, 'lead');
+    clock.advance(ctx.config.deliveryBatchMs);
+    flush(ctx);
+    const [deliver] = delivers(ctx, lead);
+    expect([deliver?.messages.map((one) => one.messageId), deliver?.more]).toEqual([[0, first.id], 1]);
+
+    // A worker's delivery has no report, so the same two fit in one.
+    const worker = createTestContext();
+    const held = addRunnerAttempt(worker.ctx);
+    const pair = filling(worker.ctx, `agent:${held.agent.id}`);
+    worker.clock.advance(worker.ctx.config.deliveryBatchMs);
+    flush(worker.ctx);
+    const [batch] = delivers(worker.ctx, held.attempt);
+    expect([batch?.messages.map((one) => one.messageId), batch?.more]).toEqual([pair.map((one) => one.id), 0]);
+  });
+
+  test("a worker's delivery has no report and counts nothing", () => {
+    const { ctx, clock } = createTestContext();
+    const held = addRunnerAttempt(ctx);
+    const message = sendMessage(ctx, { from: 'user:alice', to: `agent:${held.agent.id}`, body: 'Use the new API.' });
+    clock.advance(ctx.config.deliveryBatchMs);
+    flush(ctx);
+    expect(delivers(ctx, held.attempt).map((command) => command.messages.map((one) => one.messageId))).toEqual([
+      [message.id],
+    ]);
+    expect(getAttempt(ctx, held.attempt.id).wakeups).toBe(0);
+  });
+});
+
+describe('the periodic review', () => {
+  const reviews = (ctx: HubContext) =>
+    listMessages(ctx, { target: 'lead' }).filter((message) => message.from === 'system');
+
+  test('a review message goes to the lead every leadReviewMs while a task is held or submitted', () => {
+    const { ctx, clock } = runningLead();
+    // Nothing held: no review, and no clock runs.
+    expect(periodicLeadReview(ctx)).toBeNull();
+    expect(getHubState(ctx).lastLeadReviewAt).toBeNull();
+    const held = addRunnerAttempt(ctx);
+    const working = addRunnerAttempt(ctx);
+    ctx.db.query("UPDATE tasks SET status = 'working' WHERE id = $id").run({ id: working.task.id });
+    const submitted = addRunnerAttempt(ctx);
+    ctx.db.query("UPDATE tasks SET status = 'submitted' WHERE id = $id").run({ id: submitted.task.id });
+    // The clock starts when work is held; the first review comes leadReviewMs later.
+    expect(periodicLeadReview(ctx)).toBeNull();
+    expect(getHubState(ctx).lastLeadReviewAt).toBe(ctx.now());
+    clock.advance(ctx.config.leadReviewMs - 1);
+    expect(periodicLeadReview(ctx)).toBeNull();
+    clock.advance(1);
+    const review = periodicLeadReview(ctx);
+    expect(review).toMatchObject({ from: 'system', to: 'lead' });
+    expect(review?.body).toContain(`${held.task.id} [claimed]`);
+    expect(review?.body).toContain(`${working.task.id} [working]`);
+    expect(review?.body).toContain(`${submitted.task.id} [submitted]`);
+    expect(getHubState(ctx).lastLeadReviewAt).toBe(ctx.now());
+    expect(periodicLeadReview(ctx)).toBeNull();
+    // The tick runs it; the runners stay connected meanwhile.
+    const later = ctx.now() + 2 * ctx.config.leadReviewMs;
+    ctx.db.query("UPDATE attempts SET lease_expires_at = $later WHERE status != 'ended'").run({ later });
+    clock.advance(ctx.config.leadReviewMs);
+    expect(runTick(ctx).reconciled.leadReview).toBe(true);
+    expect(reviews(ctx)).toHaveLength(2);
+    // Once nothing is held or submitted, the clock stops.
+    ctx.db.run("UPDATE tasks SET status = 'done'");
+    expect(periodicLeadReview(ctx)).toBeNull();
+    expect(getHubState(ctx).lastLeadReviewAt).toBeNull();
+  });
+
+  test('none while the seat is empty; a lead that takes the seat gets the review that is due', () => {
+    const { ctx, clock } = createTestContext();
+    addRunnerAttempt(ctx);
+    expect(periodicLeadReview(ctx)).toBeNull();
+    clock.advance(ctx.config.leadReviewMs);
+    expect(periodicLeadReview(ctx)).toBeNull();
+    expect(reviews(ctx)).toEqual([]);
+    // The clock kept running, so the review comes as soon as a lead holds the seat.
+    clock.advance(MINUTE);
+    addAgent(ctx, 'alice', 'lead');
+    expect(periodicLeadReview(ctx)).toMatchObject({ from: 'system', to: 'lead' });
+  });
+});
+
+describe('rotation', () => {
+  /** A runner lead on R-1, running, and R-2 with more free slots, which a fresh lead would otherwise prefer. */
+  function rotationSetup(overrides: Partial<HubContext['config']> = {}) {
+    const { ctx, clock } = createTestContext(overrides);
+    const runnerId = addRunner(ctx);
+    const lead = tickLead(ctx);
+    updateAttempt(ctx, lead.id, { status: 'running', phase: 'idle' });
+    const roomier = addRunner(ctx);
+    ctx.db.query('UPDATE runners SET capacity = 8 WHERE id = $id').run({ id: roomier });
+    return { ctx, clock, runnerId, lead: getAttempt(ctx, lead.id) };
+  }
+
+  const stopsOf = (ctx: HubContext, attempt: Attempt) =>
+    pendingCommands(ctx, attempt.runnerId as string, 1).flatMap((row) =>
+      row.command.kind === 'stop_attempt' && row.command.attemptId === attempt.id ? [row.command] : [],
+    );
+
+  test('at leadRotateWakeups the lead is asked for a handoff and rotated; the next lead prefers its runner', () => {
+    const { ctx, runnerId, lead } = rotationSetup({ leadRotateWakeups: 3 });
+    updateAttempt(ctx, lead.id, { wakeups: 2 });
+    expect(rotateLeadIfDue(ctx)).toBeNull();
+    updateAttempt(ctx, lead.id, { wakeups: 3 });
+    expect(rotateLeadIfDue(ctx)).toBe(lead.id);
+    expect(getAttempt(ctx, lead.id).stopRequested).toMatchObject({ cause: 'rotation', handoff: true, by: 'system' });
+    const [stop] = stopsOf(ctx, lead);
+    expect(stop).toMatchObject({ cause: 'rotation', handoff: true });
+    expect(stop?.reason).toContain('write_handoff');
+    // One clause, which the runner's handoff prompt quotes.
+    expect(stop?.reason).toStartWith('the lead rotates after 3 wake-ups;');
+    expect(stop?.reason.endsWith('.')).toBe(false);
+    const [rotated] = listEvents(ctx.db).filter((event) => event.type === 'lead.rotated');
+    expect(rotated?.data).toMatchObject({ attemptId: lead.id, agentId: lead.agentId, runnerId });
+    // Asked once.
+    expect(rotateLeadIfDue(ctx)).toBeNull();
+    expect(stopsOf(ctx, lead)).toHaveLength(1);
+
+    insertLeadNote(ctx, { attemptId: lead.id, kind: 'handoff', body: 'Next: T-4.', author: `agent:${lead.agentId}` });
+    exited(ctx, lead);
+    expect(getAttempt(ctx, lead.id)).toMatchObject({ status: 'ended', endReason: 'rotated', failureClass: null });
+    expect(seatHolderId(ctx)).toBeNull();
+    const next = tickLead(ctx);
+    expect(next.runnerId).toBe(runnerId);
+    expect(briefOn(ctx, runnerId)).toContain('Next: T-4.');
+  });
+
+  test('context used past 0.7 rotates it too; the tick does it', () => {
+    const { ctx, lead } = rotationSetup();
+    const facts: AttemptFacts = {
+      attemptId: lead.id,
+      fence: lead.fence,
+      phase: 'idle',
+      eventAgeMs: 5_000,
+      tool: null,
+      fsAgeMs: null,
+      commitAgeMs: null,
+      turns: 9,
+      turnsWithoutProgress: 0,
+      repeatedCalls: 0,
+      continuations: 0,
+      vendorErrorMs: 0,
+      activeMs: 60_000,
+      contextUsed: 0.7,
+    };
+    updateAttempt(ctx, lead.id, { facts, factsAt: ctx.now() });
+    expect(runTick(ctx).reconciled.rotated).toBeNull();
+    updateAttempt(ctx, lead.id, { facts: { ...facts, contextUsed: 0.71 }, factsAt: ctx.now() });
+    expect(runTick(ctx).reconciled.rotated).toBe(lead.id);
+    expect(getAttempt(ctx, lead.id).stopRequested?.reason).toContain('71%');
+  });
+
+  test('a lead that is not running, or is stopping already, is not rotated', () => {
+    const { ctx, lead } = rotationSetup({ leadRotateWakeups: 1 });
+    updateAttempt(ctx, lead.id, { wakeups: 1 });
+    for (const status of ['starting', 'quota_wait', 'holding'] as const) {
+      updateAttempt(ctx, lead.id, { status });
+      expect([status, rotateLeadIfDue(ctx)]).toEqual([status, null]);
+    }
+    updateAttempt(ctx, lead.id, { status: 'running' });
+    requestStop(ctx, { attemptId: lead.id, cause: 'stop', reason: 'enough', by: 'user:alice' });
+    expect(rotateLeadIfDue(ctx)).toBeNull();
+    expect(getAttempt(ctx, lead.id).stopRequested?.cause).toBe('stop');
+  });
+
+  test('while the project is paused, a due lead is rotated only after the unpause', () => {
+    const { ctx, runnerId, lead } = rotationSetup({ leadRotateWakeups: 3 });
+    updateAttempt(ctx, lead.id, { wakeups: 3 });
+    setPaused(ctx, true, 'user:alice');
+    expect(runTick(ctx).reconciled.rotated).toBeNull();
+    expect(getAttempt(ctx, lead.id).stopRequested).toBeNull();
+    expect(seatHolderId(ctx)).toBe(lead.agentId);
+    setPaused(ctx, false, 'user:alice');
+    expect(runTick(ctx).reconciled.rotated).toBe(lead.id);
+    exited(ctx, lead);
+    expect(getAttempt(ctx, lead.id).endReason).toBe('rotated');
+    expect(runTick(ctx).lead).toMatchObject({ role: 'lead', runnerId });
   });
 });
