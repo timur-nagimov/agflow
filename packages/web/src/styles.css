@@ -529,6 +529,44 @@ tr.agent-gone td { color: var(--ink-3); }
 .agent-name { display: inline-flex; align-items: center; gap: 10px; }
 .cell-action { text-align: right; }
 
+/* ---------- Runners ---------- */
+
+.runner-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(440px, 100%), 1fr)); gap: 18px; align-items: start; }
+.runner-card { display: grid; gap: 12px; border-top: 3px solid var(--tone); }
+.runner-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.runner-id { font: 500 12px/1 var(--mono); color: var(--ink-2); }
+.card .runner-name {
+  flex: 1;
+  min-width: 0;
+  font: 500 16px/1.3 var(--sans);
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.runner-why { margin: 0; color: var(--ink-2); font-size: 13px; }
+.runner-why.warn-text { color: var(--active); }
+.runner-card .facts { margin: 0; }
+.profile { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; font-size: 13px; }
+.profile li { display: flex; align-items: baseline; gap: 8px; }
+.profile li::before { content: ''; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--tone); transform: translateY(-1px); }
+.vendor { display: grid; gap: 8px; padding-top: 12px; border-top: 1px solid var(--rule); }
+.vendor-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.card .vendor-name { margin: 0; font-size: 13.5px; color: var(--ink); }
+.vendor-meta, .vendor-note { margin: 0; font-size: 12.5px; color: var(--ink-2); }
+.vendor-note.warn-text { color: var(--active); }
+.quota-line { margin: 0; display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+
+/* A quota bar with its ceiling mark. */
+.meters { display: grid; gap: 10px; }
+.meter { display: grid; gap: 4px; }
+.meter-head { display: flex; justify-content: space-between; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; }
+.meter-label { font: 500 10.5px/1.6 var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); }
+.meter-text { font-size: 12.5px; color: var(--ink-2); }
+.meter-bar { position: relative; height: 8px; border-radius: 4px; background: var(--inset); }
+.meter-fill { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: var(--tone); transition: width 0.6s ease; }
+.meter-mark { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink); }
+
 /* ---------- Knowledge ---------- */
 
 .rules { list-style: none; padding: 0; display: grid; gap: 12px; margin-top: 12px; }

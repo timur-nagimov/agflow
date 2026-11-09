@@ -11,6 +11,7 @@ import { BoardView } from './views/BoardView';
 import { GoalView } from './views/GoalView';
 import { KnowledgeView } from './views/KnowledgeView';
 import { MessagesView } from './views/MessagesView';
+import { RunnersView } from './views/RunnersView';
 import { TaskView } from './views/TaskView';
 import { TimelineView } from './views/TimelineView';
 
@@ -20,6 +21,19 @@ const statusChanged = (event: HubEvent) =>
   event.type === 'goal.updated' ||
   event.type === 'message.sent';
 const taskChanged = (event: HubEvent) => event.type.startsWith('task.');
+/**
+ * A runner's state or settings, a shared account's quota, or an attempt that takes or frees one of its slots: started
+ * and resumed take one, holding and ended free it. An approval decision also clears its owner's away marks, which
+ * emits no account event.
+ */
+const runnersChanged = (event: HubEvent) =>
+  event.type.startsWith('runner.') ||
+  event.type.startsWith('account.') ||
+  event.type === 'attempt.started' ||
+  event.type === 'attempt.resumed' ||
+  event.type === 'attempt.holding' ||
+  event.type === 'attempt.ended' ||
+  event.type === 'approval.decided';
 
 const CONNECTION: Record<Connection, { label: string; lamp: string }> = {
   connecting: { label: 'Connecting', lamp: 'tone-active' },
@@ -34,6 +48,8 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const connection = useConnection();
   const status = useData(() => api.status(), [], { relevant: statusChanged, refreshMs: 60_000 });
   const tasks = useData(() => api.tasks(), [], { relevant: taskChanged });
+  // Heartbeats (power, disk, last seen) send no event, so the runners also reload on a timer.
+  const runners = useData(() => api.runners(), [], { relevant: runnersChanged, refreshMs: 60_000 });
   const [peopleSeen, setPeopleSeen] = useState(() => Number(localStorage.getItem(SEEN_KEY) ?? 0));
   const markPeopleSeen = useCallback((id: number) => {
     if (id <= Number(localStorage.getItem(SEEN_KEY) ?? 0)) return;
@@ -41,12 +57,14 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     setPeopleSeen(id);
   }, []);
   const hub = useMemo<Hub>(
-    () => ({ me, status, tasks, peopleSeen, markPeopleSeen }),
-    [me, status, tasks, peopleSeen, markPeopleSeen],
+    () => ({ me, status, tasks, runners, peopleSeen, markPeopleSeen }),
+    [me, status, tasks, runners, peopleSeen, markPeopleSeen],
   );
   const project = status.data?.project;
   const counts = tasks.data ? columnCounts(tasks.data) : null;
   const unseen = (status.data?.humansInbox ?? []).filter((message) => message.id > peopleSeen).length;
+  const runnerList = runners.data?.runners ?? [];
+  const online = runnerList.filter((runner) => runner.state === 'online').length;
   const current = navViewOf(route);
 
   useEffect(() => {
@@ -110,6 +128,11 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 Agents <b>{status.data.activeAgents}</b>
               </a>
             ) : null}
+            {runnerList.length > 0 ? (
+              <a className="readout" href={routeHref({ view: 'runners' })}>
+                Runners <b>{`${online}/${runnerList.length}`}</b> online
+              </a>
+            ) : null}
             {counts ? <Progress counts={counts} /> : null}
           </header>
           {project?.paused ? (
@@ -143,6 +166,8 @@ function View({ route }: { route: Route }) {
       return <TaskView key={route.id} id={route.id} />;
     case 'agents':
       return <AgentsView />;
+    case 'runners':
+      return <RunnersView />;
     case 'messages':
       return <MessagesView key={route.to ?? ''} to={route.to} />;
     case 'timeline':

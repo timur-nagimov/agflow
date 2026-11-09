@@ -11,6 +11,7 @@ import {
   splitTaskMentions,
   statusLabel,
   targetLabel,
+  type Tone,
   toneOf,
   who,
 } from './format';
@@ -90,6 +91,56 @@ export function PageHead({ title, meta, actions }: { title: ReactNode; meta?: Re
       </div>
       {actions ? <div className="page-actions">{actions}</div> : null}
     </header>
+  );
+}
+
+/** One labelled fact in a <dl className="facts">. */
+export function Fact({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="fact">
+      <dt>{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  );
+}
+
+/**
+ * A bar for a fraction 0..1 with a mark at a limit, such as a quota window against its ceiling. An unknown value
+ * draws no fill; `text` says it in words, for the eye and for screen readers.
+ */
+export function Meter({
+  label,
+  value,
+  mark,
+  tone,
+  text,
+}: {
+  label: string;
+  value: number | null;
+  mark: number;
+  tone: Tone;
+  text: string;
+}) {
+  const share = (fraction: number) => `${Math.round(Math.min(1, Math.max(0, fraction)) * 1000) / 10}%`;
+  return (
+    <div className={`meter tone-${tone}`}>
+      <div className="meter-head">
+        <span className="meter-label">{label}</span>
+        <span className="meter-text">{text}</span>
+      </div>
+      <div
+        className="meter-bar"
+        role="meter"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={value === null ? undefined : Math.round(value * 100)}
+        aria-valuetext={text}
+      >
+        {value === null ? null : <span className="meter-fill" style={{ width: share(value) }} />}
+        <span className="meter-mark" style={{ left: share(mark) }} />
+      </div>
+    </div>
   );
 }
 

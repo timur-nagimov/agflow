@@ -1,10 +1,11 @@
 import type { Task, TaskNote } from '@agflow/core';
-import { type FormEvent, type ReactNode, useState } from 'react';
+import { type FormEvent, useState } from 'react';
 import { api } from '../api';
 import {
   Composer,
   ErrorBox,
   EventList,
+  Fact,
   Linked,
   Loading,
   MessageList,
@@ -89,15 +90,6 @@ export function TaskView({ id }: { id: string }) {
           </Section>
         </div>
       </div>
-    </div>
-  );
-}
-
-function Fact({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="fact">
-      <dt>{label}</dt>
-      <dd>{children}</dd>
     </div>
   );
 }

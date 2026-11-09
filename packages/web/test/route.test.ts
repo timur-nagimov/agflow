@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { navViewOf, parseRoute, routeHref } from '../src/route';
+import { NAV, navViewOf, parseRoute, routeHref } from '../src/route';
 
 describe('routes', () => {
   test('parses every view', () => {
@@ -8,6 +8,7 @@ describe('routes', () => {
     expect(parseRoute('#/goal')).toEqual({ view: 'goal' });
     expect(parseRoute('#/task/T-12')).toEqual({ view: 'task', id: 'T-12' });
     expect(parseRoute('#/agents')).toEqual({ view: 'agents' });
+    expect(parseRoute('#/runners')).toEqual({ view: 'runners' });
     expect(parseRoute('#/messages')).toEqual({ view: 'messages' });
     expect(parseRoute('#/timeline')).toEqual({ view: 'timeline' });
     expect(parseRoute('#/knowledge')).toEqual({ view: 'knowledge' });
@@ -32,6 +33,7 @@ describe('routes', () => {
       { view: 'messages', to: 'task:T-7' },
       { view: 'messages' },
       { view: 'knowledge' },
+      { view: 'runners' },
     ] as const) {
       expect(parseRoute(routeHref(route))).toEqual(route);
     }
@@ -40,5 +42,12 @@ describe('routes', () => {
   test('a task page highlights the board in the navigation', () => {
     expect(navViewOf({ view: 'task', id: 'T-1' })).toBe('board');
     expect(navViewOf({ view: 'agents' })).toBe('agents');
+    expect(navViewOf({ view: 'runners' })).toBe('runners');
+  });
+
+  test('the navigation lists Runners right after Agents', () => {
+    const views = NAV.map((item) => item.view);
+    expect(views.indexOf('runners')).toBe(views.indexOf('agents') + 1);
+    expect(NAV.find((item) => item.view === 'runners')?.label).toBe('Runners');
   });
 });

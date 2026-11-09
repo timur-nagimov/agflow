@@ -5,6 +5,7 @@ export type Route =
   | { view: 'goal' }
   | { view: 'task'; id: string }
   | { view: 'agents' }
+  | { view: 'runners' }
   | { view: 'messages'; to?: string }
   | { view: 'timeline' }
   | { view: 'knowledge' };
@@ -15,6 +16,7 @@ export const NAV: { view: NavView; label: string }[] = [
   { view: 'board', label: 'Board' },
   { view: 'goal', label: 'Goal' },
   { view: 'agents', label: 'Agents' },
+  { view: 'runners', label: 'Runners' },
   { view: 'messages', label: 'Messages' },
   { view: 'timeline', label: 'Timeline' },
   { view: 'knowledge', label: 'Knowledge' },
@@ -29,6 +31,7 @@ export function parseRoute(hash: string): Route {
   switch (view) {
     case 'goal':
     case 'agents':
+    case 'runners':
     case 'timeline':
     case 'knowledge':
       return { view };

@@ -244,6 +244,77 @@ async function main(): Promise<void> {
     });
     await shot(page, 'agents');
 
+    await check('the strip shows how many runners are online', () =>
+      page.locator('.strip .readout', { hasText: /^Runners\s*1\/3\s*online$/ }).waitFor(),
+    );
+    await open(page, '#/runners', '.runner-card');
+    /** The text of one runner's card. */
+    const card = (id: string) => page.locator('.runner-card', { has: page.locator(`.runner-id:text-is("${id}")`) });
+    const cardText = async (id: string) => (await card(id).textContent()) ?? '';
+    await check('the Runners page lists R-1, R-2 and R-3 with owner, state, slots, power, disk, keep-awake, git and each vendor', async () => {
+      await waitForCount(page.locator('.runner-card'), 3);
+      const expected: Record<string, { owner: string; parts: (string | RegExp)[] }> = {
+        'R-1': {
+          owner: 'demo',
+          parts: ["demo's MacBook Pro", 'Online', /\d of 3 slots free/, 'On AC power', '182 GB free, 6.4 GB used by agflow'],
+        },
+        'R-2': {
+          owner: 'bob',
+          parts: ["bob's Mac mini", 'Offline', /\d of \d slots? free/, 'On battery, 57%', '41.0 GB free, 2.1 GB used by agflow'],
+        },
+        'R-3': {
+          owner: 'demo',
+          parts: ["demo's MacBook Air", 'Offline', /\d of \d slots? free/, 'On AC power', '120 GB free, 2.0 GB used by agflow'],
+        },
+      };
+      for (const [id, { owner, parts }] of Object.entries(expected)) {
+        const ownerFact = card(id).locator('.fact', { has: page.locator('dt:text-is("Owner")') }).locator('dd');
+        if ((await ownerFact.textContent()) !== owner) throw new Error(`${id}'s owner is not ${owner}`);
+        const text = await cardText(id);
+        // Every demo runner keeps the hello's default keep-awake setting.
+        const all = [...parts, 'Kept awake on AC power', 'Git ready', 'Claude Code'];
+        const missing = all.filter((part) => (typeof part === 'string' ? !text.includes(part) : !part.test(text)));
+        if (missing.length > 0) throw new Error(`${id} lacks ${missing.join(', ')}: ${text.slice(0, 300)}`);
+      }
+      for (const id of ['R-1', 'R-2']) {
+        if (!(await cardText(id)).includes('Codex')) throw new Error(`${id} does not list Codex`);
+      }
+    });
+    await check("R-2 says why it is offline, shows its weakened boundary and Codex 'not logged in'", async () => {
+      const why = (await card('R-2').locator('.runner-why').textContent()) ?? '';
+      // R-2 went away without a word, so the line is the offline default.
+      if (!why.startsWith('Last seen')) throw new Error(`the why line: ${why}`);
+      const text = await cardText('R-2');
+      if (!text.includes('Not enforced on this laptop: network allowlist')) throw new Error('no weakened boundary');
+      const codex = card('R-2').locator('.vendor', { has: page.locator('.vendor-name:text-is("Codex")') });
+      if (!((await codex.textContent()) ?? '').includes('not logged in')) throw new Error('Codex is not "not logged in"');
+    });
+    await check("R-1's Claude meters show the utilization against the 85% ceiling and the account's reset time", async () => {
+      const claude = card('R-1').locator('.vendor', { has: page.locator('.vendor-name:text-is("Claude Code")') });
+      const meters = claude.locator('.meter');
+      await waitForCount(meters, 2);
+      const used = [
+        ['42% used, ceiling 85%', '42%'],
+        ['31% used, ceiling 85%', '31%'],
+      ];
+      for (const [index, [text, width]] of used.entries()) {
+        const meter = meters.nth(index);
+        if (!((await meter.textContent()) ?? '').includes(text)) throw new Error(`meter ${index} lacks ${text}`);
+        const fill = (await meter.locator('.meter-fill').getAttribute('style')) ?? '';
+        if (!fill.includes(width)) throw new Error(`meter ${index}'s fill: ${fill}`);
+        const mark = (await meter.locator('.meter-mark').getAttribute('style')) ?? '';
+        if (!mark.includes('85%')) throw new Error(`meter ${index}'s ceiling mark: ${mark}`);
+      }
+      // The reset time as the browser shows it, in its own time zone.
+      const reset = await page.evaluate<string>(`fetch('/api/runners').then((response) => response.json()).then(({ accounts }) => {
+        const at = new Date(accounts.find((a) => a.owner === 'demo' && a.vendor === 'claude').quota.resetsAt);
+        return String(at.getHours()).padStart(2, '0') + ':' + String(at.getMinutes()).padStart(2, '0');
+      })`);
+      const line = (await claude.locator('.quota-line').textContent()) ?? '';
+      if (!line.startsWith('Resets at') || !line.includes(reset)) throw new Error(`the quota line: ${line}`);
+    });
+    await shot(page, 'runners');
+
     await open(page, '#/timeline', '.log');
     await check('live events arrive without reloading', () => page.locator('.log-row.fresh').first().waitFor({ timeout: 12_000 }));
     await shot(page, 'timeline');
