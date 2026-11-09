@@ -21,6 +21,7 @@ import {
 } from '@agflow/core';
 import {
   ATTEMPT_STATUS_LABELS,
+  actionOutcomeText,
   attemptLabel,
   attemptTone,
   canHandBack,
@@ -485,6 +486,30 @@ describe('runner actions', () => {
     expect(runnerActionsFor({ ...lead, stopRequested: stop('stop') }, online)).toEqual([]);
     expect(runnerActionsFor(attempt({ runnerId: null }), null)).toEqual([]);
     expect(runnerActionsFor(null, online)).toEqual([]);
+  });
+
+  test('an accepted action says what the hub did: done, kept the recorded stop, or held behind a submission', () => {
+    expect(actionOutcomeText('interrupt', null)).toBe('Interrupt sent: the runner interrupts the turn.');
+    expect(actionOutcomeText('stop_hold', attempt({ stopRequested: stop('stop_hold') }))).toBe(
+      'Stop and hold recorded: the agent writes a handoff note, and the task waits for people.',
+    );
+    expect(actionOutcomeText('replace', attempt({ stopRequested: stop('replace') }))).toBe(
+      'Replace recorded: the agent writes a handoff note, and a new agent goes on from its work.',
+    );
+    // X-34: a context stop may not be replaced, so the hub answers with it unchanged.
+    const context = { ...stop('context'), by: 'system' } as NonNullable<Attempt['stopRequested']>;
+    expect(actionOutcomeText('stop_hold', attempt({ stopRequested: context }))).toBe(
+      'The hub kept the stop already recorded (Context window full, asked by agflow): your request changed nothing.',
+    );
+    // 6.13: a pending submission holds the stop back; it applies only if the push fails.
+    expect(actionOutcomeText('stop', attempt({ stopRequested: stop('stop', true) }))).toBe(
+      'Recorded, but it waits for the pending submission: if the push fails it applies; if it lands, it is dropped ' +
+        'and the task goes up for review.',
+    );
+    // An attempt that ended at once (no live process) still names the stop it ended for.
+    expect(actionOutcomeText('stop', attempt({ status: 'ended', stopRequested: stop('stop') }))).toBe(
+      'Stop recorded: the agent writes a handoff note, then stops.',
+    );
   });
 });
 

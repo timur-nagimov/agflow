@@ -546,8 +546,17 @@ th {
 td { padding: 11px 16px; border-bottom: 1px solid var(--rule); font-size: 13.5px; vertical-align: middle; }
 tr:last-child td { border-bottom: none; }
 tr.agent-gone td { color: var(--ink-3); }
-.agent-name { display: inline-flex; align-items: center; gap: 10px; }
+.agent-name { display: inline-flex; align-items: center; gap: 10px; white-space: nowrap; }
+.agent-runner, .agent-attempt { white-space: nowrap; }
 .cell-action { text-align: right; }
+.row-actions { display: inline-flex; gap: 6px; }
+.lead-role { display: inline-grid; gap: 4px; justify-items: start; }
+.lead-seat { font-size: 12.5px; color: var(--ink-2); white-space: nowrap; }
+tr:has(+ .agent-actions-row) td { border-bottom-color: transparent; }
+.agent-actions-row td { padding-top: 0; background: color-mix(in srgb, var(--inset) 50%, transparent); }
+.runner-actions-panel { display: grid; gap: 10px; padding: 12px 0 4px; }
+.runner-actions-panel p { margin: 0; font-size: 13px; }
+.takeover-refused { display: grid; gap: 8px; justify-items: start; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--trouble) 45%, var(--rule)); border-radius: 4px; }
 
 /* ---------- Runners ---------- */
 

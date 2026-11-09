@@ -1,8 +1,8 @@
 // What the web says about attempts (design 6.1, 6.4, 6.8, 6.9, 6.12, 6.13, 11): labels, the phase a person sees,
 // tones, short names, the WIP position, the facts of the attempt page, log kinds, submission outcomes, who holds a
-// task, the actions on runner agents, take-over and hand-back, and the notes attempts leave each other. Free of the
-// DOM so the rules are unit-tested. From api-schemas.ts and runner-protocol.ts, which build zod schemas, only types
-// come in (X-48); the tests compare the tables here with their values.
+// task, the actions on runner agents and what the hub did with them, take-over and hand-back, and the notes attempts
+// leave each other. Free of the DOM so the rules are unit-tested. From api-schemas.ts and runner-protocol.ts, which
+// build zod schemas, only types come in (X-48); the tests compare the tables here with their values.
 import {
   type Attempt,
   type AttemptEndReason,
@@ -24,7 +24,7 @@ import {
   type TaskNote,
 } from '@agflow/core';
 import type { AgentAction, AgentActionBodies, HandbackSource, Me } from './api';
-import { duration, percent, shortSha, type TaskHolder, type Tone } from './format';
+import { duration, percent, shortSha, type TaskHolder, type Tone, who } from './format';
 
 // ---------------------------------------------------------------------------
 // Labels
@@ -399,6 +399,46 @@ export function runnerActionsFor(attempt: Attempt | null, runner: Pick<Runner, '
     actions.push('takeover');
   }
   return actions;
+}
+
+/** What a person sees once the hub took the request; the agent then acts in its own time. */
+const ACTION_DONE: Record<RunnerAction, string> = {
+  interrupt: 'Interrupt sent: the runner interrupts the turn.',
+  stop: 'Stop recorded: the agent writes a handoff note, then stops.',
+  stop_hold: 'Stop and hold recorded: the agent writes a handoff note, and the task waits for people.',
+  replace: 'Replace recorded: the agent writes a handoff note, and a new agent goes on from its work.',
+  takeover: 'Take-over started.',
+};
+
+/** The stop cause each stop action records (6.4). */
+const ACTION_CAUSES: Partial<Record<RunnerAction, StopCause>> = {
+  stop: 'stop',
+  stop_hold: 'stop_hold',
+  replace: 'replace',
+};
+
+/**
+ * What the hub did with an accepted action, from the attempt it answered with (6.4, 6.13, X-34). A stop or replace
+ * may be taken without being done now: the hub keeps a stop already recorded that the new one may not replace, and
+ * holds one back while a submission is pending, applying it only if the push fails. Interrupt answers no attempt.
+ */
+export function actionOutcomeText(action: RunnerAction, attempt: Pick<Attempt, 'stopRequested'> | null): string {
+  const stop = attempt?.stopRequested;
+  const cause = ACTION_CAUSES[action];
+  if (!stop || !cause) return ACTION_DONE[action];
+  if (stop.cause !== cause) {
+    return (
+      `The hub kept the stop already recorded (${STOP_CAUSE_LABELS[stop.cause]}, asked by ${who(stop.by)}): ` +
+      'your request changed nothing.'
+    );
+  }
+  if (stop.deferred) {
+    return (
+      'Recorded, but it waits for the pending submission: if the push fails it applies; if it lands, it is dropped ' +
+      'and the task goes up for review.'
+    );
+  }
+  return ACTION_DONE[action];
 }
 
 // ---------------------------------------------------------------------------

@@ -284,6 +284,75 @@ async function main(): Promise<void> {
       if (!(await page.locator('h1.page-title').textContent())?.startsWith('Lead attempt')) throw new Error('no lead title');
     });
 
+    await open(page, '#/agents', 'table');
+    /** The Agents row of the agent working on a task. */
+    const agentRow = (taskId: string) => page.locator('tr', { has: page.locator(`.task-link:text-is("${taskId}")`) });
+    const cell = async (row: Locator, name: string) => ((await row.locator(`.agent-${name}`).textContent()) ?? '').trim();
+    await check("runner agents show their runner, attempt and phase (T-12's agent: R-1, a1, Working)", async () => {
+      const row = agentRow('T-12');
+      // The phase comes from the open attempts, which load apart from the agents, so the check waits for it.
+      await row.locator('.agent-phase', { hasText: /^Working$/ }).waitFor();
+      const cells = { runner: await cell(row, 'runner'), attempt: await cell(row, 'attempt'), phase: await cell(row, 'phase') };
+      if (cells.runner !== 'R-1' || cells.attempt !== 'a1' || cells.phase !== 'Working') {
+        throw new Error(`the row shows ${JSON.stringify(cells)}`);
+      }
+      await row.locator('.agent-attempt a[href="#/attempt/T-12-a1"]').waitFor();
+    });
+    await check("the lead's row says it runs on R-1 and how many wake-ups it has had", async () => {
+      const lead = page.locator('tr', { has: page.locator('.chip', { hasText: 'Lead' }) });
+      const seat = (await lead.locator('.lead-seat').textContent()) ?? '';
+      if (!/^On R-1 · \d+ wake-ups? since rotation$/.test(seat)) throw new Error(`the lead's row says ${seat}`);
+    });
+    await check('live chats have no runner actions, only Message', async () => {
+      const row = agentRow('T-4');
+      await waitForCount(row, 1);
+      if ((await cell(row, 'runner')) !== 'Live chat') throw new Error(`T-4's agent runs in ${await cell(row, 'runner')}`);
+      if ((await row.locator('button').count()) !== 0) throw new Error('a live chat offers runner actions');
+      if ((await row.locator('.cell-action').textContent())?.trim() !== 'Message') throw new Error('no Message link');
+    });
+    /** Opens the actions of the agent on a task. */
+    const actionsOf = async (taskId: string) => {
+      const row = agentRow(taskId);
+      if ((await row.locator('button[aria-expanded="true"]').count()) === 0) await row.locator('button:text-is("Actions")').click();
+      return page.locator('.agent-actions-row .runner-actions-panel');
+    };
+    await check("interrupting T-12's agent succeeds, and its attempt log records the interrupt", async () => {
+      const actions = await actionsOf('T-12');
+      const offered = await actions.locator('.actions button').allTextContents();
+      if (offered.join(',') !== 'Interrupt,Stop,Stop and hold,Replace,Take over') throw new Error(`it offers ${offered.join(', ')}`);
+      await actions.locator('.actions button:text-is("Interrupt")').click();
+      // The second click.
+      await actions.locator('.action-form .confirm-action:text-is("Interrupt")').click();
+      await actions.locator('.runner-actions-done', { hasText: 'Interrupt' }).waitFor();
+      // The runner logs the interrupt in its own time, and logging sends no event, so the hub is asked until it has
+      // the entry; the attempt page, opened then, must show it.
+      for (let tries = 0; ; tries++) {
+        const logged = await page.evaluate<boolean>(
+          "fetch('/api/attempts/T-12-a1').then((response) => response.json())" +
+            ".then(({ log }) => log.some((entry) => entry.summary === 'the turn was interrupted'))",
+        );
+        if (logged) break;
+        if (tries === 20) throw new Error('the hub has no log entry for the interrupt');
+        await Bun.sleep(250);
+      }
+      await open(page, '#/attempt/T-12-a1', '.attempt-head');
+      await page.locator('.attempt-log .log-text', { hasText: 'the turn was interrupted' }).waitFor();
+    });
+    await open(page, '#/agents', 'table');
+    await check('stop and hold on T-12\'s agent asks for a reason, then T-12 is Paused', async () => {
+      const actions = await actionsOf('T-12');
+      await actions.locator('.actions button:text-is("Stop and hold")').click();
+      const confirm = actions.locator('.action-form .confirm-action:text-is("Stop and hold")');
+      if (!(await confirm.isDisabled())) throw new Error('it stops without a reason');
+      await actions.locator('.action-form textarea').fill('Hold this until the pricing review is done.');
+      await shot(page, 'agent-actions');
+      await confirm.click();
+      // The form closes once the hub took the request; the agent then leaves, and its row with it.
+      await confirm.waitFor({ state: 'detached' });
+      await open(page, '#/task/T-12', '.task-head');
+      await statusIs(page, 'Paused');
+    });
+
     await check('the strip shows how many runners are online', () =>
       page.locator('.strip .readout', { hasText: /^Runners\s*1\/3\s*online$/ }).waitFor(),
     );
