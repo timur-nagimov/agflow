@@ -18,20 +18,48 @@ const shots = mkdtempSync(join(tmpdir(), 'agflow-ui-'));
 
 const hub = Bun.spawn(['bun', join(import.meta.dir, 'demo-hub.ts')], {
   env: { ...process.env, AGFLOW_DEMO_PORT: String(port) },
-  stdout: 'inherit',
+  stdout: 'pipe',
   stderr: 'inherit',
 });
 
+/** The line the demo prints once its story has settled and checked itself. */
+const READY_LINE = 'agflow demo hub on';
+
+/** Forwards the demo's output, all along, and resolves at its ready line; rejects if the demo exits before it. */
+function readyLine(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const forward = async () => {
+      const decoder = new TextDecoder();
+      let buffered = '';
+      for await (const chunk of hub.stdout) {
+        buffered += decoder.decode(chunk, { stream: true });
+        const lines = buffered.split('\n');
+        buffered = lines.pop() ?? '';
+        for (const line of lines) {
+          console.log(line);
+          if (line.startsWith(READY_LINE)) resolve();
+        }
+      }
+      throw new Error(`the demo hub exited with code ${await hub.exited} before it was ready`);
+    };
+    forward().catch(reject);
+  });
+}
+
+/**
+ * The demo prints its ready line once its story has settled and checked itself; it exits with an error naming what
+ * did not settle instead. Either that, or 20 seconds without the line, fails the check.
+ */
 async function waitForHub(): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt++) {
-    try {
-      if ((await fetch(`${base}/api/auth-config`)).ok) return;
-    } catch {
-      // not listening yet
-    }
-    await Bun.sleep(100);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('the demo hub was not ready within 20 seconds')), 20_000);
+  });
+  try {
+    await Promise.race([readyLine(), timeout]);
+  } finally {
+    clearTimeout(timer);
   }
-  throw new Error('the demo hub did not start within 5 seconds');
 }
 
 const failures: string[] = [];
@@ -200,9 +228,19 @@ async function main(): Promise<void> {
     await shot(page, 'knowledge');
 
     await open(page, '#/agents', 'table');
-    await check('agents are listed with what they work on', async () => {
+    await check('agents are listed with what they work on, and the lead is the runner lead on R-1', async () => {
+      // The live lead chat, A-1, has been away for hours, so it is listed only with the disconnected agents.
       const text = (await page.locator('table').textContent()) ?? '';
-      if (!text.includes('A-1') || !text.includes('Lead') || !text.includes('T-4')) throw new Error(text.slice(0, 200));
+      if (!text.includes('T-4')) throw new Error(text.slice(0, 200));
+      // The page signed in, so its fetch carries the session.
+      const seat = await page.evaluate<{ kind: string; agentId: string | null; runnerId: string | null }>(
+        "fetch('/api/status').then((response) => response.json()).then((status) => status.leadSeat)",
+      );
+      if (seat.kind !== 'runner' || seat.runnerId !== 'R-1') throw new Error(`the seat: ${JSON.stringify(seat)}`);
+      const leadRow = page.locator('tr', { has: page.locator('.chip', { hasText: 'Lead' }) });
+      await waitForCount(leadRow, 1);
+      const row = (await leadRow.textContent()) ?? '';
+      if (!seat.agentId || !row.includes(seat.agentId)) throw new Error(`the Lead row: ${row}`);
     });
     await shot(page, 'agents');
 
