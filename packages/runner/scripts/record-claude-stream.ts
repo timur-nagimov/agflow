@@ -29,8 +29,10 @@ import {
   afterToolResult,
   bashTool,
   claudeTestEnv,
+  fail,
   findClaudeBinary,
   isCompaction,
+  refusal,
   reply,
   rules,
   startScriptedAnthropic,
@@ -247,6 +249,15 @@ export interface ClaudeScenario {
    * startup ends with the CLI's stderr and exit code.
    */
   failsToStart?: boolean;
+  /** CLAUDE_CODE_MAX_RETRIES for the capture; 0 by default. */
+  maxRetries?: number;
+  /** Only the scripted server's answers produce it, so --live skips it. */
+  scripted?: boolean;
+  /**
+   * A recording no capture against the scripted server can produce (outline Q3), derived from what the capture
+   * printed; its header says synthesised. --live records the real thing instead, when the account shows it.
+   */
+  synthesise?(recording: ClaudeRecording): ClaudeRecording;
   drive(session: ScenarioSession): Promise<void>;
 }
 
@@ -811,6 +822,98 @@ const PROMPTS = {
 
 const COMPACTION_SUMMARY = 'Summary: the agent said hello; nothing else happened.';
 
+/** One prompt and its turn, as the outcome scenarios drive it. */
+async function oneTurn(session: ScenarioSession): Promise<void> {
+  session.send(PROMPTS.hello);
+  await session.idle();
+}
+
+/** The reset the synthesised quota recordings name: a fixed time, in the epoch seconds rate_limit_event carries. */
+export const SYNTHESISED_RESET = 1_900_000_000;
+/** A usage-limit message as 2.1.285 words it (USAGE_LIMIT_PREFIXES in quota.ts). */
+export const SYNTHESISED_LIMIT_TEXT = "You've hit your limit · resets 5pm (UTC)";
+/** A usage-transition notice as 2.1.285 words it (USAGE_TRANSITION_PREFIXES in quota.ts). */
+export const SYNTHESISED_OVERAGE_TEXT = "You're now using extra usage · your limit resets 5pm (UTC)";
+
+/** Inserts frames before the first frame of each turn that matches. */
+function insertBefore(
+  recording: ClaudeRecording,
+  match: (frame: Json) => boolean,
+  frames: Json[],
+  change: (frame: Json) => Json = (frame) => frame,
+): ClaudeRecording {
+  const turns = recording.turns.map((turn) => {
+    const at = turn.findIndex((step) => 'frame' in step && match(step.frame));
+    if (at < 0) throw new Error(`${recording.header.scenario}: no frame to synthesise around`);
+    const steps = turn.map((step) => ('frame' in step ? { frame: change(step.frame as Json) } : step));
+    return [...steps.slice(0, at), ...frames.map((frame) => ({ frame })), ...steps.slice(at)];
+  });
+  return { ...recording, turns };
+}
+
+const isApiErrorMessage = (frame: Json) => frame.type === 'assistant' && frame.message?.model === '<synthetic>';
+
+/**
+ * A limit hit from a captured 429: the rejected rate_limit_event a subscription gets first, then the CLI's usage-limit
+ * message in place of the API error.
+ */
+export function synthesiseLimitHit(recording: ClaudeRecording): ClaudeRecording {
+  const event = {
+    type: 'rate_limit_event',
+    rate_limit_info: {
+      status: 'rejected',
+      resetsAt: SYNTHESISED_RESET,
+      rateLimitType: 'five_hour',
+      utilization: 1,
+      overageStatus: 'rejected',
+      overageDisabledReason: 'org_level_disabled',
+      isUsingOverage: false,
+    },
+    uuid: randomUUID(),
+    session_id: '$SESSION',
+  };
+  return insertBefore(recording, isApiErrorMessage, [event], (frame) => {
+    if (isApiErrorMessage(frame)) {
+      return {
+        ...frame,
+        error: 'rate_limit',
+        message: { ...frame.message, content: [{ type: 'text', text: SYNTHESISED_LIMIT_TEXT }] },
+      };
+    }
+    return frame.type === 'result' ? { ...frame, result: SYNTHESISED_LIMIT_TEXT } : frame;
+  });
+}
+
+/**
+ * Paid usage in use from a captured turn: the rate_limit_event of a five-hour window that is used up while extra
+ * usage goes on, and the CLI's notice, before the model's answer. The turn itself completes.
+ */
+export function synthesiseOverageInUse(recording: ClaudeRecording): ClaudeRecording {
+  const event = {
+    type: 'rate_limit_event',
+    rate_limit_info: {
+      status: 'rejected',
+      resetsAt: SYNTHESISED_RESET,
+      rateLimitType: 'five_hour',
+      utilization: 1,
+      overageStatus: 'allowed',
+      isUsingOverage: true,
+    },
+    uuid: randomUUID(),
+    session_id: '$SESSION',
+  };
+  const notice = {
+    type: 'system',
+    subtype: 'notification',
+    key: 'limit-reached',
+    text: SYNTHESISED_OVERAGE_TEXT,
+    priority: 'immediate',
+    uuid: randomUUID(),
+    session_id: '$SESSION',
+  };
+  return insertBefore(recording, (frame) => frame.type === 'assistant', [event, notice]);
+}
+
 /** Answers compaction requests with a summary and leaves every other request to `main`. */
 function withSummary(main: AnthropicHandler): AnthropicHandler {
   return (request) => (isCompaction(request) ? reply(COMPACTION_SUMMARY) : main(request));
@@ -921,6 +1024,60 @@ export const CLAUDE_SCENARIOS: ClaudeScenario[] = [
     failsToStart: true,
     drive: async () => {},
   },
+  // Vendor outcomes (8.3, 6.10), captured where the scripted server can produce them.
+  {
+    name: 'auth-expired',
+    fixture: 'auth-expired',
+    scripted: true,
+    handler: rules({ when: userSays(PROMPTS.hello), reply: fail(401) }),
+    drive: oneTurn,
+  },
+  {
+    name: 'context-overflow',
+    fixture: 'context-overflow',
+    scripted: true,
+    // 400 "prompt is too long".
+    handler: rules({ when: userSays(PROMPTS.hello), reply: fail(400) }),
+    drive: oneTurn,
+  },
+  {
+    name: 'policy-refusal',
+    fixture: 'policy-refusal',
+    scripted: true,
+    // Every request is refused: 2.1.285 retries a refusal once, then gives up.
+    handler: rules({ when: [], reply: refusal('I cannot help with that.') }),
+    drive: oneTurn,
+  },
+  {
+    name: 'api-retry-429',
+    fixture: 'api-retry-429',
+    scripted: true,
+    maxRetries: 1,
+    handler: rules({ when: [], reply: fail(429) }),
+    drive: oneTurn,
+  },
+  {
+    name: 'vendor-error',
+    fixture: 'vendor-error',
+    scripted: true,
+    maxRetries: 1,
+    handler: rules({ when: [], reply: fail(529) }),
+    drive: oneTurn,
+  },
+  {
+    name: 'limit-hit',
+    fixture: 'limit-hit',
+    handler: rules({ when: userSays(PROMPTS.hello), reply: fail(429) }),
+    synthesise: synthesiseLimitHit,
+    drive: oneTurn,
+  },
+  {
+    name: 'overage-in-use',
+    fixture: 'overage-in-use',
+    handler: rules({ when: userSays(PROMPTS.hello), reply: reply('Hello.') }),
+    synthesise: synthesiseOverageInUse,
+    drive: oneTurn,
+  },
   {
     name: 'session',
     transcript: 'session',
@@ -988,10 +1145,17 @@ export async function recordClaudeStream(options: RecordClaudeStreamOptions = {}
   if (unknown.length > 0) throw new Error(`no scenario named ${unknown.join(', ')}`);
   const written: string[] = [];
   for (const scenario of scenarios) {
+    if (options.live && scenario.scripted) {
+      log(`skipping ${scenario.name}: only the scripted server produces it`);
+      continue;
+    }
     log(`recording ${scenario.name}${options.live ? ' (live)' : ''}`);
     const server = options.live ? null : await startScriptedAnthropic({ handler: scenario.handler });
     const proxy = options.live ? null : await startRefusingProxy();
-    const env = server && proxy ? claudeTestEnv({ baseUrl: server.url, proxyUrl: proxy.url }) : {};
+    const env =
+      server && proxy
+        ? claudeTestEnv({ baseUrl: server.url, proxyUrl: proxy.url, maxRetries: scenario.maxRetries })
+        : {};
     const scratch = scratchLaunch({ bin, model, env, live: options.live });
     try {
       const run = await runScenario(scenario, scratch);
@@ -1007,7 +1171,11 @@ export async function recordClaudeStream(options: RecordClaudeStreamOptions = {}
           model,
           permissionMode: effectivePermissionMode(scratch.launch.profile, false),
         };
-        const recording = recordingOf(run, header, scratch, { live: options.live === true });
+        const captured = recordingOf(run, header, scratch, { live: options.live === true });
+        const recording =
+          scenario.synthesise && !options.live
+            ? scenario.synthesise({ ...captured, header: { ...captured.header, source: 'synthesised' } })
+            : captured;
         const path = join(options.fixturesDir ?? CLAUDE_FIXTURES_DIR, `${scenario.fixture}.jsonl`);
         mkdirSync(dirname(path), { recursive: true });
         writeRecording(path, recording);
