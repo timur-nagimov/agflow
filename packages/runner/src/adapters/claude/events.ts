@@ -1,13 +1,15 @@
-// A Claude session's stream as AgentEvents (design 8.3, 6.8, 10, 13): session facts, turns, the main thread's tools
-// with what stall detection needs, text, and the bridge's terminal tools and hub-unreachable answers. Frames arrive
-// as the SDK yields them, some untyped (non_execution_kind), so every field is read defensively and anything
+// A Claude session's stream as AgentEvents (design 8.3, 6.7, 6.8, 6.10, 10, 13): session facts, turns, the main
+// thread's tools with what stall detection needs, text, the bridge's terminal tools and hub-unreachable answers,
+// deliveries and acknowledgements, quota, API retries, sub-agent tasks and context use. Frames arrive as the SDK
+// yields them, some untyped (command_lifecycle, non_execution_kind), so every field is read defensively and anything
 // unknown is ignored.
-import { BRIDGE_ANSWERS } from '@agflow/core';
-import type { SDKAssistantMessageError, SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
+import { BRIDGE_ANSWERS, type VendorQuota } from '@agflow/core';
+import type { SDKAssistantMessageError, SDKRateLimitInfo, SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import { clip } from '../../attempt/pump';
 import type { AgentEvent, TerminalTool } from '../types';
 import { isRecord } from './json';
 import { classifyResult } from './outcome';
+import { isPaidUsageNotice, QuotaBook } from './quota';
 
 /** The longest tool input a tool_started carries, as JSON: enough to tell repeated calls apart (6.8). */
 export const CLAUDE_TOOL_INPUT_MAX = 4_000;
@@ -23,11 +25,25 @@ const TERMINAL_TOOLS: Readonly<Record<string, TerminalTool>> = Object.freeze({
   write_handoff: 'handoff',
 });
 
+/** Sub-agent tasks are tools in flight under ids no tool_use has. */
+const TASK_TOOL_PREFIX = 'task:';
+
 type Json = Record<string, unknown>;
+
+export interface ClaudeEventMapperOptions {
+  /** The session's account (claudeAccountId), which its quota events name. */
+  accountId?: string | null;
+  /** The adapter's last quota per account, shared by its sessions; a book of its own by default. */
+  quota?: QuotaBook;
+}
 
 /** Maps one session's frames, in order, to the events they give. */
 export class ClaudeEventMapper {
+  private readonly accountId: string | null;
+  private readonly quota: QuotaBook;
   private started = false;
+  /** The model system/init named; its modelUsage entry has the context window. */
+  private model: string | null = null;
   private inTurn = false;
   private toolCalls = 0;
   private interruptPending = false;
@@ -36,14 +52,34 @@ export class ClaudeEventMapper {
   private readonly tools = new Map<string, string>();
   /** Calls a system/permission_denied frame named before their tool_result. */
   private readonly deniedCalls = new Set<string>();
+  /** The runner's message id of each sent uuid not yet acknowledged, and whether it was delivered. */
+  private readonly messages = new Map<string, { id: string; delivered: boolean }>();
+  /** Sub-agent tasks in flight; they may outlive the turn that started them. */
+  private readonly tasks = new Set<string>();
+  /** Foreground sub-agent tasks: the Task call that spawned them is the tool in flight while they run. */
+  private readonly foregroundTasks = new Set<string>();
+  /** The prompt tokens, cache included, of the turn's last main-thread request; null before its first. */
+  private lastRequestTokens: number | null = null;
+
+  constructor(options: ClaudeEventMapperOptions = {}) {
+    this.accountId = options.accountId ?? null;
+    this.quota = options.quota ?? new QuotaBook();
+  }
+
+  /** The session sent a message with this uuid: its delivery and acknowledgement carry the runner's id. */
+  messageSent(uuid: string, id: string): void {
+    this.messages.set(uuid, { id, delivered: false });
+  }
 
   /**
    * The runner interrupted the running turn: the error_during_execution result that follows is an interrupt, not a
    * crash (8.3). The flag ends with the next result. The CLI ignores an interrupt while idle, so one counts only while
-   * a turn runs or is about to: `starting` when the caller sent input no frame has answered yet.
+   * a turn runs or is about to: `starting` when the caller sent input no frame has answered yet, or a sent message
+   * not yet delivered.
    */
   interruptRequested(options: { starting?: boolean } = {}): void {
-    if (this.inTurn || options.starting === true) this.interruptPending = true;
+    const waiting = [...this.messages.values()].some((message) => !message.delivered);
+    if (this.inTurn || options.starting === true || waiting) this.interruptPending = true;
   }
 
   /** The events one frame gives; none for a frame of an unknown type or shape. */
@@ -52,11 +88,18 @@ export class ClaudeEventMapper {
     const events: AgentEvent[] = [];
     switch (frame.type) {
       case 'system':
-        if (frame.subtype === 'init') this.init(frame, events);
-        else if (frame.subtype === 'permission_denied' && typeof frame.tool_use_id === 'string') {
-          this.deniedCalls.add(frame.tool_use_id);
+        this.system(frame, events);
+        break;
+      case 'command_lifecycle':
+        this.lifecycle(frame, events);
+        break;
+      case 'rate_limit_event': {
+        const info = rateLimitInfo(frame.rate_limit_info);
+        if (info !== null) {
+          events.push({ type: 'quota', accountId: this.accountId, quota: this.quota.rateLimit(this.accountId, info) });
         }
         break;
+      }
       case 'assistant':
         this.assistant(frame, events);
         break;
@@ -77,11 +120,133 @@ export class ClaudeEventMapper {
     this.inTurn = true;
     this.toolCalls = 0;
     this.assistantError = null;
+    this.lastRequestTokens = null;
     events.push({ type: 'turn_started' });
+  }
+
+  private system(frame: Json, events: AgentEvent[]): void {
+    switch (frame.subtype) {
+      case 'init':
+        this.init(frame, events);
+        return;
+      case 'permission_denied':
+        if (typeof frame.tool_use_id === 'string') this.deniedCalls.add(frame.tool_use_id);
+        return;
+      case 'api_retry':
+        this.apiRetry(frame, events);
+        return;
+      case 'task_started':
+        // Ambient tasks are housekeeping, not activity.
+        if (typeof frame.task_id !== 'string' || frame.skip_transcript === true || frame.ambient === true) return;
+        // A foreground task runs inside the main-thread call that spawned it, already a tool in flight; a second
+        // start would hide that call's repeats from the loop rule (6.8).
+        if (
+          typeof frame.tool_use_id === 'string' &&
+          this.tools.has(frame.tool_use_id) &&
+          frame.is_backgrounded !== true
+        ) {
+          this.foregroundTasks.add(frame.task_id);
+          return;
+        }
+        this.taskStarts(frame.task_id, frame.description, events);
+        return;
+      case 'task_updated':
+        // A foreground task moved to the background: its call returns, and the task goes on by itself.
+        if (
+          typeof frame.task_id === 'string' &&
+          isRecord(frame.patch) &&
+          frame.patch.is_backgrounded === true &&
+          this.foregroundTasks.delete(frame.task_id)
+        ) {
+          this.taskStarts(frame.task_id, frame.patch.description, events);
+        }
+        return;
+      case 'task_notification':
+        if (typeof frame.task_id !== 'string' || typeof frame.status !== 'string') return;
+        this.foregroundTasks.delete(frame.task_id);
+        if (!this.tasks.delete(frame.task_id)) return;
+        events.push({
+          type: 'tool_ended',
+          toolId: `${TASK_TOOL_PREFIX}${frame.task_id}`,
+          ok: frame.status === 'completed',
+          denied: false,
+          terminal: null,
+          hubUnreachable: false,
+        });
+        return;
+      case 'notification':
+        this.notice(frame.text, events);
+        return;
+      case 'informational':
+        this.notice(frame.content, events);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private taskStarts(taskId: string, description: unknown, events: AgentEvent[]): void {
+    this.tasks.add(taskId);
+    events.push({
+      type: 'tool_started',
+      toolId: `${TASK_TOOL_PREFIX}${taskId}`,
+      name: 'Task',
+      input: clip(text(description), CLAUDE_TOOL_INPUT_MAX),
+      command: null,
+    });
+  }
+
+  /**
+   * The CLI's own notices (system/notification mirrors its toast queue, system/informational its banners): the
+   * usage-transition notice says the work draws on paid usage from here on (8.3, 6.10). Other notices are left out.
+   */
+  private notice(value: unknown, events: AgentEvent[]): void {
+    if (typeof value !== 'string' || !isPaidUsageNotice(value)) return;
+    events.push({ type: 'warning', text: value });
+    events.push({ type: 'quota', accountId: this.accountId, quota: this.quota.paidUsageInUse(this.accountId) });
+  }
+
+  /**
+   * A retry is activity, never quota by itself (8.3): with a 429 it repeats the account's last known quota, so the
+   * hub sees how close the limits are, but only a limit hit makes it exhausted.
+   */
+  private apiRetry(frame: Json, events: AgentEvent[]): void {
+    const status = typeof frame.error_status === 'number' ? frame.error_status : null;
+    const error = typeof frame.error === 'string' ? frame.error : 'unknown';
+    const cause = status === null ? `The API request failed (${error})` : `The API answered ${status} (${error})`;
+    const delay = typeof frame.retry_delay_ms === 'number' ? ` in ${Math.round(frame.retry_delay_ms / 1000)} s` : '';
+    const retry = `retry ${number(frame.attempt)} of ${number(frame.max_retries)}`;
+    events.push({ type: 'warning', text: `${cause}; ${retry}${delay}.` });
+    const last = status === 429 ? this.quota.last(this.accountId) : null;
+    if (last === null) return;
+    // Information only: an exhaustion or paid usage the book still holds is not repeated as if the retry found it.
+    const quota: VendorQuota = {
+      ...last,
+      state: last.state === 'exhausted' ? 'unknown' : last.state,
+      paidUsage: last.paidUsage === 'in_use' ? 'unknown' : last.paidUsage,
+    };
+    events.push({ type: 'quota', accountId: this.accountId, quota });
+  }
+
+  /**
+   * The untyped command_lifecycle frames of 2.1.285 ({ command_uuid, state }): a sent message is delivered when it
+   * starts, and a cancelled one will never be acknowledged.
+   */
+  private lifecycle(frame: Json, events: AgentEvent[]): void {
+    if (typeof frame.command_uuid !== 'string') return;
+    const message = this.messages.get(frame.command_uuid);
+    if (message === undefined) return;
+    if (frame.state === 'started' && !message.delivered) {
+      message.delivered = true;
+      events.push({ type: 'delivered', id: message.id });
+    } else if (frame.state === 'cancelled') {
+      this.messages.delete(frame.command_uuid);
+    }
   }
 
   /** system/init comes again for every user message; the first one names the session. */
   private init(frame: Json, events: AgentEvent[]): void {
+    if (typeof frame.model === 'string') this.model = frame.model;
     if (!this.started) {
       this.started = true;
       events.push({
@@ -102,10 +267,18 @@ export class ClaudeEventMapper {
     const message = frame.message;
     if (!isRecord(message) || !Array.isArray(message.content)) return;
     this.assistantError = typeof frame.error === 'string' ? (frame.error as SDKAssistantMessageError) : null;
+    const tokens = promptTokens(message.usage);
+    // A synthetic API-error message made no request.
+    if (tokens > 0) this.lastRequestTokens = tokens;
+    // Only the CLI writes '<synthetic>' messages; the model's own text never counts as a notice.
+    const synthetic = message.model === SYNTHETIC_MODEL;
     for (const block of message.content) {
       if (!isRecord(block)) continue;
       if (block.type === 'text' && typeof block.text === 'string' && block.text !== '') {
         events.push({ type: 'text', text: block.text });
+        if (synthetic && isPaidUsageNotice(block.text)) {
+          events.push({ type: 'quota', accountId: this.accountId, quota: this.quota.paidUsageInUse(this.accountId) });
+        }
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
         this.toolCalls += 1;
         this.tools.set(block.id, block.name);
@@ -168,6 +341,9 @@ export class ClaudeEventMapper {
     }
     this.tools.clear();
     this.deniedCalls.clear();
+    this.acknowledge(frame.user_message_uuids, events);
+    const used = this.contextUsed(frame.modelUsage);
+    if (used !== null) events.push({ type: 'context', used });
     const classified = classifyResult(asResult(frame), {
       interruptPending: this.interruptPending,
       assistantError: this.assistantError,
@@ -176,6 +352,61 @@ export class ClaudeEventMapper {
     this.inTurn = false;
     this.interruptPending = false;
   }
+
+  /** result.user_message_uuids: the messages the turn consumed. One never seen starting was delivered as well. */
+  private acknowledge(uuids: unknown, events: AgentEvent[]): void {
+    if (!Array.isArray(uuids)) return;
+    for (const uuid of uuids) {
+      const message = typeof uuid === 'string' ? this.messages.get(uuid) : undefined;
+      if (message === undefined) continue;
+      this.messages.delete(uuid);
+      if (!message.delivered) events.push({ type: 'delivered', id: message.id });
+      events.push({ type: 'acknowledged', id: message.id });
+    }
+  }
+
+  /**
+   * The context in use (8.3, 6.8): the prompt tokens of the turn's last main-thread request over the session model's
+   * window; null when either is unknown. The result's usage sums every request of the turn, so it would overstate it.
+   */
+  private contextUsed(models: unknown): number | null {
+    if (this.model === null || this.lastRequestTokens === null || !isRecord(models)) return null;
+    const entry = models[this.model];
+    const window = isRecord(entry) ? entry.contextWindow : undefined;
+    if (typeof window !== 'number' || !(window > 0)) return null;
+    return this.lastRequestTokens / window;
+  }
+}
+
+/** The model name of the messages the CLI writes itself, such as API errors and notices. */
+const SYNTHETIC_MODEL = '<synthetic>';
+
+/** A request's prompt tokens: input plus cache creation and cache reads, counting only numbers. */
+function promptTokens(usage: unknown): number {
+  if (!isRecord(usage)) return 0;
+  return ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].reduce(
+    (sum, key) => sum + (typeof usage[key] === 'number' && Number.isFinite(usage[key]) ? (usage[key] as number) : 0),
+    0,
+  );
+}
+
+/**
+ * A rate_limit_event's info with a string status, its other fields kept only in the types sdk.d.ts gives them, so
+ * an unexpected value is unknown rather than an error; null without a status.
+ */
+function rateLimitInfo(value: unknown): SDKRateLimitInfo | null {
+  if (!isRecord(value) || typeof value.status !== 'string') return null;
+  const info: Json = { ...value };
+  for (const key of ['rateLimitType', 'overageStatus', 'overageDisabledReason']) {
+    if (typeof info[key] !== 'string') delete info[key];
+  }
+  for (const key of ['resetsAt', 'utilization', 'overageResetsAt']) {
+    if (typeof info[key] !== 'number' || !Number.isFinite(info[key])) delete info[key];
+  }
+  for (const key of ['isUsingOverage', 'overageInUse']) {
+    if (typeof info[key] !== 'boolean') delete info[key];
+  }
+  return info as unknown as SDKRateLimitInfo;
 }
 
 /** A result frame with the fields classifyResult reads made safe: errors a list, result a string. */
@@ -210,6 +441,10 @@ function resultText(content: unknown): string {
   return content
     .flatMap((block) => (isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? block.text : []))
     .join('\n');
+}
+
+function number(value: unknown): string {
+  return typeof value === 'number' ? String(value) : '?';
 }
 
 function text(value: unknown): string {
