@@ -278,6 +278,55 @@ describe('the detached spawn hook', () => {
   );
 
   test(
+    'signalGroup signals the whole group at once, without the forwarded signal, and nothing once the leader is gone',
+    async () => {
+      const { proc } = launch('group');
+      const grandchild = Number(await watchStdout(proc).firstLine());
+      await proc.signalGroup('SIGTERM');
+      expect(await proc.exited).toEqual({ code: 143, signal: null });
+      await gone(grandchild);
+
+      const orphan = launch('orphan').proc;
+      const heir = Number((await readAll(orphan.stdout)).trim());
+      expect(await orphan.exited).toEqual({ code: 0, signal: null });
+      const before = await processIdentity(heir);
+      await orphan.signalGroup('SIGKILL');
+      expect(await processIdentity(heir)).toEqual(before);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    'stderrRead resolves once stderr is read to its end: the tail then holds all of it',
+    async () => {
+      const { proc } = launch('stderr', { tailLines: 3 });
+      proc.stdout.resume();
+      await proc.exited;
+      await proc.stderrRead;
+      expect(proc.stderrTail()).toBe('last α\nlast β\nlast γ');
+    },
+    TIMEOUT,
+  );
+
+  test(
+    'stderrRead stays pending while an escaped process holds stderr open past the exit',
+    async () => {
+      const { proc } = launch('heir');
+      const heir = Number(await watchStdout(proc).firstLine());
+      expect(await proc.exited).toEqual({ code: 0, signal: null });
+      let read = false;
+      void proc.stderrRead.then(() => {
+        read = true;
+      });
+      await Bun.sleep(200);
+      expect(read).toBe(false);
+      process.kill(heir, 'SIGKILL');
+      await proc.stderrRead;
+    },
+    TIMEOUT,
+  );
+
+  test(
     "the returned object is the SDK's SpawnedProcess: stdin to EOF, stdout, exit events and exitCode",
     async () => {
       const { proc } = launch('echo');

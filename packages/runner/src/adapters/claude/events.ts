@@ -82,6 +82,32 @@ export class ClaudeEventMapper {
     if (this.inTurn || options.starting === true || waiting) this.interruptPending = true;
   }
 
+  /** Whether a turn runs: a frame of it came, and its result has not. */
+  get turnRunning(): boolean {
+    return this.inTurn;
+  }
+
+  /**
+   * The process ended without a result for the running turn (a crash, a kill): the turn ends failed with this error,
+   * and the calls and sub-agent tasks in flight end with it. Only the tasks while idle.
+   */
+  ended(error: string): AgentEvent[] {
+    const events: AgentEvent[] = [];
+    const end = (toolId: string) =>
+      events.push({ type: 'tool_ended', toolId, ok: false, denied: false, terminal: null, hubUnreachable: false });
+    for (const id of this.tools.keys()) end(id);
+    for (const id of this.tasks) end(`${TASK_TOOL_PREFIX}${id}`);
+    this.tools.clear();
+    this.tasks.clear();
+    this.deniedCalls.clear();
+    if (this.inTurn) {
+      events.push({ type: 'turn_ended', outcome: 'failed', toolCalls: this.toolCalls, error, errorKind: null });
+      this.inTurn = false;
+      this.interruptPending = false;
+    }
+    return events;
+  }
+
   /** The events one frame gives; none for a frame of an unknown type or shape. */
   map(frame: unknown): AgentEvent[] {
     if (!isRecord(frame)) return [];

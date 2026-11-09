@@ -416,3 +416,42 @@ describe('ClaudeEventMapper: text and what it ignores', () => {
     expect(mapAll(fresh, junk.slice(0, 10))).toEqual([]);
   });
 });
+
+describe('ClaudeEventMapper.ended', () => {
+  test('a turn the process left running ends failed with the error, its calls and tasks with it', () => {
+    const mapper = new ClaudeEventMapper();
+    expect(mapper.turnRunning).toBe(false);
+    mapAll(mapper, [
+      init(),
+      assistant([toolUse('toolu_1', 'Bash', { command: 'make' }), toolUse('toolu_2', 'Read')]),
+      toolResult('toolu_2', 'text'),
+      { type: 'system', subtype: 'task_started', task_id: 'task-1', description: 'Explore' },
+    ]);
+    expect(mapper.turnRunning).toBe(true);
+    mapper.interruptRequested();
+    expect(mapper.ended('panic\nclaude exited with code 3')).toEqual([
+      ended('toolu_1', { ok: false }),
+      ended('task:task-1', { ok: false }),
+      {
+        type: 'turn_ended',
+        outcome: 'failed',
+        toolCalls: 2,
+        error: 'panic\nclaude exited with code 3',
+        errorKind: null,
+      },
+    ]);
+    expect(mapper.turnRunning).toBe(false);
+    expect(mapper.ended('again')).toEqual([]);
+  });
+
+  test('while idle only the sub-agent tasks in flight end', () => {
+    const mapper = new ClaudeEventMapper();
+    mapAll(mapper, [
+      init(),
+      { type: 'system', subtype: 'task_started', task_id: 'task-1', description: 'Watch' },
+      result(),
+    ]);
+    expect(mapper.turnRunning).toBe(false);
+    expect(mapper.ended('claude exited with code 0')).toEqual([ended('task:task-1', { ok: false })]);
+  });
+});

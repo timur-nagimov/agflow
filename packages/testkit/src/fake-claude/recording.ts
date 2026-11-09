@@ -34,6 +34,8 @@ export type RecordingStep =
   | { sleep: number }
   /** Sends hook_callback for the callback the SDK registered for the event, and logs the SDK's answer. */
   | { hook: { event: string; input: Record<string, unknown>; toolUseId?: string } }
+  /** Writes this text to stderr, as a crashing CLI does before it exits. */
+  | { stderr: string }
   /** Exits with this code. */
   | { exit: number }
   /** From here to the end of the turn, stdin EOF does not end the process. */
@@ -119,7 +121,17 @@ export function claudeRecording(input: ClaudeRecordingInput): ClaudeRecording {
   };
 }
 
-const DIRECTIVES = ['$recording', '$answer', '$turn', '$wait', '$sleep', '$hook', '$exit', '$ignoreEof'] as const;
+const DIRECTIVES = [
+  '$recording',
+  '$answer',
+  '$turn',
+  '$wait',
+  '$sleep',
+  '$hook',
+  '$stderr',
+  '$exit',
+  '$ignoreEof',
+] as const;
 
 /** The JSONL form: the header, the answers, the startup steps, then each turn after a $turn line. */
 export function serializeRecording(recording: ClaudeRecording): string {
@@ -139,6 +151,7 @@ function stepLine(step: RecordingStep): unknown {
   if ('wait' in step) return { $wait: step.wait };
   if ('sleep' in step) return { $sleep: step.sleep };
   if ('hook' in step) return { $hook: step.hook };
+  if ('stderr' in step) return { $stderr: step.stderr };
   if ('exit' in step) return { $exit: step.exit };
   return { $ignoreEof: true };
 }
@@ -189,6 +202,9 @@ export function parseRecording(text: string, name = 'recording'): ClaudeRecordin
         return;
       case '$hook':
         current.push({ hook: value as { event: string; input: Record<string, unknown>; toolUseId?: string } });
+        return;
+      case '$stderr':
+        current.push({ stderr: String(value) });
         return;
       case '$exit':
         current.push({ exit: Number(value) });

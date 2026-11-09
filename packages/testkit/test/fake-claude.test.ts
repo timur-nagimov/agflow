@@ -338,6 +338,12 @@ describe('fake-claude', () => {
         command_uuid: 'user-1',
         state: 'cancelled',
       });
+      // As 2.1.285 ends every turn; the SDK ends its run on it.
+      expect(await proc.next((f) => f.type === 'system')).toMatchObject({
+        subtype: 'session_state_changed',
+        state: 'idle',
+        session_id: SESSION,
+      });
       const log = await readFakeClaudeLog(proc.log);
       const interrupt = log.find((entry) => entry.kind === 'control' && entry.request.subtype === 'interrupt');
       expect(interrupt).toMatchObject({ request: { subtype: 'interrupt', cancel_queued: true } });
@@ -427,11 +433,12 @@ describe('fake-claude', () => {
       await initialize(idle);
       expect(await idle.end()).toBe(0);
 
-      const exiting = start(claudeRecording({ turns: [[say('bye'), { exit: 3 }]] }));
+      const exiting = start(claudeRecording({ turns: [[say('bye'), { stderr: 'panic: lost\n' }, { exit: 3 }]] }));
       await initialize(exiting);
       exiting.user('go', 'user-1');
       expect(await exiting.proc.exited).toBe(3);
       expect(exiting.frames.some((f) => f.type === 'assistant')).toBe(true);
+      expect(await new Response(exiting.proc.stderr).text()).toBe('panic: lost\n');
 
       const term = start(claudeRecording({ turns: [] }));
       await initialize(term);
@@ -526,7 +533,7 @@ describe('Claude recordings', () => {
   test('claudeRecording builds one from frames, and it survives the JSONL form', () => {
     const recording = claudeRecording({
       startup: [frame({ type: 'system', subtype: 'hook_started' })],
-      turns: [[init, { wait: 'user' }, { sleep: 5 }, { ignoreEof: true }, { exit: 2 }], [result()]],
+      turns: [[init, { wait: 'user' }, { sleep: 5 }, { ignoreEof: true }, { stderr: 'x' }, { exit: 2 }], [result()]],
       header: { scenario: 'round-trip' },
     });
     expect(recording.header).toEqual({

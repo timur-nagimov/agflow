@@ -231,6 +231,9 @@ class FakeClaude {
         await this.until<void>(signal, (wake) => setTimeout(wake, step.sleep));
       } else if ('hook' in step) {
         await this.fireHook(step.hook, signal);
+      } else if ('stderr' in step) {
+        const text = step.stderr;
+        await new Promise<void>((resolve) => process.stderr.write(text, () => resolve()));
       } else if ('exit' in step) {
         await this.exit(step.exit);
       } else {
@@ -291,6 +294,15 @@ class FakeClaude {
         session_id: this.session,
       });
     }
+    // The SDK ends a run on idle after a result; without it, closing the input would wait for a run that never ends.
+    this.write({
+      type: 'system',
+      subtype: 'session_state_changed',
+      state: 'idle',
+      sdk_host_only: true,
+      uuid: randomUUID(),
+      session_id: this.session,
+    });
   }
 
   private endFrame(subtype: string, error: string | null): Json {

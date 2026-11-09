@@ -2,8 +2,8 @@
 // ChildProcess, with detached set, so each claude leads its own session and process group, and piped stdio. The SDK
 // alone reads stdout; stderr is drained into the attempt's log up to a bound, and its last lines stay in memory for
 // error classification. The process is registered before the hook returns, so before the SDK reads any output.
-// Whichever way the SDK ends the process (its forwarded abort, or kill() after close()'s stdin-EOF grace), the
-// signal reaches the whole group, so a tool the claude started ends with it (7.4).
+// Whichever way the process is ended (the SDK's forwarded abort, its kill() after close()'s stdin-EOF grace, or the
+// session's own signalGroup), the signal reaches the whole group, so a tool the claude started ends with it (7.4).
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import type { SpawnedProcess, SpawnOptions } from '@anthropic-ai/claude-agent-sdk';
@@ -25,8 +25,15 @@ export interface SpawnedClaude extends SpawnedProcess {
   readonly pid: number | undefined;
   /** The last stderr lines, joined with newlines; an unfinished last line included. */
   stderrTail(): string;
+  /** Resolves once stderr is read to its end, so stderrTail() holds all of it; a child may hold it open. */
+  readonly stderrRead: Promise<void>;
   /** Resolves when the process exits, or with nulls when it never started; inherited pipes never hold it. */
   readonly exited: Promise<ExitInfo>;
+  /**
+   * Signals the whole process group now, once the leader is still the process that was spawned; nothing after it
+   * exited. close() alone would wait out its stdin-EOF grace and then signal the leader only.
+   */
+  signalGroup(signal: NodeJS.Signals): Promise<void>;
 }
 
 export interface DetachedSpawnInput {
@@ -71,14 +78,15 @@ export function createDetachedSpawn(input: DetachedSpawnInput): (options: SpawnO
     const identity: Promise<ProcessIdentity | null> =
       child.pid === undefined ? Promise.resolve(null) : processIdentity(child.pid).catch(() => null);
     let ended = false;
-    const abort = () => {
-      void (async () => {
+    const signalGroup = async (name: NodeJS.Signals): Promise<void> => {
+      try {
         const leader = await identity;
-        if (!ended && leader) await killGroup(leader, 'SIGTERM');
-      })().catch(() => {
+        if (!ended && leader) await killGroup(leader, name);
+      } catch {
         // A failed ps or kill leaves the stop ladder's later steps to end the group.
-      });
+      }
     };
+    const abort = () => void signalGroup('SIGTERM');
     const exited = new Promise<ExitInfo>((resolve) => {
       const finish = (code: number | null, signal: NodeJS.Signals | null) => {
         ended = true;
@@ -93,10 +101,13 @@ export function createDetachedSpawn(input: DetachedSpawnInput): (options: SpawnO
     });
 
     const tail = new StderrTail(tailLines, tailChars);
+    const stderrRead = Promise.withResolvers<void>();
     const leaderKill = child.kill.bind(child);
     const proc = Object.assign(child, {
       exited,
       stderrTail: () => tail.text(),
+      stderrRead: stderrRead.promise,
+      signalGroup,
       // close() ends stdin and, after its grace, calls kill('SIGTERM'), which would reach the leader alone. While the
       // leader is not reaped, its pid and so its group id cannot have been reused, which is 7.4's identity check.
       kill: (signal: NodeJS.Signals | number = 'SIGTERM'): boolean => {
@@ -118,11 +129,15 @@ export function createDetachedSpawn(input: DetachedSpawnInput): (options: SpawnO
       if (child.pid !== undefined) input.registerProcess(child.pid);
       // The log gets the bytes as they came; the tail decodes them, characters split across chunks included.
       const stderr = (async function* () {
-        for await (const chunk of child.stderr) {
-          tail.add(chunk as Buffer);
-          yield chunk as Buffer;
+        try {
+          for await (const chunk of child.stderr) {
+            tail.add(chunk as Buffer);
+            yield chunk as Buffer;
+          }
+          tail.end();
+        } finally {
+          stderrRead.resolve();
         }
-        tail.end();
       })();
       void drainToLog(stderr, input.logFile, { maxBytes: maxLogBytes }).catch(async () => {
         // Without a log the pipe is still read to its end, so the child never blocks and Bun buffers nothing.
