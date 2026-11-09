@@ -12,7 +12,7 @@ import { findAttempt, listAttempts, unpushedHead } from './attempt-store';
 import type { HubContext } from './context';
 import { listEvents } from './events';
 import { currentGoalVersion, getCurrentGoal } from './goal';
-import { holdsSeat } from './hub-state';
+import { type LeadNoteRow, holdsSeat, leadNoteFromRow } from './hub-state';
 import { listStandingRules, unreadFor } from './messages';
 import { getProject } from './project';
 import { findTask, listTaskNotes, listTasks } from './task-store';
@@ -201,23 +201,10 @@ function handoffSection(ctx: HubContext, attempt: Attempt): string {
 
 /** The newest lead handoff (POST /api/lead/handoff, or one the hub assembled), or null. */
 export function newestLeadHandoff(ctx: HubContext): LeadNote | null {
-  const row = ctx.db.query("SELECT * FROM lead_notes WHERE kind = 'handoff' ORDER BY id DESC LIMIT 1").get() as {
-    id: number;
-    attempt_id: string | null;
-    kind: LeadNote['kind'];
-    body: string;
-    author: string;
-    created_at: number;
-  } | null;
-  if (!row) return null;
-  return {
-    id: row.id,
-    attemptId: row.attempt_id,
-    kind: row.kind,
-    body: row.body,
-    author: row.author,
-    createdAt: row.created_at,
-  };
+  const row = ctx.db
+    .query("SELECT * FROM lead_notes WHERE kind = 'handoff' ORDER BY id DESC LIMIT 1")
+    .get() as LeadNoteRow | null;
+  return row ? leadNoteFromRow(row) : null;
 }
 
 function leadHandoffSection(ctx: HubContext): string | null {

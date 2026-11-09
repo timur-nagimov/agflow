@@ -164,6 +164,28 @@ export function emptySeat(ctx: HubContext, emit: Emit, actor: string, holderId?:
   return true;
 }
 
+/** A lead_notes row as stored. */
+export interface LeadNoteRow {
+  id: number;
+  attempt_id: string | null;
+  kind: LeadNote['kind'];
+  body: string;
+  author: string;
+  created_at: number;
+}
+
+/** A lead_notes row as the API answers it. */
+export function leadNoteFromRow(row: LeadNoteRow): LeadNote {
+  return {
+    id: row.id,
+    attemptId: row.attempt_id,
+    kind: row.kind,
+    body: row.body,
+    author: row.author,
+    createdAt: row.created_at,
+  };
+}
+
 /**
  * Stores a lead note (design 6.11): a lead handoff, or a successor lead's restatement, kept as written. It is agent
  * text, so every reader quotes it.

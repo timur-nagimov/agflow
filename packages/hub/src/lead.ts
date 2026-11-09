@@ -3,9 +3,12 @@
 // also sends the periodic review and rotates a lead that is due. The seat itself is hub-state.ts's; the lead handoff a
 // successor starts from is assembled at the ending (handoff.ts).
 import {
+  type Agent,
   type Attempt,
   type AttemptEndReason,
+  type LeadNote,
   type Message,
+  type Project,
   type RunnerState,
   type TaskStatus,
   placeLead,
@@ -15,10 +18,20 @@ import { endAttempt, requestStop, resumeAttempt, startRunnerAttempt } from './at
 import type { CommandRow } from './commands';
 import { type HubContext, tx } from './context';
 import { countWakeup, injectedMessage, leadReport } from './delivery';
-import { getHubState, leadSeat, seatHolderId, updateHubState } from './hub-state';
+import { forbidden } from './errors';
+import {
+  type LeadNoteRow,
+  getHubState,
+  holdsSeat,
+  insertLeadNote,
+  leadNoteFromRow,
+  leadSeat,
+  seatHolderId,
+  updateHubState,
+} from './hub-state';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
-import { getProject } from './project';
+import { getProject, storeRunnerLeads } from './project';
 import { findRunnerRow } from './runners';
 import { listTasks } from './task-store';
 
@@ -185,15 +198,15 @@ function rotationDue(ctx: HubContext, attempt: Attempt): string | null {
 /**
  * Asks the runner lead to write a lead handoff and stops it as rotation, in the caller's transaction or its own: it
  * ends rotated on exit, the seat empties, and the next tick starts a fresh lead, preferring the same runner, from that
- * handoff (design 6.11, Rotation). The stop is the hub's, its text hub text: one clause, which the runner's handoff
- * prompt quotes, adding only what the runner cannot know, that this is a lead handoff. lead.rotated names the actor
- * whose rule or setting asked for it. Only a running lead with no stop recorded is rotated; a lead in another state
- * is left for a later tick. Whether it was asked.
+ * handoff (design 6.11, Rotation). One with no process ends rotated at once, and the hub assembles its lead handoff.
+ * The stop is the hub's, its text hub text: one clause, which the runner's handoff prompt quotes, adding only what the
+ * runner cannot know, that this is a lead handoff. lead.rotated names the actor whose rule or setting asked for it. A
+ * lead with a stop recorded is ending already and is left alone. Whether it was asked.
  */
-export function rotateLead(ctx: HubContext, attempt: Attempt, why: string, actor: string): boolean {
+function rotateLead(ctx: HubContext, attempt: Attempt, why: string, actor: string): boolean {
   return tx(ctx, (emit) => {
     const current = getAttempt(ctx, attempt.id);
-    if (current.role !== 'lead' || current.status !== 'running' || current.stopRequested !== null) return false;
+    if (current.role !== 'lead' || current.status === 'ended' || current.stopRequested !== null) return false;
     const reason =
       `the lead rotates ${why}; write your lead handoff with write_handoff and no task id, since a fresh lead starts ` +
       'from it';
@@ -207,17 +220,65 @@ export function rotateLead(ctx: HubContext, attempt: Attempt, why: string, actor
   });
 }
 
+/** The attempt of the runner lead holding the seat, or null when the seat is empty or a live lead holds it. */
+function seatedRunnerLead(ctx: HubContext): Attempt | null {
+  const seat = leadSeat(ctx);
+  return seat.kind === 'runner' && seat.attemptId !== null ? getAttempt(ctx, seat.attemptId) : null;
+}
+
 /**
  * Rotates the runner lead holding the seat once it is due (design 6.11, Rotation): after leadRotateWakeups wake-ups,
- * or when its contextUsed passes 0.7. While the project is paused, rotation waits for the unpause: step 2 could not
- * start the next lead, and the seat would stay empty. Part of the tick's reconcile step. Returns the attempt asked, or
- * null.
+ * or when its contextUsed passes 0.7. Only a running lead is: one starting, waiting for quota or holding is rotated
+ * on a later tick, once it runs. While the project is paused, rotation waits for the unpause: step 2 could not start
+ * the next lead, and the seat would stay empty. Part of the tick's reconcile step. Returns the attempt asked, or null.
  */
 export function rotateLeadIfDue(ctx: HubContext): string | null {
   if (getProject(ctx).paused) return null;
-  const seat = leadSeat(ctx);
-  if (seat.kind !== 'runner' || seat.attemptId === null) return null;
-  const attempt = getAttempt(ctx, seat.attemptId);
+  const attempt = seatedRunnerLead(ctx);
+  if (attempt === null || attempt.status !== 'running') return null;
   const why = rotationDue(ctx, attempt);
   return why !== null && rotateLead(ctx, attempt, why, 'system') ? attempt.id : null;
+}
+
+// ---------------------------------------------------------------------------
+// Lead notes and the runner-leads switch (design 6.11, 6.16)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/lead/handoff: the seat holder's lead handoff for the lead after it, stored as written in lead_notes. A
+ * runner lead's carries its attempt id, so its ending finds it written; a live lead's has none.
+ */
+export function writeLeadHandoff(ctx: HubContext, agent: Agent, note: string): void {
+  tx(ctx, () => {
+    if (!holdsSeat(ctx, agent.id)) throw forbidden('only the lead writes a lead handoff');
+    const attemptId = agent.origin === 'runner' ? agent.attemptId : null;
+    insertLeadNote(ctx, { attemptId, kind: 'handoff', body: note, author: `agent:${agent.id}` });
+  });
+}
+
+/** How many lead notes GET /api/lead/notes answers: the newest; older ones only repeat what these build on. */
+const LEAD_NOTES_LIMIT = 20;
+
+/** GET /api/lead/notes: the newest lead notes, handoffs and restatements, newest first. Their bodies are agent text. */
+export function listLeadNotes(ctx: HubContext): LeadNote[] {
+  const rows = ctx.db
+    .query('SELECT * FROM lead_notes ORDER BY id DESC LIMIT $limit')
+    .all({ limit: LEAD_NOTES_LIMIT }) as LeadNoteRow[];
+  return rows.map(leadNoteFromRow);
+}
+
+/**
+ * PATCH /api/project { runnerLeads } (design 6.11, Runner leads off): may the scheduler start leads on runners.
+ * Turning them off rotates the runner lead holding the seat out, with a lead handoff, so a person's live lead can take
+ * the seat once it has ended; turning them on lets the next tick start one when the seat is empty. Returns the
+ * project.
+ */
+export function setRunnerLeads(ctx: HubContext, runnerLeads: boolean, actor: string): Project {
+  return tx(ctx, () => {
+    if (storeRunnerLeads(ctx, runnerLeads) && !runnerLeads) {
+      const lead = seatedRunnerLead(ctx);
+      if (lead) rotateLead(ctx, lead, 'because people turned runner leads off', actor);
+    }
+    return getProject(ctx);
+  });
 }

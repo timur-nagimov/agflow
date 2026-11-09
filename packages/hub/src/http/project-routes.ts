@@ -3,6 +3,7 @@ import {
   GoalNoteInputSchema,
   type HubStatus,
   PauseInputSchema,
+  ProjectPatchInputSchema,
   UpdateGoalInputSchema,
   diffGoal,
 } from '@agflow/core';
@@ -19,6 +20,7 @@ import {
   updateGoal,
 } from '../goal';
 import { hubEpoch, leadSeat } from '../hub-state';
+import { setRunnerLeads } from '../lead';
 import { listMessages } from '../messages';
 import { getProject, setPaused } from '../project';
 import { listTasks } from '../task-store';
@@ -29,6 +31,13 @@ export function mountProjectRoutes(app: App, ctx: HubContext): void {
   app.get('/api/project', (c) => {
     principal(c);
     return c.json(getProject(ctx));
+  });
+
+  // Runner leads off rotates the runner lead out, so a person's live lead can take the seat (design 6.11).
+  app.patch('/api/project', async (c) => {
+    const p = human(c);
+    const { runnerLeads } = await readBody(c, ProjectPatchInputSchema);
+    return c.json(setRunnerLeads(ctx, runnerLeads, actor(p)));
   });
 
   app.post('/api/project/pause', async (c) => {

@@ -21,6 +21,13 @@ export function setPaused(ctx: HubContext, paused: boolean, actor: string): Proj
   });
 }
 
+/** Sets project.runner_leads (design 6.11, Runner leads off), in the caller's transaction. Whether it changed. */
+export function storeRunnerLeads(ctx: HubContext, runnerLeads: boolean): boolean {
+  if (getProject(ctx).runnerLeads === runnerLeads) return false;
+  ctx.db.query('UPDATE project SET runner_leads = $on WHERE id = 1').run({ on: runnerLeads ? 1 : 0 });
+  return true;
+}
+
 /** What request_agents sets (design 6.6): the worker target, and a vendor the scheduler prefers for a while. */
 export interface Staffing {
   /** project.worker_target; null leaves the scheduler at maxWorkers. */
