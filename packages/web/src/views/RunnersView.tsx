@@ -1,21 +1,29 @@
 import type { AccountQuota, Runner, RunnerVendor } from '@agflow/core';
-import { Empty, ErrorBox, Fact, Loading, Meter, PageHead } from '../components';
-import { useNow } from '../hooks';
+import { type FormEvent, useState } from 'react';
+import { api } from '../api';
+import { Empty, ErrorBox, Fact, Field, Loading, Meter, PageHead } from '../components';
+import { VENDOR_NAMES } from '../format';
+import { useAction, useNow } from '../hooks';
 import { useHub } from '../hub';
 import {
   KEEP_AWAKE_LABELS,
   type QuotaMeter,
   RUNNER_STATE_LABELS,
+  type SettingsDraft,
   acceptingText,
   accountOf,
   diskText,
+  draftFromRunner,
   gitText,
+  isOwner,
   paidUsageText,
   powerText,
   profileLines,
   quotaMeters,
   runnerTone,
   runnerWhy,
+  settingsPatch,
+  settingsProblem,
   slotsText,
   sortRunners,
   vendorView,
@@ -41,7 +49,14 @@ export function RunnersView() {
       ) : (
         <div className="runner-grid">
           {list.map((runner) => (
-            <RunnerCard key={runner.id} runner={runner} accounts={accounts} now={now} />
+            <RunnerCard
+              key={runner.id}
+              runner={runner}
+              accounts={accounts}
+              owner={isOwner(runner, me)}
+              onChanged={runners.reload}
+              now={now}
+            />
           ))}
         </div>
       )}
@@ -53,7 +68,20 @@ export function RunnersView() {
   );
 }
 
-function RunnerCard({ runner, accounts, now }: { runner: Runner; accounts: AccountQuota[]; now: number }) {
+function RunnerCard({
+  runner,
+  accounts,
+  owner,
+  onChanged,
+  now,
+}: {
+  runner: Runner;
+  accounts: AccountQuota[];
+  /** Only the owner changes the settings or retires the runner; the hub checks too. */
+  owner: boolean;
+  onChanged: () => void;
+  now: number;
+}) {
   const tone = runnerTone(runner);
   const why = runnerWhy(runner, now);
   const accepting = acceptingText(runner, now);
@@ -85,6 +113,7 @@ function RunnerCard({ runner, accounts, now }: { runner: Runner; accounts: Accou
       {runner.vendors.map((vendor) => (
         <VendorPanel key={vendor.vendor} runner={runner} vendor={vendor} accounts={accounts} now={now} />
       ))}
+      {owner ? <OwnerControls runner={runner} onChanged={onChanged} /> : null}
     </article>
   );
 }
@@ -140,5 +169,176 @@ function VendorPanel({
       </p>
       <p className="vendor-meta">{paidUsageText(vendor, account, now)}</p>
     </section>
+  );
+}
+
+/** The owner's controls: the settings form, drain or undrain, and retire, each asking the hub (design 6.16). */
+function OwnerControls({ runner, onChanged }: { runner: Runner; onChanged: () => void }) {
+  const [open, setOpen] = useState<'settings' | 'retire' | null>(null);
+  const action = useAction();
+  const drain = async () => {
+    if ((await action.run(() => api.updateRunner(runner.id, { draining: !runner.draining }))).ok) onChanged();
+  };
+  const toggle = (form: 'settings' | 'retire') => {
+    action.clearError();
+    setOpen(open === form ? null : form);
+  };
+  return (
+    <footer className="runner-actions">
+      <div className="actions">
+        <button aria-expanded={open === 'settings'} onClick={() => toggle('settings')}>
+          Settings
+        </button>
+        <button disabled={action.busy} onClick={() => void drain()}>
+          {runner.draining ? 'Undrain' : 'Drain'}
+        </button>
+        <button className="danger" aria-expanded={open === 'retire'} onClick={() => toggle('retire')}>
+          Retire
+        </button>
+      </div>
+      {action.error ? <p className="error">{action.error}</p> : null}
+      {open === 'settings' ? (
+        <SettingsForm
+          runner={runner}
+          onDone={(saved) => {
+            setOpen(null);
+            if (saved) onChanged();
+          }}
+        />
+      ) : null}
+      {open === 'retire' ? <RetireConfirm runner={runner} onKeep={() => setOpen(null)} onRetired={onChanged} /> : null}
+    </footer>
+  );
+}
+
+const PAID_USAGE_WARNING =
+  "Paid usage spends money: past the plan's limits, agents on this runner keep working on usage billed to the account";
+
+function SettingsForm({ runner, onDone }: { runner: Runner; onDone: (saved: boolean) => void }) {
+  // The settings as the form opened; only what the person changes is sent, whatever reloads meanwhile.
+  const [base] = useState(runner);
+  const [draft, setDraft] = useState<SettingsDraft>(() => draftFromRunner(runner));
+  const action = useAction();
+  const problem = settingsProblem(draft);
+  const patch = problem === null ? settingsPatch(base, draft) : null;
+  const vendorField = (index: number, change: Partial<SettingsDraft['vendors'][number]>) =>
+    setDraft({
+      ...draft,
+      vendors: draft.vendors.map((entry, at) => (at === index ? { ...entry, ...change } : entry)),
+    });
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!patch || action.busy) return;
+    if ((await action.run(() => api.updateRunner(runner.id, patch))).ok) onDone(true);
+  };
+
+  return (
+    <form className="runner-settings" onSubmit={save} noValidate>
+      <div className="form-grid">
+        <Field label="Capacity" note="agents at once, 1 to 16">
+          <input
+            type="number"
+            min={1}
+            max={16}
+            step={1}
+            value={draft.capacity}
+            onChange={(event) => setDraft({ ...draft, capacity: event.target.value })}
+          />
+        </Field>
+        <Field label="Keep-awake">
+          <select
+            value={draft.keepAwake}
+            onChange={(event) => setDraft({ ...draft, keepAwake: event.target.value as SettingsDraft['keepAwake'] })}
+          >
+            {Object.entries(KEEP_AWAKE_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={draft.draining}
+          onChange={(event) => setDraft({ ...draft, draining: event.target.checked })}
+        />
+        Draining: it finishes its work but starts nothing new
+      </label>
+      {draft.vendors.map((entry, index) => (
+        <fieldset key={entry.vendor} className="vendor-settings">
+          <legend>{VENDOR_NAMES[entry.vendor]}</legend>
+          <div className="form-grid">
+            <Field label="5-hour ceiling" note="%">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={entry.fiveHour}
+                onChange={(event) => vendorField(index, { fiveHour: event.target.value })}
+              />
+            </Field>
+            <Field label="Weekly ceiling" note="%">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={entry.weekly}
+                onChange={(event) => vendorField(index, { weekly: event.target.value })}
+              />
+            </Field>
+          </div>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={entry.allowPaidUsage}
+              onChange={(event) => vendorField(index, { allowPaidUsage: event.target.checked })}
+            />
+            Allow paid usage
+          </label>
+          {entry.allowPaidUsage ? <p className="warn-text">{PAID_USAGE_WARNING}</p> : null}
+        </fieldset>
+      ))}
+      <p className="hint">
+        Above a ceiling, the vendor gets no new attempts on this runner, and the rest of the account stays for the
+        owner. A ceiling of 0% keeps the vendor off this runner.
+      </p>
+      {problem ? <p className="error">{problem}</p> : null}
+      <div className="row">
+        <button className="primary" disabled={patch === null || action.busy}>
+          Save settings
+        </button>
+        <button type="button" onClick={() => onDone(false)}>
+          Never mind
+        </button>
+      </div>
+      {action.error ? <p className="error">{action.error}</p> : null}
+    </form>
+  );
+}
+
+/** Retiring is for good, so it says what happens first (design 6.16's DELETE /api/runners/:id). */
+function RetireConfirm({ runner, onKeep, onRetired }: { runner: Runner; onKeep: () => void; onRetired: () => void }) {
+  const action = useAction();
+  const retire = async () => {
+    if ((await action.run(() => api.retireRunner(runner.id))).ok) onRetired();
+  };
+  return (
+    <div className="retire-confirm" role="group" aria-label={`Retire ${runner.id}`}>
+      <p>
+        Retiring {runner.id} removes it from this hub for good. Its open attempts end lost: the tasks they held go back
+        to ready, and submitted tasks keep their status. To use this laptop again, run <code>agflow runner setup</code>{' '}
+        on it.
+      </p>
+      <div className="row">
+        <button className="danger solid" disabled={action.busy} onClick={() => void retire()}>
+          Retire {runner.id}
+        </button>
+        <button onClick={onKeep}>Keep it</button>
+      </div>
+      {action.error ? <p className="error">{action.error}</p> : null}
+    </div>
   );
 }

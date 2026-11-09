@@ -313,7 +313,44 @@ async function main(): Promise<void> {
       const line = (await claude.locator('.quota-line').textContent()) ?? '';
       if (!line.startsWith('Resets at') || !line.includes(reset)) throw new Error(`the quota line: ${line}`);
     });
+    await check('only the owner sees Settings, Drain and Retire: R-1 and R-3 show them, R-2 does not', async () => {
+      for (const [id, expected] of [
+        ['R-1', ['Settings', 'Drain', 'Retire']],
+        ['R-2', []],
+        ['R-3', ['Settings', 'Drain', 'Retire']],
+      ] as const) {
+        const buttons = await card(id).locator('.runner-actions .actions button').allTextContents();
+        if (buttons.join(',') !== expected.join(',')) throw new Error(`${id} shows ${buttons.join(', ') || 'no controls'}`);
+      }
+    });
+    await check("the owner raises R-1's capacity from 3 to 4, and the card shows 4", async () => {
+      await card('R-1').locator('button:text-is("Settings")').click();
+      const capacity = card('R-1').locator('.runner-settings input[type=number] >> nth=0');
+      if ((await capacity.inputValue()) !== '3') throw new Error(`the form says ${await capacity.inputValue()}`);
+      await capacity.fill('4');
+      await card('R-1').locator('button:text-is("Save settings")').click();
+      await card('R-1').locator('.runner-settings').waitFor({ state: 'detached' });
+      await card('R-1').locator('.fact', { hasText: /\d of 4 slots free/ }).waitFor();
+    });
+    await check('Drain marks R-1 draining, and Undrain clears it', async () => {
+      await card('R-1').locator('button:text-is("Drain")').click();
+      await card('R-1').locator('.runner-why', { hasText: 'Draining' }).waitFor();
+      await card('R-1').locator('button:text-is("Undrain")').click();
+      await card('R-1').locator('button:text-is("Drain")').waitFor();
+      await card('R-1').locator('.runner-why', { hasText: 'Draining' }).waitFor({ state: 'detached' });
+    });
     await shot(page, 'runners');
+    await check('retiring the offline R-3 asks first, then its card goes', async () => {
+      await card('R-3').locator('button:text-is("Retire")').click();
+      const confirm = card('R-3').locator('.retire-confirm');
+      const text = (await confirm.textContent()) ?? '';
+      for (const part of ['end lost', 'back to ready', 'submitted tasks keep their status']) {
+        if (!text.includes(part)) throw new Error(`the question lacks "${part}": ${text}`);
+      }
+      await confirm.locator('button:text-is("Retire R-3")').click();
+      await waitForCount(page.locator('.runner-card'), 2);
+      await page.locator('.strip .readout', { hasText: /^Runners\s*1\/2\s*online$/ }).waitFor();
+    });
 
     await open(page, '#/timeline', '.log');
     await check('live events arrive without reloading', () => page.locator('.log-row.fresh').first().waitFor({ timeout: 12_000 }));

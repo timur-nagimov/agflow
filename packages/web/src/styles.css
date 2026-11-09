@@ -557,6 +557,20 @@ tr.agent-gone td { color: var(--ink-3); }
 .vendor-note.warn-text { color: var(--active); }
 .quota-line { margin: 0; display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
 
+/* The owner's controls at the foot of a runner card. */
+.runner-actions { display: grid; gap: 12px; padding-top: 12px; border-top: 1px solid var(--rule); }
+.runner-actions .error { margin: 0; }
+.runner-settings { display: grid; gap: 14px; }
+.vendor-settings { margin: 0; padding: 10px 12px 12px; border: 1px solid var(--rule); border-radius: 4px; display: grid; gap: 10px; min-width: 0; }
+.vendor-settings legend { padding: 0 6px; font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.vendor-settings .warn-text,
+.runner-settings .hint,
+.runner-settings .error { margin: 0; font-size: 12.5px; }
+.runner-settings .row,
+.retire-confirm .row { margin-top: 0; }
+.retire-confirm { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--trouble) 45%, var(--rule)); border-radius: 4px; }
+.retire-confirm p { margin: 0; font-size: 13px; }
+
 /* A quota bar with its ceiling mark. */
 .meters { display: grid; gap: 10px; }
 .meter { display: grid; gap: 4px; }

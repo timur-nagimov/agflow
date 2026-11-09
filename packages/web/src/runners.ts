@@ -12,7 +12,7 @@ import {
   utilization,
   type Vendor,
 } from '@agflow/core';
-import type { Me } from './api';
+import type { Me, RunnerPatch } from './api';
 import { ago, percent, type Tone, untilText, VENDOR_NAMES } from './format';
 
 // ---------------------------------------------------------------------------
@@ -304,6 +304,102 @@ export function paidUsageText(
         ? 'Paid usage unknown; this runner may draw on it'
         : 'Paid usage unknown; this runner never draws on it';
   }
+}
+
+// ---------------------------------------------------------------------------
+// Owner settings (design 6.16: PATCH /api/runners/:id)
+// ---------------------------------------------------------------------------
+
+/** One vendor's part of the settings form; the ceilings are percents as typed. */
+export interface VendorSettingsDraft {
+  vendor: Vendor;
+  fiveHour: string;
+  weekly: string;
+  allowPaidUsage: boolean;
+}
+
+/** The settings form: numbers stay as typed until settingsProblem has passed them. */
+export interface SettingsDraft {
+  capacity: string;
+  keepAwake: Runner['keepAwake'];
+  draining: boolean;
+  vendors: VendorSettingsDraft[];
+}
+
+/** The draft of the runner's current settings, its ceilings as whole percents. */
+export function draftFromRunner(runner: Pick<Runner, 'capacity' | 'keepAwake' | 'draining' | 'vendors'>): SettingsDraft {
+  return {
+    capacity: String(runner.capacity),
+    keepAwake: runner.keepAwake,
+    draining: runner.draining,
+    vendors: runner.vendors.map((vendor) => ({
+      vendor: vendor.vendor,
+      fiveHour: String(Math.round(vendor.ceilings.fiveHour * 100)),
+      weekly: String(Math.round(vendor.ceilings.weekly * 100)),
+      allowPaidUsage: vendor.allowPaidUsage,
+    })),
+  };
+}
+
+/** A typed number; an empty field is no number, where Number('') would read 0. */
+const typedNumber = (text: string): number => (text.trim() === '' ? Number.NaN : Number(text));
+
+const CEILING_WINDOWS = [
+  ['fiveHour', '5-hour'],
+  ['weekly', 'weekly'],
+] as const;
+
+/**
+ * Why the hub would refuse the draft, or null. The bounds are core's RunnerPatchInputSchema (capacity a whole number
+ * 1..16, ceilings 0..1), checked in plain code so zod stays out of the bundle; a test runs both on the same values.
+ */
+export function settingsProblem(draft: SettingsDraft): string | null {
+  const capacity = typedNumber(draft.capacity);
+  if (!Number.isInteger(capacity) || capacity < 1 || capacity > 16) return 'Capacity must be a whole number from 1 to 16';
+  for (const vendor of draft.vendors) {
+    for (const [window, label] of CEILING_WINDOWS) {
+      const value = typedNumber(vendor[window]);
+      if (!(value >= 0 && value <= 100)) {
+        return `${VENDOR_NAMES[vendor.vendor]}'s ${label} ceiling must be a percentage from 0 to 100`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The PATCH body for what the draft changed, or null when it changed nothing; for a draft settingsProblem passed.
+ * Fields are compared as the form showed them, so a ceiling set by hand to 85.5% is not rounded and sent back. A
+ * vendor's ceilings go as the pair the schema asks for.
+ */
+export function settingsPatch(
+  runner: Pick<Runner, 'capacity' | 'keepAwake' | 'draining' | 'vendors'>,
+  draft: SettingsDraft,
+): RunnerPatch | null {
+  const before = draftFromRunner(runner);
+  const patch: RunnerPatch = {};
+  const capacity = typedNumber(draft.capacity);
+  if (capacity !== typedNumber(before.capacity)) patch.capacity = capacity;
+  if (draft.keepAwake !== before.keepAwake) patch.keepAwake = draft.keepAwake;
+  if (draft.draining !== before.draining) patch.draining = draft.draining;
+  for (const vendor of draft.vendors) {
+    const was = before.vendors.find((entry) => entry.vendor === vendor.vendor);
+    if (!was) continue;
+    const changed = CEILING_WINDOWS.some(([window]) => typedNumber(vendor[window]) !== typedNumber(was[window]));
+    if (changed) {
+      const current = runner.vendors.find((entry) => entry.vendor === vendor.vendor)?.ceilings;
+      // An untouched window keeps its exact value.
+      const fraction = (window: 'fiveHour' | 'weekly') =>
+        typedNumber(vendor[window]) === typedNumber(was[window]) && current
+          ? current[window]
+          : typedNumber(vendor[window]) / 100;
+      patch.ceilings = { ...patch.ceilings, [vendor.vendor]: { fiveHour: fraction('fiveHour'), weekly: fraction('weekly') } };
+    }
+    if (vendor.allowPaidUsage !== was.allowPaidUsage) {
+      patch.allowPaidUsage = { ...patch.allowPaidUsage, [vendor.vendor]: vendor.allowPaidUsage };
+    }
+  }
+  return Object.keys(patch).length > 0 ? patch : null;
 }
 
 // ---------------------------------------------------------------------------

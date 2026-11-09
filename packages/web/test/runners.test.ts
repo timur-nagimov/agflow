@@ -1,10 +1,18 @@
 import { describe, expect, test } from 'bun:test';
-import { type AccountQuota, type Runner, RunnerSchema, type RunnerState, type RunnerVendor } from '@agflow/core';
+import {
+  type AccountQuota,
+  type Runner,
+  RunnerPatchInputSchema,
+  RunnerSchema,
+  type RunnerState,
+  type RunnerVendor,
+} from '@agflow/core';
 import {
   accountOf,
   acceptingText,
   clockTime,
   diskText,
+  draftFromRunner,
   formatBytes,
   gitText,
   isOwner,
@@ -16,6 +24,9 @@ import {
   RUNNER_STATE_LABELS,
   runnerTone,
   runnerWhy,
+  type SettingsDraft,
+  settingsPatch,
+  settingsProblem,
   slotsText,
   sortRunners,
   vendorView,
@@ -429,5 +440,125 @@ describe('profile and order', () => {
     expect(sortRunners(runners, { user: 'demo' }).map((r) => r.id)).toEqual(['R-11', 'R-4', 'R-2', 'R-10', 'R-3']);
     expect(runners[0]?.id).toBe('R-10');
     expect(sortRunners(runners, null).map((r) => r.id)).toEqual(['R-2', 'R-10', 'R-11', 'R-3', 'R-4']);
+  });
+});
+
+describe('owner settings', () => {
+  const twoVendors = () =>
+    runner({
+      capacity: 3,
+      keepAwake: 'ac',
+      draining: false,
+      vendors: [
+        vendor(),
+        vendor({ vendor: 'codex', ceilings: { fiveHour: 0.6, weekly: 0 }, allowPaidUsage: true }),
+      ],
+    });
+
+  /** The runner's draft with some fields typed over. */
+  const edited = (change: (draft: SettingsDraft) => void, from: Runner = twoVendors()): SettingsDraft => {
+    const draft = draftFromRunner(from);
+    change(draft);
+    return draft;
+  };
+
+  test('draftFromRunner reads capacity, keep-awake, draining, the ceilings as whole percents and paid usage', () => {
+    expect(draftFromRunner(twoVendors())).toEqual({
+      capacity: '3',
+      keepAwake: 'ac',
+      draining: false,
+      vendors: [
+        { vendor: 'claude', fiveHour: '85', weekly: '85', allowPaidUsage: false },
+        { vendor: 'codex', fiveHour: '60', weekly: '0', allowPaidUsage: true },
+      ],
+    });
+    // A ceiling set by hand in runner.json reads as the nearest whole percent.
+    const odd = runner({ vendors: [vendor({ ceilings: { fiveHour: 0.855, weekly: 0.004 } })] });
+    expect(draftFromRunner(odd).vendors[0]).toMatchObject({ fiveHour: '86', weekly: '0' });
+  });
+
+  test('settingsPatch sends only what changed, with the ceilings back as 0..1, and null when nothing changed', () => {
+    const before = twoVendors();
+    expect(settingsPatch(before, draftFromRunner(before))).toBeNull();
+    expect(settingsPatch(before, edited((draft) => (draft.capacity = '4')))).toEqual({ capacity: 4 });
+    expect(settingsPatch(before, edited((draft) => (draft.capacity = ' 03 ')))).toBeNull();
+    expect(settingsPatch(before, edited((draft) => (draft.keepAwake = 'always')))).toEqual({ keepAwake: 'always' });
+    expect(settingsPatch(before, edited((draft) => (draft.draining = true)))).toEqual({ draining: true });
+    // A vendor's ceilings go as a pair, the window left alone included; the other vendor is not sent.
+    const codex = edited((draft) => {
+      const entry = draft.vendors[1];
+      if (entry) entry.weekly = '50';
+    });
+    expect(settingsPatch(before, codex)).toEqual({ ceilings: { codex: { fiveHour: 0.6, weekly: 0.5 } } });
+    const paid = edited((draft) => {
+      const entry = draft.vendors[0];
+      if (entry) entry.allowPaidUsage = true;
+    });
+    expect(settingsPatch(before, paid)).toEqual({ allowPaidUsage: { claude: true } });
+    const everything = edited((draft) => {
+      draft.capacity = '16';
+      draft.keepAwake = 'off';
+      draft.vendors = draft.vendors.map((entry) => ({ ...entry, fiveHour: '100', allowPaidUsage: !entry.allowPaidUsage }));
+    });
+    expect(settingsPatch(before, everything)).toEqual({
+      capacity: 16,
+      keepAwake: 'off',
+      ceilings: { claude: { fiveHour: 1, weekly: 0.85 }, codex: { fiveHour: 1, weekly: 0 } },
+      allowPaidUsage: { claude: true, codex: false },
+    });
+    // An untouched ceiling set by hand is not rounded and sent back.
+    const odd = runner({ vendors: [vendor({ ceilings: { fiveHour: 0.855, weekly: 0.85 } })] });
+    expect(settingsPatch(odd, draftFromRunner(odd))).toBeNull();
+    // Editing the other window sends the hand-set one back exactly, not as its rounded percent.
+    const oddWeekly = draftFromRunner(odd);
+    const claude = oddWeekly.vendors[0];
+    if (claude) claude.weekly = '50';
+    expect(settingsPatch(odd, oddWeekly)).toEqual({ ceilings: { claude: { fiveHour: 0.855, weekly: 0.5 } } });
+  });
+
+  test('settingsProblem refuses a capacity outside 1..16 or not whole, and a ceiling outside 0-100%', () => {
+    expect(settingsProblem(draftFromRunner(twoVendors()))).toBeNull();
+    for (const capacity of ['0', '17', '2.5', '-1', '', ' ', 'three']) {
+      expect(settingsProblem(edited((draft) => (draft.capacity = capacity)))).toBe(
+        'Capacity must be a whole number from 1 to 16',
+      );
+    }
+    const ceiling = (value: string) =>
+      settingsProblem(
+        edited((draft) => {
+          const entry = draft.vendors[1];
+          if (entry) entry.weekly = value;
+        }),
+      );
+    for (const value of ['0', '100', '42', '12.5']) expect(ceiling(value)).toBeNull();
+    for (const value of ['-1', '101', '', 'most']) {
+      expect(ceiling(value)).toBe("Codex's weekly ceiling must be a percentage from 0 to 100");
+    }
+  });
+
+  test("settingsProblem agrees with core's RunnerPatchInputSchema on a table of values", () => {
+    const capacities = [-1, 0, 0.5, 1, 2, 2.5, 8, 15.99, 16, 17, 100, Number.NaN];
+    for (const value of capacities) {
+      const accepted = settingsProblem(edited((draft) => (draft.capacity = String(value)))) === null;
+      const schema = RunnerPatchInputSchema.safeParse({ capacity: value }).success;
+      expect({ capacity: value, accepted }).toEqual({ capacity: value, accepted: schema });
+    }
+    const percents = [-50, -1, -0.5, 0, 0.5, 1, 42, 85, 99.5, 100, 100.5, 101, 1000, Number.NaN];
+    for (const value of percents) {
+      const draft = edited((entry) => {
+        const claude = entry.vendors[0];
+        if (claude) claude.fiveHour = String(value);
+      });
+      const accepted = settingsProblem(draft) === null;
+      const patch = { ceilings: { claude: { fiveHour: value / 100, weekly: 0.85 } } };
+      const schema = RunnerPatchInputSchema.safeParse(patch).success;
+      expect({ percent: value, accepted }).toEqual({ percent: value, accepted: schema });
+      // What the form sends for an accepted value passes the schema too.
+      const sent = settingsPatch(twoVendors(), draft);
+      if (accepted && sent) expect(RunnerPatchInputSchema.safeParse(sent).success).toBe(true);
+    }
+    expect(capacities.filter((value) => settingsProblem(edited((d) => (d.capacity = String(value)))) === null)).toEqual([
+      1, 2, 8, 16,
+    ]);
   });
 });
