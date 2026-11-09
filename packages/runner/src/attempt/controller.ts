@@ -22,6 +22,8 @@
 // after an outage, is the turn policy's (turns.ts). A resume (resume.ts) stops a live process first, then prepares
 // the clone the attempt has and resumes its session with the new fence and token. A submission (submit.ts) harvests
 // the clone and pushes the task branch and the WIP ref together; a stop or hold arriving meanwhile ends its retries.
+// A take-over (takeover.ts) stops the agent with a handoff turn, pushes its work, and hands the clone to a person
+// with a .git the runner built; attempt.taken_over takes attempt.exited's place.
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -48,11 +50,11 @@ import type {
 } from '../adapters/types';
 import type { AttemptRecord, AttemptStore } from '../attempt-store';
 import type { AwakeClock } from '../clock';
-import type { RunnerConfig } from '../config';
+import { type RunnerConfig, vendorHomes } from '../config';
 import { buildAgentEnv } from '../env';
 import { diffFingerprint, FactsTracker } from '../facts';
 import { lsRemote, pushLateWork, pushSubmission, type PushResult, pushWip, type SubmitPushOutcome } from '../git/push';
-import { detectProtected, resolveRestoreBase } from '../git/protect';
+import { detectProtected, resolveRestoreBase, restoreProtected } from '../git/protect';
 import { type GitEnvironment, runGit } from '../git/run';
 import type { Vault } from '../git/vault';
 import type { RunnerHubHttp } from '../hub-http';
@@ -84,6 +86,15 @@ import {
   type SubmitResult,
   type SubmittedData,
 } from './submit';
+import {
+  inspectAgentGitDir,
+  type LocalCommandInput,
+  moveNestedGitDirs,
+  replaceGitDir,
+  TAKEOVER_STOP_REASON,
+  takeoverCommands,
+  type TakeoverOutcome,
+} from './takeover';
 import { TurnPolicy } from './turns';
 import { prepareForStop, RUNNER_STOP_REASON, type StopOptions, type StopOutcome, TurnWatch } from './stop';
 import {
@@ -193,6 +204,14 @@ interface ExitContext {
   cause: ExitCause | null;
   /** The runner asked for the exit; an unrequested one is killed and swept before the harvest (X-15). */
   requested: boolean;
+}
+
+/** What the final work harvested, noted as soon as it is known: what a failure after the harvest still has. */
+interface Harvested {
+  /** What a push carries. */
+  sha: string | null;
+  /** The clone's committed work, which a take-over's new .git starts at. */
+  head: string | null;
 }
 
 /**
@@ -507,6 +526,62 @@ export class AttemptController {
       const outcome = await this.submission(spec, command, record?.clone ?? null, stops);
       this.report(fence, { type: 'attempt.submitted', data: outcome });
       return { ok: true, outcome };
+    });
+  }
+
+  /**
+   * prepare_takeover (design 6.12): the live agent is interrupted, asked for a handoff note and stopped; then, or at
+   * once for an agent that is gone (a command resent after a restart), the WIP is harvested and pushed, the protected
+   * paths restored, the clone's .git replaced with one the runner builds, and attempt.taken_over reported in place of
+   * attempt.exited. A failure after the stop still reports attempt.taken_over, with local null and the error.
+   */
+  prepareTakeover(command: { fence: Fence; person: string }): Promise<TakeoverOutcome> {
+    if (this.isCurrentFence(command.fence)) this.stopArriving();
+    return this.enqueue(async () => {
+      const record = this.deps.store.get(this.attemptId);
+      const fence = this.currentFence ?? record?.fence ?? null;
+      if (record === null || fence === null || compareFence(command.fence, fence) !== 0) {
+        return { ok: false, error: 'stale_fence' };
+      }
+      const spec = this.current ?? record.spec;
+      const { taskId, branch, wipRef } = spec;
+      if (spec.role !== 'worker' || taskId === null || branch === null || wipRef === null) {
+        return { ok: false, error: 'not_running' };
+      }
+      // A controller made after a restart knows the attempt only from its record.
+      this.currentFence = fence;
+      this.current = spec;
+      const clone = this.cloneDir ?? record.clone;
+      const harvested: Harvested = { sha: null, head: null };
+      const final = await this.stopForTakeover(clone, harvested);
+      let local: LocalCommandInput | null = null;
+      let error = final.pushError;
+      try {
+        local = await this.handOver({ spec, clone, head: harvested.head, failure: final.pushError });
+      } catch (failure) {
+        this.deps.logger.error('the take-over failed', { attemptId: this.attemptId, error: describe(failure) });
+        error = describe(failure);
+      }
+      const commands = takeoverCommands({
+        local,
+        wipRefPrefix: this.deps.wipRefPrefix(),
+        taskId,
+        wipRef,
+        branch,
+        person: command.person,
+      });
+      if (local !== null && commands.local === null) {
+        error = 'the agent never started a session, so there is none to resume';
+      }
+      const takenOverSeq = this.report(fence, {
+        type: 'attempt.taken_over',
+        data: {
+          commands,
+          wipSha: final.finalWip?.sha ?? null,
+          error: error === null ? null : clipPushError(error),
+        },
+      });
+      return { ok: true, takenOverSeq };
     });
   }
 
@@ -1197,6 +1272,111 @@ export class AttemptController {
     return { ok: true, stoppedBy: ladder.stoppedBy, exitedSeq };
   }
 
+  /**
+   * Steps 1-3 of a take-over: a live agent interrupted, asked for a handoff note and stopped with the ladder, and its
+   * final work done, with no attempt.exited; a gone one's clone harvested and pushed. Either way the WIP ref never
+   * moves again: the person pushes to their take-over ref.
+   */
+  private async stopForTakeover(clone: string | null, harvested: Harvested): Promise<FinalWork> {
+    const live = this.live;
+    if (live !== null) {
+      live.stopping = true;
+      live.handoffsAtStop ??= live.pump.handoffs;
+      const { timings } = this.deps.config();
+      await prepareForStop({
+        session: live.session,
+        watch: live.watch,
+        toolInFlight: () => live.pump.toolInFlight,
+        handoffWritten: () => handoffSinceStop(live),
+        options: { handoff: true, interruptFirst: true, reason: TAKEOVER_STOP_REASON },
+        interruptMs: timings.stopInterrupt,
+        handoffMs: this.deps.handoffMs(),
+      });
+      this.setPhase('stopping');
+      const ladder = await runStopLadder({
+        session: live.session,
+        turnEnded: () => live.watch.turnEnded(),
+        groups: () => this.groupsOf(live),
+        clone: live.workspace.clone,
+        timings,
+      });
+      await boundedWait(live.events, EVENTS_AFTER_EXIT_MS);
+      const context: ExitContext = { stoppedBy: ladder.stoppedBy, cause: null, requested: true };
+      const final = await this.endProcess(live, context, harvested);
+      if (final !== null) {
+        this.standing.exited = true;
+        await this.cleanUpExit(live, final, context);
+        return final;
+      }
+    }
+    this.deps.store.update(this.attemptId, { finalizedAt: null });
+    let final: FinalWork;
+    try {
+      if (clone === null) throw new Error(`${this.attemptId} has no clone on this runner`);
+      final = await this.finalWork(clone, harvested);
+    } catch (error) {
+      final = this.finalWorkFailed(error, harvested);
+    }
+    this.standing.exited = true;
+    this.recordFinalWork('stopped', final);
+    if (final.late !== null) this.startLateWork(final.late.sha, final.late.now);
+    return { ...final, pushError: final.pushError === null ? null : clipPushError(final.pushError) };
+  }
+
+  /**
+   * Steps 4 and 5 of a take-over: the protected paths restored in the clone, every nested .git the agent left moved
+   * aside, and the clone's .git replaced, the agent's ones inspected where they went; gives what the local command
+   * resumes. Throws when a step fails, or when the harvest did (failure).
+   */
+  private async handOver(input: {
+    spec: Omit<AttemptSpec, 'agentToken'>;
+    clone: string | null;
+    head: string | null;
+    failure: string | null;
+  }): Promise<LocalCommandInput> {
+    const { spec, clone, head } = input;
+    if (clone === null) throw new Error(`${this.attemptId} has no clone on this runner`);
+    if (head === null) throw new Error(input.failure ?? 'the clone was not harvested');
+    const { vault, local, paths, store } = this.deps;
+    const base = await resolveRestoreBase(vault, spec);
+    await restoreProtected({ vault, local }, { clone, base, paths: spec.restore.paths });
+    const branch = spec.branch as string;
+    const forensics = paths.forensics(this.attemptId);
+    const nested = await moveNestedGitDirs({ clone, forensics });
+    const moved = await replaceGitDir({ vault, local, clone, branch, head, forensics });
+    const inspected = [
+      ...(moved === null ? [] : [{ gitDir: moved, label: '.git' }]),
+      ...nested.map((entry) => ({ gitDir: entry.moved, label: entry.path })),
+    ];
+    const found = new Set(nested.map((entry) => entry.path));
+    for (const { gitDir, label } of inspected) {
+      try {
+        for (const path of await inspectAgentGitDir({ gitDir, local, vault, label })) found.add(path);
+      } catch (error) {
+        // The inspection is a report on the agent's .git; the clone is the person's already.
+        const fields = { attemptId: this.attemptId, label, error: describe(error) };
+        this.deps.logger.warn("cannot inspect the agent's .git", fields);
+        found.add(label);
+      }
+    }
+    if (found.size > 0) {
+      const fence = this.currentFence ?? spec.fence;
+      const listed = clipViolationPaths([...found]);
+      this.report(fence, { type: 'attempt.violation', data: { phase: 'takeover', paths: listed } });
+    }
+    const record = store.get(this.attemptId);
+    // The version that wrote the session (X-13).
+    const cliVersion = record?.cliVersion ?? this.deps.cliVersion(spec.vendor);
+    return {
+      vendor: spec.vendor,
+      cliVersion,
+      sessionRef: record?.sessionRef ?? null,
+      clone,
+      runnerDir: paths.runner,
+      home: vendorHomes(this.deps.config(), paths)[spec.vendor],
+    };
+  }
+
   /** The groups a kill reaches: the recorded ones and those the descendant snapshots found. */
   private async groupsOf(live: LiveAgent): Promise<ProcessIdentity[]> {
     await live.pump.settled();
@@ -1210,19 +1390,8 @@ export class AttemptController {
    * attempt never stays live without a process. Gives attempt.exited's seq; null when the exit was already dealt with.
    */
   private async finishExit(live: LiveAgent, exit: ExitInfo, context: ExitContext): Promise<number | null> {
-    if (live.finished) return null;
-    live.finished = true;
-    live.policy.close();
-    const { logger } = this.deps;
-    this.stopWipTimer();
-    if (!context.requested) {
-      try {
-        await killAndSweep({ groups: () => this.groupsOf(live), clone: live.workspace.clone });
-      } catch (error) {
-        logger.error('cannot kill and sweep after an exit', { attemptId: this.attemptId, error: describe(error) });
-      }
-    }
-    const final = await this.endWork(live);
+    const final = await this.endProcess(live, context);
+    if (final === null) return null;
     // Work left for a late-work ref is on record before the exit is reported, so a restart still pushes it.
     if (final.late !== null) this.recordLateWork(final.late.sha);
     try {
@@ -1247,24 +1416,45 @@ export class AttemptController {
   }
 
   /**
+   * A process's end, once: for an unrequested exit the kill and sweep first, then the exit's work (endWork). Gives
+   * null when the process was already dealt with. Its report and cleanup are the caller's: attempt.exited, or
+   * attempt.taken_over.
+   */
+  private async endProcess(
+    live: LiveAgent,
+    context: ExitContext,
+    harvested: Harvested = { sha: null, head: null },
+  ): Promise<FinalWork | null> {
+    if (live.finished) return null;
+    live.finished = true;
+    live.policy.close();
+    this.stopWipTimer();
+    if (!context.requested) {
+      try {
+        await killAndSweep({ groups: () => this.groupsOf(live), clone: live.workspace.clone });
+      } catch (error) {
+        const fields = { attemptId: this.attemptId, error: describe(error) };
+        this.deps.logger.error('cannot kill and sweep after an exit', fields);
+      }
+    }
+    return this.endWork(live, harvested);
+  }
+
+  /**
    * The exit's work before attempt.exited: the pump closed, the final work, the transcript tail and the voided
    * approvals. A failure is logged and gives a final work with finalWip null and the failure as pushError; work
    * already harvested then goes to a late-work ref.
    */
-  private async endWork(live: LiveAgent): Promise<FinalWork> {
-    const harvested: { sha: string | null } = { sha: null };
+  private async endWork(live: LiveAgent, harvested: Harvested): Promise<FinalWork> {
     let final: FinalWork;
     try {
       live.pump.close();
       await live.pump.settled();
       live.facts.close();
       this.setPhase('stopping');
-      final = await this.finalWork(live, harvested);
+      final = await this.finalWork(live.workspace.clone, harvested);
     } catch (error) {
-      this.deps.logger.error('the final work failed', { attemptId: this.attemptId, error: describe(error) });
-      const sha = harvested.sha;
-      const pushError = `the final work failed: ${describe(error)}`;
-      final = { finalSha: sha, finalWip: null, pushError, late: sha === null ? null : { sha, now: false } };
+      final = this.finalWorkFailed(error, harvested);
     }
     await uploadTranscriptTail({
       adapter: this.deps.adapters.get(live.spec.vendor) as VendorAdapter,
@@ -1280,6 +1470,14 @@ export class AttemptController {
       this.deps.logger.error('cannot void the pending approvals', { attemptId: this.attemptId, error: describe(error) });
     }
     return { ...final, pushError: final.pushError === null ? null : clipPushError(final.pushError) };
+  }
+
+  /** A final work that threw: finalWip null, the failure as pushError, and work already harvested left for late work. */
+  private finalWorkFailed(error: unknown, harvested: Harvested): FinalWork {
+    this.deps.logger.error('the final work failed', { attemptId: this.attemptId, error: describe(error) });
+    const sha = harvested.sha;
+    const pushError = `the final work failed: ${describe(error)}`;
+    return { finalSha: sha, finalWip: null, pushError, late: sha === null ? null : { sha, now: false } };
   }
 
   /** Persist the outcome before completion: a crash or failed write must never hide pending work from purge. */
@@ -1316,9 +1514,9 @@ export class AttemptController {
   /**
    * The final harvest, strip and push of a worker, with retries for up to finalPush, canPushWip asked before each
    * try. Work canPushWip keeps from the WIP ref, or that the push could not place, is left for a late-work ref; a lead
-   * has no harvest. The harvest's sha is noted in harvested as soon as it is known.
+   * has no harvest. The harvest's sha and head are noted in harvested as soon as they are known.
    */
-  private async finalWork(live: LiveAgent, harvested: { sha: string | null }): Promise<FinalWork> {
+  private async finalWork(clone: string, harvested: Harvested): Promise<FinalWork> {
     const spec = this.current;
     const none: FinalWork = { finalSha: null, finalWip: null, pushError: null, late: null };
     if (spec === null || spec.role !== 'worker' || spec.branch === null || spec.wipRef === null) return none;
@@ -1326,11 +1524,12 @@ export class AttemptController {
     const ref = spec.wipRef;
     let work: WorkResult;
     try {
-      work = await this.collect(spec, live.workspace.clone, spec.branch);
+      work = await this.collect(spec, clone, spec.branch);
     } catch (error) {
       return { ...none, pushError: `cannot harvest the clone: ${describe(error)}` };
     }
     harvested.sha = work.sha;
+    harvested.head = work.head;
     // Protected changes are reported whatever happens next: a change only there strips back to the pushed tree.
     this.reportViolations(work.stripped);
     const pushed = store.get(this.attemptId)?.pushedSha ?? null;

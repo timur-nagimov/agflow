@@ -7,6 +7,7 @@ export * from './attempt/pump';
 export * from './attempt/resume';
 export * from './attempt/stop';
 export * from './attempt/submit';
+export * from './attempt/takeover';
 export * from './attempt/turns';
 export * from './attempt/work';
 export * from './attempt/workspace';
