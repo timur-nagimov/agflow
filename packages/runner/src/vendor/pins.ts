@@ -9,16 +9,25 @@ export interface VendorPin {
   /** The npm package the binary comes from, at packageVersion. */
   package: string;
   packageVersion: string;
+  /** The whole npm tarball's sha512 SRI. */
+  integrity: string;
 }
 
 export interface ClaudePin extends VendorPin {
   /** The @anthropic-ai/claude-agent-sdk version that bundles this CLI; packages/runner depends on it. */
   sdkVersion: string;
+  /** The platform checksum in the SDK's manifest.json. */
+  sha256: string;
+}
+
+export interface CodexPin extends VendorPin {
+  /** Package-relative tree containing bin/, codex-path/ and codex-resources/. */
+  tree: string;
 }
 
 export interface PlatformPins {
   claude: ClaudePin;
-  codex: VendorPin;
+  codex: CodexPin;
 }
 
 /** Keyed by `<process.platform>-<process.arch>`. M2 pins darwin-arm64 only; elsewhere preflight reports it. */
@@ -30,9 +39,17 @@ export const VENDOR_PINS: Partial<Record<string, PlatformPins>> = {
       sdkVersion: '0.3.285',
       package: '@anthropic-ai/claude-agent-sdk-darwin-arm64',
       packageVersion: '0.3.285',
+      integrity: 'sha512-2h6iCTH5uPYKA9jBXB7Of0dXZ5hUdu88VnXq9u50AFfMnusy+w83dKgpu+TD+mWiO+mbvMdi1ZsGaoI8HPFTXQ==',
+      sha256: '51f09bd1e021d9fa8a1864c179799bd37cb39962a937935c5cf6823398e86db4',
     },
     // Codex has no separate platform package; the platform build of @openai/codex carries the whole vendor tree.
-    codex: { version: '0.159.2', package: '@openai/codex', packageVersion: '0.159.2-darwin-arm64' },
+    codex: {
+      version: '0.159.2',
+      package: '@openai/codex',
+      packageVersion: '0.159.2-darwin-arm64',
+      integrity: 'sha512-7SPaPFU0tdqapQ5VEgrF+wb+p9dxfWfLMXMKZMRKoWPn/tLMajlMjYBBnu8o6VtaVH2DHQ6kpnp5TMkv5bqvrg==',
+      tree: 'vendor/aarch64-apple-darwin',
+    },
   },
 };
 

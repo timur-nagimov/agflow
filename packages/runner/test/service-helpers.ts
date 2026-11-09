@@ -1,5 +1,7 @@
 // Shared service test helpers: recorded commands and isolated vendor CLIs.
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Vendor } from '@agflow/core';
 import type { RunnerPaths } from '../src/paths';
@@ -65,5 +67,64 @@ process.exit(script.result.exitCode ?? 0);
         .split('\n')
         .filter(Boolean)
         .map((line) => JSON.parse(line)),
+  };
+}
+
+/** Builds an npm tarball from package-relative files, keeping executable modes. */
+export async function packTarball(
+  files: Record<string, { content: string; mode?: number }>,
+): Promise<{ bytes: Buffer; integrity: string }> {
+  const root = mkdtempSync(join(tmpdir(), 'agf-pack-'));
+  try {
+    mkdirSync(join(root, 'package'));
+    for (const [name, file] of Object.entries(files)) {
+      const path = join(root, 'package', name);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, file.content);
+      chmodSync(path, file.mode ?? 0o644);
+    }
+    const proc = Bun.spawn(['tar', '-czf', join(root, 'package.tgz'), '-C', root, 'package'], {
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [code, , stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    if (code !== 0) throw new Error(`packing tarball failed: ${stderr}`);
+    const bytes = readFileSync(join(root, 'package.tgz'));
+    return { bytes, integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}` };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** A local npm registry with a request log; unknown packages return 404. */
+export function localRegistry(packages: { package: string; packageVersion: string; bytes: Buffer }[]): {
+  url: string;
+  requests: string[];
+  stop(): void;
+} {
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      requests.push(path);
+      const entry = packages.find(
+        (item) => path === `/${item.package}/-/${item.package.split('/').at(-1)}-${item.packageVersion}.tgz`,
+      );
+      return entry ? new Response(entry.bytes) : new Response('not found', { status: 404 });
+    },
+  });
+  return {
+    url: server.url.origin,
+    requests,
+    stop: () => {
+      server.stop(true);
+    },
   };
 }
