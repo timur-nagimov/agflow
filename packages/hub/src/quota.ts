@@ -17,12 +17,20 @@ interface AccountRow {
   updated_at: number;
 }
 
+/**
+ * vendor_accounts.owner_away: 0 while the owner is present; 1 once an expiry marked them away; 2 once the lead was
+ * told that ready work waits on it, which happens once per away period (design 6.10, Owner away).
+ */
+const OWNER_PRESENT = 0;
+const OWNER_AWAY = 1;
+const OWNER_AWAY_TOLD = 2;
+
 const rowToAccount = (row: AccountRow): AccountQuota => ({
   owner: row.owner,
   vendor: row.vendor,
   accountId: row.account_id,
   quota: JSON.parse(row.quota) as VendorQuota,
-  ownerAway: row.owner_away === 1,
+  ownerAway: row.owner_away !== OWNER_PRESENT,
 });
 
 /** The stored account, or null when no runner of the owner has reported it. */
@@ -176,18 +184,28 @@ export function setOwnerAway(ctx: HubContext, emit: Emit, input: OwnerAwayInput)
     accountId === null
       ? ctx.db
           .query(
-            `UPDATE vendor_accounts SET owner_away = 1 WHERE owner = $owner AND vendor = $vendor AND owner_away = 0
+            `UPDATE vendor_accounts SET owner_away = $away WHERE owner = $owner AND vendor = $vendor
+               AND owner_away = $present
              RETURNING account_id`,
           )
-          .all({ owner, vendor })
+          .all({ owner, vendor, away: OWNER_AWAY, present: OWNER_PRESENT })
       : ctx.db
           .query(
             `INSERT INTO vendor_accounts (owner, vendor, account_id, quota, owner_away, updated_at)
-             VALUES ($owner, $vendor, $accountId, $quota, 1, $now)
-             ON CONFLICT (owner, vendor, account_id) DO UPDATE SET owner_away = 1 WHERE vendor_accounts.owner_away = 0
+             VALUES ($owner, $vendor, $accountId, $quota, $away, $now)
+             ON CONFLICT (owner, vendor, account_id) DO UPDATE SET owner_away = $away
+               WHERE vendor_accounts.owner_away = $present
              RETURNING account_id`,
           )
-          .all({ owner, vendor, accountId, quota: JSON.stringify(UNREPORTED), now: ctx.now() })
+          .all({
+            owner,
+            vendor,
+            accountId,
+            quota: JSON.stringify(UNREPORTED),
+            now: ctx.now(),
+            away: OWNER_AWAY,
+            present: OWNER_PRESENT,
+          })
   ) as { account_id: string }[];
   for (const row of marked) {
     emit({
@@ -206,8 +224,32 @@ export function setOwnerAway(ctx: HubContext, emit: Emit, input: OwnerAwayInput)
  */
 export function clearOwnerAway(ctx: HubContext, owner: string): number {
   return ctx.db
-    .query('UPDATE vendor_accounts SET owner_away = 0 WHERE owner = $owner AND owner_away = 1')
-    .run({ owner }).changes;
+    .query('UPDATE vendor_accounts SET owner_away = $present WHERE owner = $owner AND owner_away != $present')
+    .run({ owner, present: OWNER_PRESENT }).changes;
+}
+
+/**
+ * Records that the lead was told about the account's owner being away; false when it already was in this away period,
+ * or the owner is not away. The scheduler tells the lead only when this returns true.
+ */
+export function markOwnerAwayTold(
+  ctx: HubContext,
+  account: Pick<AccountQuota, 'owner' | 'vendor' | 'accountId'>,
+): boolean {
+  return (
+    ctx.db
+      .query(
+        `UPDATE vendor_accounts SET owner_away = $told
+         WHERE owner = $owner AND vendor = $vendor AND account_id = $accountId AND owner_away = $away`,
+      )
+      .run({
+        owner: account.owner,
+        vendor: account.vendor,
+        accountId: account.accountId,
+        told: OWNER_AWAY_TOLD,
+        away: OWNER_AWAY,
+      }).changes === 1
+  );
 }
 
 // ---------------------------------------------------------------------------
