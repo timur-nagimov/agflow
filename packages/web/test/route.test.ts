@@ -37,6 +37,8 @@ describe('routes', () => {
       { view: 'knowledge' },
       { view: 'runners' },
       { view: 'approvals' },
+      { view: 'attempt', id: 'T-42-a3' },
+      { view: 'attempt', id: 'lead-e2-a5' },
     ] as const) {
       expect(parseRoute(routeHref(route))).toEqual(route);
     }
@@ -47,6 +49,26 @@ describe('routes', () => {
     expect(navViewOf({ view: 'agents' })).toBe('agents');
     expect(navViewOf({ view: 'runners' })).toBe('runners');
     expect(navViewOf({ view: 'approvals' })).toBe('approvals');
+  });
+
+  test("an attempt page takes every id core's parseAttemptId reads, from any epoch, leads included", () => {
+    for (const id of ['T-42-a3', 'T-42-e2-a3', 'lead-a5', 'lead-e2-a5']) {
+      expect(parseRoute(`#/attempt/${id}`)).toEqual({ view: 'attempt', id });
+      expect(routeHref({ view: 'attempt', id })).toBe(`#/attempt/${id}`);
+    }
+  });
+
+  test('a malformed attempt id falls back to the board', () => {
+    for (const id of ['', 'T-42', 'T-42-a0', 'T-42-e1-a3', 'T-42-a03', 'lead', 'lead-x5', 'A-3', 'T-42-a3%3Cscript%3E']) {
+      expect(parseRoute(`#/attempt/${id}`)).toEqual({ view: 'board' });
+    }
+  });
+
+  test("a task's attempt highlights the board, and a lead's attempt the agents", () => {
+    expect(navViewOf({ view: 'attempt', id: 'T-42-a3' })).toBe('board');
+    expect(navViewOf({ view: 'attempt', id: 'T-42-e2-a3' })).toBe('board');
+    expect(navViewOf({ view: 'attempt', id: 'lead-a5' })).toBe('agents');
+    expect(navViewOf({ view: 'attempt', id: 'lead-e2-a5' })).toBe('agents');
   });
 
   test('the navigation lists Runners right after Agents', () => {

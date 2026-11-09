@@ -433,6 +433,26 @@ label.inline select { width: auto; max-width: 340px; }
 .notes { list-style: none; padding: 0; display: grid; gap: 14px; }
 .notes li { display: grid; gap: 4px; }
 
+/* ---------- Attempt page ---------- */
+
+.attempt-link { font: 500 12.5px/1 var(--mono); white-space: nowrap; }
+.toned { color: var(--tone); font-weight: 500; }
+.stop-reason { margin-top: 10px; }
+.takeover { display: grid; gap: 8px; }
+.command-block { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px; align-items: start; }
+.command-block pre {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 4px;
+  background: var(--inset);
+  font: 400 13px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.command-block code { background: none; padding: 0; }
+.command-block .hint { grid-column: 1 / -1; margin: 0; font-size: 12.5px; }
+.log-kind { margin-right: 8px; font: 500 10.5px/1.6 var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--tone); }
+
 /* ---------- Log (timeline and histories) ---------- */
 
 .filters { display: flex; gap: 6px; flex-wrap: wrap; }

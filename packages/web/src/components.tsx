@@ -1,6 +1,16 @@
-import type { AgentStatus, BlockedKind, DiffLine, HubEvent, Message, MessageView, TaskStatus } from '@agflow/core';
-import { type FormEvent, type KeyboardEvent, type ReactNode, useRef, useState } from 'react';
+import type {
+  AgentStatus,
+  AttemptLogEntry,
+  BlockedKind,
+  DiffLine,
+  HubEvent,
+  Message,
+  MessageView,
+  TaskStatus,
+} from '@agflow/core';
+import { type FormEvent, type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import { api } from './api';
+import { LOG_KIND_LABELS, LOG_KIND_TONES, attemptLabel } from './attempts';
 import {
   actorKind,
   ago,
@@ -47,6 +57,15 @@ export function TaskLink({ id }: { id: string }) {
   return (
     <a className="task-link" href={routeHref({ view: 'task', id })}>
       {id}
+    </a>
+  );
+}
+
+/** An attempt's short name ('a3', 'lead a5'), linked to its page; the full id is in the title. */
+export function AttemptLink({ id }: { id: string }) {
+  return (
+    <a className="attempt-link" href={routeHref({ view: 'attempt', id })} title={id}>
+      {attemptLabel(id)}
     </a>
   );
 }
@@ -237,6 +256,67 @@ export function DiffView({ lines }: { lines: DiffLine[] }) {
         </span>
       ))}
     </pre>
+  );
+}
+
+/** An attempt's log, newest first, as the runner reported it. */
+export function AttemptLog({ entries }: { entries: AttemptLogEntry[] }) {
+  if (entries.length === 0) return <p className="muted">Nothing logged yet.</p>;
+  return (
+    <ol className="log attempt-log">
+      {[...entries].reverse().map((entry) => (
+        <li key={entry.id} className={`log-row tone-${LOG_KIND_TONES[entry.kind]}`}>
+          <span className="log-mark" />
+          <When ts={entry.ts} clock />
+          <span className="log-text">
+            <span className="log-kind">{LOG_KIND_LABELS[entry.kind]}</span>
+            <Linked text={entry.summary} />
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/**
+ * A command to run, with a Copy button. Where the clipboard API is missing, as on a hub served over plain http, Copy
+ * selects the command instead, for the person to copy themselves.
+ */
+export function CommandBlock({ command, label }: { command: string; label: string }) {
+  const code = useRef<HTMLElement>(null);
+  const [done, setDone] = useState<'copied' | 'selected' | null>(null);
+  useEffect(() => {
+    if (done === null) return;
+    const timer = setTimeout(() => setDone(null), 2500);
+    return () => clearTimeout(timer);
+  }, [done]);
+
+  const select = () => {
+    const selection = window.getSelection();
+    if (!code.current || !selection) return;
+    selection.selectAllChildren(code.current);
+    setDone('selected');
+  };
+  const copy = async () => {
+    if (!navigator.clipboard) return select();
+    try {
+      await navigator.clipboard.writeText(command);
+      setDone('copied');
+    } catch {
+      select();
+    }
+  };
+
+  return (
+    <div className="command-block">
+      <pre aria-label={label}>
+        <code ref={code}>{command}</code>
+      </pre>
+      <button className="small" onClick={() => void copy()}>
+        {done === 'copied' ? 'Copied' : 'Copy'}
+      </button>
+      {done === 'selected' ? <span className="hint">Selected: press ⌘C or Ctrl+C to copy it.</span> : null}
+    </div>
   );
 }
 

@@ -244,6 +244,46 @@ async function main(): Promise<void> {
     });
     await shot(page, 'agents');
 
+    /** The text of the attempt page's fact with this label. */
+    const fact = async (label: string) =>
+      (await page.locator('.fact', { has: page.locator(`dt:text-is("${label}")`) }).locator('dd').first().textContent()) ?? '';
+    await open(page, '#/attempt/T-10-a1', '.attempt-head');
+    await check("the page of T-10's first attempt shows Replaced, its class, who asked and why, its WIP ref and the log", async () => {
+      const chip = (await page.locator('.attempt-head .chip').textContent()) ?? '';
+      if (chip !== 'Replaced') throw new Error(`the chip reads ${chip}`);
+      if ((await fact('Class')) !== 'None') throw new Error(`the class reads ${await fact('Class')}`);
+      const stop = page.locator('.stop-request');
+      if ((await fact('Cause')) !== 'Replace') throw new Error(`the cause reads ${await fact('Cause')}`);
+      if (!(await fact('Asked by')).startsWith('alice')) throw new Error(`asked by ${await fact('Asked by')}`);
+      await stop.locator('.stop-reason', { hasText: 'It keeps re-reading the plan catalogue' }).waitFor();
+      if (!(await fact('Work in progress')).startsWith('refs/agflow/T-10/a1 at ')) {
+        throw new Error(`the WIP reads ${await fact('Work in progress')}`);
+      }
+      await page.locator('.attempt-log .log-text', { hasText: 'the agent exited' }).waitFor();
+      await page.locator('a.back[href="#/task/T-10"]').waitFor();
+    });
+    await shot(page, 'attempt');
+    await open(page, '#/attempt/T-12-a1', '.attempt-head');
+    await check("the page of T-12's running attempt shows its facts: phase, last event, turns", async () => {
+      await page.locator('.attempt-facts').waitFor();
+      const facts = { Phase: 'Working', 'Last agent event': /^\d+ s ago$/, Turns: '3', Fence: /^e1\.\d+$/ };
+      for (const [label, expected] of Object.entries(facts)) {
+        const value = await fact(label);
+        if (typeof expected === 'string' ? value !== expected : !expected.test(value)) throw new Error(`${label} reads ${value}`);
+      }
+    });
+    await check("the lead's attempt page has no task and links to Agents", async () => {
+      const seat = await page.evaluate<{ attemptId: string | null }>(
+        "fetch('/api/status').then((response) => response.json()).then((status) => status.leadSeat)",
+      );
+      if (!seat.attemptId?.startsWith('lead-')) throw new Error(`the seat's attempt: ${seat.attemptId}`);
+      await open(page, `#/attempt/${seat.attemptId}`, '.attempt-head');
+      await page.locator('a.back[href="#/agents"]').waitFor();
+      await page.locator('.nav a[href="#/agents"][aria-current="page"]').waitFor();
+      if ((await page.locator('.attempt-head .task-link').count()) !== 0) throw new Error('the page names a task');
+      if (!(await page.locator('h1.page-title').textContent())?.startsWith('Lead attempt')) throw new Error('no lead title');
+    });
+
     await check('the strip shows how many runners are online', () =>
       page.locator('.strip .readout', { hasText: /^Runners\s*1\/3\s*online$/ }).waitFor(),
     );

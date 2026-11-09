@@ -8,6 +8,7 @@ import { type Connection, useConnection } from './live';
 import { NAV, type Route, navViewOf, routeHref } from './route';
 import { AgentsView } from './views/AgentsView';
 import { ApprovalsView } from './views/ApprovalsView';
+import { AttemptView } from './views/AttemptView';
 import { BoardView } from './views/BoardView';
 import { GoalView } from './views/GoalView';
 import { KnowledgeView } from './views/KnowledgeView';
@@ -177,6 +178,8 @@ function View({ route }: { route: Route }) {
       return <GoalView />;
     case 'task':
       return <TaskView key={route.id} id={route.id} />;
+    case 'attempt':
+      return <AttemptView key={route.id} id={route.id} />;
     case 'agents':
       return <AgentsView />;
     case 'runners':
