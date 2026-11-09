@@ -165,6 +165,15 @@ export async function rejectedStart(f: SessionFixture, reason: string): Promise<
   return runs[0]!;
 }
 
+/** Polls until check holds, failing after ms. */
+export async function until(check: () => boolean, ms = 5_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for the condition');
+    await Bun.sleep(5);
+  }
+}
+
 export async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
   const result: AgentEvent[] = [];
   for await (const event of events) result.push(event);

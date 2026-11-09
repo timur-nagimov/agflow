@@ -6,7 +6,7 @@ import type { RunnerTestBlock } from '../../config';
 import type { Logger } from '../../log';
 import { boundedWait } from '../../processes';
 import { vendorBinary } from '../../vendor/pins';
-import type { AgentEvent, AgentLaunch, ExitInfo } from '../types';
+import type { AgentEvent, AgentLaunch, AgentSession, ExitInfo } from '../types';
 import { isFinalError, mergeRateLimits, quotaFromRateLimits, turnErrorKind } from './classify';
 import { appServerArgs, appServerEnv, threadOverrides } from './config';
 import { codexToolEnded, codexToolStarted } from './items';
@@ -58,9 +58,21 @@ export class CodexSession {
   private ending: Promise<void> | null = null;
   private startingTurn = false;
   private recoveredContext = false;
-  private compaction: { turnId: string | null; toolCalls: number } | null = null;
+  /**
+   * Context recovery, from the failed turn's end until the continuation's turn/start answers. The session sends no
+   * turn/start or turn/steer of its own meanwhile; an interrupt ends it without the continuation.
+   */
+  private compaction: { turnId: string | null; toolCalls: number; interrupted: boolean } | null = null;
   /** Turns a turn/start of ours answered: never the compaction turn. */
   private readonly ownTurns = new Set<string>();
+  private sends: Promise<void> = Promise.resolve();
+  private sendGeneration = 0;
+  private closed = false;
+  /** A send waiting for that turn's completion or, with turnId null, for recovery or a quota end to finish. */
+  private held: { turnId: string | null; release(): void } | null = null;
+  private readonly acknowledgements = new Map<string, string[]>();
+  private sending = false;
+  private readonly completions: Turn[] = [];
 
   private constructor(
     private readonly app: AppServerProcess,
@@ -72,8 +84,11 @@ export class CodexSession {
     this.events = this.queue;
     this.exited = app.exited;
     void this.exited.then(async () => {
+      this.closed = true;
+      this.held?.release();
       // An escaped child can hold stdout open after the leader exits.
       await boundedWait(app.rpc.ended, 1000);
+      app.rpc.close();
       unsubscribe();
       await this.ending;
       this.queue.end();
@@ -179,8 +194,121 @@ export class CodexSession {
     }
   }
 
+  async send(message: Parameters<AgentSession['send']>[0]): Promise<void> {
+    this.checkSend();
+    const generation = this.sendGeneration;
+    const sent = this.sends.then(() => this.sendMessage(message, generation));
+    this.sends = sent.catch(() => {});
+    await sent;
+  }
+
+  async interrupt(options: { cancelQueued?: boolean } = {}): Promise<void> {
+    if (options.cancelQueued) {
+      this.sendGeneration += 1;
+      this.held?.release();
+    }
+    if (this.closed || this.app.rpc.closed) return;
+    // Recovery then ends without a continuation; a compaction turn not started yet is interrupted when it starts.
+    if (this.compaction) this.compaction.interrupted = true;
+    if (this.activeTurn === null) return;
+    await request(this.app, 'turn/interrupt', { threadId: this.sessionRef, turnId: this.activeTurn });
+  }
+
   async close(): Promise<void> {
+    this.closed = true;
+    this.held?.release();
     await this.app.end();
+  }
+
+  private checkSend(generation = this.sendGeneration): void {
+    if (this.closed || this.app.rpc.closed) throw new Error('codex session is closed');
+    if (generation !== this.sendGeneration) throw new Error('codex send cancelled');
+  }
+
+  private async sendMessage(message: Parameters<AgentSession['send']>[0], generation: number): Promise<void> {
+    this.checkSend(generation);
+    try {
+      await this.deliverMessage(message, generation);
+    } finally {
+      this.flushCompletions();
+    }
+  }
+
+  private flushCompletions(): void {
+    this.sending = false;
+    for (const turn of this.completions.splice(0)) this.turnCompleted(turn);
+  }
+
+  private async deliverMessage(message: Parameters<AgentSession['send']>[0], generation: number): Promise<void> {
+    const input: ParamsOf<'turn/start'>['input'] = [{ type: 'text', text: message.text, text_elements: [] }];
+    let turnId: string | null = null;
+    // A turn that answered the steer as no longer active.
+    let ended: string | null = null;
+    while (turnId === null) {
+      while (this.compaction || this.ending) {
+        await this.hold(null);
+        this.checkSend(generation);
+      }
+      if (message.authority === 'agent' || this.activeTurn === null || this.activeTurn === ended) break;
+      const expectedTurnId: string = this.activeTurn;
+      this.sending = true;
+      try {
+        // Inspect the RPC error before flattening it to the session's one-line reason.
+        const answer = await this.app.rpc.request('turn/steer', { threadId: this.sessionRef, input, expectedTurnId });
+        turnId = answer.turnId;
+      } catch (error) {
+        if (!(error instanceof RpcError) || error.code !== -32600) {
+          throw new Error(`codex turn/steer failed: ${oneLine(error)}`);
+        }
+        if (notSteerable(error.data)) {
+          this.checkSend(generation);
+          const completed = this.completions.some((turn) => turn.id === expectedTurnId);
+          this.flushCompletions();
+          // Keep send pending so a failed delivery still reaches the caller; later sends wait in the chain.
+          if (!completed) await this.hold(expectedTurnId);
+          this.checkSend(generation);
+        } else if (
+          error.message.startsWith('expected active turn id') ||
+          error.message.startsWith('no active turn to steer')
+        ) {
+          // That turn's end goes first: it may start recovery, which the new turn must wait for.
+          this.flushCompletions();
+          ended = expectedTurnId;
+        } else {
+          throw new Error(`codex turn/steer failed: ${oneLine(error)}`);
+        }
+      }
+    }
+    if (turnId === null) {
+      this.checkSend(generation);
+      this.sending = true;
+      this.startingTurn = true;
+      try {
+        const { turn } = await request(this.app, 'turn/start', {
+          threadId: this.sessionRef,
+          input: message.authority === 'agent' ? [] : input,
+          ...(message.authority === 'agent'
+            ? { toolOutput: { name: 'agent_message', namespace: 'agflow', output: message.text } }
+            : {}),
+        });
+        turnId = turn.id;
+        this.ownTurns.add(turnId);
+        this.activeTurn = turnId;
+      } finally {
+        this.startingTurn = false;
+      }
+    }
+    const ids = this.acknowledgements.get(turnId) ?? [];
+    ids.push(message.id);
+    this.acknowledgements.set(turnId, ids);
+    this.queue.push({ type: 'delivered', id: message.id });
+  }
+
+  private async hold(turnId: string | null): Promise<void> {
+    await new Promise<void>((release) => {
+      this.held = { turnId, release };
+    });
+    this.held = null;
   }
 
   private notification(notification: ServerNotification): void {
@@ -199,6 +327,8 @@ export class CodexSession {
           !state.started
         ) {
           this.compaction.turnId = turn.id;
+          if (this.compaction.interrupted)
+            void this.interrupt().catch((error) => this.warn('interrupt', oneLine(error)));
         }
         if (!state.started) {
           state.started = true;
@@ -303,7 +433,15 @@ export class CodexSession {
 
   private turnCompleted(turn: Turn): void {
     if (turn.status === 'inProgress') return;
+    // A completion may overtake an input answer; its acknowledgements must follow delivered.
+    if (this.sending) {
+      this.completions.push(turn);
+      return;
+    }
     this.endOpenTools((tool) => tool.mainTurn === turn.id);
+    for (const id of this.acknowledgements.get(turn.id) ?? []) this.queue.push({ type: 'acknowledged', id });
+    this.acknowledgements.delete(turn.id);
+    if (this.held?.turnId === turn.id) this.held.release();
     const state = this.turnState(turn.id);
     const error = turn.status === 'failed' ? (state.error ?? turn.error) : null;
     const errorKind = turn.status === 'failed' ? turnErrorKind(error?.codexErrorInfo ?? null, this.rateLimits) : null;
@@ -311,30 +449,33 @@ export class CodexSession {
     this.ownTurns.delete(turn.id);
     if (this.activeTurn === turn.id) this.activeTurn = null;
     if (this.compaction?.turnId === turn.id) {
-      const toolCalls = this.compaction.toolCalls + state.toolCalls;
-      this.compaction = null;
-      if (turn.status === 'completed') {
-        void this.startTurn(
-          'System note: The context window filled up and was compacted. Continue your task where you left off.',
-        ).catch((error) => {
-          if (!this.gone) this.contextFailed(oneLine(error), toolCalls);
-        });
+      const recovery = this.compaction;
+      const toolCalls = recovery.toolCalls + state.toolCalls;
+      if (turn.status === 'completed' && !recovery.interrupted) {
+        void this.continueRecovery(recovery, toolCalls);
       } else {
+        this.endRecovery();
         // Only a second context error is the context outcome; an interrupt or another failure ends as itself (9.2).
-        this.endTurn(turn.status, toolCalls, error, errorKind);
+        this.endTurn(turn.status === 'failed' ? 'failed' : 'interrupted', toolCalls, error, errorKind);
       }
       return;
     }
     // The final error or, without one, the failed turn's own error (design 9.2).
     if (error?.codexErrorInfo === 'contextWindowExceeded' && !this.recoveredContext) {
       this.recoveredContext = true;
-      this.compaction = { turnId: null, toolCalls: state.toolCalls };
+      const recovery: NonNullable<CodexSession['compaction']> = {
+        turnId: null,
+        toolCalls: state.toolCalls,
+        interrupted: false,
+      };
+      this.compaction = recovery;
       void request(this.app, 'thread/compact/start', { threadId: this.sessionRef }).catch((error) => {
-        const compaction = this.compaction;
         // A started compaction turn ends the recovery itself, and an exit reports the end on its own.
-        if (!compaction || compaction.turnId !== null) return;
-        this.compaction = null;
-        if (!this.gone) this.contextFailed(oneLine(error), compaction.toolCalls);
+        if (this.compaction !== recovery || recovery.turnId !== null) return;
+        this.endRecovery();
+        if (this.gone) return;
+        if (recovery.interrupted) this.endTurn('interrupted', recovery.toolCalls, null, null);
+        else this.contextFailed(oneLine(error), recovery.toolCalls);
       });
       return;
     }
@@ -387,6 +528,7 @@ export class CodexSession {
       .then(() => {
         this.ending = null;
         end();
+        this.wakeHeld();
       });
   }
 
@@ -400,6 +542,34 @@ export class CodexSession {
           updatedAt: Date.now(),
         };
     this.queue.push({ type: 'quota', accountId: this.accountId, quota: { ...quota, state: 'exhausted' } });
+  }
+
+  /** Messages wait for the continuation and are then steered into its turn. */
+  private async continueRecovery(recovery: NonNullable<CodexSession['compaction']>, toolCalls: number): Promise<void> {
+    try {
+      await this.startTurn(
+        'System note: The context window filled up and was compacted. Continue your task where you left off.',
+      );
+    } catch (error) {
+      if (this.gone) return;
+      if (recovery.interrupted) this.endTurn('interrupted', toolCalls, null, null);
+      else this.contextFailed(oneLine(error), toolCalls);
+      return;
+    } finally {
+      this.endRecovery();
+    }
+    // An interrupt that came while the start was pending applies to the turn it opened.
+    if (recovery.interrupted) void this.interrupt().catch((error) => this.warn('interrupt', oneLine(error)));
+  }
+
+  private endRecovery(): void {
+    this.compaction = null;
+    this.wakeHeld();
+  }
+
+  /** Lets a send waiting for recovery or a quota end go on. */
+  private wakeHeld(): void {
+    if (this.held?.turnId === null) this.held.release();
   }
 
   private async startTurn(...texts: string[]): Promise<void> {
@@ -418,7 +588,7 @@ export class CodexSession {
 
   /** The transport is gone: a rejected request then reports nothing, since the exit does. */
   private get gone(): boolean {
-    return this.app.rpc.closed;
+    return this.closed || this.app.rpc.closed;
   }
 
   private contextFailed(error: string, toolCalls: number): void {
@@ -528,6 +698,12 @@ async function request<M extends CodexClientMethod>(
   } catch (error) {
     throw new Error(`codex ${method} failed: ${oneLine(error)}`);
   }
+}
+
+function notSteerable(data: unknown): boolean {
+  if (typeof data !== 'object' || data === null || !('codexErrorInfo' in data)) return false;
+  const info = data.codexErrorInfo;
+  return typeof info === 'object' && info !== null && 'activeTurnNotSteerable' in info;
 }
 
 function oneLine(error: unknown): string {
