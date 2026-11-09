@@ -207,17 +207,20 @@ function inside(path: string, root: string): boolean {
   return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 }
 
+/** The processes found in a clone; skipped says why none could be looked for. */
+export interface CloneProcesses {
+  processes: PsRow[];
+  skipped: string | null;
+}
+
 /**
- * Ladder step 4 (design 7.4): finds the user's processes whose cwd is inside the clone with
- * `lsof -a -d cwd -u <uid> -Fpn` and kills each one after an identity check. The clone must be an absolute path at
- * least two levels deep: a relative one would resolve against the runner's cwd, which is / under launchd, and a sweep
- * of / kills every process of the owner. Only the runner-owned parent is resolved (/tmp is /private/tmp): the last
- * component is the agent's to replace, and a link there must not widen the sweep to wherever it points.
+ * Finds the user's processes whose cwd is inside the clone with `lsof -a -d cwd -u <uid> -Fpn`, with their identity.
+ * The clone must be an absolute path at least two levels deep: a relative one would resolve against the runner's
+ * cwd, which is / under launchd, and a sweep of / kills every process of the owner. Only the runner-owned parent is
+ * resolved (/tmp is /private/tmp): the last component is the agent's to replace, and a link there must not widen
+ * the search to wherever it points.
  */
-export async function sweepCloneProcesses(
-  clone: string,
-  options: { signal?: NodeJS.Signals; lsof?: string } = {},
-): Promise<SweepResult> {
+export async function findCloneProcesses(clone: string, options: { lsof?: string } = {}): Promise<CloneProcesses> {
   const lsof = options.lsof ?? 'lsof';
   if (!isAbsolute(clone)) throw new Error(`refusing to sweep a clone path that is not absolute: '${clone}'`);
   let root: string;
@@ -233,12 +236,22 @@ export async function sweepCloneProcesses(
   try {
     output = await run([lsof, '-w', '-a', '-d', 'cwd', '-u', String(process.getuid?.() ?? 0), '-Fpn']);
   } catch {
-    return { killed: [], skipped: `lsof is not available (${lsof})` };
+    return { processes: [], skipped: `lsof is not available (${lsof})` };
   }
   const found = parseLsofCwds(output).filter((entry) => inside(entry.cwd, root) && entry.pid !== process.pid);
   const pids = [...new Set(found.map((entry) => entry.pid))];
+  return { processes: await listProcesses(pids), skipped: null };
+}
+
+/** Ladder step 4 (design 7.4): kills each process findCloneProcesses finds in the clone, after an identity check. */
+export async function sweepCloneProcesses(
+  clone: string,
+  options: { signal?: NodeJS.Signals; lsof?: string } = {},
+): Promise<SweepResult> {
+  const found = await findCloneProcesses(clone, options);
+  if (found.skipped !== null) return { killed: [], skipped: found.skipped };
   const killed: number[] = [];
-  for (const row of await listProcesses(pids)) {
+  for (const row of found.processes) {
     if (await killProcess(row, options.signal ?? 'SIGKILL')) killed.push(row.pid);
   }
   return { killed, skipped: null };

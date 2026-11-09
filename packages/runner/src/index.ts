@@ -3,6 +3,7 @@ export * from './adapters/types';
 export * from './attempt/cleanup';
 export * from './attempt/controller';
 export * from './attempt/exit';
+export * from './attempt/handback';
 export * from './attempt/launch';
 export * from './attempt/pump';
 export * from './attempt/resume';

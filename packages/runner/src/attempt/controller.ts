@@ -25,7 +25,7 @@
 // A take-over (takeover.ts) stops the agent with a handoff turn, pushes its work, and hands the clone to a person
 // with a .git the runner built; attempt.taken_over takes attempt.exited's place. A cleanup (cleanup.ts) stops a live
 // process, saves the clone's work that is not on the origin as late work, uploads the transcript tail and removes
-// the attempt's files.
+// the attempt's files; a hand-back (handback.ts) pushes a taken-over clone's work to a late-work ref first.
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -68,9 +68,10 @@ import type { NewEvent, Outbox } from '../outbox';
 import type { RunnerPaths } from '../paths';
 import type { SerialQueue } from '../queue';
 import { removeAgentTools } from '../run-dir';
-import { boundedWait, type ProcessIdentity } from '../processes';
+import { boundedWait, findCloneProcesses, type ProcessIdentity } from '../processes';
 import type { DependencyPreparer, Notifier, RunnerHealth } from '../seams';
 import { killAndSweep, runStopLadder } from '../stop-ladder';
+import { vendorBinary } from '../vendor/pins';
 import { clipPushError, EVENTS_AFTER_EXIT_MS, LateWorkRetries, pushWithRetries, uploadTranscriptTail } from './exit';
 import { buildLaunch, ProcessRegistration } from './launch';
 import { ACTIVITY_SUMMARY_MAX, clip, EventPump, type PumpEvent } from './pump';
@@ -103,6 +104,7 @@ import {
 } from './takeover';
 import { TurnPolicy } from './turns';
 import { CLEANUP_STOP_REASON, type CleanupOutcome, removeTree } from './cleanup';
+import { type HandBackOutcome, type HandBackSource, processRunningNote, stopCodexDaemon } from './handback';
 import { prepareForStop, RUNNER_STOP_REASON, type StopOptions, type StopOutcome, TurnWatch } from './stop';
 import {
   canPushWip,
@@ -600,29 +602,149 @@ export class AttemptController {
    */
   cleanup(): Promise<CleanupOutcome> {
     this.stopArriving();
+    return this.enqueue(() => this.cleanupJob({ saveWork: true }));
+  }
+
+  /**
+   * hand_back (design 6.12, X-37): with the clone source, the runner-home Codex daemon is stopped, a process still in
+   * the clone refuses the hand-back with its pids, and otherwise the clone's work, harvested and stripped like a
+   * WIP, goes to a new late-work ref, reported as attempt.handed_back, before the attempt is cleaned up. A ref source
+   * only fetches the ref into the vault (X-2).
+   */
+  handBack(command: { source: HandBackSource }): Promise<HandBackOutcome> {
     return this.enqueue(async () => {
-      // The hub queues a cleanup only as it ends the attempt (design 6.4), so its WIP ref never moves again (7.3): a
-      // live process's final work is refused there, and saved below as late work.
-      this.markEnded();
-      if (this.live !== null) {
-        const options = { handoff: false, interruptFirst: false, reason: CLEANUP_STOP_REASON, cause: null };
-        await this.stopLive(this.live, options);
-      }
-      const pending = await this.pushPendingLateWork();
-      if (!pending.ok) return pending;
       const record = this.deps.store.get(this.attemptId);
-      if (record === null) return { ok: true };
+      if (record === null) return { ok: false, error: `${this.attemptId} has no record on this runner` };
       this.current ??= record.spec;
-      // The exit's late-work retries end here: the cleanup pushes what is left itself, or keeps the clone.
+      this.currentFence ??= record.fence;
+      const spec = this.current;
+      const { source } = command;
+      if (source.kind === 'ref') return this.fetchHandedBackRef(spec, source.ref);
+      const { taskId, branch } = spec;
+      if (spec.role !== 'worker' || taskId === null || branch === null) {
+        return { ok: false, error: `${this.attemptId} is not a task attempt` };
+      }
+      const clone = record.clone;
+      if (clone === null || !cloneExists(clone)) return { ok: false, error: `the clone of ${this.attemptId} is gone` };
+      await this.stopRunnerCodexDaemon(record);
+      const found = await findCloneProcesses(clone);
+      if (found.skipped !== null) {
+        // A clone someone may still be writing to is never harvested and removed unchecked.
+        const error = `cannot look for processes in the clone: ${found.skipped}`;
+        this.deps.logger.warn('cannot look for processes in the clone', { attemptId: this.attemptId, error });
+        this.note(`hand-back refused: ${error}`);
+        return { ok: false, error: clipPushError(error) };
+      }
+      if (found.processes.length > 0) {
+        const pids = found.processes.map((row) => row.pid);
+        this.note(processRunningNote(pids));
+        return { ok: false, error: 'process_running', pids };
+      }
+      let work: WorkResult;
+      try {
+        work = await this.collect(spec, clone, branch);
+      } catch (error) {
+        return { ok: false, error: clipPushError(`cannot harvest the clone: ${describe(error)}`) };
+      }
+      // Every path stripped from the person's work, whatever the agent's pushes reported before: their feedback.
+      const fence = this.currentFence ?? spec.fence;
+      if (work.stripped.length > 0) {
+        const paths = clipViolationPaths(work.stripped);
+        this.report(fence, { type: 'attempt.violation', data: { phase: 'wip', paths } });
+      }
+      const { vault, local, store } = this.deps;
+      let pushed: Awaited<ReturnType<typeof pushLateWork>>;
+      try {
+        pushed = await pushLateWork({
+          vault,
+          local,
+          remote: await this.deps.remote(),
+          wipRefPrefix: this.deps.wipRefPrefix(),
+          attemptId: this.attemptId,
+          sha: work.sha,
+        });
+      } catch (error) {
+        pushed = { ok: false, error: 'remote', detail: describe(error) };
+      }
+      if (!pushed.ok) return { ok: false, error: clipPushError(`cannot push the hand-back: ${pushed.detail}`) };
+      // The person's work holds the agent's: late work of the agent still pending is settled with it, whatever the
+      // cleanup below does, so no later run pushes that older work after the hand-back.
       this.late?.cancel();
       this.late = null;
-      const clone = record.clone !== null && cloneExists(record.clone) ? record.clone : null;
-      if (clone !== null) {
+      store.update(this.attemptId, { lateWorkCount: pushed.n, lateWorkSha: null, pushError: null });
+      const handedBack = { ref: pushed.ref, sha: work.sha };
+      this.report(fence, { type: 'attempt.handed_back', data: handedBack });
+      // The hand-back stands whatever the cleanup does; a cleanup that fails is resent by the hub as any other.
+      const cleaned = await this.cleanupJob({ saveWork: false });
+      if (!cleaned.ok) {
+        this.deps.logger.warn('cannot clean up after a hand-back', { attemptId: this.attemptId, error: cleaned.error });
+      }
+      return { ok: true, handedBack };
+    });
+  }
+
+  /**
+   * A cleanup's work, inside a job: a live process stopped with the ladder, the pending late work pushed and the
+   * clone's work saved as late work when saveWork is set, the transcript tail uploaded, and the attempt's files
+   * removed.
+   */
+  private async cleanupJob(options: { saveWork: boolean }): Promise<CleanupOutcome> {
+    // The hub queues a cleanup only as it ends the attempt (design 6.4), so its WIP ref never moves again (7.3): a
+    // live process's final work is refused there, and saved below as late work.
+    this.markEnded();
+    if (this.live !== null) {
+      const stop = { handoff: false, interruptFirst: false, reason: CLEANUP_STOP_REASON, cause: null };
+      await this.stopLive(this.live, stop);
+    }
+    if (options.saveWork) {
+      const pending = await this.pushPendingLateWork();
+      if (!pending.ok) return pending;
+    }
+    const record = this.deps.store.get(this.attemptId);
+    if (record === null) return { ok: true };
+    this.current ??= record.spec;
+    // The exit's late-work retries end here: the cleanup pushes what is left itself, or keeps the clone.
+    this.late?.cancel();
+    this.late = null;
+    const clone = record.clone !== null && cloneExists(record.clone) ? record.clone : null;
+    if (clone !== null) {
+      if (options.saveWork) {
         const saved = await this.saveLateWork(record.spec, clone, record.lateWorkCount);
         if (!saved.ok) return saved;
-        await this.uploadTail(record.spec.vendor, record.sessionRef, clone);
       }
-      return this.removeAttempt(record);
+      await this.uploadTail(record.spec.vendor, record.sessionRef, clone);
+    }
+    return this.removeAttempt(record);
+  }
+
+  /** A ref hand-back, which protocol-1 hubs never send: the ref fetched into the vault, and no event (X-2). */
+  private async fetchHandedBackRef(spec: Omit<AttemptSpec, 'agentToken'>, ref: string): Promise<HandBackOutcome> {
+    if (spec.taskId === null) return { ok: false, error: `${this.attemptId} is not a task attempt` };
+    try {
+      await this.deps.vault.refresh(spec.taskId, [ref], this.deps.wipRefPrefix());
+      return { ok: true, handedBack: null };
+    } catch (error) {
+      return { ok: false, error: clipPushError(`cannot fetch ${ref}: ${describe(error)}`) };
+    }
+  }
+
+  /**
+   * Stops the Codex daemon of the runner's Codex home with the runner's own codex: the attempt's version for a Codex
+   * attempt, the current pin otherwise. No pin for this platform, or any failure, is only logged.
+   */
+  private async stopRunnerCodexDaemon(record: AttemptRecord): Promise<void> {
+    const { paths, config, logger } = this.deps;
+    let version: string;
+    try {
+      version = (record.spec.vendor === 'codex' ? record.cliVersion : null) ?? this.deps.cliVersion('codex');
+    } catch (error) {
+      logger.warn('cannot stop the Codex daemon', { attemptId: this.attemptId, error: describe(error) });
+      return;
+    }
+    await stopCodexDaemon({
+      binary: join(paths.runner, vendorBinary('codex', version)),
+      home: vendorHomes(config(), paths).codex,
+      env: { PATH: config().capturedPath, HOME: paths.homes.codexUser },
     });
   }
 
