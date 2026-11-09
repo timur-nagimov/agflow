@@ -1,4 +1,4 @@
-// New-thread startup and its fail-closed checks (design 9.2, 7.4).
+// Thread startup, resume and their fail-closed checks (design 9.2, 7.4).
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import type { RunnerTestBlock } from '../../config';
@@ -8,6 +8,7 @@ import type { AgentEvent, AgentLaunch, ExitInfo } from '../types';
 import { appServerArgs, appServerEnv, threadOverrides } from './config';
 import type { CodexClientMethod, ParamsOf, ResultOf } from './methods';
 import { openAppServer, type AppServerProcess } from './process';
+import { RpcError } from './rpc';
 
 export interface CodexSessionOptions {
   /** paths.runner: vendorBinary paths are relative to it. */
@@ -73,11 +74,19 @@ export class CodexSession {
       unsubscribeStartup();
     };
     try {
-      const thread = await CodexSession.openThread(app, launch, options.userHome);
-      const tools = await CodexSession.checkThread(app, launch, thread, startedServers);
+      const { thread, resumed } = await CodexSession.openThread(app, launch, options.userHome, options.logger);
+      const tools = await CodexSession.checkThread(
+        app,
+        launch,
+        thread,
+        resumed ? 'thread/resume' : 'thread/start',
+        startedServers,
+      );
       if (warning !== null) throw new Error(warning);
       unsubscribe();
-      await request(app, 'thread/name/set', { threadId: thread.thread.id, name: `agflow ${launch.attemptId}` });
+      if (!resumed) {
+        await request(app, 'thread/name/set', { threadId: thread.thread.id, name: `agflow ${launch.attemptId}` });
+      }
       const session = new CodexSession(app, thread.thread.id);
       // The controller starts consuming only after start resolves, so these must already be buffered.
       session.queue.push({
@@ -96,11 +105,13 @@ export class CodexSession {
       if (tools.length > 0) {
         session.queue.push({ type: 'warning', text: `codex thread lists extra agflow tools: ${tools.join(', ')}` });
       }
-      // The tools note is already in developerInstructions; the first turn carries only the launch prompt.
-      await request(app, 'turn/start', {
-        threadId: session.sessionRef,
-        input: [{ type: 'text', text: launch.firstPrompt, text_elements: [] }],
-      });
+      if (!resumed) {
+        // Both start and resume carry the tools note in developerInstructions.
+        await request(app, 'turn/start', {
+          threadId: session.sessionRef,
+          input: [{ type: 'text', text: launch.firstPrompt, text_elements: [] }],
+        });
+      }
       return session;
     } catch (error) {
       await app.end();
@@ -114,12 +125,32 @@ export class CodexSession {
     await this.app.end();
   }
 
-  private static openThread(
+  private static async openThread(
     app: AppServerProcess,
     launch: AgentLaunch,
     bridgeCwd: string,
-  ): Promise<ResultOf<'thread/start'>> {
-    return request(app, 'thread/start', threadOverrides(launch, bridgeCwd));
+    logger?: Logger,
+  ): Promise<{ thread: ResultOf<'thread/start'> | ResultOf<'thread/resume'>; resumed: boolean }> {
+    if (launch.resume !== null) {
+      try {
+        // Keep the RPC error intact until the never-ran case has been distinguished from other failures.
+        const thread = await app.rpc.request('thread/resume', {
+          threadId: launch.resume.sessionRef,
+          ...threadOverrides(launch, bridgeCwd),
+          excludeTurns: true,
+        });
+        return { thread, resumed: true };
+      } catch (error) {
+        if (!(error instanceof RpcError) || error.code !== -32600 || !error.message.startsWith('no rollout found')) {
+          throw new Error(`codex thread/resume failed: ${oneLine(error)}`);
+        }
+        logger?.info('codex thread/resume: no rollout found; starting a fresh thread', {
+          attemptId: launch.attemptId,
+          sessionRef: launch.resume.sessionRef,
+        });
+      }
+    }
+    return { thread: await request(app, 'thread/start', threadOverrides(launch, bridgeCwd)), resumed: false };
   }
 
   /** Checks required tools against the live bridge; returns sorted extra names to warn about. */
@@ -127,24 +158,25 @@ export class CodexSession {
     app: AppServerProcess,
     launch: AgentLaunch,
     thread: Pick<ResultOf<'thread/start'>, 'thread' | 'approvalPolicy' | 'approvalsReviewer' | 'sandbox' | 'cwd'>,
+    method: 'thread/start' | 'thread/resume',
     startedServers: readonly { threadId: string | null; name: string }[],
   ): Promise<string[]> {
     if (thread.approvalPolicy !== 'on-request') {
       throw new Error(
-        `codex thread/start reported approval policy ${JSON.stringify(thread.approvalPolicy)}, expected on-request`,
+        `codex ${method} reported approval policy ${JSON.stringify(thread.approvalPolicy)}, expected on-request`,
       );
     }
     if (thread.approvalsReviewer !== 'user') {
-      throw new Error(`codex thread/start reported approvals reviewer ${thread.approvalsReviewer}, expected user`);
+      throw new Error(`codex ${method} reported approvals reviewer ${thread.approvalsReviewer}, expected user`);
     }
     if (thread.sandbox.type !== 'workspaceWrite') {
-      throw new Error(`codex thread/start reported sandbox ${thread.sandbox.type}, expected workspaceWrite`);
+      throw new Error(`codex ${method} reported sandbox ${thread.sandbox.type}, expected workspaceWrite`);
     }
     if (thread.sandbox.networkAccess !== false) {
-      throw new Error('codex thread/start reported sandbox network access, expected no network');
+      throw new Error(`codex ${method} reported sandbox network access, expected no network`);
     }
     if (thread.cwd !== realpathSync(launch.clone)) {
-      throw new Error(`codex thread/start reported cwd ${thread.cwd}, expected ${realpathSync(launch.clone)}`);
+      throw new Error(`codex ${method} reported cwd ${thread.cwd}, expected ${realpathSync(launch.clone)}`);
     }
     const mcp = await request(app, 'mcpServerStatus/list', { threadId: thread.thread.id });
     // An incomplete inventory cannot establish that agflow is the only server.
