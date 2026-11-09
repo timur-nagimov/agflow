@@ -3,6 +3,7 @@ import {
   ClaimInputSchema,
   CreateTasksInputSchema,
   FeedbackInputSchema,
+  HandbackInputSchema,
   HandoffInputSchema,
   ImpossibleInputSchema,
   MarkMergedInputSchema,
@@ -16,7 +17,7 @@ import {
 } from '@agflow/core';
 import type { HubContext } from '../context';
 import { requestSubmission } from '../submissions';
-import { requestTakeover } from '../takeover';
+import { requestHandback, requestTakeover } from '../takeover';
 import {
   acceptTask,
   blockTask,
@@ -104,6 +105,13 @@ export function mountTaskRoutes(app: App, ctx: HubContext): void {
   app.post('/api/tasks/:id/takeover', (c) => {
     const p = human(c);
     return c.json(requestTakeover(ctx, c.req.param('id'), p.user), 202);
+  });
+
+  // The person who took over, or anyone once the runner is not online, hands the work back (design 6.12, X-24).
+  app.post('/api/tasks/:id/handback', async (c) => {
+    const p = human(c);
+    const { source } = await readBody(c, HandbackInputSchema);
+    return c.json(requestHandback(ctx, c.req.param('id'), { source, login: p.user }), 202);
   });
 
   // The agent doing the work.

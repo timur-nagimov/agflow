@@ -110,13 +110,21 @@ describe('cleanup', () => {
       attemptId: held.attempt.id,
     });
 
-    // The clone of a take-over waits for the hand-back while its task is still blocked as taken over.
-    const taken = addRunnerAttempt(ctx, { runnerId: held.runner.id });
-    writeTask(ctx, taken.task.id, { status: 'blocked', blockedKind: 'takeover', blockedReason: 'taken over by alice' });
+    // The clone of a take-over waits for the hand-back while its task is still blocked as taken over, whatever ended
+    // the attempt.
+    const takeover = { cause: 'takeover', reason: 'taken over by alice', by: 'user:alice', handoff: false } as const;
+    const takenOver = () => {
+      const taken = addRunnerAttempt(ctx, { runnerId: held.runner.id });
+      updateAttempt(ctx, taken.attempt.id, { stopRequested: { ...takeover, deferred: false, at: ctx.now() } });
+      writeTask(ctx, taken.task.id, { status: 'blocked', blockedKind: 'takeover', blockedReason: takeover.reason });
+      return taken;
+    };
+    const taken = takenOver();
     endAttempt(ctx, { attemptId: taken.attempt.id, trigger: 'takeover' });
+    endAttempt(ctx, { attemptId: takenOver().attempt.id, trigger: 'crashed' });
     expect(kinds(ctx, held.runner.id)).toEqual(['cleanup_attempt']);
     // One whose task was cancelled meanwhile can have no hand-back: its clone goes.
-    const cancelled = addRunnerAttempt(ctx, { runnerId: held.runner.id });
+    const cancelled = takenOver();
     writeTask(ctx, cancelled.task.id, { status: 'cancelled' });
     endAttempt(ctx, { attemptId: cancelled.attempt.id, trigger: 'takeover' });
     expect(kinds(ctx, held.runner.id)).toEqual(['cleanup_attempt', 'cleanup_attempt']);

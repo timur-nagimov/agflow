@@ -140,6 +140,7 @@ describe('attempt rows', () => {
       anywhere: 'git fetch origin refs/agflow/T-1/takeover-alice',
       ref: 'refs/agflow/T-1/takeover-alice',
       error: null,
+      handingBack: null,
     };
     updateAttempt(ctx, attempt.id, {
       model: 'claude-sonnet-5-5',
@@ -253,7 +254,13 @@ describe('attempt rows', () => {
       facts,
       factsAt: 8,
       stopRequested: { cause: 'cancel', reason: 'r', by: 'user:bob', handoff: false, deferred: true, at: 9 },
-      takeover: { local: 'l', anywhere: 'a', ref: 'refs/agflow/T-1/takeover-bob', error: 'e' },
+      takeover: {
+        local: 'l',
+        anywhere: 'a',
+        ref: 'refs/agflow/T-1/takeover-bob',
+        error: 'e',
+        handingBack: { by: 'user:bob', at: 10 },
+      },
       finalSha: '4'.repeat(40),
       compactionSummary: 'compacted',
       transcriptTail: 'tail',

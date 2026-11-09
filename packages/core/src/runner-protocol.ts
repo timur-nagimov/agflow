@@ -231,6 +231,10 @@ export type RunnerCommand =
     }
   | { kind: 'prepare_takeover'; attemptId: string; fence: Fence; person: string }
   | {
+      /**
+       * Refused while processes still run in the clone, with the result
+       * { ok: false, error: 'process_running', data: { pids: number[] } }: the hub names the pids to the person (X-37).
+       */
       kind: 'hand_back';
       attemptId: string;
       /**

@@ -201,6 +201,7 @@ const takenOver: Attempt = {
     anywhere: 'git fetch origin refs/agflow/T-42/a3 && git switch -c agflow/T-42-add-login FETCH_HEAD',
     ref: 'refs/agflow/T-42/takeover-timur',
     error: null,
+    handingBack: { by: 'user:timur', at },
   },
   leaseExpiresAt: null,
   endedAt: at,

@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { type AttemptFacts, type RawRunnerEvent, TEST_ACCOUNT_ID, type Vendor, type VendorQuota } from '@agflow/core';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
-import { endAttempt, startRunnerAttempt } from '../src/attempts';
+import { endAttempt, requestStop, startRunnerAttempt } from '../src/attempts';
 import { pendingCommands } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
 import { applyRunnerEvents } from '../src/events-in';
@@ -362,6 +362,14 @@ describe('the reconcile step', () => {
       });
     // An exhausted Codex account with an unknown reset, for the probe.
     exhaust(ctx, 'codex', { resetsAt: null });
+    // A taken-over attempt whose hand-back from the clone gets no answer.
+    const taken = addRunnerAttempt(ctx);
+    const by = 'user:alice';
+    requestStop(ctx, { attemptId: taken.attempt.id, cause: 'takeover', reason: 'taken over by alice', by });
+    endAttempt(ctx, { attemptId: taken.attempt.id, trigger: 'takeover' });
+    const takeover = getAttempt(ctx, taken.attempt.id).takeover;
+    if (!takeover) throw new Error('no take-over recorded');
+    updateAttempt(ctx, taken.attempt.id, { takeover: { ...takeover, handingBack: { by, at: ctx.now() } } });
 
     clock.advance(ctx.config.quotaUnknownMs);
     const later = ctx.now() + ctx.config.runnerLeaseMs;
@@ -389,6 +397,7 @@ describe('the reconcile step', () => {
       stalls: { suspected: [], stopped: [erring.attempt.id] },
       stops: 1,
       submissions: 1,
+      handbacks: 1,
       holdingLeads: [],
       probes: 1,
       quotaWaits: [],
@@ -396,6 +405,7 @@ describe('the reconcile step', () => {
       rotated: null,
     });
     expect(getAttempt(ctx, lost.attempt.id).endReason).toBe('lost');
+    expect(getAttempt(ctx, taken.attempt.id).takeover?.handingBack).toBeNull();
     expect(result.started.map((attempt) => [attempt.taskId, attempt.runnerId])).toContainEqual([swept, runnerId]);
   });
 

@@ -328,8 +328,17 @@ export interface Attempt {
   phase: AttemptPhase | null;
   facts: AttemptFacts | null;
   stopRequested: { cause: StopCause; reason: string; by: string; handoff: boolean; deferred: boolean; at: number } | null;
-  /** The commands shown to the person, and the take-over ref they push to. */
-  takeover: { local: string | null; anywhere: string; ref: string; error: string | null } | null;
+  /**
+   * The commands shown to the person, and the take-over ref they push to. handingBack: a hand-back from the clone on
+   * its way, by whom and since when, until attempt.handed_back, a refused hand_back or handbackTimeoutMs (X-49).
+   */
+  takeover: {
+    local: string | null;
+    anywhere: string;
+    ref: string;
+    error: string | null;
+    handingBack: { by: string; at: number } | null;
+  } | null;
   leaseExpiresAt: number | null;
   quotaResetsAt: number | null;
   startedAt: number;

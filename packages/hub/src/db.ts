@@ -227,7 +227,7 @@ CREATE TABLE attempts (
   facts TEXT,                        -- JSON AttemptFacts
   facts_at INTEGER,                  -- when the hub received them
   stop_requested TEXT,               -- JSON {cause, reason, by, handoff, deferred, at}
-  takeover TEXT,                     -- JSON {local, anywhere, ref, error}
+  takeover TEXT,                     -- JSON {local, anywhere, ref, error, handingBack}
   final_sha TEXT,                    -- the harvested head reported at exit, even when its push failed
   compaction_summary TEXT,
   transcript_tail TEXT,

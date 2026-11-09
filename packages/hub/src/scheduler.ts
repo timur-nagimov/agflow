@@ -34,6 +34,7 @@ import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from '.
 import { markOwnerAwayTold, probeUnknownResets } from './quota';
 import { expireSubmissions } from './submissions';
 import { type StallDecisions, judgeStalls } from './supervisor';
+import { expireHandbacks } from './takeover';
 import { getTask, isPathHolder, listTasks, unmetDependencies } from './task-store';
 import { sweepLeases } from './tasks';
 
@@ -311,6 +312,8 @@ export interface ReconcileResult {
   stops: number;
   /** Submissions failed at their timeout (expireSubmissions). */
   submissions: number;
+  /** Hand-backs from the clone given up at handbackTimeoutMs (expireHandbacks). */
+  handbacks: number;
   /** Holding runner leads ended lost because they can no longer be resumed (checkHoldingLeads). */
   holdingLeads: string[];
   /** Codex preflights sent for unknown resets (probeUnknownResets). */
@@ -346,6 +349,7 @@ export function reconcile(ctx: HubContext): ReconcileResult {
     stalls: duty('the stall decisions', () => judgeStalls(ctx), { suspected: [], stopped: [] }),
     stops: duty('the stop timeouts', () => expireStops(ctx), 0),
     submissions: duty('the submission timeouts', () => expireSubmissions(ctx), 0),
+    handbacks: duty('the hand-back timeouts', () => expireHandbacks(ctx), 0),
     holdingLeads: duty('the holding lead check', () => checkHoldingLeads(ctx), []),
     probes: duty('the Codex reset probe', () => probeUnknownResets(ctx), 0),
     quotaWaits: duty('the quota_wait replacement', () => replaceQuotaWaits(ctx), []),

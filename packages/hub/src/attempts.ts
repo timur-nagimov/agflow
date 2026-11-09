@@ -654,9 +654,10 @@ export function endAttempt(ctx: HubContext, input: EndAttemptInput): Ending | nu
     const attempt = getAttempt(ctx, before.id);
     failPendingSubmission(ctx, emit, attempt, actor);
     let task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
-    // A take-over's clone waits for the hand-back while the task is still taken over by this attempt. A task cancelled
-    // meanwhile gets no hand-back, so its clone is cleaned up like any other (design 6.12).
-    const waitsForHandBack = row.endReason === 'taken_over' && task !== null && takenOverBy(task, attempt);
+    // A take-over's clone waits for the hand-back while the task is still taken over by this attempt, whatever ended
+    // it: the take-over, or a crash first. A task cancelled meanwhile gets no hand-back, so its clone is cleaned up
+    // like any other (design 6.12).
+    const waitsForHandBack = takeoverPerson(attempt) !== null && task !== null && takenOverBy(task, attempt);
     let moved: TaskStatus[] = [];
     let noteAdded = false;
     let ladder: LadderOutcome | null = null;
@@ -763,9 +764,10 @@ export function takeoverPerson(attempt: Pick<Attempt, 'stopRequested'>): string 
 
 /**
  * A take-over's ending (design 6.12) while its task waits for the hand-back, and task.taken_over for the pages.
- * Without the runner's attempt.taken_over (the lease expiry or the stop timeout) the hub builds the command that works
- * anywhere itself, with core's takeoverAnywhereCommand, the one builder the runner's take-over also calls: from the
- * task's work position onto its branch, and pushed to the person's take-over ref. There is no local command then.
+ * Without the runner's attempt.taken_over (the lease expiry, the stop timeout, or a crash before the take-over was
+ * done) the hub builds the command that works anywhere itself, with core's takeoverAnywhereCommand, the one builder
+ * the runner's take-over also calls: from the task's work position onto its branch, and pushed to the person's
+ * take-over ref. There is no local command then.
  */
 function endTakeover(ctx: HubContext, emit: Emit, attempt: Attempt, task: Task, actor: string): void {
   const person = takeoverPerson(attempt);
@@ -777,7 +779,7 @@ function endTakeover(ctx: HubContext, emit: Emit, attempt: Attempt, task: Task, 
     const branch = task.branch ?? taskBranchName(task.id, task.title, attempt.fence.epoch);
     const work = task.workRef ?? attempt.startRef ?? ctx.config.mainBranch;
     const anywhere = takeoverAnywhereCommand({ ref: work, branch, takeoverRef: ref });
-    takeover = { local: null, anywhere, ref, error: null };
+    takeover = { local: null, anywhere, ref, error: null, handingBack: null };
     updateAttempt(ctx, attempt.id, { takeover });
   }
   emit({

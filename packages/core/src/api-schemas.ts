@@ -198,7 +198,13 @@ export const AttemptSchema = schemaFor<Attempt>()(
         })
         .nullable(),
       takeover: z
-        .strictObject({ local: Name.nullable(), anywhere: Name, ref: RefSchema, error: z.string().nullable() })
+        .strictObject({
+          local: Name.nullable(),
+          anywhere: Name,
+          ref: RefSchema,
+          error: z.string().nullable(),
+          handingBack: z.strictObject({ by: Name, at: NonNegativeInt }).nullable(),
+        })
         .nullable(),
       leaseExpiresAt: NonNegativeInt.nullable(),
       quotaResetsAt: NonNegativeInt.nullable(),

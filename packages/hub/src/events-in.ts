@@ -39,7 +39,7 @@ import { resumeDeferred } from './recovery';
 import { applyRunnerSettings, applyVendorReport, markGitPushed, setReportedState } from './runners';
 import { onSubmitted } from './submissions';
 import { onVendorOutcome } from './supervisor';
-import { onTakenOver } from './takeover';
+import { onHandedBack, onTakenOver } from './takeover';
 import { clip } from './text';
 
 /**
@@ -130,6 +130,8 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
   'attempt.submitted': (ctx, event, context) =>
     onSubmitted(ctx, context.emit, context.runnerId, context.attempt, event),
   'attempt.taken_over': (ctx, event, context) => onTakenOver(ctx, attemptOf(context), event.data),
+  'attempt.handed_back': (ctx, event, context) =>
+    onHandedBack(ctx, context.emit, context.runnerId, context.attempt, event),
   'attempt.prepared': (ctx, event, context) => onPrepared(ctx, context.emit, attemptOf(context), event.data),
   'attempt.delivered': (ctx, event, context) =>
     onDelivered(ctx, context.emit, attemptOf(context), event.data.messageIds),
