@@ -6,6 +6,7 @@ import { claudeProjectDir } from '../../../src/adapters/claude/paths';
 import {
   deleteClaudeTranscript,
   findClaudeTranscript,
+  hasClaudeConversation,
   readClaudeTranscriptTail,
 } from '../../../src/adapters/claude/transcript';
 
@@ -204,6 +205,29 @@ describe('readClaudeTranscriptTail', () => {
     const { home, clone } = setup();
     writeSession(join(home, 'projects', '-moved'), SESSION, [prompt('1'), said([text('found')])]);
     expect(await readClaudeTranscriptTail(home, { sessionRef: SESSION, clone, maxChars: 100 })).toBe('found');
+  });
+});
+
+describe('hasClaudeConversation', () => {
+  test("a transcript in the clone's project directory with a main-thread message has a conversation", async () => {
+    const { home, clone, projectDir } = setup();
+    writeSession(projectDir, SESSION, [JSON.stringify({ type: 'summary', summary: 'x' }), prompt('go')]);
+    expect(await hasClaudeConversation(home, { sessionRef: SESSION, clone })).toBe(true);
+  });
+
+  test('no transcript, one without messages, or one elsewhere has none: what the CLI cannot resume', async () => {
+    const { home, clone, projectDir } = setup();
+    expect(await hasClaudeConversation(home, { sessionRef: SESSION, clone })).toBe(false);
+    writeSession(join(home, 'projects', '-moved'), SESSION, [prompt('1'), said([text('elsewhere')])]);
+    expect(await hasClaudeConversation(home, { sessionRef: SESSION, clone })).toBe(false);
+    const queued = JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'go' });
+    writeSession(projectDir, SESSION, ['not json', queued, prompt('a sub-agent', { isSidechain: true }), '']);
+    expect(await hasClaudeConversation(home, { sessionRef: SESSION, clone })).toBe(false);
+  });
+
+  test('a session id containing path characters is refused', async () => {
+    const { home, clone } = setup();
+    await expect(hasClaudeConversation(home, { sessionRef: '../x', clone })).rejects.toThrow(/is not valid/);
   });
 });
 

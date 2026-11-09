@@ -3,6 +3,9 @@
 // spawns the session, pushes the first prompt and resolves once the first system/init passes the first-turn check
 // (8.1). A mismatch fails the start and does nothing else (X-29), and so does a CLI that starts no turn within the
 // start's deadline. The auto profile runs acceptEdits unless the last preflight saw the account offer auto mode (7.6).
+// A resume runs in the same clone with the same options (8.4). A session that never ran a turn has no conversation to
+// resume, so a fresh one takes its place without a resume being spawned, and any resume the CLI refuses fails the
+// start once the process is gone (7.4): one launch spawns one process.
 import type { Vendor } from '@agflow/core';
 import type { RunnerPaths } from '../../paths';
 import { boundedWait } from '../../processes';
@@ -12,7 +15,7 @@ import { CLAUDE_BRIEF_HOOK_TIMEOUT_S, claudeBinary, claudeTools, effectivePermis
 import { readClaudeVersion } from './pin';
 import { QuotaBook } from './quota';
 import { ClaudeSession } from './session';
-import { deleteClaudeTranscript, readClaudeTranscriptTail } from './transcript';
+import { deleteClaudeTranscript, hasClaudeConversation, readClaudeTranscriptTail } from './transcript';
 
 /** How long a failed start waits for the CLI it ended to exit, before it kills the CLI's group. */
 const FAILED_START_EXIT_MS = 5_000;
@@ -59,6 +62,13 @@ export class ClaudeAdapter {
     // Taken once, so the options and the check agree even if a preflight runs meanwhile.
     const expected = this.firstTurnExpectation(launch);
     if (!launch.resume) return this.startNew(launch, expected);
+    // A session that never ran a turn cannot be resumed ('No conversation found'): it starts afresh in its clone with
+    // the first prompt, and started reports the new sessionRef. Checked before spawning, so the launch registers one
+    // process (AgentLaunch.registerProcess).
+    const ref = { sessionRef: launch.resume.sessionRef, clone: launch.clone };
+    if (!(await hasClaudeConversation(this.options.vendorHomes.claude, ref))) {
+      return this.startNew({ ...launch, resume: null }, expected);
+    }
     // A resumed session waits for the runner's message, which M2b's controller sends only once start() resolved: so
     // the start resolves once the CLI answers initialize, and the first turn is checked when that message starts it.
     // A mismatch then ends the session (a warning, then SIGTERM), which the hub sees as an exit nobody asked for, not
@@ -159,7 +169,9 @@ export class ClaudeAdapter {
     if (!options.exit) return new Error(problem);
     await session.stderrRead();
     const how = exit.done ? exitText(exit.value) : null;
-    const parts = [problem, how, session.stderrTail().trim()];
+    // The SDK's error often quotes the CLI's own last line already.
+    const stderr = session.stderrTail().trim();
+    const parts = [problem, how, problem.includes(stderr) ? null : stderr];
     return new Error(parts.filter((part) => part !== null && part !== '').join(': '));
   }
 }

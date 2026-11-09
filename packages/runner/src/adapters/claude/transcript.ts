@@ -1,8 +1,11 @@
-// A Claude session's transcript under the runner's Claude home (design 8.3, 6.8, 7.8): the tail the hub's handoff
-// note quotes, read without a live session, and the deletion cleanup_attempt and retention run. Both look in the
+// A Claude session's transcript under the runner's Claude home (design 8.3, 6.8, 7.8, 8.4): the tail the hub's handoff
+// note quotes, read without a live session, whether a resume has a conversation to resume, and the deletion
+// cleanup_attempt and retention run. Both look in the
 // clone's project directory first, then for the session id under any project directory. The SDK's own session helpers
 // are not used: they resolve the projects directory from the runner's environment, not from the Claude home.
+import { createReadStream } from 'node:fs';
 import { open, readdir, rm, rmdir, stat } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { isRecord } from './json';
 import { claudeProjectDir } from './paths';
@@ -61,6 +64,34 @@ export async function readClaudeTranscriptTail(
     kept.unshift(turn);
   }
   return kept.join(TURN_SEPARATOR);
+}
+
+/**
+ * Whether the clone's project directory, where the CLI resumes from, holds the session's transcript with a message of
+ * the main thread in it. A session that never ran a turn has none, and 2.1.285 refuses to resume it ('No conversation
+ * found'); the adapter then starts a fresh session instead of spawning a resume that fails (8.4, 7.4).
+ */
+export async function hasClaudeConversation(claudeHome: string, ref: ClaudeTranscriptRef): Promise<boolean> {
+  checkSessionRef(ref.sessionRef);
+  const own = ownProjectDir(claudeHome, ref.clone);
+  if (own === null) return false;
+  const path = join(own, `${ref.sessionRef}.jsonl`);
+  if (!(await isFile(path))) return false;
+  // Line by line, up to the first message: a long transcript is not read whole.
+  const input = createReadStream(path, { encoding: 'utf8' });
+  const lines = createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
+  try {
+    for await (const line of lines) {
+      const entry = parseEntry(line);
+      if (entry !== null && entry.isSidechain !== true && (entry.type === 'user' || entry.type === 'assistant')) {
+        return true;
+      }
+    }
+    return false;
+  } finally {
+    lines.close();
+    input.destroy();
+  }
 }
 
 /**

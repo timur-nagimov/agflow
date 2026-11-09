@@ -240,11 +240,18 @@ export interface ClaudeScenario {
   transcript?: string;
   /** The scripted server's answers; --live leaves them to the model, which the prompts instruct the same way. */
   handler: AnthropicHandler;
+  /** The session the launch resumes, instead of starting a new one. */
+  resume?: string;
+  /**
+   * The CLI ends before it answers initialize: drive is not run, no transcript is expected, and the recording's
+   * startup ends with the CLI's stderr and exit code.
+   */
+  failsToStart?: boolean;
   drive(session: ScenarioSession): Promise<void>;
 }
 
 export interface ScenarioRun {
-  /** The id the session was started with. */
+  /** The id the session was started with, or the one it resumed. */
   sessionId: string;
   /** The id the last result named: /clear starts a new conversation. */
   finalSessionId: string;
@@ -260,6 +267,8 @@ export interface ScenarioRun {
   settings: Json | null;
   exit: { code: number | null; signal: string | null } | null;
   stderr: string;
+  /** Why the session never started, for a scenario that fails to start; null otherwise. */
+  startError: string | null;
 }
 
 /** Runs one scenario through the SDK with buildQueryOptions and records every line both ways. */
@@ -322,7 +331,9 @@ export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaun
     compactions.push(input as Json);
     return {};
   };
-  const options = buildQueryOptions(scratch.launch, {
+  const launch: AgentLaunch =
+    scenario.resume === undefined ? scratch.launch : { ...scratch.launch, resume: { sessionRef: scenario.resume } };
+  const options = buildQueryOptions(launch, {
     agflow: scratch.agflow,
     paths: scratch.paths,
     vendorHomes: scratch.vendorHomes,
@@ -330,7 +341,7 @@ export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaun
     spawnClaudeCodeProcess,
     compaction: { preCompact: compactionHook, postCompact: compactionHook },
   });
-  const sessionId = options.sessionId as string;
+  const sessionId = (options.resume ?? options.sessionId) as string;
 
   const queue: SDKUserMessage[] = [];
   const inboxState: { wake: (() => void) | null; ended: boolean } = { wake: null, ended: false };
@@ -402,12 +413,21 @@ export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaun
 
   let initialization: Json = {};
   let settings: Json | null = null;
+  let startError: string | null = null;
   try {
-    initialization = (await q.initializationResult()) as Json;
-    // Untyped in sdk.d.ts, like cancelQueued; preflight reads the same answer.
-    settings = await (q as unknown as { getSettings(): Promise<Json> }).getSettings().catch(() => null);
-    await q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }).catch(() => null);
-    await scenario.drive(session);
+    try {
+      initialization = (await q.initializationResult()) as Json;
+    } catch (error) {
+      if (!scenario.failsToStart) throw error;
+      startError = (error as Error).message;
+    }
+    if (scenario.failsToStart && startError === null) throw new Error(`${scenario.name}: the session started`);
+    if (startError === null) {
+      // Untyped in sdk.d.ts, like cancelQueued; preflight reads the same answer.
+      settings = await (q as unknown as { getSettings(): Promise<Json> }).getSettings().catch(() => null);
+      await q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }).catch(() => null);
+      await scenario.drive(session);
+    }
   } finally {
     inboxState.ended = true;
     inboxState.wake?.();
@@ -439,6 +459,7 @@ export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaun
     settings,
     exit,
     stderr,
+    startError,
   };
 }
 
@@ -542,6 +563,11 @@ export function assembleRecording(run: ScenarioRun, header: RecordingHeader): Cl
     if (frame.type === 'keep_alive') continue;
     current.push({ frame });
     if (frame.type === 'system' && frame.subtype === 'session_state_changed' && frame.state === 'idle') idle = true;
+  }
+  if (run.startError !== null) {
+    // The CLI ended by itself: what it wrote to stderr, then its exit.
+    if (run.stderr !== '') startup.push({ stderr: run.stderr });
+    if (run.exit?.code !== null && run.exit?.code !== undefined) startup.push({ exit: run.exit.code });
   }
   const template = (steps: RecordingStep[], users: string[]) =>
     steps.map((step) => mapStrings(step, (value, key) => templated(value, key, users, header)) as RecordingStep);
@@ -877,6 +903,25 @@ export const CLAUDE_SCENARIOS: ClaudeScenario[] = [
     },
   },
   {
+    // A session that never ran a turn has no transcript: 2.1.285 prints an error result and exits 1 before it
+    // answers initialize (8.4, 7.4).
+    name: 'resume-not-found',
+    fixture: 'resume-not-found',
+    handler: rules(),
+    resume: randomUUID(),
+    failsToStart: true,
+    drive: async () => {},
+  },
+  {
+    // Any other resume failure; a reference that is no session id is one the CLI refuses without a model.
+    name: 'resume-failure',
+    fixture: 'resume-failure',
+    handler: rules(),
+    resume: 'not-a-session',
+    failsToStart: true,
+    drive: async () => {},
+  },
+  {
     name: 'session',
     transcript: 'session',
     handler: rules(
@@ -950,7 +995,9 @@ export async function recordClaudeStream(options: RecordClaudeStreamOptions = {}
     const scratch = scratchLaunch({ bin, model, env, live: options.live });
     try {
       const run = await runScenario(scenario, scratch);
-      const transcript = assertTranscriptPlacement(scratch.vendorHomes.claude, scratch.clone, run.finalSessionId);
+      const transcript = scenario.failsToStart
+        ? null
+        : assertTranscriptPlacement(scratch.vendorHomes.claude, scratch.clone, run.finalSessionId);
       if (scenario.fixture) {
         const header: RecordingHeader = {
           cliVersion: version.version,
@@ -966,7 +1013,7 @@ export async function recordClaudeStream(options: RecordClaudeStreamOptions = {}
         writeRecording(path, recording);
         written.push(path);
       }
-      if (scenario.transcript) {
+      if (scenario.transcript && transcript !== null) {
         const path = join(options.transcriptsDir ?? CLAUDE_TRANSCRIPT_FIXTURES_DIR, `${scenario.transcript}.jsonl`);
         mkdirSync(dirname(path), { recursive: true });
         const context = {

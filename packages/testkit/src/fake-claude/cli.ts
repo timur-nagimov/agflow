@@ -232,7 +232,7 @@ class FakeClaude {
       } else if ('hook' in step) {
         await this.fireHook(step.hook, signal);
       } else if ('stderr' in step) {
-        const text = step.stderr;
+        const text = this.fillText(step.stderr);
         await new Promise<void>((resolve) => process.stderr.write(text, () => resolve()));
       } else if ('exit' in step) {
         await this.exit(step.exit);
