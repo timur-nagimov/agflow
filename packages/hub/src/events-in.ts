@@ -38,6 +38,7 @@ import { recordQuotaReports } from './quota';
 import { resumeDeferred } from './recovery';
 import { applyRunnerSettings, applyVendorReport, markGitPushed, setReportedState } from './runners';
 import { onSubmitted } from './submissions';
+import { onVendorOutcome } from './supervisor';
 import { clip } from './text';
 
 /**
@@ -146,6 +147,8 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
     applyVendorReport(ctx, runnerId, event.data.vendors);
     recordQuotaReports(ctx, emit, runnerId, event.data.quota);
   },
+  'attempt.vendor_outcome': (ctx, event, context) =>
+    onVendorOutcome(ctx, context.emit, attemptOf(context), event.data),
   'attempt.quota': (ctx, event, context) =>
     onAttemptQuota(ctx, context.emit, context.runnerId, attemptOf(context), event.data),
   'approval.requested': (ctx, event, context) =>
