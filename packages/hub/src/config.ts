@@ -136,6 +136,11 @@ function runnerSettings(env: Env, testMode: boolean): HubRunnerSettings {
   return settings;
 }
 
+/** The hub's database file: AGFLOW_DB, or data/agflow.db. The restore command reads it the same way. */
+export function databasePath(env: Env): string {
+  return env.AGFLOW_DB ?? 'data/agflow.db';
+}
+
 export function loadConfig(env: Env): LoadedConfig {
   const auth = env.AGFLOW_AUTH ?? 'github';
   if (auth !== 'github' && auth !== 'dev') throw new Error('AGFLOW_AUTH must be "github" or "dev"');
@@ -185,7 +190,7 @@ export function loadConfig(env: Env): LoadedConfig {
   return {
     host,
     port,
-    dbPath: env.AGFLOW_DB ?? 'data/agflow.db',
+    dbPath: databasePath(env),
     backupDir: env.AGFLOW_BACKUP_DIR ?? 'data/backups',
     config,
   };

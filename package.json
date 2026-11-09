@@ -8,6 +8,7 @@
     "build:web": "bun run --cwd packages/web build",
     "test": "bun test",
     "hub": "bun packages/hub/src/main.ts",
+    "restore": "bun packages/hub/src/restore.ts",
     "smoke:hub": "bun scripts/smoke-hub.ts",
     "smoke:cli": "bun packages/cli/scripts/smoke.ts",
     "build:cli": "bun build --compile packages/cli/src/main.ts --outfile dist/agflow",

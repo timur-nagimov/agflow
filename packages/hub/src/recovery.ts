@@ -1,19 +1,28 @@
 // What the hub does when a runner comes back (design 6.3, Reconciliation on hello; 6.4, Lease expiry): it decides,
 // in the hello transaction, every attempt it believes open on that runner from the state the runner reports, builds
 // the list of attempts the runner must stop before it runs any command, and asks for the transcripts of attempts that
-// ended lost while it was away. Resumes that wait for the runner to be ok, and transcript tails uploaded over HTTP,
-// are here too. So is what the hub does when it comes back itself (design 6.14): the clock check that finds downtime,
-// and the pid file that keeps two hubs, or a hub and a restore, off one database.
+// ended lost while it was away; after a restore, it ends what the restored hub no longer names and re-fences the rest
+// once the runner's replay is complete. Resumes that wait for the runner to be ok, and transcript tails uploaded over
+// HTTP, are here too. So is what the hub does when it comes back itself (design 6.14): the clock check that finds
+// downtime, and the pid file that keeps two hubs, or a hub and a restore, off one database.
 import { linkSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
-import type { Attempt, HubMessage, LiveAttempt } from '@agflow/core';
-import { findAttempt, getAttempt, listAttempts, updateAttempt } from './attempt-store';
-import { endAttempt, recentResumes, resumeAttempt } from './attempts';
-import { enqueueCommand } from './commands';
+import { type Attempt, type HubMessage, type LiveAttempt, formatFence } from '@agflow/core';
+import { appendAttemptLog, findAttempt, getAttempt, issueFence, listAttempts, updateAttempt } from './attempt-store';
+import { endAttempt, recentResumes, resumeAttempt, stopCommand } from './attempts';
+import { revokeAgentTokens } from './auth';
+import { cancelPendingCommands, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import { forbidden } from './errors';
-import { getHubState, updateHubState } from './hub-state';
-import { type HelloMessage, findRunnerRow, setDeferredResumes, takeDeferredResumes } from './runners';
+import { getHubState, hubEpoch, updateHubState } from './hub-state';
+import {
+  type HelloMessage,
+  findRunnerRow,
+  isRestorePending,
+  setDeferredResumes,
+  setRestorePending,
+  takeDeferredResumes,
+} from './runners';
 import { getTask, writeTask } from './task-store';
 
 type WelcomeStop = Extract<HubMessage, { t: 'welcome' }>['stop'][number];
@@ -33,12 +42,19 @@ export type ReconcileAction =
   | 'resumed'
   /** The same, while the runner is not ok: the resume waits for runner.state ok, and the lease keeps running. */
   | 'deferred'
-  /** Not reported while its start_attempt is still pending: the start goes out again, with a fresh token. */
+  /**
+   * Not reported while its start_attempt is still pending: the start goes out again, with a fresh token, and at a new
+   * fence when its fence is of an epoch before a restore.
+   */
   | 'resent'
   /** Lost on the runner while it held a process, or restarted too often: it ended crashed. */
   | 'crashed'
   /** A holding attempt the runner no longer has: it cannot be resumed. */
-  | 'unresumable';
+  | 'unresumable'
+  /** After a restore: reported, but its task or the lead seat no longer names it, so it ended superseded. */
+  | 'superseded'
+  /** After a restore: reported and still named, so it gets a new fence once the runner's replay is complete. */
+  | 'refence';
 
 export interface ReconcileResult {
   /** The attempts the runner must stop: reported, but ended, unknown or not this runner's. */
@@ -68,6 +84,30 @@ function startPending(ctx: HubContext, attemptId: string): boolean {
 }
 
 const actorOf = (attempt: Attempt): string => `runner:${attempt.runnerId}`;
+
+/**
+ * A start the runner never had, queued at a fence of an epoch before a restore: the restored hub accepts no token of
+ * that fence (design 6.5), so the start goes out again at a new fence, with the attempt's tokens revoked and a recorded
+ * stop queued again after it. As the runner does not report the attempt, it never ran the old start, so a fresh one is
+ * safe. Keyed on the fence, not on the hello, so a runner whose restore-pending flag is cleared is covered too.
+ */
+function restartAtNewFence(ctx: HubContext, attempt: Attempt): void {
+  const cancelled = cancelPendingCommands(ctx, attempt.id);
+  revokeAgentTokens(ctx, attempt.id);
+  const fence = issueFence(ctx);
+  updateAttempt(ctx, attempt.id, { fence });
+  appendAttemptLog(ctx, attempt.id, 'note', `started again at fence ${formatFence(fence)}: the hub was restored from a backup`);
+  for (const row of cancelled) {
+    if (row.command.kind !== 'start_attempt') continue;
+    enqueueCommand(ctx, attempt.runnerId as string, { ...row.command, attempt: { ...row.command.attempt, fence } });
+  }
+  const stop = attempt.stopRequested;
+  if (stop && !stop.deferred) {
+    // The process the stop is for has not started yet: it gets the whole grace, as after a resume.
+    updateAttempt(ctx, attempt.id, { stopRequested: { ...stop, at: ctx.now() } });
+    enqueueCommand(ctx, attempt.runnerId as string, stopCommand(getAttempt(ctx, attempt.id)));
+  }
+}
 
 /**
  * The process is gone, so a recorded stop is complete (invariant a): the attempt ends with the requested cause. While
@@ -103,11 +143,38 @@ function restartResume(ctx: HubContext, attempt: Attempt): ReconcileAction {
 export interface ReconcileOptions {
   /** The runner holds events after the acknowledged position, which it replays once welcomed. */
   replayPending?: boolean | undefined;
+  /** The hub was restored since this runner's last welcome, or its re-fences are still pending (afterRestore). */
+  afterRestore?: boolean | undefined;
+}
+
+/** The statuses whose process a resume brings back. */
+const RESUMABLE = new Set<Attempt['status']>(['starting', 'running', 'quota_wait']);
+
+/** Whether the attempt's task, or for a lead the lead seat, still names it. */
+function stillNamed(ctx: HubContext, attempt: Attempt): boolean {
+  if (attempt.taskId === null) return getHubState(ctx).leadAgentId === attempt.agentId;
+  return getTask(ctx, attempt.taskId).currentAttempt === attempt.id;
 }
 
 /**
- * Decides one open attempt by the first row of the table that matches (the restore rows aside). ok: the hello's
- * state; while the runner is not ok, the resume row waits (X-36).
+ * The two rows after a restore (design 6.3), for an attempt the runner reports: one its task or the seat no longer
+ * names ends superseded at once, and welcome.stop lists it; one still named waits for the replay, which cannot change
+ * what names it, and is then re-fenced (reconcileAfterRestore). A holding attempt has no process to re-fence, and a
+ * take-over in flight is the take-over's to finish: both go on to the other rows, and the next resume of a holding
+ * one brings a fence of the new epoch. Null when no restore row applies.
+ */
+function decideAfterRestore(ctx: HubContext, attempt: Attempt): ReconcileAction | null {
+  if (!stillNamed(ctx, attempt)) {
+    endAttempt(ctx, { attemptId: attempt.id, trigger: 'superseded', actor: actorOf(attempt) });
+    return 'superseded';
+  }
+  if (!RESUMABLE.has(attempt.status) || attempt.stopRequested?.cause === 'takeover') return null;
+  return 'refence';
+}
+
+/**
+ * Decides one open attempt by the first row of the table that matches, the restore rows first after a restore. ok:
+ * the hello's state; while the runner is not ok, the resume row waits (X-36).
  */
 function decide(
   ctx: HubContext,
@@ -116,6 +183,10 @@ function decide(
   ok: boolean,
   options: ReconcileOptions,
 ): ReconcileAction {
+  if (options.afterRestore && live) {
+    const restored = decideAfterRestore(ctx, attempt);
+    if (restored !== null) return restored;
+  }
   const actor = actorOf(attempt);
   const stop = attempt.stopRequested;
   if (gone(live) && stop) {
@@ -131,7 +202,10 @@ function decide(
     if (attempt.status === 'holding') return 'kept';
     return ok ? restartResume(ctx, attempt) : 'deferred';
   }
-  if (!live && attempt.status === 'starting' && startPending(ctx, attempt.id)) return 'resent';
+  if (!live && attempt.status === 'starting' && startPending(ctx, attempt.id)) {
+    if (attempt.fence.epoch < hubEpoch(ctx)) restartAtNewFence(ctx, attempt);
+    return 'resent';
+  }
   if (attempt.status === 'holding') {
     updateAttempt(ctx, attempt.id, { resumable: false });
     return 'unresumable';
@@ -152,8 +226,9 @@ function stopReason(ctx: HubContext, runnerId: string, attemptId: string): strin
 
 /**
  * Reconciliation on hello (design 6.3), in the hello transaction: each attempt the hub has open on the runner is
- * decided from what the hello reports about it (X-36), by the first row of the table that matches. The rows after a
- * restore are decided elsewhere. While the hello's state is not ok, resumes wait for runner.state ok (resumeDeferred).
+ * decided from what the hello reports about it (X-36), by the first row of the table that matches. After a restore,
+ * superseded attempts end here, and the re-fences wait for the replay (reconcileAfterRestore). While the hello's state
+ * is not ok, resumes wait for runner.state ok (resumeDeferred).
  * Then every reported attempt that is ended by now, unknown, or not this runner's goes to welcome.stop, and those that
  * ended lost bring their transcripts (onRunnerBack). Pending commands of the attempts that stay are sent again after
  * welcome, as every pending command is, and the runner's journal keeps it from running one twice.
@@ -185,9 +260,6 @@ export function reconcileOnHello(
   return { stop, actions };
 }
 
-/** The statuses whose process a resume brings back. */
-const RESUMABLE = new Set<Attempt['status']>(['starting', 'running', 'quota_wait']);
-
 /**
  * runner.state ok after a hello that was not (X-36): the resumes that waited apply now, to the attempts still open on
  * the runner. One whose stop was requested meanwhile ends with that cause instead, as its process is gone.
@@ -199,6 +271,36 @@ export function resumeDeferred(ctx: HubContext, runnerId: string): void {
     if (attempt.stopRequested) completeStop(ctx, attempt);
     else restartResume(ctx, attempt);
   }
+}
+
+/**
+ * Whether a hello comes after a restore (design 6.3, X-1): its lastHubEpoch is below the hub's epoch, or an earlier
+ * hello after the restore left the runner's re-fences pending, as a link that drops before the replay is complete does.
+ */
+export function isAfterRestore(ctx: HubContext, runnerId: string, lastHubEpoch: number | null): boolean {
+  return (lastHubEpoch !== null && lastHubEpoch < hubEpoch(ctx)) || isRestorePending(ctx, runnerId);
+}
+
+/**
+ * The re-fences after a restore (design 6.3, 6.14), once the runner's replay is complete (X-1), so that the events it
+ * sent after the backup are applied first: each attempt the hello reported and decided 'refence' that is still open
+ * on this runner, and can be resumed, gets resume_attempt with a new fence of the new epoch. It is cause restore, not
+ * a runner-restart resume, so the restart limit does not count it. Then the runner is no longer restore-pending.
+ * Returns the attempts re-fenced.
+ */
+export function reconcileAfterRestore(ctx: HubContext, runnerId: string, attemptIds: readonly string[]): string[] {
+  return tx(ctx, () => {
+    const refenced: string[] = [];
+    for (const attemptId of attemptIds) {
+      const attempt = findAttempt(ctx, attemptId);
+      if (!attempt || attempt.runnerId !== runnerId || !RESUMABLE.has(attempt.status)) continue;
+      if (attempt.stopRequested?.cause === 'takeover') continue;
+      resumeAttempt(ctx, { attemptId, cause: 'restore', prompt: RESTART_PROMPT, actor: actorOf(attempt) });
+      refenced.push(attemptId);
+    }
+    setRestorePending(ctx, runnerId, false);
+    return refenced;
+  });
 }
 
 /** Whether the attempt's transcript was asked for already. */
@@ -287,7 +389,7 @@ function extendLeases(ctx: HubContext, gapMs: number): void {
  * downtime, so the leases are extended by the gap and a recovery window of recoveryMs starts, for runners to reconnect
  * and replay; a window that is over is closed (system.recovery_ended). A backward clock step is no downtime, and as
  * leases are times, it shortens none; an open window is cut back to end within recoveryMs of now, so that the step does
- * not stretch it. Then last_alive_at becomes now.
+ * not stretch it. The first check after a restore moves restored_at to now. Then last_alive_at becomes now.
  */
 export function checkClock(ctx: HubContext): ClockCheck {
   return tx(ctx, (emit) => {
@@ -308,6 +410,9 @@ export function checkClock(ctx: HubContext): ClockCheck {
     } else if (state.recoveryUntil !== null && gapMs < 0) {
       updateHubState(ctx, { recoveryUntil: Math.min(state.recoveryUntil, now + ctx.config.recoveryMs) });
     }
+    // The first check after a restore, whose last_alive_at is the backup's: the time unknown agent tokens answer
+    // attempt_refenced counts from the restored hub's start, not from the restore command, which may be long before.
+    if (state.restoredAt !== null && state.restoredAt > state.lastAliveAt) updateHubState(ctx, { restoredAt: now });
     updateHubState(ctx, { lastAliveAt: now });
     return { gapMs, downtime, recoveryEnded };
   });

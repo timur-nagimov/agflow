@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { type Fence, type LiveAttempt, type RawRunnerEvent, type RunnerEventType, formatFence } from '@agflow/core';
-import { appendAttemptLog, attemptLog, updateAttempt } from '../src/attempt-store';
+import { appendAttemptLog, attemptLog, getAttempt, updateAttempt } from '../src/attempt-store';
 import { createSession, sessionHashOf } from '../src/auth';
 import { findCommand, pendingCommands } from '../src/commands';
 import { tx } from '../src/context';
@@ -417,14 +417,24 @@ describe('the replay after hello', () => {
       ['rejected', `attempt.activity at fence ${formatFence(newer.fence)}`],
     ]);
 
-    // Without a restore the same fence is stale from the start.
+    // The re-fence that follows the replay ends the restore for this runner (restore.test.ts).
+    await settle();
+    const refenced = formatFence(getAttempt(ctx, held.attempt.id).fence);
+    // A hello that reports nothing, at the hub's epoch, is no restore: the re-fenced attempt it does not report ends
+    // crashed, so its event is refused as an ended attempt's.
     seen = [];
     const plain = gateway.open(socket(), { user: 'alice', sessionHash: sessionHashOf(token) });
     gateway.message(plain, helloOf({ firstSeq: 5, lastSeq: 5, lastHubEpoch: 2 }));
     expect(plain.afterRestore).toBe(false);
     gateway.message(plain, events(newer, [5]));
     expect(seen).toEqual([]);
-    expect(attemptLog(ctx, held.attempt.id).map((entry) => entry.kind)).toEqual(Array(3).fill('rejected'));
+    expect(attemptLog(ctx, held.attempt.id).map((entry) => [entry.kind, entry.summary.split(':')[0]])).toEqual([
+      ['rejected', `attempt.activity at fence ${formatFence(original.fence)} ignored`],
+      ['rejected', `attempt.activity at fence ${formatFence(newer.fence)} ignored`],
+      ['note', `resumed at fence ${refenced}`],
+      ['rejected', `attempt.activity at fence ${formatFence(newer.fence)} ignored`],
+    ]);
+    expect(attemptLog(ctx, held.attempt.id).at(-1)?.summary).toEndWith('the attempt ended (crashed)');
   });
 });
 

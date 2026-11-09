@@ -45,6 +45,12 @@ export interface RunnerInfo {
    * runner.state ok. Rows written before it existed have none.
    */
   deferredResumes?: string[];
+  /**
+   * The runner said hello after a restore and its open attempts still wait for their re-fence, which follows the
+   * replay (design 6.3, X-1): until then every hello decides the restore rows again, whatever its lastHubEpoch. Rows
+   * written before it existed have none.
+   */
+  restorePending?: boolean;
 }
 
 /** A refused start: the runner's code for it, and when the hub heard of it. */
@@ -394,6 +400,18 @@ export function takeDeferredResumes(ctx: HubContext, runnerId: string): string[]
   const deferred = runnerInfo(existingRow(ctx, runnerId)).deferredResumes ?? [];
   if (deferred.length > 0) setDeferredResumes(ctx, runnerId, []);
   return deferred;
+}
+
+/** Marks the runner restore-pending, or clears it once its re-fences ran. */
+export function setRestorePending(ctx: HubContext, runnerId: string, pending: boolean): void {
+  const info = runnerInfo(existingRow(ctx, runnerId));
+  info.restorePending = pending;
+  ctx.db.query('UPDATE runners SET info = $info WHERE id = $id').run({ id: runnerId, info: JSON.stringify(info) });
+}
+
+/** Whether the runner's re-fences after a restore are still to run. */
+export function isRestorePending(ctx: HubContext, runnerId: string): boolean {
+  return runnerInfo(existingRow(ctx, runnerId)).restorePending ?? false;
 }
 
 // ---------------------------------------------------------------------------

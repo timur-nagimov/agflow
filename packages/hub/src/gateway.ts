@@ -9,7 +9,7 @@ import { type HubContext, type RunnerLink, afterCommit, tx } from './context';
 import { acknowledgePosition, applyRunnerEvents } from './events-in';
 import { hubEpoch } from './hub-state';
 import { recordQuotaReports } from './quota';
-import { reconcileOnHello } from './recovery';
+import { isAfterRestore, reconcileAfterRestore, reconcileOnHello } from './recovery';
 import {
   type HelloMessage,
   checkRunnerIdentity,
@@ -19,6 +19,7 @@ import {
   reconcileHelloSettings,
   recordHeartbeatInfo,
   recordHelloInfo,
+  setRestorePending,
   unlinkAll,
 } from './runners';
 
@@ -65,7 +66,10 @@ export class RunnerConnection {
   /** The outbox epoch and highest seq the hello reported: the replay is complete once the ack reaches lastSeq. */
   outboxEpoch: string | null = null;
   lastSeq = 0;
-  /** The hello's lastHubEpoch is below the hub's: the hub was restored since this runner's last welcome. */
+  /**
+   * The hello came after a restore: its lastHubEpoch is below the hub's, or the runner's re-fences are still pending.
+   * Until the replay is complete, a fence newer than an attempt's recorded one is current (X-1).
+   */
   afterRestore = false;
   /** The replay reached hello.lastSeq. */
   replayed = false;
@@ -264,7 +268,8 @@ export class Gateway implements RunnerLink {
   /**
    * Identifies the runner, records the hello and reconciles its attempts in one transaction. The welcome goes out once
    * it commits, before any command that transaction queued: the attach step is queued first, so it runs before their
-   * flush.
+   * flush. After a restore the runner is restore-pending until the attempts to re-fence get their new fences, once its
+   * replay is complete; a link that drops before leaves it pending, and its next hello decides again.
    */
   private hello(connection: RunnerConnection, hello: HelloMessage): void {
     const { ctx } = this;
@@ -275,8 +280,8 @@ export class Gateway implements RunnerLink {
         const identity = identifyRunner(ctx, user, hello);
         if (!identity.ok) return identity;
         const runnerId = identity.runner.id;
-        const welcome: { message: Welcome | null } = { message: null };
-        afterCommit(ctx, () => this.attach(connection, runnerId, hello, welcome.message as Welcome));
+        const welcome: { message: Welcome | null; refence: string[] | null } = { message: null, refence: null };
+        afterCommit(ctx, () => this.attach(connection, runnerId, hello, welcome.message as Welcome, welcome.refence));
         recordHelloInfo(ctx, runnerId, hello);
         recordQuotaReports(ctx, emit, runnerId, hello.quota);
         reconcileHelloSettings(ctx, runnerId, hello.settings);
@@ -284,7 +289,12 @@ export class Gateway implements RunnerLink {
         markFactsStale(ctx, runnerId);
         const ackedSeq = acknowledgePosition(ctx, runnerId, hello.outboxEpoch, hello.firstSeq);
         const replayPending = hello.lastSeq > ackedSeq;
-        const { stop } = reconcileOnHello(ctx, runnerId, hello, { replayPending });
+        const afterRestore = isAfterRestore(ctx, runnerId, hello.lastHubEpoch);
+        if (afterRestore) setRestorePending(ctx, runnerId, true);
+        const { stop, actions } = reconcileOnHello(ctx, runnerId, hello, { replayPending, afterRestore });
+        if (afterRestore) {
+          welcome.refence = actions.filter((entry) => entry.action === 'refence').map((entry) => entry.attemptId);
+        }
         slideSession(ctx, sessionHash);
         markLinked(ctx, emit, runnerId, {
           connectionId: connection.id,
@@ -319,9 +329,16 @@ export class Gateway implements RunnerLink {
 
   /**
    * Makes the link the runner's current one, replacing an older link with 4409, and sends welcome then commands. With
-   * nothing to replay, the replay is complete at once.
+   * nothing to replay, the replay is complete at once. After a restore (refence not null), the re-fences follow the
+   * replay.
    */
-  private attach(connection: RunnerConnection, runnerId: string, hello: HelloMessage, welcome: Welcome): void {
+  private attach(
+    connection: RunnerConnection,
+    runnerId: string,
+    hello: HelloMessage,
+    welcome: Welcome,
+    refence: string[] | null,
+  ): void {
     if (connection.closed) return;
     const previous = this.links.get(runnerId);
     if (previous && previous !== connection) this.close(previous, CLOSE_CODES.replaced, 'another connection replaced this one');
@@ -329,12 +346,24 @@ export class Gateway implements RunnerLink {
     connection.protocol = hello.protocol;
     connection.outboxEpoch = hello.outboxEpoch;
     connection.lastSeq = hello.lastSeq;
-    connection.afterRestore = hello.lastHubEpoch !== null && hello.lastHubEpoch < welcome.hubEpoch;
+    connection.afterRestore = refence !== null;
     this.links.set(runnerId, connection);
     this.send(connection, welcome);
     connection.welcomed = true;
     connection.acknowledged(hello.outboxEpoch, welcome.ackedSeq);
     this.flush(runnerId);
+    if (refence !== null) void connection.replayComplete.then(() => this.afterReplay(connection, runnerId, refence));
+  }
+
+  /** The replay after a restore is complete: the re-fences run, while the link is still the runner's current one. */
+  private afterReplay(connection: RunnerConnection, runnerId: string, refence: string[]): void {
+    if (connection.closed || this.links.get(runnerId) !== connection) return;
+    try {
+      reconcileAfterRestore(this.ctx, runnerId, refence);
+    } catch (error) {
+      // The runner stays restore-pending, so its next hello decides again.
+      this.log(`re-fencing the attempts of runner ${runnerId} after the restore failed`, error);
+    }
   }
 
   /**

@@ -17,7 +17,7 @@ function snapshotName(kind: BackupKind, now: number): string {
   return kind === 'daily' ? `agflow-daily-${iso.slice(0, 10)}.db` : `agflow-start-${iso.replace(/[:.]/g, '-')}.db`;
 }
 
-export function checkIntegrity(ctx: HubContext): void {
+export function checkIntegrity(ctx: Pick<HubContext, 'db'>): void {
   const row = ctx.db.query('PRAGMA integrity_check').get() as { integrity_check: string };
   if (row.integrity_check !== 'ok') throw new Error(`database integrity check failed: ${row.integrity_check}`);
 }
