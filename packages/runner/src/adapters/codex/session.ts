@@ -56,6 +56,11 @@ export class CodexSession {
   private rateLimits: RateLimitSnapshot | null = null;
   /** A quota failure's end, held until account/rateLimits/read settles. */
   private ending: Promise<void> | null = null;
+  private startingTurn = false;
+  private recoveredContext = false;
+  private compaction: { turnId: string | null; toolCalls: number } | null = null;
+  /** Turns a turn/start of ours answered: never the compaction turn. */
+  private readonly ownTurns = new Set<string>();
 
   private constructor(
     private readonly app: AppServerProcess,
@@ -162,11 +167,7 @@ export class CodexSession {
       pending.length = 0;
       if (!resumed) {
         // Both start and resume carry the tools note in developerInstructions.
-        const { turn } = await request(app, 'turn/start', {
-          threadId: session.sessionRef,
-          input: [{ type: 'text', text: launch.firstPrompt, text_elements: [] }],
-        });
-        session.activeTurn = turn.id;
+        await session.startTurn(launch.firstPrompt);
       }
       return session;
     } catch (error) {
@@ -189,9 +190,19 @@ export class CodexSession {
         if (threadId !== this.sessionRef) return;
         this.activeTurn = turn.id;
         const state = this.turnState(turn.id);
+        // compact/start answers no id: its turn is the next new main-thread turn that no turn/start of ours opened.
+        if (
+          this.compaction &&
+          this.compaction.turnId === null &&
+          !this.startingTurn &&
+          !this.ownTurns.has(turn.id) &&
+          !state.started
+        ) {
+          this.compaction.turnId = turn.id;
+        }
         if (!state.started) {
           state.started = true;
-          this.queue.push({ type: 'turn_started' });
+          if (this.compaction?.turnId !== turn.id) this.queue.push({ type: 'turn_started' });
         }
         return;
       }
@@ -240,6 +251,12 @@ export class CodexSession {
           item.type === 'agentMessage'
         ) {
           this.queue.push({ type: 'text', text: item.text });
+        } else if (
+          notification.method === 'item/completed' &&
+          threadId === this.sessionRef &&
+          item.type === 'contextCompaction'
+        ) {
+          this.queue.push({ type: 'compacted', summary: null });
         }
         return;
       }
@@ -291,7 +308,36 @@ export class CodexSession {
     const error = turn.status === 'failed' ? (state.error ?? turn.error) : null;
     const errorKind = turn.status === 'failed' ? turnErrorKind(error?.codexErrorInfo ?? null, this.rateLimits) : null;
     this.turns.delete(turn.id);
+    this.ownTurns.delete(turn.id);
     if (this.activeTurn === turn.id) this.activeTurn = null;
+    if (this.compaction?.turnId === turn.id) {
+      const toolCalls = this.compaction.toolCalls + state.toolCalls;
+      this.compaction = null;
+      if (turn.status === 'completed') {
+        void this.startTurn(
+          'System note: The context window filled up and was compacted. Continue your task where you left off.',
+        ).catch((error) => {
+          if (!this.gone) this.contextFailed(oneLine(error), toolCalls);
+        });
+      } else {
+        // Only a second context error is the context outcome; an interrupt or another failure ends as itself (9.2).
+        this.endTurn(turn.status, toolCalls, error, errorKind);
+      }
+      return;
+    }
+    // The final error or, without one, the failed turn's own error (design 9.2).
+    if (error?.codexErrorInfo === 'contextWindowExceeded' && !this.recoveredContext) {
+      this.recoveredContext = true;
+      this.compaction = { turnId: null, toolCalls: state.toolCalls };
+      void request(this.app, 'thread/compact/start', { threadId: this.sessionRef }).catch((error) => {
+        const compaction = this.compaction;
+        // A started compaction turn ends the recovery itself, and an exit reports the end on its own.
+        if (!compaction || compaction.turnId !== null) return;
+        this.compaction = null;
+        if (!this.gone) this.contextFailed(oneLine(error), compaction.toolCalls);
+      });
+      return;
+    }
     this.endTurn(turn.status, state.toolCalls, error, errorKind);
   }
 
@@ -354,6 +400,30 @@ export class CodexSession {
           updatedAt: Date.now(),
         };
     this.queue.push({ type: 'quota', accountId: this.accountId, quota: { ...quota, state: 'exhausted' } });
+  }
+
+  private async startTurn(...texts: string[]): Promise<void> {
+    this.startingTurn = true;
+    try {
+      const { turn } = await request(this.app, 'turn/start', {
+        threadId: this.sessionRef,
+        input: texts.map((text) => ({ type: 'text', text, text_elements: [] })),
+      });
+      this.ownTurns.add(turn.id);
+      this.activeTurn = turn.id;
+    } finally {
+      this.startingTurn = false;
+    }
+  }
+
+  /** The transport is gone: a rejected request then reports nothing, since the exit does. */
+  private get gone(): boolean {
+    return this.app.rpc.closed;
+  }
+
+  private contextFailed(error: string, toolCalls: number): void {
+    // Recovery hid the original end; expose one failure so the runner can replace the attempt.
+    this.queue.push({ type: 'turn_ended', outcome: 'failed', toolCalls, error, errorKind: 'context' });
   }
 
   private warn(kind: string, text: string): void {

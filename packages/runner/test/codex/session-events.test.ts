@@ -516,10 +516,7 @@ describe('CodexSession events', () => {
         begin(),
         m.error(MAIN, TURN, m.turnError('unauthorized', 'retry'), true),
         m.error(MAIN, TURN, m.turnError({ activeTurnNotSteerable: { turnKind: 'review' } }, 'steer')),
-        m.turnCompleted(
-          MAIN,
-          m.turn({ id: TURN, status: 'failed', error: m.turnError('contextWindowExceeded', 'full') }),
-        ),
+        m.turnCompleted(MAIN, m.turn({ id: TURN, status: 'failed', error: m.turnError('cyberPolicy', 'blocked') })),
       ]),
     ).toEqual([
       started,
@@ -528,8 +525,8 @@ describe('CodexSession events', () => {
         type: 'turn_ended',
         outcome: 'failed',
         toolCalls: 0,
-        error: 'full',
-        errorKind: 'context',
+        error: 'blocked',
+        errorKind: 'policy',
       },
     ]);
   });
