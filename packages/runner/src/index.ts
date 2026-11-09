@@ -38,6 +38,7 @@ export * from './paths';
 export * from './processes';
 export * from './profile';
 export * from './queue';
+export * from './recovery';
 export * from './run-dir';
 export * from './seams';
 export * from './stop-ladder';
