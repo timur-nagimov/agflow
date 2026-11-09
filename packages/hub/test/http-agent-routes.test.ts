@@ -51,6 +51,13 @@ describe('the agent-token route allowlist', () => {
     expect(AGENT_ROUTES.map((route) => `${route.method} ${route.path}`).sort()).toEqual([...DESIGN_TABLE].sort());
   });
 
+  test('every allowlist entry matches a mounted route', () => {
+    const hub = createTestHub();
+    const mounted = new Set(hub.app.routes.map((route) => `${route.method} ${route.path}`));
+    const listed = AGENT_ROUTES.map((route) => `${route.method} ${route.path}`);
+    expect(listed.filter((route) => !mounted.has(route))).toEqual([]);
+  });
+
   test('every mounted route matches an allowlist entry or answers an agent token 403 agent_not_allowed', async () => {
     // A web build directory mounts the static catch-all too, so the walk covers every route the hub can have.
     const hub = createTestHub({ webDist: '/nonexistent/agflow-web-dist' });
