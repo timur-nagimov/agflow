@@ -29,6 +29,11 @@ export interface StopOptions {
   reason: string;
   /** attempt.exited.cause: the runner's own stops; null for the hub's. */
   cause: ExitCause | null;
+  /**
+   * The runner's own stops of several attempts run together, and their final work goes one at a time: the harvest,
+   * the push and attempt.exited wait for this, once the agent is stopped.
+   */
+  after?: Promise<void>;
 }
 
 /** What a stop did: the step that ended the agent and the seq of its attempt.exited, or why nothing was stopped. */

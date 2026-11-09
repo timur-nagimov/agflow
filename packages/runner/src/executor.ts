@@ -12,7 +12,9 @@
 //   once, a live process is stopped without a handoff turn (its new work goes to a late-work ref), and later commands
 //   for it answer attempt_ended, except those that outlive an attempt: cleanup_attempt, upload_transcript and
 //   hand_back (X-36).
-// - pause() holds new commands until resume(), which runs them in order; work already dispatched goes on (X-7).
+// - pause() holds new commands, neither journaled nor run, until resume(), which takes them in order; work already
+//   dispatched goes on (X-7). A runner that exits while paused (a suspend) leaves no trace of them, and the hub sends
+//   them again after the next welcome.
 // - After a restart, journal rows left running are run again when their handler is idempotent (RESTARTABLE_COMMANDS)
 //   and answered interrupted otherwise. start_attempt and resume_attempt are never re-run: the journal keeps no agent
 //   token, and the hub resends them with a fresh one. update_settings runs again when the hub sends it again.
@@ -160,7 +162,7 @@ export class CommandExecutor {
   private readonly active = new Map<string, Execution>();
   /** The attempts welcome.stop named. */
   private readonly ended = new Set<string>();
-  /** Commands that arrived while paused, in order. */
+  /** Commands that arrived while paused, and journal rows recovered meanwhile, in order. */
   private readonly held: (() => void)[] = [];
   /** The runner's own commands, one at a time. */
   private readonly runnerQueue = new SerialQueue();
@@ -189,12 +191,12 @@ export class CommandExecutor {
     });
   }
 
-  /** Holds new commands until resume(); commands already dispatched go on. */
+  /** Holds new commands, unjournaled, until resume(); commands already dispatched go on. */
   pause(): void {
     this.paused = true;
   }
 
-  /** Runs the held commands in their arrival order, and every new one at once again. */
+  /** Takes the held commands in their arrival order, and every new one at once again. */
   resume(): void {
     this.paused = false;
     for (const run of this.held.splice(0)) {
@@ -261,6 +263,11 @@ export class CommandExecutor {
    * than for a reconnect, and answers any other command with the failure.
    */
   private take(message: CommandMessage, seen: Sighting): Promise<CommandResult | null> {
+    if (this.paused) {
+      const held = Promise.withResolvers<CommandResult | null>();
+      this.held.push(() => this.take(message, seen).then(held.resolve, held.reject));
+      return held.promise;
+    }
     try {
       return this.takeNow(message, seen);
     } catch (error) {

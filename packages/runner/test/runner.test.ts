@@ -1,159 +1,37 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import {
-  AGFLOW_VERSION,
-  type AttemptSpec,
-  type Credentials,
-  PROTOCOL_VERSION,
-  restoreSet,
-  type RunnerCommand,
-  RunnerMessageSchema,
-} from '@agflow/core';
-import { FakeAdapter, type FakeScript, gitIn, type OriginRepo, originRepo } from '@agflow/testkit';
+import { AGFLOW_VERSION, PROTOCOL_VERSION, type RunnerCommand, RunnerMessageSchema, restoreSet } from '@agflow/core';
+import { FakeAdapter, gitIn } from '@agflow/testkit';
 import { AttemptStore } from '../src/attempt-store';
-import { type RunnerConfigInput, RunnerConfigSchema, saveRunnerConfig } from '../src/config';
-import { openRunnerDb, type RunnerDb } from '../src/db';
+import { RunnerConfigSchema } from '../src/config';
 import { Journal } from '../src/journal';
-import { memoryLogger } from '../src/log';
 import { Outbox } from '../src/outbox';
-import { projectKey, type RunnerPaths, runnerPaths } from '../src/paths';
+import { projectKey } from '../src/paths';
 import { killGroup, type ProcessIdentity, processIdentity } from '../src/processes';
-import { removeAgentTools } from '../src/run-dir';
-import { createRunner, type RunnerHandle } from '../src/runner';
-import type { DependencyPreparer, PrepareInput, RunnerHealth } from '../src/seams';
+import { createRunner } from '../src/runner';
+import type { PrepareInput, RunnerHealth } from '../src/seams';
 import { vendorPlatform } from '../src/vendor/pins';
-import { type FakeHub, type FakeHubOptions, type HelloMessage, startFakeHub } from './fake-hub';
-import { FIXTURE_AGFLOW, fixtureAgentToken, fixtureCliVersion, waitFor } from './fixture';
+import { testWelcome } from './fake-hub';
+import { FIXTURE_AGFLOW, fixtureCliVersion, waitFor } from './fixture';
+import {
+  afterThisTest,
+  cleanupRunnerSetups,
+  hellos,
+  openRunnerDb,
+  runCommand as run,
+  SETUP_PROJECT as PROJECT,
+  SETUP_TOKEN as TOKEN,
+  setupRunner as setup,
+  setupSpec as specOf,
+  startFakeHub,
+  tempDir,
+} from './runner-setup';
+
+afterEach(cleanupRunnerSetups);
 
 // Every test here runs git or agent processes, which take several times as long on a machine loaded by other suites.
 setDefaultTimeout(30_000);
-
-const TOKEN = 'cli_token_for_the_runner';
-const PROJECT = 'demo';
-
-const cleanups: (() => void | Promise<void>)[] = [];
-afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-});
-
-function tempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
-
-interface Setup {
-  hub: FakeHub;
-  origin: OriginRepo;
-  paths: RunnerPaths;
-  db: RunnerDb;
-  logger: ReturnType<typeof memoryLogger>;
-  /** Starts a runner on these files; stopped after the test. */
-  start(options?: {
-    config?: Partial<RunnerConfigInput>;
-    health?: RunnerHealth;
-    preparer?: DependencyPreparer;
-    script?: FakeScript;
-  }): Promise<RunnerHandle>;
-}
-
-/** A fake hub serving the project, an origin, and a runner home whose runner.db the test may fill first. */
-async function setup(hubOptions: FakeHubOptions = {}): Promise<Setup> {
-  const origin = await originRepo({ 'README.md': '# demo\n', 'src/app.ts': 'app\n' });
-  cleanups.push(() => origin.remove());
-  const hub = startFakeHub({ token: TOKEN, status: { name: PROJECT, repo: origin.path }, ...hubOptions });
-  // Not waited for: Bun's server.stop(true) never settles once the hub side closed a socket, as some tests do.
-  cleanups.push(() => {
-    hub.stop();
-  });
-  const paths = runnerPaths(tempDir('agflow-runner-home-'));
-  // The attempts' tools directories are read-only: they must be made writable before the home can go.
-  cleanups.push(() => {
-    if (!existsSync(paths.vaults)) return;
-    for (const entry of readdirSync(paths.vaults).filter((name) => name.endsWith('.agent'))) {
-      for (const attempt of readdirSync(join(paths.vaults, entry))) removeAgentTools(join(paths.vaults, entry, attempt));
-    }
-  });
-  mkdirSync(dirname(paths.db), { recursive: true });
-  const db = openRunnerDb(paths.db);
-  cleanups.push(() => db.close());
-  const logger = memoryLogger();
-  const credentials: Credentials = { hubUrl: hub.url, token: TOKEN, user: 'alice' };
-  // Short, as Claude's private temporary directories must be.
-  const tmpRoot = mkdtempSync('/tmp/ag');
-  cleanups.push(() => rmSync(tmpRoot, { recursive: true, force: true }));
-  const start: Setup['start'] = async (options = {}) => {
-    const config = RunnerConfigSchema.parse({
-      runnerKey: 'rk_test_runner',
-      machineId: 'MACHINE-1',
-      name: 'laptop',
-      test: { skipAuthChecks: true, allowShortTimings: true },
-      ...options.config,
-    });
-    saveRunnerConfig(paths.config, config);
-    const script = options.script ?? { turns: [[]] };
-    const adapters = (['claude', 'codex'] as const).map(
-      (vendor) => new FakeAdapter({ vendor, skipAuthChecks: true, script }),
-    );
-    const runner = await createRunner({
-      paths,
-      config,
-      db,
-      credentials: () => credentials,
-      adapters,
-      agflow: FIXTURE_AGFLOW,
-      // The darwin-arm64 pins, so the fake agents start where no CLI is pinned (CI's linux-x64).
-      cliVersion: fixtureCliVersion,
-      health: options.health,
-      preparer: options.preparer,
-      logger,
-      tmpRoot,
-    });
-    cleanups.push(async () => {
-      // Whatever agent a test left running goes before the files do.
-      for (const group of new AttemptStore(db).processes()) await killGroup(group, 'SIGKILL');
-      await runner.close();
-    });
-    return runner;
-  };
-  return { hub, origin, paths, db, logger, start };
-}
-
-/** A worker spec of T-4 for the setup's origin. */
-function specOf(s: Setup, overrides: Partial<AttemptSpec> = {}): AttemptSpec {
-  return {
-    attemptId: 'T-4-a1',
-    taskId: 'T-4',
-    role: 'worker',
-    vendor: 'claude',
-    model: null,
-    fence: { epoch: 1, counter: 1 },
-    agentToken: fixtureAgentToken('T-4-a1'),
-    hubUrl: s.hub.url,
-    repo: { url: s.origin.path, mainBranch: 'main' },
-    start: { ref: 'refs/heads/main', sha: null },
-    branch: 'agflow/T-4-tidy',
-    wipRef: 'refs/agflow/T-4/a1',
-    restore: { paths: restoreSet(null), base: 'refs/heads/main' },
-    acceptanceIds: ['A1'],
-    toolCaps: { defaultMs: 30 * 60_000, longMs: 90 * 60_000, checks: [] },
-    taskPack: '# T-4 Tidy the app\n',
-    brief: 'You are an agflow worker on T-4.',
-    firstPrompt: 'Start working on T-4.',
-    successor: false,
-    ...overrides,
-  };
-}
-
-const hellos = (hub: FakeHub) => hub.messages().filter((message): message is HelloMessage => message.t === 'hello');
-
-/** Sends the command and waits for its result. */
-async function run(hub: FakeHub, command: RunnerCommand, timeoutMs = 10_000) {
-  const id = hub.command(command);
-  return hub.waitFor(() => hub.results.get(id), timeoutMs);
-}
 
 /** A runner.settings that names a field: an edit, not a probe. */
 const isEdit = (event: { type: string; [key: string]: unknown }) =>
@@ -250,7 +128,7 @@ describe('createRunner', () => {
 
     // The hub answers no status now: the cached project names the same vault, and the runner says hello.
     const down = startFakeHub({ token: TOKEN, status: 503 });
-    cleanups.push(() => down.stop());
+    afterThisTest(() => down.stop());
     const runner = await createRunner({
       paths: s.paths,
       db: s.db,
@@ -259,13 +137,13 @@ describe('createRunner', () => {
       agflow: FIXTURE_AGFLOW,
       fetch: (input, init) => fetch(String(input).replace(s.hub.url, down.url), init),
     });
-    cleanups.push(() => runner.close());
+    afterThisTest(() => runner.close());
     await s.hub.waitFor(() => hellos(s.hub).length > 1);
     expect(s.db.meta('project')).toEqual(cached);
 
     // With neither the hub nor a cache, the runner cannot start.
     const empty = openRunnerDb(join(tempDir('agflow-runner-db-'), 'runner.db'));
-    cleanups.push(() => empty.close());
+    afterThisTest(() => empty.close());
     const refused = createRunner({
       paths: s.paths,
       db: empty,
@@ -420,6 +298,63 @@ describe('createRunner', () => {
       error: expect.stringMatching(/the hub names the repository \/elsewhere\/origin\.git/),
     });
   }, 30_000);
+
+  for (const key of ['wipRefPrefix', 'lastHubEpoch'] as const) {
+    test(`a failed ${key} and outbox ack write at welcome are logged and the runner stays online`, async () => {
+      const s = await setup({ welcome: false, autoAck: false });
+      new Outbox(s.db).append({ type: 'runner.state', data: { state: 'ok', detail: null } });
+      await s.start();
+      await s.hub.waitFor(() => hellos(s.hub).length === 1);
+      s.db.sqlite.run(`CREATE TRIGGER fail_meta BEFORE INSERT ON meta WHEN NEW.key = '${key}'
+        BEGIN SELECT RAISE(ABORT, 'meta disk full'); END`);
+      s.db.sqlite.run("CREATE TRIGGER fail_ack BEFORE UPDATE ON outbox_ack BEGIN SELECT RAISE(ABORT, 'ack disk full'); END");
+      (await s.hub.connection(0)).send(testWelcome(0));
+      await s.hub.waitFor(() => s.logger.entries.some((entry) => entry.fields?.error === 'meta disk full'));
+      expect(s.logger.entries).toContainEqual({
+        level: 'error',
+        message: key === 'wipRefPrefix' ? 'cannot record the WIP ref prefix' : 'cannot record the hub epoch',
+        fields: { error: 'meta disk full' },
+      });
+      expect(s.logger.entries.some((entry) => entry.fields?.error === 'ack disk full')).toBe(true);
+      expect(await run(s.hub, { kind: 'preflight', vendor: 'claude' })).toMatchObject({ ok: true });
+      // The outbox still replays, and a later welcome retries both writes.
+      s.db.sqlite.run('DROP TRIGGER fail_meta');
+      s.db.sqlite.run('DROP TRIGGER fail_ack');
+      await s.hub.waitFor(() => s.hub.events().length > 0);
+      (await s.hub.connection(0)).send(testWelcome(1));
+      await s.hub.waitFor(() => s.db.meta(key) !== null);
+      expect(new Outbox(s.db).ackedSeq()).toBeGreaterThanOrEqual(1);
+      expect(await run(s.hub, { kind: 'preflight', vendor: 'claude' })).toMatchObject({ ok: true });
+    });
+  }
+
+  for (const key of ['restoredThrough', 'lastHubEpoch'] as const) {
+    test(`a restored hub retries a failed ${key} write with normal link backoff before replay`, async () => {
+      const s = await setup({ welcome: false, autoAck: false });
+      s.db.setMeta('lastHubEpoch', 1);
+      new Outbox(s.db).append({ type: 'runner.state', data: { state: 'ok', detail: null } });
+      await s.start();
+      await s.hub.waitFor(() => hellos(s.hub).length === 1);
+      s.db.sqlite.run(`CREATE TRIGGER fail_restore BEFORE INSERT ON meta WHEN NEW.key = '${key}'
+        BEGIN SELECT RAISE(ABORT, 'restore disk full'); END`);
+      const first = await s.hub.connection(0);
+      first.send(testWelcome(0, { hubEpoch: 2 }));
+      await s.hub.waitFor(() => s.logger.entries.some((entry) => entry.fields?.error === 'restore disk full'));
+      expect(s.db.meta('lastHubEpoch')).toBe(1);
+      expect(first.messages.filter((message) => message.t !== 'hello')).toEqual([]);
+      expect(s.logger.entries.some((entry) => entry.message === 'the hub link closed')).toBe(true);
+      await s.hub.waitFor(() => first.closed !== null);
+      s.db.sqlite.run('DROP TRIGGER fail_restore');
+      await s.hub.waitFor(() => hellos(s.hub).length === 2);
+      (await s.hub.connection(1)).send(testWelcome(0, { hubEpoch: 2 }));
+      await s.hub.waitFor(() => hellos(s.hub).length === 3);
+      expect(s.db.meta('lastHubEpoch')).toBe(2);
+      expect(s.db.meta('restoredThrough')).toBeGreaterThanOrEqual(1);
+      (await s.hub.connection(2)).send(testWelcome(0, { hubEpoch: 2 }));
+      await s.hub.waitFor(() => s.hub.events().length > 0);
+      expect(await run(s.hub, { kind: 'preflight', vendor: 'claude' })).toMatchObject({ ok: true });
+    });
+  }
 
   test('welcome sets the WIP ref prefix, the hub epoch and the timings, handoffMs and wipGraceMs included', async () => {
     const timings = { heartbeatMs: 10_000, deadLinkMs: 60_000, handoffMs: 300, wipGraceMs: 400 };
@@ -681,22 +616,28 @@ describe('createRunner', () => {
   test("after a hub restore, the replay leaves out the edits whose echo the snapshot holds, and a probe ends it", async () => {
     // The welcomes after the first are a restored hub's, of a new hub epoch: its backup acknowledged nothing.
     const s = await setup({
+      autoAck: false,
       welcome: (_hello, connection) =>
         connection.index === 0 ? {} : { ackedSeq: 0, hubEpoch: 2, wipRefPrefix: 'refs/agflow-2/' },
     });
-    await s.start({ config: { draining: true, confirmedSettings: SNAPSHOT } });
+    const runner = await s.start({ config: { draining: true, confirmedSettings: SNAPSHOT } });
     const outbox = new Outbox(s.db);
     const settings = (index: number) =>
       (s.hub.connections[index]?.messages ?? [])
         .flatMap((message) => (message.t === 'events' ? message.events : []))
         .filter((event) => event.type === 'runner.settings');
     // The drain, and the probe this hub's ack without an echo brings; both echoed and acknowledged.
-    const [drain, probe] = await s.hub.waitFor(() => settings(0).length === 2 && settings(0));
+    const [drain] = await s.hub.waitFor(() => settings(0).length === 1 && settings(0));
+    const first = await s.hub.connection(0);
+    first.send({ t: 'ack', outboxEpoch: outbox.epoch, seq: drain!.seq });
+    const [, probe] = await s.hub.waitFor(() => settings(0).length === 2 && settings(0));
     expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5 })).toMatchObject({
       ok: true,
     });
     expect(await run(s.hub, { kind: 'update_settings', settings: {}, version: 6 })).toMatchObject({ ok: true });
-    await waitFor(() => outbox.ackedSeq() >= (probe?.seq as number));
+    const probeAcked = runner.waitAcked(probe!.seq, 5_000);
+    first.send({ t: 'ack', outboxEpoch: outbox.epoch, seq: probe!.seq });
+    expect(await probeAcked).toBe(true);
     expect(outbox.settingsInFlight()).toEqual([]);
     // The hub is restored. At its first welcome the runner records what it holds and says hello again at once, sending
     // nothing first. That hello reports version 6, which the hub adopts, and the replay starts from 0. Applying the
@@ -709,7 +650,12 @@ describe('createRunner', () => {
     expect(replayed?.data).toEqual({ settings: {}, baseVersion: 6 });
     expect(replayed?.seq).toBeGreaterThan(probe?.seq as number);
     expect(settings(2).map((event) => event.seq)).not.toContain(drain?.seq);
-    await waitFor(() => outbox.ackedSeq() >= (replayed?.seq as number), 5_000);
+    expect(outbox.ackedSeq()).toBeLessThan(replayed!.seq);
+    // Subscribe through the runtime's Outbox, then release the ack; a separately constructed Outbox has no
+    // runtime ack callbacks. This exercises the ordering that used to fail when the ack arrived after the wait.
+    const replayAcked = runner.waitAcked(replayed!.seq, 5_000);
+    (await s.hub.connection(2)).send({ t: 'ack', outboxEpoch: outbox.epoch, seq: replayed!.seq });
+    expect(await replayAcked).toBe(true);
     // The welcomes of that hub that follow do not count as a restore.
     expect(s.hub.connections).toHaveLength(3);
   });
@@ -830,6 +776,55 @@ describe('createRunner', () => {
     expect(s.db.meta('settingsSavedVersion')).toBe(6);
   });
 
+  test("the person's drain made offline, while the owner's drain and undrain wait behind a long command, reaches the hub", async () => {
+    /** A Claude adapter whose preflight the test holds. */
+    class HeldAdapter extends FakeAdapter {
+      hold: PromiseWithResolvers<void> | null = null;
+      override async preflight() {
+        await this.hold?.promise;
+        return super.preflight();
+      }
+    }
+    const held = new HeldAdapter({ vendor: 'claude', skipAuthChecks: true, script: { turns: [[]] } });
+    const codex = new FakeAdapter({ vendor: 'codex', skipAuthChecks: true, script: { turns: [[]] } });
+    // The second connection gets its welcome only when the test sends it.
+    const s = await setup({ welcome: (_hello, connection) => (connection.index === 0 ? {} : false) });
+    const runner = await s.start({ config: { confirmedSettings: SNAPSHOT }, adapters: [held, codex] });
+    await waitFor(() => runner.status().link === 'online');
+    held.hold = Promise.withResolvers<void>();
+    const journal = new Journal(s.db);
+    const echoes: RunnerCommand[] = [
+      { kind: 'update_settings', settings: { draining: true }, version: 5 },
+      { kind: 'update_settings', settings: { draining: false }, version: 6 },
+    ];
+    const ids = [s.hub.command({ kind: 'preflight', vendor: 'claude' }), ...echoes.map((echo) => s.hub.command(echo))];
+    await waitFor(() => ids.every((id) => journal.get(id) !== null));
+    // The link drops, and the runner says hello again; offline, the person drains. The owner's echoes then run: taken
+    // before that hello, they answer nothing, for the hub to send again after its welcome.
+    (await s.hub.connection(0)).close(1012, 'the hub restarts');
+    const connection = await s.hub.connection(1);
+    await s.hub.waitFor(() => connection.messages.some((message) => message.t === 'hello'));
+    const seq = await runner.changeSettings({ draining: true });
+    held.hold.resolve();
+    await waitFor(() => s.logger.entries.filter((entry) => /before the last hello/.test(entry.message)).length === 2);
+    expect(ids.slice(1).map((id) => journal.get(id)?.state)).toEqual(['running', 'running']);
+    expect(await runnerJson(s)).toMatchObject({ draining: true, confirmedSettings: { draining: false, version: 4 } });
+    // The welcome, and the hub sends them again. The drain is still in flight: runner.json keeps it, and the replay on
+    // the same hub sends it.
+    connection.send(testWelcome(0));
+    for (const [index, command] of echoes.entries()) {
+      connection.send({ t: 'command', id: ids[index + 1] as string, seq: index + 2, command });
+    }
+    await waitFor(() => journal.get(ids[2] as string)?.state === 'done');
+    expect(runner.status().settings.draining).toBe(true);
+    expect(await runnerJson(s)).toMatchObject({ draining: true, confirmedSettings: { draining: false, version: 6 } });
+    const replayed = await s.hub.waitFor(() => {
+      const edits = connection.messages.flatMap((message) => (message.t === 'events' ? message.events : []));
+      return edits.find((event) => event.type === 'runner.settings' && event.seq === seq);
+    });
+    expect(replayed).toMatchObject({ data: { settings: { draining: true } } });
+  });
+
   test("hello carries the health seam's state, and git not ready when the vault cannot be made", async () => {
     const s = await setup();
     // A file where the vault goes.
@@ -855,30 +850,44 @@ describe('createRunner', () => {
   test('after three consecutive failed WIP pushes, hello says git is not ready', async () => {
     const timings = { heartbeatMs: 50, deadLinkMs: 60_000, handoffMs: 1_000, wipGraceMs: 300_000 };
     const s = await setup({ welcome: { timings } });
-    await s.start({
-      config: { timings: { wip: 100, backoffBase: 50, backoffCap: 100 } },
-      script: {
-        turns: [
-          [
-            // Written once the origin is gone.
-            { do: 'sleep', ms: 500 },
-            { do: 'write', path: 'work.txt', content: 'work\n' },
-            { do: 'sleep', ms: 30_000 },
-          ],
-        ],
-      },
+    const runner = await s.start({
+      // This tests the hello's failure count. Drive its three pushes explicitly through the runtime handle;
+      // the normal WIP interval stays at its default, rather than enqueueing harvests every 100 ms.
+      config: { timings: { backoffBase: 50, backoffCap: 100 } },
+      // A scripted terminal result prevents autonomous continuations from releasing the write before the test.
+      script: { turns: [[{ do: 'terminal', tool: 'blocked' }], [{ do: 'write', path: 'work.txt', content: 'work\n' }]] },
     });
     await s.hub.waitFor(() => hellos(s.hub).length > 0);
-    expect(await run(s.hub, { kind: 'start_attempt', attempt: specOf(s) })).toMatchObject({ ok: true });
+    const spec = specOf(s);
+    expect(await run(s.hub, { kind: 'start_attempt', attempt: spec })).toMatchObject({ ok: true });
+    const completedTurns = () => s.hub.events().filter(
+      (event) => event.type === 'attempt.activity' && (event.data as { kind: string }).kind === 'turn',
+    ).length;
+    await s.hub.waitFor(() => completedTurns() === 1, 10_000);
     renameSync(s.origin.path, `${s.origin.path}.gone`);
-    const failed = () => s.hub.events().filter((event) => event.type === 'attempt.wip_failed');
-    await s.hub.waitFor(() => failed().length >= 3, 10_000);
-    s.hub.connections[0]?.close(4000, 'the hub restarts');
-    const again = await s.hub.waitFor(() => hellos(s.hub)[1], 10_000);
-    expect(again.git).toMatchObject({
-      ready: false,
-      problem: expect.stringMatching(/^\d+ consecutive WIP pushes failed$/),
-    });
+    try {
+      // The write is released only after the origin is gone; it cannot land successfully before the failure test.
+      expect(await run(s.hub, {
+        kind: 'deliver', attemptId: spec.attemptId, fence: spec.fence,
+        messages: [{ messageId: 7, authority: 'person', text: 'write the work' }], more: 0,
+      })).toMatchObject({ ok: true });
+      await s.hub.waitFor(() => completedTurns() === 2, 10_000);
+      for (let i = 0; i < 3; i++) {
+        expect(await runner.pushWipNow()).toMatchObject([{ attemptId: spec.attemptId, outcome: { status: 'failed' } }]);
+      }
+      const failed = () => s.hub.events().filter((event) => event.type === 'attempt.wip_failed');
+      await s.hub.waitFor(() => failed().length >= 3, 10_000);
+      expect(failed().map((event) => (event.data as { failures: number }).failures)).toEqual([1, 2, 3]);
+      s.hub.connections[0]?.close(4000, 'the hub restarts');
+      const again = await s.hub.waitFor(() => hellos(s.hub)[1], 10_000);
+      expect(again.git).toMatchObject({
+        ready: false,
+        problem: expect.stringMatching(/^\d+ consecutive WIP pushes failed$/),
+      });
+    } finally {
+      renameSync(`${s.origin.path}.gone`, s.origin.path);
+      await runner.stopAgents('runner_stop', { handoff: false });
+    }
   }, 30_000);
 
   test('after the first welcome, the journal rows a previous run left running are settled', async () => {

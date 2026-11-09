@@ -14,9 +14,10 @@
 //   falls back to the hub's value for it. Nothing is ever sent again for a refused edit.
 // - A replay to a restored hub leaves out the edits held at its welcome whose answer the snapshot holds (resent): it
 //   would apply them twice. Any other replay sends all the hub has not acknowledged.
-import type { RunnerSettings } from '@agflow/core';
+import { RunnerSettingsChangesSchema, type RunnerSettings } from '@agflow/core';
 import {
   applySettingsEcho,
+  editLocalSettings,
   isWholeSettings,
   localSettingsEdits,
   type RunnerConfig,
@@ -165,6 +166,49 @@ export class SettingsSync {
     const newest = outbox.eventsAfter(outbox.lastSeq() - 1, 1)[0];
     if (newest !== undefined && newest.seq > welcome.ackedSeq && this.resent(newest)) {
       outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: config.confirmedSettings.version } });
+    }
+  }
+
+  /**
+   * A local edit (drain, undrain, the crash-loop self-drain): runner.json takes the patch, and the fields it changed
+   * go out as runner.settings on the confirmed snapshot's version. runner.json holds the view, so an edit back to the
+   * value an older edit in flight changed is a change, and is sent. Gives that event's seq, or null when the patch
+   * changed nothing. When runner.json cannot be written, or the runner.settings cannot be stored, nothing changes and
+   * the error is thrown.
+   */
+  change(patch: SettingsEdits): number | null {
+    const current = this.options.config();
+    const { config, changed } = editLocalSettings(current, RunnerSettingsChangesSchema.parse(patch));
+    if (Object.keys(changed).length === 0) return null;
+    try {
+      this.options.saveConfig(config);
+    } catch (error) {
+      this.restore(current);
+      throw error;
+    }
+    // Retention reads it, and an older one only keeps more: a failure is logged.
+    try {
+      this.options.outbox.settingsSaved(config.confirmedSettings.version);
+    } catch (error) {
+      this.options.logger.error('cannot note the version runner.json was written with', { error: describe(error) });
+    }
+    const baseVersion = config.confirmedSettings.version;
+    try {
+      return this.options.outbox.append({ type: 'runner.settings', data: { settings: changed, baseVersion } }).seq;
+    } catch (error) {
+      // An edit runner.json kept with no event would apply here and never reach the hub but as a hand edit.
+      this.restore(current);
+      throw error;
+    }
+  }
+
+  /** The settings before a local edit that failed, back in config() and runner.json. */
+  private restore(current: RunnerConfig): void {
+    try {
+      this.options.saveConfig(current);
+    } catch (error) {
+      // config() gives them again; runner.json keeps whatever it had, and the next write that succeeds catches it up.
+      this.options.logger.warn('cannot write runner.json back after a failed edit', { error: describe(error) });
     }
   }
 }

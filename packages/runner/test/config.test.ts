@@ -17,10 +17,12 @@ import {
   applySettingsEcho,
   CONNECTIVITY_VARS,
   DEFAULT_TIMINGS,
+  editLocalSettings,
   isTestMode,
   isWholeSettings,
   loadRunnerConfig,
   localSettingsEdits,
+  localSettingsOf,
   type RunnerConfig,
   RunnerConfigSchema,
   saveRunnerConfig,
@@ -309,6 +311,24 @@ describe('settings sync', () => {
     const ceilings = { ...drainedOffline().ceilings, codex: { fiveHour: 0.5, weekly: 0.9 } };
     const edited = { ...drainedOffline(), ceilings };
     expect(localSettingsEdits(edited)).toEqual({ draining: true, ceilings: { codex: { fiveHour: 0.5, weekly: 0.9 } } });
+  });
+
+  test('editLocalSettings changes runner.json and names only the fields and vendors it changed', () => {
+    const runner = drainedOffline();
+    const { config: next, changed } = editLocalSettings(runner, {
+      draining: true,
+      capacity: 4,
+      ceilings: { claude: { fiveHour: 0.85, weekly: 0.85 }, codex: { fiveHour: 0.5, weekly: 0.9 } },
+      allowPaidUsage: { claude: false },
+    });
+    expect(changed).toEqual({ capacity: 4, ceilings: { codex: { fiveHour: 0.5, weekly: 0.9 } } });
+    expect(next).toMatchObject({ capacity: 4, draining: true, ceilings: { codex: { fiveHour: 0.5, weekly: 0.9 } } });
+    expect(next.ceilings.claude).toEqual({ fiveHour: 0.85, weekly: 0.85 });
+    // The snapshot and the given config stay as they were.
+    expect(next.confirmedSettings).toEqual(runner.confirmedSettings);
+    expect(runner.capacity).toBe(2);
+    expect(localSettingsOf(next)).toMatchObject({ capacity: 4, draining: true });
+    expect(editLocalSettings(next, { capacity: 4 }).changed).toEqual({});
   });
 
   test('an in-place edit of the live settings never reaches the snapshot', () => {

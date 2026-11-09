@@ -469,7 +469,7 @@ describe('CommandExecutor', () => {
     expect(f.store.get('T-4-a1')).toMatchObject({ state: 'ended', clone: null });
   }, 60_000);
 
-  test('pause lets in-flight work finish and resumes held commands in order', async () => {
+  test('pause lets in-flight work finish, holds new commands unjournaled and resumes them in order', async () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const gate = Promise.withResolvers<void>();
@@ -489,7 +489,8 @@ describe('CommandExecutor', () => {
     gate.resolve();
     await first;
     expect(seen).toEqual([1]);
-    expect(x.journal.get('1-R-1-2')?.state).toBe('running');
+    // Held commands are not journaled: a runner that exits while paused leaves them to the hub's resend.
+    expect(x.journal.get('1-R-1-2')).toBeNull();
     x.run.resume();
     await Promise.all([second, third]);
     expect(seen).toEqual([1, 2, 3]);

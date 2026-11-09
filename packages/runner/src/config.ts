@@ -313,6 +313,42 @@ export function localSettingsEdits(config: RunnerConfig): SettingsEdits {
   return result as SettingsEdits;
 }
 
+/** runner.json's own settings, local edits included: what the runner applies now. */
+export function localSettingsOf(config: RunnerConfig): SettingsValues {
+  return structuredClone(localSettings(config));
+}
+
+/**
+ * A local edit (drain, undrain, the crash-loop self-drain): runner.json takes the patch, and changed holds the fields,
+ * and of the per-vendor records the vendors, whose value it changed; runner.settings sends those. An empty changed
+ * means the patch changed nothing.
+ */
+export function editLocalSettings(
+  config: RunnerConfig,
+  patch: SettingsEdits,
+): { config: RunnerConfig; changed: SettingsEdits } {
+  const changed: Record<string, unknown> = {};
+  const next: RunnerConfig = structuredClone(config);
+  for (const field of SCALAR_FIELDS) {
+    const value = patch[field];
+    if (value !== undefined && value !== config[field]) {
+      changed[field] = value;
+      Object.assign(next, { [field]: value });
+    }
+  }
+  for (const field of VENDOR_FIELDS) {
+    const given: Partial<Record<Vendor, unknown>> = patch[field] ?? {};
+    const vendors = VENDORS.filter(
+      (vendor) => given[vendor] !== undefined && !Bun.deepEquals(given[vendor], config[field][vendor]),
+    );
+    if (vendors.length === 0) continue;
+    const values = Object.fromEntries(vendors.map((vendor) => [vendor, structuredClone(given[vendor])]));
+    changed[field] = values;
+    Object.assign(next, { [field]: { ...next[field], ...values } });
+  }
+  return { config: next, changed: changed as SettingsEdits };
+}
+
 /**
  * The snapshot with runner.settings edits laid over it in order: what the hub holds once it has applied them. Of the
  * per-vendor records an edit replaces only the vendors it names.

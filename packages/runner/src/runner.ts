@@ -25,28 +25,48 @@
 //   sends anything, so that hub reconciles against the runner's snapshot, not what its backup knew of it. The replays
 //   to it leave out the edits held then whose answer the snapshot holds, which it would apply twice. runner.json's
 //   write may fail; the runner goes on with the settings it holds.
+// - After a welcome, a runner.state or runner.vendors the outbox replays that differs from the hello goes out again
+//   as it is now, so the hub's last word on each is current.
 // - Heartbeats carry every live attempt's facts, a start still preparing included, which renews its lease, and the
-//   health seam's power, disk and acceptingUntil.
+//   health seam's power, disk and acceptingUntil; a change of the health seam's state since the last hello or report
+//   goes out as runner.state.
+// - Preflight runs again every preflightEvery; runner.vendors goes out only when the report changed.
 // The runtime schedules no outbox pruning: M2c's retention calls pruneAcked (X-7).
+// What M2c drives (design 7.1, X-7, X-41) is the RunnerHandle: status, local settings edits, the runner's own stops,
+// the outage interrupt, WIP pushes, the executor's pause, waitAcked on the outbox, the vault and close. What it hears
+// are the RunnerEvents callbacks: link, gap, welcome, needsLogin and attemptState, and done for the link's end.
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   AGFLOW_VERSION,
+  type AgentRole,
   type AttemptFacts,
   type AttemptPhase,
   DEFAULT_WIP_REF_PREFIX,
+  type ExitCause,
   type Fence,
   PROTOCOL_VERSION,
   type Runner,
+  type RunnerEvent,
+  type RunnerVendor,
   type Vendor,
 } from '@agflow/core';
 import type { AgflowCommand, PreflightResult, VendorAdapter } from './adapters/types';
-import { AttemptController, type ControllerDeps } from './attempt/controller';
+import { isCleanedUp } from './attempt/cleanup';
+import { AttemptController, type ControllerDeps, type WipOutcome } from './attempt/controller';
 import { pinnedCliVersion } from './attempt/launch';
 import { WipFailures, wipGateOf } from './attempt/work';
-import { AttemptStore } from './attempt-store';
-import { AwakeClock } from './clock';
-import { loadRunnerConfig, type RunnerConfig, saveRunnerConfig, settingsOf } from './config';
+import { AttemptStore, type LocalAttemptState } from './attempt-store';
+import { AwakeClock, type ClockGap } from './clock';
+import {
+  localSettingsOf,
+  loadRunnerConfig,
+  type RunnerConfig,
+  type SettingsEdits,
+  type SettingsValues,
+  saveRunnerConfig,
+  settingsOf,
+} from './config';
 import { openRunnerDb, type RunnerDb } from './db';
 import { CommandExecutor } from './executor';
 import { ensureRunnerGitFiles, type GitEnvironment, localGitEnv, remoteGitEnv } from './git/run';
@@ -58,12 +78,14 @@ import {
   type HeartbeatContent,
   type HelloMessage,
   LinkClient,
+  type LinkState,
   sameHubUrl,
   type WelcomeMessage,
 } from './link';
 import { type Logger, noopLogger } from './log';
 import { Outbox } from './outbox';
 import { projectKey, type RunnerPaths } from './paths';
+import type { ProcessIdentity } from './processes';
 import { SerialQueue } from './queue';
 import { liveAttemptsForHello, recoverOnStart } from './recovery';
 import {
@@ -104,12 +126,110 @@ export interface RunnerOptions {
   fetch?: FetchFn;
   /** Where Claude attempts' private temporary directories go: /tmp by default. */
   tmpRoot?: string;
+  /** What the runner tells its host as it happens. */
+  events?: RunnerEvents;
 }
 
-/** What createRunner gives: the running runner. */
+/** An attempt's phase changed: null once no start, process or exit holds it; live counts the attempts that do. */
+export interface AttemptStateChange {
+  attemptId: string;
+  phase: AttemptPhase | null;
+  live: number;
+}
+
+/**
+ * What the runner tells its host (X-7), exactly these callbacks, each called as it happens; one that throws is logged.
+ * welcome is called before the executor runs any command that follows that welcome, resent ones included.
+ */
+export interface RunnerEvents {
+  /** Each link state change, with the close code and reason of the socket that ended (null and '' otherwise). */
+  link?(state: LinkState, detail: { code: number | null; reason: string }): void;
+  /** A clock gap: the Mac slept, or the process froze. */
+  gap?(gap: ClockGap): void;
+  welcome?(welcome: WelcomeMessage): void;
+  /** The hub refuses the CLI's token: once each time the link enters needs_login. */
+  needsLogin?(): void;
+  attemptState?(change: AttemptStateChange): void;
+}
+
+/** One attempt the runner still has (not cleaned up), as runner status shows it. */
+export interface AttemptStatus {
+  attemptId: string;
+  taskId: string | null;
+  role: AgentRole;
+  vendor: Vendor;
+  state: LocalAttemptState;
+  /** Null when no start, process or exit holds it. */
+  phase: AttemptPhase | null;
+  /** The newest harvested work, and what the WIP ref holds as last pushed. */
+  wipSha: string | null;
+  pushedSha: string | null;
+  lastPushAt: number | null;
+  pushError: string | null;
+  /**
+   * Work that waits for a late-work ref (AttemptRecord.lateWorkSha): not on the origin yet. Null once all the
+   * attempt's work is there, so it is what tells unpushed work.
+   */
+  lateWorkSha: string | null;
+  /** The agent's process group as recorded: M2g and runner status --json find agents through it. */
+  process: ProcessIdentity | null;
+}
+
+/** What `agflow runner status` reports of the running runner. */
+export interface RunnerStatus {
+  /** The runner's id on the hub, from the last welcome; null before one. */
+  runnerId: string | null;
+  link: LinkState;
+  /** The health seam's state, as hello and runner.state report it. */
+  state: ReturnType<RunnerHealth['state']>;
+  /** runner.json's settings as they apply now, local edits included. */
+  settings: SettingsValues;
+  vendors: RunnerVendor[];
+  git: Runner['git'];
+  attempts: AttemptStatus[];
+}
+
+/**
+ * How the runner ended: replaced (4409, another process uses its key), refused (4403), incompatible (4426), each with
+ * the hub's reason, or closed by close().
+ */
+export interface RunnerEnd {
+  kind: 'replaced' | 'refused' | 'incompatible' | 'closed';
+  reason: string;
+}
+
+/** What createRunner gives: the running runner, which M2c drives (X-7, X-41). */
 export interface RunnerHandle {
+  status(): RunnerStatus;
+  /**
+   * A local edit: runner.json takes the patch, and the changed fields go out as runner.settings on the confirmed
+   * snapshot's version. Resolves with that event's seq, for waitAcked; null when the patch changed nothing.
+   */
+  changeSettings(patch: SettingsEdits): Promise<number | null>;
+  /**
+   * The runner's own stops of every attempt, with a handoff turn or without: every agent is interrupted and stopped
+   * at once, and their final harvests, pushes and attempt.exited go one at a time, the oldest unpushed work first.
+   * Resolves with each attempt.exited's seq, in that order.
+   */
+  stopAgents(cause: ExitCause, options: { handoff: boolean }): Promise<number[]>;
+  /** Interrupts every running turn without an exit; outage marks them for the one reconnect message (X-38). */
+  interruptAgents(options: { outage: boolean }): Promise<void>;
+  /**
+   * A WIP push of every attempt's clone, each as canPushWip allows (held otherwise). Attempts a WIP push does not
+   * apply to (leads, no clone, already exited) are left out; an unchanged clone is listed as unchanged.
+   */
+  pushWipNow(): Promise<{ attemptId: string; outcome: WipOutcome }[]>;
+  /** Holds the commands that arrive, unjournaled, until resume(); work already dispatched goes on. */
+  pause(): void;
+  resume(): void;
+  /** Whether the hub acknowledged the event with this seq within timeoutMs; true at once if it has. */
+  waitAcked(seq: number, timeoutMs: number): Promise<boolean>;
+  /** The project's vault, so M2c's daily consolidate shares its per-vault lock. */
+  readonly vault: Vault;
   /** Ends the link and the runner's timers. Agents keep running: a suspend or a stop ends them first. */
   close(): Promise<void>;
+  /** Resolves when the link ends for good (4409, 4403, 4426) or close() is called. */
+  readonly done: Promise<RunnerEnd>;
 }
 
 /** A vendor's last preflight and when it ran. */
@@ -170,6 +290,16 @@ function startingFacts(attemptId: string, fence: Fence, phase: AttemptPhase): At
   };
 }
 
+/**
+ * What a vendor report says, without when it was made: two preflights that found the same are the same report, and
+ * runner.vendors goes out only when this changes.
+ */
+function reportSignature(report: Pick<VendorReport, 'vendors' | 'quota'>): string {
+  const vendors = report.vendors.map(({ preflightAt: _at, ...facts }) => facts);
+  const quota = report.quota.map((entry) => ({ ...entry, quota: { ...entry.quota, updatedAt: 0 } }));
+  return JSON.stringify({ vendors, quota });
+}
+
 /** One adapter's preflight; one that throws is not ready, with its error as the problem. */
 async function preflightOf(adapter: VendorAdapter): Promise<Preflight> {
   try {
@@ -228,7 +358,7 @@ export async function createRunner(options: RunnerOptions): Promise<RunnerHandle
     runtime.gitProblem = gitProblem;
     for (const preflight of preflights) runtime.preflights.set(preflight.result.facts.vendor, preflight);
     runtime.start();
-    return { close: () => runtime.close() };
+    return runtime.handle();
   } catch (error) {
     if (ownDb) db.close();
     throw error;
@@ -273,6 +403,17 @@ class Runtime {
   private readonly wipFailures = new WipFailures();
   /** The journal rows a previous run left running were settled after the first welcome. */
   private recovered = false;
+  private readonly events: RunnerEvents;
+  private readonly ended = Promise.withResolvers<RunnerEnd>();
+  /** The runner's id from the last welcome. */
+  private runnerId: string | null = null;
+  /** The health seam's state as the hub last heard it: in hello, or as runner.state. */
+  private reportedState: ReturnType<RunnerHealth['state']> | null = null;
+  /** The vendor report as the hub last heard it (reportSignature). */
+  private reportedVendors: string | null = null;
+  private preflightTimer: ReturnType<typeof setInterval> | null = null;
+  private preflighting = false;
+  private readonly stopGaps: () => void;
   private readonly stopAcks: () => void;
 
   constructor(input: RuntimeInput) {
@@ -291,7 +432,9 @@ class Runtime {
     this.outbox.settingsSaved(this.config.confirmedSettings.version);
     this.local = localGitEnv(options.paths);
     this.adapters = new Map(options.adapters.map((adapter) => [adapter.vendor, adapter]));
+    this.events = options.events ?? {};
     this.clock = new AwakeClock({ gapMs: this.config.timings.tickGap, logger });
+    this.stopGaps = this.clock.onGap((gap) => this.emit('gap', () => this.events.gap?.(gap)));
     this.link = new LinkClient({
       credentials: options.credentials,
       hubUrl: input.hubUrl,
@@ -308,6 +451,11 @@ class Runtime {
       handlers: {
         onCommand: (message) => this.executor.onCommand(message),
         onWelcome: (welcome) => this.welcomed(welcome),
+        onState: (state, detail) => this.emit('link', () => this.events.link?.(state, detail)),
+        onNeedsLogin: () => this.emit('needsLogin', () => this.events.needsLogin?.()),
+        onReplaced: (reason) => this.ended.resolve({ kind: 'replaced', reason }),
+        onRefused: (reason) => this.ended.resolve({ kind: 'refused', reason }),
+        onIncompatible: (reason) => this.ended.resolve({ kind: 'incompatible', reason }),
       },
       http: this.http,
       logger,
@@ -329,9 +477,10 @@ class Runtime {
       wipRefPrefix: () => this.wipRefPrefix(),
       adapters: this.adapters,
       preflighted: (result) => this.preflights.set(result.facts.vendor, { result, at: Date.now() }),
-      // The executor sends it as runner.vendors.
+      // The executor sends it as runner.vendors: the hub hears this report.
       vendors: () => {
         const { vendors, quota } = this.vendorReport();
+        this.reportedVendors = reportSignature({ vendors, quota });
         return { vendors, quota };
       },
       logger,
@@ -340,17 +489,159 @@ class Runtime {
   }
 
   start(): void {
+    this.reportedVendors = reportSignature(this.vendorReport());
     this.clock.start();
     this.link.start();
+    this.preflightTimer = setInterval(() => void this.preflightAgain(), this.config.timings.preflightEvery);
+    this.preflightTimer.unref?.();
   }
 
   async close(): Promise<void> {
     this.link.close();
     this.executor.close();
     this.clock.stop();
+    this.stopGaps();
     this.stopAcks();
+    if (this.preflightTimer !== null) clearInterval(this.preflightTimer);
+    this.preflightTimer = null;
     for (const controller of this.controllers.values()) controller.close();
     if (this.ownDb) this.db.close();
+    this.ended.resolve({ kind: 'closed', reason: '' });
+  }
+
+  /** The handle createRunner gives. */
+  handle(): RunnerHandle {
+    return {
+      status: () => this.status(),
+      changeSettings: async (patch) => this.changeSettings(patch),
+      stopAgents: (cause, options) => this.stopAgents(cause, options),
+      interruptAgents: (options) => this.interruptAgents(options),
+      pushWipNow: () => this.pushWipNow(),
+      pause: () => this.executor.pause(),
+      resume: () => this.executor.resume(),
+      waitAcked: (seq, timeoutMs) => this.outbox.waitAcked(seq, timeoutMs),
+      vault: this.vault,
+      close: () => this.close(),
+      done: this.ended.promise,
+    };
+  }
+
+  private status(): RunnerStatus {
+    const attempts = this.store
+      .list()
+      .filter((record) => !isCleanedUp(record))
+      .map((record): AttemptStatus => {
+        const controller = this.controllers.get(record.attemptId);
+        const groups = this.store.processes(record.attemptId);
+        const pid = controller?.session?.pid;
+        const group = groups.find((recorded) => recorded.pid === pid) ?? groups[0];
+        return {
+          attemptId: record.attemptId,
+          taskId: record.spec.taskId,
+          role: record.spec.role,
+          vendor: record.spec.vendor,
+          state: record.state,
+          phase: controller?.phase ?? null,
+          wipSha: record.wipSha,
+          pushedSha: record.pushedSha,
+          lastPushAt: record.lastPushAt,
+          pushError: record.pushError,
+          lateWorkSha: record.lateWorkSha,
+          process: group === undefined ? null : { pid: group.pid, pgid: group.pgid, lstart: group.lstart },
+        };
+      });
+    return {
+      runnerId: this.runnerId,
+      link: this.link.state,
+      state: this.health.state(),
+      settings: localSettingsOf(this.config),
+      vendors: this.vendorReport().vendors,
+      git: this.gitReport(),
+      attempts,
+    };
+  }
+
+  /** A local edit through runner.json, sent as runner.settings (SettingsSync.change, X-12); gives its seq, or null. */
+  private changeSettings(patch: SettingsEdits): number | null {
+    return this.executor.settings.change(patch);
+  }
+
+  /**
+   * Every attempt that holds a slot, all stopped at once, so a suspend's deadline never leaves an agent unstopped
+   * (design 7.1). Their final work goes one at a time, the oldest unpushed work first: the attempt whose last push
+   * (or, never pushed, whose start) is oldest. Each waits for the stop before it, however that one ended.
+   */
+  private async stopAgents(cause: ExitCause, options: { handoff: boolean }): Promise<number[]> {
+    const since = (controller: AttemptController) => {
+      const record = this.store.get(controller.attemptId);
+      return record === null ? Number.POSITIVE_INFINITY : (record.lastPushAt ?? record.createdAt);
+    };
+    const holding = [...this.controllers.values()].filter((controller) => controller.holdsSlot);
+    holding.sort((a, b) => since(a) - since(b));
+    let previous: Promise<unknown> = Promise.resolve();
+    const stops = holding.map((controller) => {
+      const after = previous.then(() => {});
+      const stop = controller.stopForRunner(cause, { ...options, after }).catch((error) => {
+        const fields = { attemptId: controller.attemptId, error: describe(error) };
+        this.logger.error("cannot stop an attempt for the runner's stop", fields);
+        return null;
+      });
+      previous = stop;
+      return stop;
+    });
+    const outcomes = await Promise.all(stops);
+    return outcomes.flatMap((outcome) => (outcome?.ok ? [outcome.exitedSeq] : []));
+  }
+
+  private async interruptAgents(options: { outage: boolean }): Promise<void> {
+    const live = [...this.controllers.values()].filter((controller) => controller.session !== null);
+    await Promise.all(
+      live.map((controller) =>
+        controller.interrupt({ outage: options.outage }).catch((error) => {
+          this.logger.warn('cannot interrupt an agent', { attemptId: controller.attemptId, error: describe(error) });
+        }),
+      ),
+    );
+  }
+
+  private async pushWipNow(): Promise<{ attemptId: string; outcome: WipOutcome }[]> {
+    const pushes = [...this.controllers.values()].map(async (controller) => ({
+      attemptId: controller.attemptId,
+      outcome: await controller.pushWip(),
+    }));
+    return (await Promise.all(pushes)).filter((push) => push.outcome.status !== 'skipped');
+  }
+
+  /** Every adapter's preflight again; runner.vendors goes out only when the report changed. */
+  private async preflightAgain(): Promise<void> {
+    if (this.preflighting) return;
+    this.preflighting = true;
+    try {
+      const preflights = await Promise.all(this.options.adapters.map(preflightOf));
+      for (const preflight of preflights) this.preflights.set(preflight.result.facts.vendor, preflight);
+      const { vendors, quota } = this.vendorReport();
+      const signature = reportSignature({ vendors, quota });
+      if (signature === this.reportedVendors) return;
+      this.outbox.append({ type: 'runner.vendors', data: { vendors, quota } });
+      this.reportedVendors = signature;
+    } catch (error) {
+      this.logger.error('the periodic preflight failed', { error: describe(error) });
+    } finally {
+      this.preflighting = false;
+    }
+  }
+
+  /** Calls one of the host's callbacks; a throw is logged, never passed on. */
+  private emit(name: keyof RunnerEvents, call: () => void): void {
+    try {
+      call();
+    } catch (error) {
+      this.logger.error('a runner event listener failed', { event: name, error: describe(error) });
+    }
+  }
+
+  private get health(): RunnerHealth {
+    return this.options.health ?? defaultHealth;
   }
 
   private get preparer(): DependencyPreparer {
@@ -378,7 +669,7 @@ class Runtime {
       vault: this.vault,
       local: this.local,
       adapters: this.adapters,
-      health: options.health ?? defaultHealth,
+      health: this.health,
       preparer: this.preparer,
       notifier: options.notifier ?? silentNotifier,
       logger: this.logger,
@@ -396,6 +687,10 @@ class Runtime {
       hub: this.http,
       handoffMs: () => this.link.welcome?.timings.handoffMs ?? this.config.timings.handoff,
       linkUp: () => this.link.state === 'online',
+      phaseChanged: (phase) => {
+        const live = [...this.controllers.values()].filter((controller) => controller.holdsSlot).length;
+        this.emit('attemptState', () => this.events.attemptState?.({ attemptId, phase, live }));
+      },
     };
   }
 
@@ -438,8 +733,10 @@ class Runtime {
 
   private hello(): HelloMessage {
     const { vendors, quota, profile } = this.vendorReport();
+    this.reportedVendors = reportSignature({ vendors, quota });
     const git = this.gitReport();
-    const { state, detail } = (this.options.health ?? defaultHealth).state();
+    const { state, detail } = this.health.state();
+    this.reportedState = { state, detail };
     return {
       t: 'hello',
       protocol: PROTOCOL_VERSION,
@@ -463,7 +760,15 @@ class Runtime {
     };
   }
 
+  /** Each heartbeat's content; a health state the hub has not heard yet goes out first, as runner.state. */
   private heartbeat(): HeartbeatContent {
+    const now = this.health.state();
+    const reported = this.reportedState;
+    if (reported === null || reported.state !== now.state || reported.detail !== now.detail) {
+      this.reportedState = { state: now.state, detail: now.detail };
+      const data: Extract<RunnerEvent, { type: 'runner.state' }>['data'] = { state: now.state, detail: now.detail };
+      this.outbox.append({ type: 'runner.state', data });
+    }
     const attempts = [...this.controllers.values()].flatMap((controller): AttemptFacts[] => {
       const facts = controller.facts();
       if (facts !== null) return [facts];
@@ -474,7 +779,7 @@ class Runtime {
       }
       return [];
     });
-    return { attempts, ...(this.options.health ?? defaultHealth).heartbeat() };
+    return { attempts, ...this.health.heartbeat() };
   }
 
   /**
@@ -513,6 +818,8 @@ class Runtime {
     } catch (error) {
       this.logger.error('cannot record the hub epoch', { error: describe(error) });
     }
+    this.runnerId = welcome.runnerId;
+    this.emit('welcome', () => this.events.welcome?.(welcome));
     // The attempts it ended are marked so at once; their stops run on their queues.
     void this.executor.onWelcome(welcome);
     if (!this.recovered) {
@@ -529,6 +836,11 @@ class Runtime {
       });
     }
     // A write that fails here is logged: the welcome's handling goes on, and the link replays the outbox after it.
+    try {
+      this.reportAfterReplay();
+    } catch (error) {
+      this.logger.error('cannot report the state after the replay', { error: describe(error) });
+    }
     try {
       this.executor.settings.welcomed({ ackedSeq: welcome.ackedSeq });
     } catch (error) {
@@ -549,6 +861,28 @@ class Runtime {
       } catch (error) {
         this.logger.error('cannot resume the late work', { attemptId: record.attemptId, error: describe(error) });
       }
+    }
+  }
+
+  /**
+   * The events the hub has not acknowledged are replayed after this welcome, so after the hello the hub has just
+   * applied. A runner.state or runner.vendors among them that says something other than the hello would leave the
+   * hub with the older report, and nothing would correct it: the current one goes out again, after them.
+   */
+  private reportAfterReplay(): void {
+    const replayed = this.outbox.eventsAfter(this.outbox.ackedSeq());
+    const state = replayed.findLast((event) => event.type === 'runner.state');
+    const reported = this.reportedState;
+    if (state?.type === 'runner.state' && reported !== null) {
+      if (state.data.state !== reported.state || state.data.detail !== reported.detail) {
+        this.outbox.append({ type: 'runner.state', data: { state: reported.state, detail: reported.detail } });
+      }
+    }
+    const vendors = replayed.findLast((event) => event.type === 'runner.vendors');
+    if (vendors?.type === 'runner.vendors' && reportSignature(vendors.data) !== this.reportedVendors) {
+      const { vendors: current, quota } = this.vendorReport();
+      this.reportedVendors = reportSignature({ vendors: current, quota });
+      this.outbox.append({ type: 'runner.vendors', data: { vendors: current, quota } });
     }
   }
 }

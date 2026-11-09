@@ -178,6 +178,8 @@ export interface ControllerDeps {
   handoffMs(): number;
   /** Whether the link to the hub is up: no continuation is sent while it is down. */
   linkUp(): boolean;
+  /** Each change of the phase, null once no start, process or exit holds the attempt (RunnerEvents.attemptState). */
+  phaseChanged?(phase: AttemptPhase | null): void;
 }
 
 /** The agent process of the attempt's current start or resume, while the controller follows it. */
@@ -279,7 +281,7 @@ async function startStep<T>(what: string, step: () => Promise<T>): Promise<T> {
 
 export class AttemptController {
   private currentFence: Fence | null = null;
-  private currentPhase: AttemptPhase | null = null;
+  private phaseNow: AttemptPhase | null = null;
   private prepared: PreparedWorkspace | null = null;
   private live: LiveAgent | null = null;
   /** The last start's or resume's spec, without its token. */
@@ -312,6 +314,21 @@ export class AttemptController {
     readonly attemptId: string,
     private readonly deps: ControllerDeps,
   ) {}
+
+  /** The phase the controller reports; each change is told to deps.phaseChanged. */
+  private get currentPhase(): AttemptPhase | null {
+    return this.phaseNow;
+  }
+
+  private set currentPhase(phase: AttemptPhase | null) {
+    if (phase === this.phaseNow) return;
+    this.phaseNow = phase;
+    try {
+      this.deps.phaseChanged?.(phase);
+    } catch (error) {
+      this.deps.logger.error('a phase listener failed', { attemptId: this.attemptId, error: describe(error) });
+    }
+  }
 
   /** The attempt's fence: its spec's, then each resume's; null before a start. */
   get fence(): Fence | null {
@@ -460,14 +477,15 @@ export class AttemptController {
   /**
    * The runner's own stops (X-7, X-41): runner_stop with a handoff turn (agflow runner stop and uninstall) or without
    * one (the disk and battery guards), and suspend, which records the attempt as suspended. The exit reports cause.
+   * With after, the final harvest, push and attempt.exited wait for it once the agent is stopped.
    */
-  stopForRunner(cause: ExitCause, options: { handoff: boolean }): Promise<StopOutcome> {
+  stopForRunner(cause: ExitCause, options: { handoff: boolean; after?: Promise<void> }): Promise<StopOutcome> {
     this.stopArriving();
     return this.enqueue(async () => {
       const live = this.live;
       if (live === null) return { ok: false, error: 'not_running' };
-      const { handoff } = options;
-      return this.stopLive(live, { handoff, interruptFirst: false, reason: RUNNER_STOP_REASON, cause });
+      const { handoff, after } = options;
+      return this.stopLive(live, { handoff, interruptFirst: false, reason: RUNNER_STOP_REASON, cause, after });
     });
   }
 
@@ -1513,6 +1531,7 @@ export class AttemptController {
       timings,
     });
     await boundedWait(live.events, EVENTS_AFTER_EXIT_MS);
+    await options.after;
     // Killed, with its exit not reported in time.
     const exit = ladder.exit ?? { code: null, signal: ladder.stoppedBy === 'sigkill' ? 'SIGKILL' : null };
     const context = { stoppedBy: ladder.stoppedBy, cause: options.cause, requested: true };
