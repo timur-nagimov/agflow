@@ -1,14 +1,26 @@
-import type { Attempt, SubmissionRecord, Task, TaskNote } from '@agflow/core';
+import {
+  type Attempt,
+  liveChatOnly,
+  type Runner,
+  runnerForbiddenPaths,
+  type SubmissionRecord,
+  type Task,
+  type TaskNote,
+} from '@agflow/core';
 import { type FormEvent, useState } from 'react';
 import { api } from '../api';
 import {
   ATTEMPT_STATUS_LABELS,
   END_REASON_LABELS,
   FAILURE_CLASS_LABELS,
+  type NoteGroup,
+  attemptLabel,
   attemptTone,
   currentAttempt,
+  holderOf,
   newestLog,
   nextTryText,
+  noteGroups,
   phaseLabel,
   submissionOutcome,
   wipText,
@@ -30,8 +42,11 @@ import {
   When,
 } from '../components';
 import {
+  BLOCKED_TITLES,
   NOTE_LABELS,
+  NOTE_TONES,
   TASK_ACTIONS,
+  type TaskHolder,
   type TaskAction,
   VENDOR_NAMES,
   actionBody,
@@ -42,14 +57,19 @@ import {
   duration,
   evidenceText,
   threadTarget,
+  toneOf,
   who,
 } from '../format';
 import { useAction, useData, useNow } from '../hooks';
 import { useHub } from '../hub';
+import { RunnerActions } from '../RunnerActions';
 import { routeHref } from '../route';
 
+/** The notes that stay in the Notes list; handoffs, restatements and late work sit side by side instead. */
+const LISTED_NOTES = new Set<TaskNote['kind']>(['progress', 'release']);
+
 export function TaskView({ id }: { id: string }) {
-  const { status } = useHub();
+  const { status, runners } = useHub();
   // With 6.17's subjects, the events of the task's attempts name the task too.
   const detail = useData(() => api.task(id), [id], { relevant: (event) => concernsTask(event, id) });
   if (!detail.data) return detail.error ? <ErrorBox error={detail.error} onRetry={detail.reload} /> : <Loading />;
@@ -58,6 +78,9 @@ export function TaskView({ id }: { id: string }) {
   const goalVersion = status.data?.goalVersion;
   const thread = threadTarget(task);
   const current = currentAttempt(task, attempts);
+  const holder = holderOf(task, attempts);
+  const runner = runners.data?.runners.find((entry) => entry.id === current?.runnerId) ?? null;
+  const groups = noteGroups(notes, attempts);
 
   return (
     <div className="page">
@@ -68,6 +91,7 @@ export function TaskView({ id }: { id: string }) {
         <div className="task-head-top">
           <span className="task-id big">{task.id}</span>
           <StatusChip status={task.status} blockedKind={task.blockedKind} />
+          {liveChatOnly(task) ? <LiveChatOnly task={task} /> : null}
         </div>
         <h1 className="page-title">{task.title}</h1>
         <dl className="facts">
@@ -116,14 +140,22 @@ export function TaskView({ id }: { id: string }) {
         </dl>
       </header>
       <Attention task={task} />
-      <Actions key={task.status} task={task} onDone={detail.reload} />
+      <Actions
+        key={task.status}
+        task={task}
+        holder={holder}
+        attempt={current}
+        runner={runner}
+        onDone={detail.reload}
+      />
       {attempts.length > 0 ? <Attempts attempts={attempts} current={task.currentAttempt} /> : null}
+      {groups.length > 0 ? <Handoffs groups={groups} /> : null}
       <div className="grid-2">
         <div className="stack">
           <Contract task={task} />
           {task.submission ? <Submission task={task} repo={repo} /> : null}
           {submissions.length > 0 ? <Submissions submissions={submissions} /> : null}
-          <Notes notes={notes} />
+          <Notes notes={notes.filter((note) => LISTED_NOTES.has(note.kind))} />
         </div>
         <div className="stack">
           {task.currentAttempt ? <CurrentLog attemptId={task.currentAttempt} /> : null}
@@ -268,20 +300,29 @@ function Submissions({ submissions }: { submissions: SubmissionRecord[] }) {
   );
 }
 
+/** The mark of a task only live chats may take, with the owned paths that keep runner agents off it (design 6.6). */
+function LiveChatOnly({ task }: { task: Task }) {
+  const paths = runnerForbiddenPaths(task).map((entry) => entry.path);
+  return (
+    <span
+      className="chip tone-wait live-only"
+      title={`Runner agents may not change ${paths.join(', ')}, so the scheduler leaves this task to live chats.`}
+    >
+      Live chat only
+    </span>
+  );
+}
+
 function Attention({ task }: { task: Task }) {
-  if (task.status === 'blocked' && task.blockedReason) {
-    const title =
-      task.blockedKind === 'deps'
-        ? 'Waiting on other tasks'
-        : task.blockedKind === 'impossible'
-          ? 'The agent says this cannot be done as written'
-          : 'Blocked';
+  if (task.status === 'blocked') {
     return (
-      <div className={`card attention tone-${task.blockedKind === 'deps' ? 'wait' : 'trouble'}`}>
-        <h2>{title}</h2>
-        <p className="pre">
-          <Linked text={task.blockedReason} />
-        </p>
+      <div className={`card attention tone-${toneOf(task.status, task.blockedKind)}`}>
+        <h2>{task.blockedKind ? BLOCKED_TITLES[task.blockedKind] : 'Blocked'}</h2>
+        {task.blockedReason ? (
+          <p className="pre">
+            <Linked text={task.blockedReason} />
+          </p>
+        ) : null}
       </div>
     );
   }
@@ -296,12 +337,30 @@ function Attention({ task }: { task: Task }) {
   return null;
 }
 
-function Actions({ task, onDone }: { task: Task; onDone: () => void }) {
-  const available = actionsFor(task);
+/**
+ * People's actions on the task. On a task a runner agent holds, the agent's actions (stop, stop and hold, replace,
+ * take over) stand in for M1's Release claim (design 11).
+ */
+function Actions({
+  task,
+  holder,
+  attempt,
+  runner,
+  onDone,
+}: {
+  task: Task;
+  holder: TaskHolder;
+  attempt: Attempt | null;
+  runner: Runner | null;
+  onDone: () => void;
+}) {
+  const available = actionsFor(task, holder);
   const [open, setOpen] = useState<TaskAction | null>(null);
   const [text, setText] = useState('');
   const action = useAction();
-  if (available.length === 0) return null;
+  // Where actionsFor drops Release claim; runnerActionsFor offers nothing on a runner task in any other status.
+  const onRunner = holder === 'runner' && attempt !== null && (task.status === 'claimed' || task.status === 'working');
+  if (available.length === 0 && !onRunner) return null;
   const spec = open ? TASK_ACTIONS[open] : null;
   const body = open ? actionBody(open, text) : null;
 
@@ -322,7 +381,12 @@ function Actions({ task, onDone }: { task: Task; onDone: () => void }) {
 
   return (
     <section className="card actions-card" aria-label="Actions">
-      <p className="action-hint">{actionHint(task)}</p>
+      <p className="action-hint">{actionHint(task, holder)}</p>
+      {onRunner ? (
+        // Keyed by the attempt: the agent routes act on whatever attempt the agent has now, so a form opened for an
+        // attempt that was since replaced must not survive into its successor's.
+        <RunnerActions key={attempt.id} agentId={attempt.agentId} attempt={attempt} runner={runner} onDone={onDone} />
+      ) : null}
       <div className="actions">
         {available.map((name) => (
           <button
@@ -477,28 +541,84 @@ function Submission({ task, repo }: { task: Task; repo: string | undefined }) {
   );
 }
 
+function NoteItem({ note }: { note: TaskNote }) {
+  return (
+    <li className="note">
+      <div className="meta">
+        <span className={`chip tone-${NOTE_TONES[note.kind]}`}>{NOTE_LABELS[note.kind]}</span> {who(note.author)} ·{' '}
+        <When ts={note.createdAt} />
+      </div>
+      <p className="pre">
+        <Linked text={note.body} />
+      </p>
+    </li>
+  );
+}
+
 function Notes({ notes }: { notes: TaskNote[] }) {
   return (
     <Section title="Notes">
       {notes.length === 0 ? (
-        <p className="muted">Agents post progress and handoff notes here.</p>
+        <p className="muted">Agents post progress notes here.</p>
       ) : (
         <ol className="notes">
           {[...notes].reverse().map((note) => (
-            <li key={note.id}>
-              <div className="meta">
-                <span className={`chip tone-${note.kind === 'progress' ? 'active' : note.kind === 'handoff' ? 'review' : 'closed'}`}>
-                  {NOTE_LABELS[note.kind]}
-                </span>{' '}
-                {who(note.author)} · <When ts={note.createdAt} />
-              </div>
-              <p className="pre">
-                <Linked text={note.body} />
-              </p>
-            </li>
+            <NoteItem key={note.id} note={note} />
           ))}
         </ol>
       )}
+    </Section>
+  );
+}
+
+/** A step's heading: 'a1 → a2', or where the chain starts or ends. */
+function stepTitle({ from, to }: Pick<NoteGroup, 'from' | 'to'>): string {
+  if (from && to) return `${attemptLabel(from)} → ${attemptLabel(to)}`;
+  if (to) return `The task → ${attemptLabel(to)}`;
+  if (from) return `${attemptLabel(from)} → the next attempt`;
+  return 'Notes from before attempts';
+}
+
+/**
+ * Each step from one attempt to the next (design 6.8): what the attempt left, its handoff and any late work, beside
+ * how its successor read it back in its restatement, so a person sees at a glance whether the handoff landed.
+ */
+function Handoffs({ groups }: { groups: NoteGroup[] }) {
+  return (
+    <Section title="Handoffs" className="handoffs">
+      <ol className="note-steps">
+        {groups.map((group) => (
+          <li key={`${group.from}:${group.to}`} className="note-step">
+            <h3 className="note-step-head">{stepTitle(group)}</h3>
+            <div className="note-columns">
+              <div className="note-left">
+                <p className="note-side">{group.from ? `What ${attemptLabel(group.from)} left` : 'Left before'}</p>
+                {group.handoffs.length + group.lateWork.length > 0 ? (
+                  <ol className="notes">
+                    {[...group.handoffs, ...group.lateWork].map((note) => (
+                      <NoteItem key={note.id} note={note} />
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="muted">No handoff note.</p>
+                )}
+              </div>
+              <div className="note-right">
+                <p className="note-side">{group.to ? `How ${attemptLabel(group.to)} read it` : 'Read back'}</p>
+                {group.restatements.length > 0 ? (
+                  <ol className="notes">
+                    {group.restatements.map((note) => (
+                      <NoteItem key={note.id} note={note} />
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="muted">{group.to ? 'No restatement.' : 'No attempt has read it yet.'}</p>
+                )}
+              </div>
+            </div>
+          </li>
+        ))}
+      </ol>
     </Section>
   );
 }

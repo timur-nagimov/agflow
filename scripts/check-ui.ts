@@ -352,6 +352,11 @@ async function main(): Promise<void> {
       await open(page, '#/task/T-12', '.task-head');
       await statusIs(page, 'Paused');
     });
+    await check("T-12, paused by the Agents check, shows the 'Stopped and held by a person' heading and offers Unblock", async () => {
+      await page.locator('.attention h2', { hasText: /^Stopped and held by a person$/ }).waitFor();
+      await page.locator('.attention', { hasText: 'Hold this until the pricing review is done.' }).waitFor();
+      await page.locator('.actions button:text-is("Unblock")').waitFor();
+    });
 
     /** A task as the hub has it, through the page's signed-in session. */
     const taskDetail = (id: string) =>
@@ -387,6 +392,14 @@ async function main(): Promise<void> {
       await page.locator('.task-attempt-log a[href="#/attempt/T-8-a1"]').waitFor();
       if ((await fact('Attempts')) !== '1') throw new Error(`the attempt count reads ${await fact('Attempts')}`);
     });
+    await check('T-8, held by a runner, offers Stop, Stop and hold, Replace and Take over, but not Release claim', async () => {
+      const offered = await page.locator('.actions-card .runner-actions-panel .actions button').allTextContents();
+      if (offered.join(',') !== 'Stop,Stop and hold,Replace,Take over') throw new Error(`it offers ${offered.join(', ')}`);
+      const all = await page.locator('.actions-card button').allTextContents();
+      if (all.includes('Release claim')) throw new Error(`the page offers ${all.join(', ')}`);
+      const hint = (await page.locator('.actions-card .action-hint').textContent()) ?? '';
+      if (!hint.includes('on a runner')) throw new Error(`the hint reads ${hint}`);
+    });
     await open(page, '#/task/T-10', '.task-head');
     await check('T-10 lists attempts a1 (Replaced, its runner, WIP ref and sha) and a2 (Holding), each linking its attempt page', async () => {
       await waitForCount(page.locator('.attempts-table tbody tr'), 2);
@@ -406,6 +419,24 @@ async function main(): Promise<void> {
       await attemptRow('a2').locator('a.attempt-link[href="#/attempt/T-10-a2"]').waitFor();
       if ((await fact('Attempts')) !== '2') throw new Error(`the attempt count reads ${await fact('Attempts')}`);
     });
+    await check("T-10's handoff note, its successor's restatement and the late-work note sit side by side", async () => {
+      const step = page.locator('.note-step', { has: page.locator('.note-step-head', { hasText: 'a1 → a2' }) });
+      await waitForCount(step, 1);
+      const left = step.locator('.note-left');
+      const right = step.locator('.note-right');
+      await left.locator('.note', { hasText: 'It keeps re-reading the plan catalogue' }).waitFor();
+      await left.locator('.note', { hasText: 'Late work of attempt T-10-a1' }).waitFor();
+      await right.locator('.note', { hasText: 'Restating T-10' }).waitFor();
+      const [a, b] = [await left.boundingBox(), await right.boundingBox()];
+      if (!a || !b || a.x + a.width > b.x || a.y >= b.y + b.height || b.y >= a.y + a.height) {
+        throw new Error(`the columns are not side by side: ${JSON.stringify([a, b])}`);
+      }
+      // The progress note stays in the notes list, outside the handoffs.
+      await page.locator('.card:not(.handoffs) .note', { hasText: 'it has no per-day prices yet' }).waitFor();
+      if ((await page.locator('.handoffs .note', { hasText: 'no per-day prices' }).count()) !== 0) {
+        throw new Error('the progress note is among the handoffs');
+      }
+    });
     await check("T-10's submissions show S-1 refused because the branch needs a merge, and S-2 submitted at its sha; accepting T-10 still works", async () => {
       const { submissions } = await taskDetail('T-10');
       const s2 = submissions.find((submission) => submission.id === 'S-2');
@@ -417,11 +448,23 @@ async function main(): Promise<void> {
       await record('S-1').locator('.submission-detail', { hasText: 'someone pushed to agflow/T-10' }).waitFor();
       const submitted = (await record('S-2').locator('.submission-outcome').textContent()) ?? '';
       if (!s2?.headSha || submitted !== `Submitted at ${s2.headSha.slice(0, 7)}`) throw new Error(`S-2 reads ${submitted}`);
+      // Its attempt still holds, but a submitted task has no runner actions: only people's review.
+      const runnerPanels = await page.locator('.actions-card .runner-actions-panel').count();
+      if (runnerPanels !== 0) throw new Error('T-10 offers runner actions');
       await page.click('.actions button:has-text("Accept")');
       await page.click('.action-form .confirm-action');
       await statusIs(page, 'Accepted');
     });
     await shot(page, 'task-attempts');
+    await open(page, '#/task/T-11', '.task-head');
+    await check('T-11 is marked live chat only', async () => {
+      await page.locator('.task-head .chip.live-only', { hasText: 'Live chat only' }).waitFor();
+    });
+    await open(page, '#/task/T-12', '.task-head');
+    await check('a task runners may take has no live-chat-only mark', async () => {
+      await statusIs(page, 'Paused');
+      if ((await page.locator('.live-only').count()) !== 0) throw new Error('T-12 is marked live chat only');
+    });
 
     await check('the strip shows how many runners are online', () =>
       page.locator('.strip .readout', { hasText: /^Runners\s*1\/3\s*online$/ }).waitFor(),

@@ -443,6 +443,15 @@ tr.attempt-current td { background: color-mix(in srgb, var(--inset) 60%, transpa
 .submission-outcome { font-size: 13.5px; }
 .submission-detail { font: 400 12.5px/1.5 var(--mono); }
 .submission-evidence { margin: 0; padding-left: 18px; font-size: 13px; }
+.note-steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 18px; }
+.note-step { display: grid; gap: 8px; }
+.note-step-head { font: 500 12.5px/1.4 var(--mono); }
+.note-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.note-left, .note-right { display: grid; gap: 8px; align-content: start; padding: 10px 12px; border-radius: 4px; background: var(--inset); }
+.note-side { margin: 0; font: 500 10.5px/1.6 var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); }
+@media (max-width: 720px) {
+  .note-columns { grid-template-columns: 1fr; }
+}
 
 /* ---------- Attempt page ---------- */
 
