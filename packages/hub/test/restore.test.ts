@@ -47,7 +47,7 @@ function hubWithBackup(): { dbPath: string; backupDir: string; backupPath: strin
   const { dbPath, backupDir } = dataDir();
   const ctx = createContext({ dbPath, config: makeConfig(), now: () => NOW });
   createTasks(ctx, [newTask({ title: 'Before the backup' })], 'user:alice');
-  const backupPath = backupDatabase(ctx, backupDir, 'start');
+  const backupPath = backupDatabase(ctx, backupDir, 'start').file;
   createTasks(ctx, [newTask({ title: 'After the backup' })], 'user:alice');
   ctx.db.close();
   return { dbPath, backupDir, backupPath };
@@ -156,7 +156,7 @@ describe('restoreBackup', () => {
     const [task] = createTasks(ctx, [newTask()], 'user:alice');
     writeTask(ctx, task?.id as string, { branchHead: 'b'.repeat(40) });
     const before = counters(ctx);
-    const backupPath = backupDatabase(ctx, backupDir, 'daily');
+    const backupPath = backupDatabase(ctx, backupDir, 'daily').file;
     ctx.db.close();
     // An earlier restore from this folder recorded epoch 3, which the backup and the replaced database are below.
     writeFileSync(join(backupDir, 'epoch'), '3\n');
@@ -203,7 +203,7 @@ describe('restoreBackup', () => {
     const ctx = createContext({ dbPath, config: makeConfig(), now: () => NOW });
     const say = (body: string) => tx(ctx, (emit) => insertMessage(ctx, emit, { from: 'user:alice', to: 'humans', body }));
     say('before the backup');
-    const backupPath = backupDatabase(ctx, backupDir, 'daily');
+    const backupPath = backupDatabase(ctx, backupDir, 'daily').file;
     // The old hub went on after the backup: clients and runners hold these ids as cursors.
     const after = say('after the backup');
     createTasks(ctx, [newTask()], 'user:alice');

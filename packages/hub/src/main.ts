@@ -1,9 +1,10 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { type BackupKind, backupDatabase, checkIntegrity, dailyBackupDue } from './backup';
+import { backupAndLog, checkIntegrity, dailyBackupDue } from './backup';
 import { loadConfig } from './config';
 import { createContext } from './context';
 import { acquireDbLock } from './recovery';
+import { startHousekeeping } from './retention';
 import { startHub } from './server';
 
 const { config, host, port, dbPath, backupDir } = loadConfig(process.env);
@@ -13,18 +14,11 @@ acquireDbLock(dbPath);
 const ctx = createContext({ dbPath, config });
 checkIntegrity(ctx);
 
-function backup(kind: BackupKind): void {
-  try {
-    console.log(`backup written to ${backupDatabase(ctx, backupDir, kind)}`);
-  } catch (error) {
-    console.error(`${kind} backup failed`, error);
-  }
-}
-
-backup('start');
+backupAndLog(ctx, backupDir, 'start');
 // A hub restarted more often than every 24 hours never reaches the timer, so a start also writes a missing daily.
-if (dailyBackupDue(ctx, backupDir)) backup('daily');
-setInterval(() => backup('daily'), 24 * 60 * 60_000);
+if (dailyBackupDue(ctx, backupDir)) backupAndLog(ctx, backupDir, 'daily');
+// Hourly snapshots, the daily one and retention, on a timer outside the tick; the first run comes an hour from now.
+const stopHousekeeping = startHousekeeping(ctx, backupDir);
 
 // The server's own timers sweep sign-ins and dead runner links; its scheduler's tick sweeps the leases, M1's included.
 const hub = startHub(ctx, { port, hostname: host, scheduler: 'auto', dbLock: true, timers: true });
@@ -32,6 +26,7 @@ const hub = startHub(ctx, { port, hostname: host, scheduler: 'auto', dbLock: tru
 /** SIGTERM and SIGINT stop the hub and close the database with its WAL checkpointed, then give up the lock. */
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
   console.log(`${signal}: stopping the hub`);
+  stopHousekeeping();
   try {
     await hub.stop({ closeDatabase: true });
   } catch (error) {
