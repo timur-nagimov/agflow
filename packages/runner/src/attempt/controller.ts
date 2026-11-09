@@ -23,7 +23,9 @@
 // the clone the attempt has and resumes its session with the new fence and token. A submission (submit.ts) harvests
 // the clone and pushes the task branch and the WIP ref together; a stop or hold arriving meanwhile ends its retries.
 // A take-over (takeover.ts) stops the agent with a handoff turn, pushes its work, and hands the clone to a person
-// with a .git the runner built; attempt.taken_over takes attempt.exited's place.
+// with a .git the runner built; attempt.taken_over takes attempt.exited's place. A cleanup (cleanup.ts) stops a live
+// process, saves the clone's work that is not on the origin as late work, uploads the transcript tail and removes
+// the attempt's files.
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -38,6 +40,8 @@ import {
   type InjectedMessage,
   type StartRefusal,
   type StoppedBy,
+  lateWorkRef,
+  localPinRefs,
   type Vendor,
 } from '@agflow/core';
 import type {
@@ -56,12 +60,14 @@ import { diffFingerprint, FactsTracker } from '../facts';
 import { lsRemote, pushLateWork, pushSubmission, type PushResult, pushWip, type SubmitPushOutcome } from '../git/push';
 import { detectProtected, resolveRestoreBase, restoreProtected } from '../git/protect';
 import { type GitEnvironment, runGit } from '../git/run';
+import { cloneExists } from '../git/clone';
 import type { Vault } from '../git/vault';
 import type { RunnerHubHttp } from '../hub-http';
 import type { Logger } from '../log';
 import type { NewEvent, Outbox } from '../outbox';
 import type { RunnerPaths } from '../paths';
 import type { SerialQueue } from '../queue';
+import { removeAgentTools } from '../run-dir';
 import { boundedWait, type ProcessIdentity } from '../processes';
 import type { DependencyPreparer, Notifier, RunnerHealth } from '../seams';
 import { killAndSweep, runStopLadder } from '../stop-ladder';
@@ -96,6 +102,7 @@ import {
   type TakeoverOutcome,
 } from './takeover';
 import { TurnPolicy } from './turns';
+import { CLEANUP_STOP_REASON, type CleanupOutcome, removeTree } from './cleanup';
 import { prepareForStop, RUNNER_STOP_REASON, type StopOptions, type StopOutcome, TurnWatch } from './stop';
 import {
   canPushWip,
@@ -582,6 +589,52 @@ export class AttemptController {
         },
       });
       return { ok: true, takenOverSeq };
+    });
+  }
+
+  /**
+   * cleanup_attempt (design 6.4, 7.8): a live process is stopped with the ladder first. The clone's work that is not
+   * yet on the origin goes to a new late-work ref before anything is deleted; a push that fails keeps everything and
+   * gives the reason. Then the transcript tail is uploaded, the attempt's files and pins removed, and the record kept
+   * with endedAt and no clone. A cleanup that already ran answers ok.
+   */
+  cleanup(): Promise<CleanupOutcome> {
+    this.stopArriving();
+    return this.enqueue(async () => {
+      // The hub queues a cleanup only as it ends the attempt (design 6.4), so its WIP ref never moves again (7.3): a
+      // live process's final work is refused there, and saved below as late work.
+      this.markEnded();
+      if (this.live !== null) {
+        const options = { handoff: false, interruptFirst: false, reason: CLEANUP_STOP_REASON, cause: null };
+        await this.stopLive(this.live, options);
+      }
+      const pending = await this.pushPendingLateWork();
+      if (!pending.ok) return pending;
+      const record = this.deps.store.get(this.attemptId);
+      if (record === null) return { ok: true };
+      this.current ??= record.spec;
+      // The exit's late-work retries end here: the cleanup pushes what is left itself, or keeps the clone.
+      this.late?.cancel();
+      this.late = null;
+      const clone = record.clone !== null && cloneExists(record.clone) ? record.clone : null;
+      if (clone !== null) {
+        const saved = await this.saveLateWork(record.spec, clone, record.lateWorkCount);
+        if (!saved.ok) return saved;
+        await this.uploadTail(record.spec.vendor, record.sessionRef, clone);
+      }
+      return this.removeAttempt(record);
+    });
+  }
+
+  /** upload_transcript (design 6.3): the tail of the attempt's session, read without a live one, posted to the hub. */
+  uploadTranscript(): Promise<{ uploaded: boolean }> {
+    return this.enqueue(async () => {
+      const record = this.deps.store.get(this.attemptId);
+      const sessionRef = this.live?.session.sessionRef ?? record?.sessionRef ?? null;
+      const clone = this.cloneDir ?? record?.clone ?? null;
+      const vendor = (this.current ?? record?.spec)?.vendor;
+      if (sessionRef === null || clone === null || vendor === undefined) return { uploaded: false };
+      return { uploaded: await this.uploadTail(vendor, sessionRef, clone) };
     });
   }
 
@@ -1571,13 +1624,17 @@ export class AttemptController {
   private startLateWork(sha: string, now: boolean): void {
     this.recordLateWork(sha);
     this.late?.cancel();
-    this.late = new LateWorkRetries({
+    const retries: LateWorkRetries = new LateWorkRetries({
       delay: this.deps.config().timings.lateRetry,
       logger: this.deps.logger,
       attemptId: this.attemptId,
-      attempt: () => this.enqueue(() => this.lateWorkJob(sha)),
+      // A try already queued when the retries were cancelled, as a cleanup or a hand-back took the work over, does
+      // nothing: the same work would go to a second late-work ref.
+      attempt: () =>
+        this.enqueue(async () => (this.late === retries && retries.active ? this.lateWorkJob(sha) : { ok: true })),
     });
-    this.late.start(now);
+    this.late = retries;
+    retries.start(now);
   }
 
   /** The record's lateWorkSha: the work waits for a late-work ref. A failure is logged; the retries still run. */
@@ -1608,6 +1665,140 @@ export class AttemptController {
       type: 'attempt.late_work',
       data: { taskId: spec.taskId, ref: pushed.ref, sha },
     });
+    return { ok: true };
+  }
+
+  /**
+   * A cleanup's first step: late work still pending (the record's lateWorkSha) is pushed before anything is deleted.
+   * It is the exit's own harvest, which the vault holds whatever became of the clone. A push that fails keeps
+   * everything, and the retries go on: the hub never sends a failed cleanup again. Work the vault no longer holds is
+   * dropped from the record: nothing is left to push.
+   */
+  private async pushPendingLateWork(): Promise<CleanupOutcome> {
+    this.late?.cancel();
+    this.late = null;
+    const record = this.deps.store.get(this.attemptId);
+    const sha = record?.lateWorkSha ?? null;
+    if (record === null || sha === null) return { ok: true };
+    this.current ??= record.spec;
+    if ((await this.treeOf(sha)) === null) {
+      this.deps.logger.warn('the pending late work is gone from the vault', { attemptId: this.attemptId, sha });
+      this.deps.store.update(this.attemptId, { lateWorkSha: null });
+      return { ok: true };
+    }
+    const pushed = await this.lateWorkJob(sha).catch((error) => ({ ok: false as const, error: describe(error) }));
+    if (pushed.ok) return pushed;
+    this.startLateWork(sha, false);
+    return { ok: false, error: clipPushError(`cannot push the late work: ${pushed.error}`) };
+  }
+
+  /**
+   * A worker clone's work as it is now, harvested and stripped, pushed to a new late-work ref unless the attempt's
+   * start, its WIP ref or one of its late-work refs already holds it. A lead has no WIP and is never harvested. Only a
+   * failure to reach the origin keeps the clone, and that work is then late work, pending in the record and retried
+   * until it lands, as the hub never sends a failed cleanup again. A clone that cannot be harvested (its .git removed,
+   * say) never will be, so that is noted and the cleanup goes on.
+   */
+  private async saveLateWork(
+    spec: Omit<AttemptSpec, 'agentToken'>,
+    clone: string,
+    lateWorkCount: number,
+  ): Promise<CleanupOutcome> {
+    const { taskId, branch, wipRef } = spec;
+    if (spec.role !== 'worker' || taskId === null || branch === null || wipRef === null) return { ok: true };
+    const { vault, local } = this.deps;
+    let work: WorkResult;
+    try {
+      work = await this.collect(spec, clone, branch);
+    } catch (error) {
+      this.harvestFailed(describe(error));
+      return { ok: true };
+    }
+    this.reportViolations(work.stripped);
+    // By tree: every harvest of uncommitted work makes a new snapshot commit, even of the same files.
+    const resolved = (): CleanupOutcome => {
+      this.deps.store.update(this.attemptId, { pushError: null });
+      return { ok: true };
+    };
+    if ((await this.treeOf(localPinRefs(this.attemptId).start)) === work.tree) return resolved();
+    try {
+      const prefix = this.deps.wipRefPrefix();
+      const late = Array.from({ length: lateWorkCount }, (_, index) => lateWorkRef(prefix, this.attemptId, index + 1));
+      const heads = await lsRemote({ vault, local, remote: await this.deps.remote() }, [wipRef, ...late]);
+      for (const sha of new Set(heads.values())) {
+        if ((await this.treeOf(sha)) === work.tree) return resolved();
+      }
+      const pushed = await this.lateWorkJob(work.sha);
+      if (pushed.ok) return pushed;
+      this.startLateWork(work.sha, false);
+      return { ok: false, error: clipPushError(`cannot push the late work: ${pushed.error}`) };
+    } catch (error) {
+      // Unchecked against the origin's refs, which could not be read: at worst a late-work ref holds a tree twice.
+      this.startLateWork(work.sha, false);
+      return { ok: false, error: clipPushError(`cannot save the clone's work: ${describe(error)}`) };
+    }
+  }
+
+  /** The tree of a commit or ref in the vault; null when the vault has none. */
+  private async treeOf(rev: string): Promise<string | null> {
+    const { vault, local } = this.deps;
+    const args = [`--git-dir=${vault.path}`, 'rev-parse', '--verify', '--quiet', `${rev}^{tree}`];
+    const tree = await runGit(local, args, { check: false });
+    return tree.code === 0 ? tree.stdout.trim() : null;
+  }
+
+  /** Uploads the session's transcript tail; gives whether one was posted. A failure is logged, never thrown. */
+  private uploadTail(vendor: Vendor, sessionRef: string | null, clone: string): Promise<boolean> {
+    const adapter = this.deps.adapters.get(vendor);
+    if (sessionRef === null || !adapter) return Promise.resolve(false);
+    const { hub, logger } = this.deps;
+    return uploadTranscriptTail({ adapter, hub, attemptId: this.attemptId, sessionRef, clone, logger });
+  }
+
+  /**
+   * The removals of a cleanup, each logged when it fails: the vendor's transcript, the clone, the vault pins, the
+   * private tmp dir, the tools, quarantine and forensics directories, and the base checkout. Only when all went is
+   * the record marked cleaned up; otherwise the first failure is the answer, and a resent cleanup tries again.
+   */
+  private async removeAttempt(record: AttemptRecord): Promise<CleanupOutcome> {
+    const { paths, vault, store, logger } = this.deps;
+    const id = this.attemptId;
+    const project = vault.project;
+    const adapter = this.deps.adapters.get(record.spec.vendor);
+    const sessionRef = record.sessionRef;
+    const clone = record.clone ?? paths.clone(project, id);
+    const steps: [string, () => Promise<void>][] = [
+      ['the transcript', async () => {
+        if (sessionRef !== null && adapter) await adapter.deleteTranscript({ sessionRef, clone });
+      }],
+      ['the clone', () => removeTree(clone)],
+      ['the pins', () => vault.deletePins(id)],
+      ['the private tmp dir', async () => {
+        if (record.tmpDir !== null) await removeTree(record.tmpDir);
+      }],
+      ['the tools directory', async () => removeAgentTools(paths.agentTools(project, id))],
+      ['the quarantine', () => removeTree(paths.quarantine(project, id))],
+      ['the forensics directory', () => removeTree(paths.forensics(id))],
+      ['the base checkout', async () => {
+        await this.prepared?.baseCheckout?.release();
+      }],
+    ];
+    let failed: string | null = null;
+    for (const [what, step] of steps) {
+      try {
+        await step();
+      } catch (error) {
+        logger.warn(`cannot remove ${what}`, { attemptId: id, error: describe(error) });
+        failed ??= `cannot remove ${what}: ${describe(error)}`;
+      }
+    }
+    if (failed !== null) return { ok: false, error: clipPushError(failed) };
+    const ended = { state: 'ended', endedAt: record.endedAt ?? Date.now() } as const;
+    store.update(id, { ...ended, clone: null, tmpDir: null, lateWorkSha: null });
+    this.close();
+    this.prepared = null;
+    this.cloneDir = null;
+    this.currentPhase = null;
     return { ok: true };
   }
 
