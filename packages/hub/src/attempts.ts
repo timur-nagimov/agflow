@@ -1120,6 +1120,23 @@ function moveAtRequest(ctx: HubContext, emit: Emit, attempt: Attempt, input: Sto
   return [...planned.path];
 }
 
+/** Attempts that still hold something of their runner's: a process, a clone or a lease. */
+const OPEN_ON_RUNNER: readonly AttemptStatus[] = ['starting', 'running', 'quota_wait', 'holding'];
+
+/**
+ * Ends the runner's open attempts lost as it is retired (design 6.16), in the caller's transaction: a held task goes
+ * stale and back to ready, a submitted one keeps its status for its review, and a lead's seat empties. A take-over in
+ * flight ends taken_over, as at its lease expiry: its clone waits for the hand-back. Returns how many ended.
+ */
+export function retireRunnerAttempts(ctx: HubContext, runnerId: string, actor: string): number {
+  let ended = 0;
+  for (const attempt of listAttempts(ctx, { runner: runnerId, status: [...OPEN_ON_RUNNER] }).reverse()) {
+    const trigger = attempt.stopRequested?.cause === 'takeover' ? 'takeover' : 'lost';
+    if (endAttempt(ctx, { attemptId: attempt.id, trigger, error: 'the runner was retired', actor })) ended += 1;
+  }
+  return ended;
+}
+
 /**
  * Ends every stop not completed within stopGraceMs with its requested reason (invariant d), each in its own
  * transaction; the runner stops the process at its next hello, through welcome.stop. Deferred stops wait for their

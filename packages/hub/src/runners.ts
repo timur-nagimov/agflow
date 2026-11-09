@@ -16,7 +16,7 @@ import { verifySessionHash } from './auth';
 import { type CommandRow, type StoredCommand, cancelPendingSettings, enqueueCommand } from './commands';
 import { type HubContext, afterCommit, tx } from './context';
 import { nextId } from './db';
-import { notFound } from './errors';
+import { forbidden, notFound } from './errors';
 import type { Emit } from './events';
 
 export type HelloMessage = Extract<RunnerMessage, { t: 'hello' }>;
@@ -166,6 +166,23 @@ export function getRunner(ctx: HubContext, id: string): Runner {
   const runner = findRunner(ctx, id);
   if (!runner) throw notFound(`runner ${id}`);
   return runner;
+}
+
+/** The runner row for an action only its owner may take: 404 when unknown, 403 for anyone else. Retired ones too. */
+function ownersRow(row: RunnerRow | null, user: string, name: string): RunnerRow {
+  if (!row) throw notFound(name);
+  if (row.owner !== user) throw forbidden(`only ${row.owner}, the owner of runner ${row.id}, can do this`);
+  return row;
+}
+
+/** The runner by id, for its owner (ownersRow). */
+export function ownedRunnerRow(ctx: HubContext, runnerId: string, user: string): RunnerRow {
+  return ownersRow(findRunnerRow(ctx, runnerId), user, `runner ${runnerId}`);
+}
+
+/** The runner by its key, for its owner, as agflow runner uninstall names it (ownersRow). */
+export function ownedRunnerRowByKey(ctx: HubContext, runnerKey: string, user: string): RunnerRow {
+  return ownersRow(findRunnerByKey(ctx, runnerKey), user, 'the runner with this key');
 }
 
 /** Runner rows in id order; retired ones only when asked for. */
