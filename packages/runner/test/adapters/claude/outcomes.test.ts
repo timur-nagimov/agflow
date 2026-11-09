@@ -18,6 +18,7 @@ import { ClaudeAdapter } from '../../../src/adapters/claude/adapter';
 import { CLAUDE_CLI_VERSION } from '../../../src/adapters/claude/pin';
 import type { AgentEvent, AgentLaunch, AgentSession } from '../../../src/adapters/types';
 import { isLimitHit } from '../../../src/attempt/turns';
+import { RunnerConfigSchema } from '../../../src/config';
 import { runnerPaths } from '../../../src/paths';
 import { standardProfile } from '../../../src/profile';
 
@@ -82,6 +83,7 @@ function setup(scenario: string): { adapter: ClaudeAdapter; launch: AgentLaunch 
   };
   const adapter = new ClaudeAdapter({
     agflow: { command: '/usr/bin/false', args: [] },
+    config: RunnerConfigSchema.parse({ runnerKey: 'r-1', machineId: 'machine-1', name: 'laptop' }),
     paths,
     vendorHomes: { claude: paths.homes.claude, codex: paths.homes.codex },
   });

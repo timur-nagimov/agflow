@@ -29,6 +29,7 @@ import { claudeBinary } from '../../../src/adapters/claude/options';
 import { claudeProjectDir } from '../../../src/adapters/claude/paths';
 import { CLAUDE_CLI_VERSION } from '../../../src/adapters/claude/pin';
 import type { AgentEvent, AgentLaunch, AgentSession, VendorAdapter } from '../../../src/adapters/types';
+import { RunnerConfigSchema } from '../../../src/config';
 import { runnerPaths } from '../../../src/paths';
 import { standardProfile } from '../../../src/profile';
 
@@ -112,6 +113,7 @@ function setup(
   };
   const adapter = new ClaudeAdapter({
     agflow: { command: '/usr/bin/false', args: [] },
+    config: RunnerConfigSchema.parse({ runnerKey: 'r-1', machineId: 'machine-1', name: 'laptop' }),
     paths,
     vendorHomes: { claude: paths.homes.claude, codex: paths.homes.codex },
     ...options.adapter,

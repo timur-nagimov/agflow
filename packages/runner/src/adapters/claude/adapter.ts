@@ -5,14 +5,18 @@
 // start's deadline. The auto profile runs acceptEdits unless the last preflight saw the account offer auto mode (7.6).
 // A resume runs in the same clone with the same options (8.4). A session that never ran a turn has no conversation to
 // resume, so a fresh one takes its place without a resume being spawned, and any resume the CLI refuses fails the
-// start once the process is gone (7.4): one launch spawns one process.
+// start once the process is gone (7.4): one launch spawns one process. Preflight runs the zero-model handshake (8.1);
+// what it learns, the account and whether auto mode is offered, the later starts use.
 import type { Vendor } from '@agflow/core';
+import type { RunnerConfig } from '../../config';
 import type { RunnerPaths } from '../../paths';
 import { boundedWait } from '../../processes';
-import type { AgentLaunch, AgentSession, AgflowCommand, ExitInfo } from '../types';
+import { vendorPlatform } from '../../vendor/pins';
+import type { AgentLaunch, AgentSession, AgflowCommand, ExitInfo, PreflightResult, VendorAdapter } from '../types';
 import { checkSystemInit, type SystemInitExpectation } from './checks';
 import { CLAUDE_BRIEF_HOOK_TIMEOUT_S, claudeBinary, claudeTools, effectivePermissionMode } from './options';
 import { readClaudeVersion } from './pin';
+import { claudePreflight } from './preflight';
 import { QuotaBook } from './quota';
 import { ClaudeSession } from './session';
 import { deleteClaudeTranscript, hasClaudeConversation, readClaudeTranscriptTail } from './transcript';
@@ -28,21 +32,30 @@ const KILLED_EXIT_MS = 1_000;
  * above the brief hook's timeout. The attempt's later stop waits behind the start, so the start must end.
  */
 export const CLAUDE_START_TIMEOUT_MS = (CLAUDE_BRIEF_HOOK_TIMEOUT_S + 60) * 1_000;
+
 const DEFAULT_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 
 export interface ClaudeAdapterOptions {
   /** How the runner runs agflow; the brief hook runs it (X-5). */
   agflow: AgflowCommand;
+  /** runner.json: the captured PATH, the models and profile, test mode's Claude environment. */
+  config: RunnerConfig;
   paths: RunnerPaths;
   /** vendorHomes(config, paths): the Claude home is every launch's CLAUDE_CONFIG_DIR. */
   vendorHomes: Record<Vendor, string>;
   /** Test mode (15.1): the scripted server's API key is expected, so the first-turn check leaves apiKeySource be. */
   skipAuthChecks?: boolean;
+  /** `<os>-<arch>`, vendorPlatform() by default; the pin decides whether it is supported. */
+  platform?: string;
+  /** The runner's environment, which preflight's agent environment is built from; process.env by default. */
+  env?: Record<string, string | undefined>;
   /** CLAUDE_START_TIMEOUT_MS by default. */
   startTimeoutMs?: number;
+  /** How long preflight's handshake gets; CLAUDE_PREFLIGHT_TIMEOUT_MS by default. */
+  preflightTimeoutMs?: number;
 }
 
-export class ClaudeAdapter {
+export class ClaudeAdapter implements VendorAdapter {
   readonly vendor = 'claude' as const;
   /** The last quota per account, which every session reports into. */
   readonly quota = new QuotaBook();
@@ -52,6 +65,24 @@ export class ClaudeAdapter {
   protected accountId: string | null = null;
 
   constructor(protected readonly options: ClaudeAdapterOptions) {}
+
+  /** Facts only, with the quota and the weakened items (X-5); the account and auto mode carry over to later starts. */
+  async preflight(): Promise<PreflightResult> {
+    const { autoOffered, ...result } = await claudePreflight({
+      agflow: this.options.agflow,
+      config: this.options.config,
+      paths: this.options.paths,
+      vendorHomes: this.options.vendorHomes,
+      platform: this.options.platform ?? vendorPlatform(),
+      quota: this.quota,
+      skipAuthChecks: this.options.skipAuthChecks === true,
+      env: this.options.env,
+      timeoutMs: this.options.preflightTimeoutMs,
+    });
+    this.autoOffered = autoOffered;
+    this.accountId = result.facts.accountId;
+    return result;
+  }
 
   async start(launch: AgentLaunch): Promise<AgentSession> {
     // The binary that wrote the session, or the pin for a new one (X-13); --version needs no more than PATH.

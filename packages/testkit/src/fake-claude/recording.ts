@@ -14,9 +14,10 @@ export interface RecordingHeader {
   scenario: string;
   /**
    * The account the frames show. Captures run against the scripted server with an API key, and the recorder rewrites
-   * them into a synthetic subscription account; live captures keep the (redacted) real one.
+   * them into a synthetic subscription account; live captures keep the (redacted) real one, and api-key captures the
+   * scripted server's key account, for what preflight refuses.
    */
-  account: 'synthetic-subscription' | 'live';
+  account: 'synthetic-subscription' | 'live' | 'api-key';
   /** The --model and --permission-mode the frames were recorded with; $MODEL and $PERMISSION_MODE default to them. */
   model: string;
   permissionMode: string;

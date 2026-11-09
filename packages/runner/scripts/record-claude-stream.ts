@@ -50,6 +50,7 @@ import {
 } from '@agflow/testkit/src/fake-claude';
 import {
   type HookCallback,
+  type Options,
   query,
   type SDKUserMessage,
   type SpawnedProcess,
@@ -253,6 +254,10 @@ export interface ClaudeScenario {
   maxRetries?: number;
   /** Only the scripted server's answers produce it, so --live skips it. */
   scripted?: boolean;
+  /** Keeps the scripted server's API-key account instead of the synthetic subscription. */
+  apiKeyAccount?: boolean;
+  /** How the capture's options differ from buildQueryOptions': what preflight must catch. */
+  adjustOptions?(options: Options, scratch: ScratchLaunch): Options;
   /**
    * A recording no capture against the scripted server can produce (outline Q3), derived from what the capture
    * printed; its header says synthesised. --live records the real thing instead, when the account shows it.
@@ -344,7 +349,7 @@ export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaun
   };
   const launch: AgentLaunch =
     scenario.resume === undefined ? scratch.launch : { ...scratch.launch, resume: { sessionRef: scenario.resume } };
-  const options = buildQueryOptions(launch, {
+  const built = buildQueryOptions(launch, {
     agflow: scratch.agflow,
     paths: scratch.paths,
     vendorHomes: scratch.vendorHomes,
@@ -352,6 +357,7 @@ export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaun
     spawnClaudeCodeProcess,
     compaction: { preCompact: compactionHook, postCompact: compactionHook },
   });
+  const options = scenario.adjustOptions ? scenario.adjustOptions(built, scratch) : built;
   const sessionId = (options.resume ?? options.sessionId) as string;
 
   const queue: SDKUserMessage[] = [];
@@ -688,17 +694,18 @@ function isObject(value: unknown): value is Json {
 }
 
 /**
- * The recording the recorder writes for a run: assembled, rewritten into the synthetic subscription unless live,
- * without the managed policy, and redacted.
+ * The recording the recorder writes for a run: assembled, rewritten into the synthetic subscription unless live or
+ * an API-key capture, without the managed policy, and redacted.
  */
 export function recordingOf(
   run: ScenarioRun,
   header: RecordingHeader,
   scratch: ScratchLaunch,
-  options: { live: boolean },
+  options: { live: boolean; apiKeyAccount?: boolean },
 ): ClaudeRecording {
   const assembled = assembleRecording(run, header);
-  return redactRecording(stripManagedPolicy(options.live ? assembled : asSubscription(assembled)), {
+  const account = options.live || options.apiKeyAccount ? assembled : asSubscription(assembled);
+  return redactRecording(stripManagedPolicy(account), {
     sessionId: run.sessionId,
     sessionPlaceholder: '$SESSION',
     paths: redactionPaths(scratch, scratch.clone),
@@ -822,6 +829,40 @@ const PROMPTS = {
 
 const COMPACTION_SUMMARY = 'Summary: the agent said hello; nothing else happened.';
 
+/** The preflight handshake: /clear is a local command, so no request reaches any model. */
+async function clearOnly(session: ScenarioSession): Promise<void> {
+  session.send('/clear');
+  await session.idle();
+}
+
+/** Changes the handshake's system/init frames. */
+function changeInit(recording: ClaudeRecording, change: (init: Json) => Json): ClaudeRecording {
+  const step = (item: RecordingStep): RecordingStep =>
+    'frame' in item && item.frame.type === 'system' && item.frame.subtype === 'init'
+      ? { frame: change(item.frame as Json) }
+      : item;
+  return { ...recording, startup: recording.startup.map(step), turns: recording.turns.map((turn) => turn.map(step)) };
+}
+
+/** A plugin from outside the CLI: what a marketplace or a plugin directory would add. */
+export const SYNTHESISED_PLUGIN = Object.freeze({
+  name: 'repo-helper',
+  path: '/Users/redacted/.claude/plugins/repo-helper',
+});
+
+/**
+ * The handshake of an auto-profile session on an account that does not offer auto mode: 2.1.285 falls back to the
+ * default mode, which system/init reports.
+ */
+export function synthesiseAutoOff(recording: ClaudeRecording): ClaudeRecording {
+  return changeInit(recording, (init) => ({ ...init, permissionMode: 'default' }));
+}
+
+/** The handshake of a session that loaded a plugin that is not built in. */
+export function synthesisePlugin(recording: ClaudeRecording): ClaudeRecording {
+  return changeInit(recording, (init) => ({ ...init, plugins: [...(init.plugins ?? []), { ...SYNTHESISED_PLUGIN }] }));
+}
+
 /** One prompt and its turn, as the outcome scenarios drive it. */
 async function oneTurn(session: ScenarioSession): Promise<void> {
   session.send(PROMPTS.hello);
@@ -929,6 +970,52 @@ export const CLAUDE_SCENARIOS: ClaudeScenario[] = [
       session.send('/clear');
       await session.idle();
     },
+  },
+  // What preflight refuses (8.1), captured where options can produce it.
+  {
+    name: 'preflight-api-key',
+    fixture: 'preflight-api-key',
+    scripted: true,
+    apiKeyAccount: true,
+    handler: rules(),
+    drive: clearOnly,
+  },
+  {
+    name: 'preflight-extra-mcp',
+    fixture: 'preflight-extra-mcp',
+    scripted: true,
+    handler: rules(),
+    // A second server: the stub bridge under another name.
+    adjustOptions: (options) => {
+      const bridge = options.mcpServers?.agflow;
+      if (bridge === undefined) throw new Error('the options name no agflow server');
+      return { ...options, mcpServers: { ...options.mcpServers, github: bridge } };
+    },
+    drive: clearOnly,
+  },
+  {
+    name: 'preflight-sandbox-off',
+    fixture: 'preflight-sandbox-off',
+    scripted: true,
+    handler: rules(),
+    adjustOptions: (options) => ({ ...options, sandbox: { ...options.sandbox, enabled: false } }),
+    drive: clearOnly,
+  },
+  {
+    name: 'preflight-plugin',
+    fixture: 'preflight-plugin',
+    scripted: true,
+    handler: rules(),
+    synthesise: synthesisePlugin,
+    drive: clearOnly,
+  },
+  {
+    name: 'preflight-auto-off',
+    fixture: 'preflight-auto-off',
+    scripted: true,
+    handler: rules(),
+    synthesise: synthesiseAutoOff,
+    drive: clearOnly,
   },
   {
     name: 'turn-basic',
@@ -1167,11 +1254,14 @@ export async function recordClaudeStream(options: RecordClaudeStreamOptions = {}
           cliVersion: version.version,
           source: 'captured',
           scenario: scenario.name,
-          account: options.live ? 'live' : 'synthetic-subscription',
+          account: options.live ? 'live' : scenario.apiKeyAccount ? 'api-key' : 'synthetic-subscription',
           model,
           permissionMode: effectivePermissionMode(scratch.launch.profile, false),
         };
-        const captured = recordingOf(run, header, scratch, { live: options.live === true });
+        const captured = recordingOf(run, header, scratch, {
+          live: options.live === true,
+          apiKeyAccount: scenario.apiKeyAccount,
+        });
         const recording =
           scenario.synthesise && !options.live
             ? scenario.synthesise({ ...captured, header: { ...captured.header, source: 'synthesised' } })
