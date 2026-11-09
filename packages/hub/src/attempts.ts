@@ -77,7 +77,7 @@ import {
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { deliverBacklog, messagesInFlight, retargetDeliveries, settleDeliveriesOnEnd } from './delivery';
-import { HubError, badRequest, conflict, notFound } from './errors';
+import { HubError, badRequest, conflict, forbidden, notFound } from './errors';
 import type { Emit } from './events';
 import { assembleHandoffNote, handoffWritten } from './handoff';
 import { emptySeat, insertLeadNote, seatHolderId, takeSeat } from './hub-state';
@@ -1095,6 +1095,75 @@ export function requestStop(ctx: HubContext, input: StopRequestInput): StopReque
     if (recorded) cancelPendingOfKind(ctx, attempt.id, 'stop_attempt');
     if (!deferred && input.cause !== 'takeover') enqueueCommand(ctx, attempt.runnerId as string, stopCommand(stopping));
     return { attempt: stopping, outcome, ending: null };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Agent actions (design 6.16, X-34): stop, stop and hold, replace and interrupt of a runner agent
+// ---------------------------------------------------------------------------
+
+export interface AgentActionInput {
+  agentId: string;
+  /** The text the agent is given. */
+  reason: string;
+  /** user:<login> for a person, agent:<id> for the agent holding the lead seat. */
+  by: string;
+}
+
+/**
+ * The open runner attempt of the agent an action names. A live chat is refused (409: people release its task), and so
+ * is an agent whose attempt has ended. The lead acts on runner workers only; people act on leads too (X-34).
+ */
+function actionTarget(ctx: HubContext, input: Pick<AgentActionInput, 'agentId' | 'by'>): Attempt {
+  const agent = getAgent(ctx, input.agentId);
+  if (agent.origin !== 'runner' || agent.attemptId === null) {
+    throw conflict(`agent ${agent.id} runs in a live chat; release its task instead`);
+  }
+  const attempt = getAttempt(ctx, agent.attemptId);
+  if (attempt.status === 'ended') {
+    throw conflict(`agent ${agent.id}'s attempt has ended (${attempt.endReason ?? 'unknown reason'})`);
+  }
+  if (attempt.role === 'lead' && !input.by.startsWith('user:')) {
+    throw forbidden('the lead stops and replaces runner workers only; people stop or replace a lead');
+  }
+  return attempt;
+}
+
+/**
+ * POST /api/agents/:id/stop: a stop, or with hold a stop and hold, which pauses the task at once. A lead cannot be
+ * held (409). A person stopping a runner lead ends it stopped on exit, after its handoff turn, and the seat empties.
+ */
+export function stopAgent(ctx: HubContext, input: AgentActionInput & { hold: boolean }): StopRequestResult {
+  return tx(ctx, () => {
+    const attempt = actionTarget(ctx, input);
+    const cause = input.hold ? 'stop_hold' : 'stop';
+    return requestStop(ctx, { attemptId: attempt.id, cause, reason: input.reason, by: input.by });
+  });
+}
+
+/** POST /api/agents/:id/replace: the attempt ends replaced on exit, and a worker's task goes back to ready. */
+export function replaceAgent(ctx: HubContext, input: AgentActionInput): StopRequestResult {
+  return tx(ctx, () => {
+    const attempt = actionTarget(ctx, input);
+    return requestStop(ctx, { attemptId: attempt.id, cause: 'replace', reason: input.reason, by: input.by });
+  });
+}
+
+/**
+ * POST /api/agents/:id/interrupt, a person's: the runner interrupts the agent's current turn, at the attempt's fence.
+ * An attempt with no process has no turn to interrupt (409).
+ */
+export function interruptAgent(ctx: HubContext, agentId: string, by: string): CommandRow {
+  return tx(ctx, () => {
+    const attempt = actionTarget(ctx, { agentId, by });
+    if (!hasLiveProcess(attempt)) {
+      throw conflict(`agent ${agentId} has no running process to interrupt (its attempt is ${attempt.status})`);
+    }
+    return enqueueCommand(ctx, attempt.runnerId as string, {
+      kind: 'interrupt',
+      attemptId: attempt.id,
+      fence: attempt.fence,
+    });
   });
 }
 
