@@ -1,5 +1,6 @@
 // Thread startup, resume, fail-closed checks and app-server events (design 9.2, 7.4).
 import { TEST_ACCOUNT_ID } from '@agflow/core';
+import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import type { RunnerTestBlock } from '../../config';
@@ -7,13 +8,20 @@ import type { Logger } from '../../log';
 import { boundedWait } from '../../processes';
 import { vendorBinary } from '../../vendor/pins';
 import type { AgentEvent, AgentLaunch, AgentSession, ExitInfo } from '../types';
+import { approvalFromRequest, decisionResponse, unattendedResponse, type FileChange } from './approvals';
 import { isFinalError, mergeRateLimits, quotaFromRateLimits, turnErrorKind } from './classify';
 import { appServerArgs, appServerEnv, threadOverrides } from './config';
 import { codexToolEnded, codexToolStarted } from './items';
-import type { CodexClientMethod, ParamsOf, ResultOf } from './methods';
+import {
+  CodexServerRequestMethods,
+  type CodexClientMethod,
+  type CodexServerRequestMethod,
+  type ParamsOf,
+  type ResultOf,
+} from './methods';
 import { codexAccountIdentity } from './policy';
 import { openAppServer, type AppServerProcess } from './process';
-import type { ServerNotification } from './protocol';
+import type { RequestId, ServerNotification } from './protocol';
 import type { RateLimitSnapshot, Turn, TurnError } from './protocol/v2';
 import { RpcError } from './rpc';
 
@@ -42,7 +50,14 @@ interface OpenTool {
   mainTurn: string | null;
 }
 
-export class CodexSession {
+interface PendingApproval {
+  requestId: RequestId;
+  threadId: string;
+  turnId: string;
+  answer(decision: 'approve' | 'decline'): void;
+}
+
+export class CodexSession implements AgentSession {
   readonly pid: number;
   readonly events: AsyncIterable<AgentEvent>;
   readonly exited: Promise<ExitInfo>;
@@ -73,6 +88,9 @@ export class CodexSession {
   private readonly acknowledgements = new Map<string, string[]>();
   private sending = false;
   private readonly completions: Turn[] = [];
+  private readonly approvals = new Map<string, PendingApproval>();
+  private readonly fileChanges = new Map<string, FileChange>();
+  private readonly waitingThreads = new Set<string>();
 
   private constructor(
     private readonly app: AppServerProcess,
@@ -85,6 +103,7 @@ export class CodexSession {
     this.exited = app.exited;
     void this.exited.then(async () => {
       this.closed = true;
+      this.forgetApprovals();
       this.held?.release();
       // An escaped child can hold stdout open after the leader exits.
       await boundedWait(app.rpc.ended, 1000);
@@ -119,10 +138,20 @@ export class CodexSession {
       requestTimeoutMs: options.requestTimeoutMs,
     });
     let session: CodexSession | null = null;
-    const pending: ServerNotification[] = [];
+    const pending: ((session: CodexSession | null) => void)[] = [];
+    for (const method of CodexServerRequestMethods) {
+      app.rpc.handle(method, (params, id) => {
+        if (session) return session.serverRequest(method, params, id);
+        return new Promise<ResultOf<typeof method>>((resolve) => {
+          pending.push((ready) =>
+            resolve(ready ? ready.serverRequest(method, params, id) : decisionResponse(method, 'decline')),
+          );
+        });
+      });
+    }
     const unsubscribeNotifications = app.rpc.onNotification((notification) => {
       if (session) session.notification(notification);
-      else pending.push(notification);
+      else pending.push((ready) => ready?.notification(notification));
     });
     let warning: string | null = null;
     const unsubscribeWarning = app.rpc.on('configWarning', ({ summary }) => {
@@ -178,7 +207,7 @@ export class CodexSession {
       if (tools.length > 0) {
         session.queue.push({ type: 'warning', text: `codex thread lists extra agflow tools: ${tools.join(', ')}` });
       }
-      for (const notification of pending) session.notification(notification);
+      for (const deliver of pending) deliver(session);
       pending.length = 0;
       if (!resumed) {
         // Both start and resume carry the tools note in developerInstructions.
@@ -187,6 +216,7 @@ export class CodexSession {
       return session;
     } catch (error) {
       unsubscribeNotifications();
+      for (const deliver of pending.splice(0)) deliver(null);
       await app.end();
       throw new Error(oneLine(warning ?? error));
     } finally {
@@ -200,6 +230,31 @@ export class CodexSession {
     const sent = this.sends.then(() => this.sendMessage(message, generation));
     this.sends = sent.catch(() => {});
     await sent;
+  }
+
+  async answerApproval(approvalId: string, decision: 'approve' | 'decline', reason: string | null): Promise<boolean> {
+    if (this.closed || this.app.rpc.closed) return false;
+    const pending = this.approvals.get(approvalId);
+    if (!pending) return false;
+    this.approvals.delete(approvalId);
+    pending.answer(decision);
+    if (decision === 'decline' && reason !== null) {
+      // The reason goes to the turn that asked, a child thread's too; once that turn has ended it is dropped, since a
+      // new turn would be work nobody asked for (design 9.3).
+      const { threadId, turnId } = pending;
+      const note = this.sends.then(() =>
+        request(this.app, 'turn/steer', {
+          threadId,
+          expectedTurnId: turnId,
+          input: [{ type: 'text', text: `System note: ${reason}`, text_elements: [] }],
+        }),
+      );
+      this.sends = note.then(
+        () => {},
+        (error) => this.warn('approval note', oneLine(error)),
+      );
+    }
+    return true;
   }
 
   async interrupt(options: { cancelQueued?: boolean } = {}): Promise<void> {
@@ -218,6 +273,7 @@ export class CodexSession {
     this.closed = true;
     this.held?.release();
     await this.app.end();
+    this.forgetApprovals();
   }
 
   private checkSend(generation = this.sendGeneration): void {
@@ -304,6 +360,49 @@ export class CodexSession {
     this.queue.push({ type: 'delivered', id: message.id });
   }
 
+  private serverRequest<M extends CodexServerRequestMethod>(
+    method: M,
+    params: unknown,
+    id: RequestId,
+  ): Promise<ResultOf<M>> | ResultOf<M> {
+    if (this.closed || this.app.rpc.closed) return decisionResponse(method, 'decline');
+    if (method === 'item/tool/requestUserInput' || method === 'mcpServer/elicitation/request') {
+      const response = unattendedResponse(method, params);
+      if (response) return response as ResultOf<M>;
+    } else {
+      let parsed = approvalFromRequest(method, params);
+      if (parsed) {
+        if (method === 'item/fileChange/requestApproval') {
+          parsed = approvalFromRequest(
+            method,
+            params,
+            this.fileChanges.get(JSON.stringify([parsed.threadId, parsed.itemId])),
+          )!;
+        }
+        const approvalId = randomUUID();
+        const { kind, summary, detail, threadId, turnId, permissions } = parsed;
+        return new Promise((resolve) => {
+          this.approvals.set(approvalId, {
+            requestId: id,
+            threadId,
+            turnId,
+            answer: (decision) => resolve(decisionResponse(method, decision, permissions)),
+          });
+          this.queue.push({ type: 'approval_request', approvalId, kind, summary, detail });
+        });
+      }
+    }
+    this.warn('approval', `cannot parse ${method}; declined`);
+    return decisionResponse(method, 'decline');
+  }
+
+  private forgetApprovals(): void {
+    for (const pending of this.approvals.values()) pending.answer('decline');
+    this.approvals.clear();
+    this.fileChanges.clear();
+    this.waitingThreads.clear();
+  }
+
   private async hold(turnId: string | null): Promise<void> {
     await new Promise<void>((release) => {
       this.held = { turnId, release };
@@ -313,6 +412,28 @@ export class CodexSession {
 
   private notification(notification: ServerNotification): void {
     switch (notification.method) {
+      case 'serverRequest/resolved': {
+        const { threadId, requestId } = notification.params;
+        for (const [approvalId, pending] of this.approvals) {
+          if (pending.requestId !== requestId || pending.threadId !== threadId) continue;
+          this.approvals.delete(approvalId);
+          this.queue.push({ type: 'approval_void', approvalId });
+          // RPC requires each handler to settle; a late decline cannot grant a withdrawn request.
+          pending.answer('decline');
+          break;
+        }
+        return;
+      }
+      case 'thread/status/changed': {
+        const { threadId, status } = notification.params;
+        const wasWaiting = this.waitingThreads.size > 0;
+        if (status.type === 'active' && status.activeFlags.includes('waitingOnApproval'))
+          this.waitingThreads.add(threadId);
+        else this.waitingThreads.delete(threadId);
+        const waiting = this.waitingThreads.size > 0;
+        if (waiting !== wasWaiting) this.queue.push({ type: 'waiting_approval', waiting });
+        return;
+      }
       case 'turn/started': {
         const { threadId, turn } = notification.params;
         if (threadId !== this.sessionRef) return;
@@ -357,6 +478,11 @@ export class CodexSession {
       case 'item/started':
       case 'item/completed': {
         const { item, threadId, turnId } = notification.params;
+        if (item.type === 'fileChange') {
+          const key = JSON.stringify([threadId, item.id]);
+          if (notification.method === 'item/started') this.fileChanges.set(key, item);
+          else this.fileChanges.delete(key);
+        }
         const start = codexToolStarted(item);
         if (start) {
           const key = JSON.stringify([threadId, turnId, item.id]);
