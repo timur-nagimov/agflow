@@ -1,4 +1,5 @@
 export * from './adapters/bridge-tools';
+export * from './adapters/index';
 export * from './adapters/types';
 export * from './attempt/cleanup';
 export * from './attempt/controller';
@@ -40,3 +41,4 @@ export * from './run-dir';
 export * from './seams';
 export * from './stop-ladder';
 export * from './vendor/pins';
+export * from './vendors';
