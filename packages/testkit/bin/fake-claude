@@ -1,0 +1,13 @@
+#!/bin/sh
+# The recorded-stream fake claude (packages/testkit/src/fake-claude). The Agent SDK spawns this file directly, as it
+# does the real binary; it runs the fake with FAKE_CLAUDE_BUN, which fakeClaudeEnv sets, or the bun on PATH.
+# A symlink to this file (a test runner home's vendor/claude/<version>/claude) is followed to find the sources.
+self=$0
+while [ -L "$self" ]; do
+  target=$(readlink "$self")
+  case $target in
+    /*) self=$target ;;
+    *) self=$(dirname "$self")/$target ;;
+  esac
+done
+exec "${FAKE_CLAUDE_BUN:-bun}" "$(dirname "$self")/../src/fake-claude/cli.ts" "$@"
