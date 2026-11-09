@@ -1,0 +1,516 @@
+{
+  "usageLimit": [
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a1c034-afaa-7541-abf2-e2bb147b02e9",
+        "turn": {
+          "id": "01a1c034-afde-7cf0-ab34-8854fb8327c0",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794226040,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1794226040815
+    },
+    {
+      "method": "account/rateLimits/updated",
+      "params": {
+        "rateLimits": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 100,
+            "windowDurationMins": 300,
+            "resetsAt": 1794227840
+          },
+          "secondary": {
+            "usedPercent": 40,
+            "windowDurationMins": 10080,
+            "resetsAt": 1794830840
+          },
+          "credits": null,
+          "individualLimit": null,
+          "spendControlReached": null,
+          "planType": null,
+          "rateLimitReachedType": null
+        }
+      },
+      "emittedAtMs": 1794226040849
+    },
+    {
+      "method": "error",
+      "params": {
+        "error": {
+          "message": "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:37 PM.",
+          "codexErrorInfo": "usageLimitExceeded",
+          "additionalDetails": null,
+          "misalignment": null
+        },
+        "willRetry": false,
+        "threadId": "01a1c034-afaa-7541-abf2-e2bb147b02e9",
+        "turnId": "01a1c034-afde-7cf0-ab34-8854fb8327c0"
+      },
+      "emittedAtMs": 1794226040849
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "01a1c034-afaa-7541-abf2-e2bb147b02e9",
+        "turn": {
+          "id": "01a1c034-afde-7cf0-ab34-8854fb8327c0",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "failed",
+          "error": {
+            "message": "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:37 PM.",
+            "codexErrorInfo": "usageLimitExceeded",
+            "additionalDetails": null,
+            "misalignment": null
+          },
+          "startedAt": 1794226040,
+          "completedAt": 1794226040,
+          "durationMs": 47
+        }
+      },
+      "emittedAtMs": 1794226040851
+    }
+  ],
+  "http500": [
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a1c034-b072-7792-b9bf-778d01e3c997",
+        "turn": {
+          "id": "01a1c034-b07c-79a3-912d-d11d1134bb9c",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794226040,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1794226040979
+    },
+    {
+      "method": "error",
+      "params": {
+        "error": {
+          "message": "We’re currently experiencing high demand, which may cause temporary errors.",
+          "codexErrorInfo": "internalServerError",
+          "additionalDetails": null,
+          "misalignment": null
+        },
+        "willRetry": false,
+        "threadId": "01a1c034-b072-7792-b9bf-778d01e3c997",
+        "turnId": "01a1c034-b07c-79a3-912d-d11d1134bb9c"
+      },
+      "emittedAtMs": 1794226040999
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "01a1c034-b072-7792-b9bf-778d01e3c997",
+        "turn": {
+          "id": "01a1c034-b07c-79a3-912d-d11d1134bb9c",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "failed",
+          "error": {
+            "message": "We’re currently experiencing high demand, which may cause temporary errors.",
+            "codexErrorInfo": "internalServerError",
+            "additionalDetails": null,
+            "misalignment": null
+          },
+          "startedAt": 1794226040,
+          "completedAt": 1794226040,
+          "durationMs": 41
+        }
+      },
+      "emittedAtMs": 1794226041000
+    }
+  ],
+  "http401": [
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a1c034-b0fe-72e3-8d52-78f62615d4bb",
+        "turn": {
+          "id": "01a1c034-b108-7991-9386-15dafb6f843e",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794226041,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1794226041105
+    },
+    {
+      "method": "error",
+      "params": {
+        "error": {
+          "message": "unexpected status 401 Unauthorized: bad key, url: http://127.0.0.1:60882/v1/responses",
+          "codexErrorInfo": {
+            "httpConnectionFailed": {
+              "httpStatusCode": 401
+            }
+          },
+          "additionalDetails": null,
+          "misalignment": null
+        },
+        "willRetry": false,
+        "threadId": "01a1c034-b0fe-72e3-8d52-78f62615d4bb",
+        "turnId": "01a1c034-b108-7991-9386-15dafb6f843e"
+      },
+      "emittedAtMs": 1794226041121
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "01a1c034-b0fe-72e3-8d52-78f62615d4bb",
+        "turn": {
+          "id": "01a1c034-b108-7991-9386-15dafb6f843e",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "failed",
+          "error": {
+            "message": "unexpected status 401 Unauthorized: bad key, url: http://127.0.0.1:60882/v1/responses",
+            "codexErrorInfo": {
+              "httpConnectionFailed": {
+                "httpStatusCode": 401
+              }
+            },
+            "additionalDetails": null,
+            "misalignment": null
+          },
+          "startedAt": 1794226041,
+          "completedAt": 1794226041,
+          "durationMs": 23
+        }
+      },
+      "emittedAtMs": 1794226041122
+    }
+  ],
+  "responseFailed": [
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a1c034-b16b-7c93-8e1b-37128e3dfa03",
+        "turn": {
+          "id": "01a1c034-b174-7651-b223-cf1ec72d08ed",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794226041,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1794226041212
+    },
+    {
+      "method": "account/rateLimits/updated",
+      "params": {
+        "rateLimits": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "individualLimit": null,
+          "spendControlReached": null,
+          "planType": null,
+          "rateLimitReachedType": null
+        }
+      },
+      "emittedAtMs": 1794226041229
+    },
+    {
+      "method": "error",
+      "params": {
+        "error": {
+          "message": "stream disconnected before completion: The server had an error while processing your request.",
+          "codexErrorInfo": "other",
+          "additionalDetails": null,
+          "misalignment": null
+        },
+        "willRetry": false,
+        "threadId": "01a1c034-b16b-7c93-8e1b-37128e3dfa03",
+        "turnId": "01a1c034-b174-7651-b223-cf1ec72d08ed"
+      },
+      "emittedAtMs": 1794226041229
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "01a1c034-b16b-7c93-8e1b-37128e3dfa03",
+        "turn": {
+          "id": "01a1c034-b174-7651-b223-cf1ec72d08ed",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "failed",
+          "error": {
+            "message": "stream disconnected before completion: The server had an error while processing your request.",
+            "codexErrorInfo": "other",
+            "additionalDetails": null,
+            "misalignment": null
+          },
+          "startedAt": 1794226041,
+          "completedAt": 1794226041,
+          "durationMs": 24
+        }
+      },
+      "emittedAtMs": 1794226041230
+    }
+  ],
+  "contextFailed": [
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a1c034-b1e9-7eb3-bc83-3fe4cd56cff6",
+        "turn": {
+          "id": "01a1c034-b1f2-76a0-ab1d-ef3e50898dc9",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794226041,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1794226041339
+    },
+    {
+      "method": "account/rateLimits/updated",
+      "params": {
+        "rateLimits": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "individualLimit": null,
+          "spendControlReached": null,
+          "planType": null,
+          "rateLimitReachedType": null
+        }
+      },
+      "emittedAtMs": 1794226041356
+    },
+    {
+      "method": "account/rateLimits/updated",
+      "params": {
+        "rateLimits": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": null,
+          "secondary": null,
+          "credits": null,
+          "individualLimit": null,
+          "spendControlReached": null,
+          "planType": null,
+          "rateLimitReachedType": null
+        }
+      },
+      "emittedAtMs": 1794226041357
+    },
+    {
+      "method": "error",
+      "params": {
+        "error": {
+          "message": "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+          "codexErrorInfo": "contextWindowExceeded",
+          "additionalDetails": null,
+          "misalignment": null
+        },
+        "willRetry": false,
+        "threadId": "01a1c034-b1e9-7eb3-bc83-3fe4cd56cff6",
+        "turnId": "01a1c034-b1f2-76a0-ab1d-ef3e50898dc9"
+      },
+      "emittedAtMs": 1794226041357
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "01a1c034-b1e9-7eb3-bc83-3fe4cd56cff6",
+        "turn": {
+          "id": "01a1c034-b1f2-76a0-ab1d-ef3e50898dc9",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "failed",
+          "error": {
+            "message": "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+            "codexErrorInfo": "contextWindowExceeded",
+            "additionalDetails": null,
+            "misalignment": null
+          },
+          "startedAt": 1794226041,
+          "completedAt": 1794226041,
+          "durationMs": 26
+        }
+      },
+      "emittedAtMs": 1794226041359
+    }
+  ],
+  "headerUpdates": [
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a1c034-b264-7832-84e7-5595c1b7f455",
+        "turn": {
+          "id": "01a1c034-b270-7000-a1ad-abc73c092469",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794226041,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1794226041468
+    },
+    {
+      "method": "account/rateLimits/updated",
+      "params": {
+        "rateLimits": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 42,
+            "windowDurationMins": 300,
+            "resetsAt": 1794229640
+          },
+          "secondary": {
+            "usedPercent": 7,
+            "windowDurationMins": 10080,
+            "resetsAt": 1794726040
+          },
+          "credits": {
+            "hasCredits": true,
+            "unlimited": false,
+            "balance": "12.5"
+          },
+          "individualLimit": null,
+          "spendControlReached": null,
+          "planType": null,
+          "rateLimitReachedType": null
+        }
+      },
+      "emittedAtMs": 1794226041495
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "01a1c034-b264-7832-84e7-5595c1b7f455",
+        "turn": {
+          "id": "01a1c034-b270-7000-a1ad-abc73c092469",
+          "items": [
+            {
+              "type": "agentMessage",
+              "id": "msg_8d5b392a5200414f82b3021b2d4cf219",
+              "text": "first",
+              "phase": null,
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null
+            }
+          ],
+          "itemsView": "summary",
+          "status": "completed",
+          "error": null,
+          "startedAt": 1794226041,
+          "completedAt": 1794226041,
+          "durationMs": 38
+        }
+      },
+      "emittedAtMs": 1794226041498
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "01a1c034-b264-7832-84e7-5595c1b7f455",
+        "turn": {
+          "id": "01a1c034-b29b-7841-ab7d-08b8abbd3f05",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": 1794226041,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "emittedAtMs": 1794226041502
+    },
+    {
+      "method": "account/rateLimits/updated",
+      "params": {
+        "rateLimits": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 100,
+            "windowDurationMins": 300,
+            "resetsAt": 1794229040
+          },
+          "secondary": null,
+          "credits": {
+            "hasCredits": true,
+            "unlimited": false,
+            "balance": "12.5"
+          },
+          "individualLimit": null,
+          "spendControlReached": null,
+          "planType": null,
+          "rateLimitReachedType": null
+        }
+      },
+      "emittedAtMs": 1794226041521
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "01a1c034-b264-7832-84e7-5595c1b7f455",
+        "turn": {
+          "id": "01a1c034-b29b-7841-ab7d-08b8abbd3f05",
+          "items": [
+            {
+              "type": "agentMessage",
+              "id": "msg_182bf962690143e09ca35bf055179fd4",
+              "text": "second",
+              "phase": null,
+              "memoryCitation": null,
+              "delivery": null,
+              "questions": null
+            }
+          ],
+          "itemsView": "summary",
+          "status": "completed",
+          "error": null,
+          "startedAt": 1794226041,
+          "completedAt": 1794226041,
+          "durationMs": 22
+        }
+      },
+      "emittedAtMs": 1794226041523
+    }
+  ]
+}
