@@ -189,6 +189,19 @@ export class Outbox {
     this.db.setMeta('settingsSavedVersion', version);
   }
 
+  /**
+   * A restored hub welcomed the runner (X-12): the events held now are those the hub it replaced may have had. The
+   * replays to it leave out the settings edits among them whose answer the snapshot holds (SettingsSync.resent).
+   */
+  hubRestored(): void {
+    this.db.setMeta('restoredThrough', this.lastSeq());
+  }
+
+  /** The newest seq held at the last welcome of a restored hub; 0 when none came. */
+  restoredThrough(): number {
+    return this.db.meta('restoredThrough') ?? 0;
+  }
+
   /** The runner.settings events no echo has answered yet, counted or not: what a probe may still settle. */
   settingsUnanswered(): SettingsEvent[] {
     const marked = new Set(this.marks().map((mark) => mark.seq));

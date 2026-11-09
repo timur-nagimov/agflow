@@ -95,8 +95,15 @@ export interface RunnerMeta {
   lastHubEpoch: number | null;
   /** The last welcome's wipRefPrefix, for pushes made before the next welcome. */
   wipRefPrefix: string | null;
-  /** The project's name and repo from GET /api/status; the project key names the vault and work directories. */
-  project: { name: string; repo: string } | null;
+  /**
+   * The project's name and repo from GET /api/status, with the hub that gave them; the project key names the vault
+   * and work directories.
+   */
+  project: { hubUrl: string; name: string; repo: string } | null;
+  /** The repository's main branch as the hub's last start named it (AttemptSpec.repo.mainBranch). */
+  mainBranch: string | null;
+  /** The newest outbox seq held at the last welcome of a restored hub (Outbox.hubRestored). */
+  restoredThrough: number | null;
 }
 
 const OUTBOX_EPOCH = 'outboxEpoch';

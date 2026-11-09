@@ -217,6 +217,8 @@ export async function openWorkspace(
   const path = paths.clone(vault.project, spec.attemptId);
   // A link left at the clone path stays there for forensics; nothing is done through it.
   await assertCloneDirectory(path);
+  // The hub's configuration names the main branch; a start may bring a new one.
+  await vault.useRepo(spec.repo);
   await vault.fetchForAttempt({ taskId: spec.taskId, start: spec.start }, deps.wipRefPrefix());
   const { created, startSha } = await cloneStep(deps, spec, path);
   return { clone: await realClonePath(path), created, startSha };

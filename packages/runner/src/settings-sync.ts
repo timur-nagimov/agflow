@@ -12,16 +12,19 @@
 // - Refusals: the hub acknowledges an edit it refuses and never echoes it. A probe (isSettingsProbe) settles which
 //   acknowledged edits will get no echo: at its echo, every older edit still unanswered was refused, and runner.json
 //   falls back to the hub's value for it. Nothing is ever sent again for a refused edit.
+// - A replay to a restored hub leaves out the edits held at its welcome whose answer the snapshot holds (resent): it
+//   would apply them twice. Any other replay sends all the hub has not acknowledged.
 import type { RunnerSettings } from '@agflow/core';
 import {
   applySettingsEcho,
   isWholeSettings,
+  localSettingsEdits,
   type RunnerConfig,
   type SettingsEdits,
   settingsAfterEdits,
 } from './config';
 import type { Logger } from './log';
-import { isSettingsProbe, type Outbox, type SettingsEvent } from './outbox';
+import { isSettingsProbe, type Outbox, type SettingsEvent, type StoredEvent } from './outbox';
 
 export interface SettingsSyncOptions {
   config(): RunnerConfig;
@@ -127,5 +130,41 @@ export class SettingsSync {
     if (probes.length > 0 && !options.welcome) return;
     const baseVersion = this.options.config().confirmedSettings.version;
     outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion } });
+  }
+
+  /**
+   * Whether the replay leaves an event out: a runner.settings whose answer the snapshot holds (its echo, or its
+   * refusal) and that the hub a restore replaced may have had, one held at the restored hub's welcome
+   * (Outbox.restoredThrough). That replay starts below what the old hub processed, and the restored hub adopted the
+   * snapshot hello reported, so applying such an edit again would revert whatever came after it. Every other event
+   * goes: M2a acknowledges an event in the transaction that applies it, so no hub has applied those, and an edit that
+   * an equal echo answered before the hub had it is still a change to deliver.
+   */
+  resent(event: StoredEvent): boolean {
+    const { outbox } = this.options;
+    if (event.type !== 'runner.settings' || event.seq > outbox.restoredThrough()) return false;
+    return !outbox.settingsInFlight().some((open) => open.seq === event.seq);
+  }
+
+  /**
+   * After each welcome (the runtime records a restored hub's first, Outbox.hubRestored, and says hello again): every
+   * field runner.json changed while the runner was down (a hand edit) goes out as runner.settings, less what the edits
+   * in flight carry: the replay delivers those, or the hub applied them and their echo is to come, and an edit sent
+   * twice would apply twice. When the newest event the outbox holds is in the replay and one it leaves out (resent), a
+   * probe follows it, so the hub's acknowledgement reaches hello.lastSeq and its replay completes (X-1).
+   */
+  welcomed(welcome: { ackedSeq: number }): void {
+    const { outbox } = this.options;
+    const config = this.options.config();
+    const view = this.view(config);
+    const settings = localSettingsEdits({ ...config, confirmedSettings: view });
+    if (Object.keys(settings).length > 0) {
+      outbox.append({ type: 'runner.settings', data: { settings, baseVersion: config.confirmedSettings.version } });
+      return;
+    }
+    const newest = outbox.eventsAfter(outbox.lastSeq() - 1, 1)[0];
+    if (newest !== undefined && newest.seq > welcome.ackedSeq && this.resent(newest)) {
+      outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: config.confirmedSettings.version } });
+    }
   }
 }

@@ -110,18 +110,22 @@ describe('openRunnerDb', () => {
     expect(() => open(dbPath(), { migrations: [twice, twice] })).toThrow(/m2c.x/);
   });
 
-  test('keeps lastHubEpoch, wipRefPrefix and the project in meta', () => {
+  test('keeps lastHubEpoch, wipRefPrefix, the project and the main branch in meta', () => {
     const db = open();
     expect(db.meta('lastHubEpoch')).toBeNull();
     expect(db.meta('wipRefPrefix')).toBeNull();
     expect(db.meta('project')).toBeNull();
+    expect(db.meta('mainBranch')).toBeNull();
+    const project = { hubUrl: 'https://hub.example.com', name: 'demo', repo: 'git@example.com:demo.git' };
     db.setMeta('lastHubEpoch', 3);
     db.setMeta('wipRefPrefix', 'refs/agflow/');
-    db.setMeta('project', { name: 'demo', repo: 'git@example.com:demo.git' });
+    db.setMeta('project', project);
+    db.setMeta('mainBranch', 'trunk');
     const again = reopen(db);
     expect(again.meta('lastHubEpoch')).toBe(3);
     expect(again.meta('wipRefPrefix')).toBe('refs/agflow/');
-    expect(again.meta('project')).toEqual({ name: 'demo', repo: 'git@example.com:demo.git' });
+    expect(again.meta('project')).toEqual(project);
+    expect(again.meta('mainBranch')).toBe('trunk');
   });
 });
 

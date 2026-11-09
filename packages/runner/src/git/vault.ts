@@ -36,7 +36,10 @@ export interface VaultOptions {
   paths: RunnerPaths;
   /** The project key (projectKey) naming the vault and the work directories. */
   project: string;
+  /** The repository and its main branch; useRepo follows a main branch the hub's specs name. */
   repo: { url: string; mainBranch: string };
+  /** Told each main branch useRepo takes, so the runner starts with it next time. */
+  mainBranchChanged?(mainBranch: string): void;
   /** The local environment; localGitEnv(paths) by default. */
   local?: GitEnvironment;
   /**
@@ -59,11 +62,12 @@ const baseUsers = new Map<string, Map<string, Set<string>>>();
 export class Vault {
   readonly path: string;
   readonly project: string;
-  readonly mainBranch: string;
   /** The local environment every command on the vault runs with. */
   readonly local: GitEnvironment;
   private readonly paths: RunnerPaths;
   private readonly url: string;
+  private branch: string;
+  private readonly mainBranchChanged: (mainBranch: string) => void;
   private readonly remote: () => Promise<GitEnvironment>;
 
   constructor(options: VaultOptions) {
@@ -71,10 +75,32 @@ export class Vault {
     this.project = options.project;
     this.path = options.paths.vault(options.project);
     this.url = options.repo.url;
-    this.mainBranch = options.repo.mainBranch;
+    this.branch = options.repo.mainBranch;
+    this.mainBranchChanged = options.mainBranchChanged ?? (() => {});
     this.local = options.local ?? localGitEnv(options.paths);
     // The owner's includes conditional on the repository (an SSH key per organisation, say) apply to the vault.
     this.remote = options.remote ?? (() => remoteGitEnv({ gitDir: this.path }));
+  }
+
+  /** The repository's main branch: the hub's configuration names it, and each start's spec carries it. */
+  get mainBranch(): string {
+    return this.branch;
+  }
+
+  /**
+   * Before an attempt's fetch: the repository its spec names. A URL other than the vault's origin is refused, since
+   * the vault holds one project's repository; another main branch becomes the vault's, with HEAD pointing at it.
+   */
+  async useRepo(repo: { url: string; mainBranch: string }): Promise<void> {
+    if (repo.url !== this.url) {
+      throw new Error(`the hub names the repository ${repo.url}, but this runner's vault holds ${this.url}`);
+    }
+    if (repo.mainBranch === this.branch) return;
+    await this.withLock(async () => {
+      await this.git(['symbolic-ref', 'HEAD', `refs/heads/${repo.mainBranch}`]);
+      this.branch = repo.mainBranch;
+    });
+    this.mainBranchChanged(repo.mainBranch);
   }
 
   /** Runs fn once every earlier holder of this vault's lock is done; a failure releases it too. */

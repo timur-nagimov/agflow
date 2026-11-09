@@ -178,6 +178,11 @@ export function canPushWip(gate: WipGate, attempt: WipStanding): boolean {
 export class WipFailures {
   private count = 0;
 
+  /** The failures since the last WIP push that went. */
+  get consecutive(): number {
+    return this.count;
+  }
+
   /** Counts one more failure; gives the new count. */
   failed(): number {
     this.count += 1;

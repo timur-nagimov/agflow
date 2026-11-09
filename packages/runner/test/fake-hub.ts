@@ -2,7 +2,8 @@
 // the bearer token before the upgrade, validates every runner message with core's schemas (and every event with
 // parseRunnerEvent), keeps acknowledged positions per outbox epoch as the hub does, and by default welcomes each
 // hello, acknowledges each events message and answers each heartbeat. Tests script the rest through the connections.
-// GET /api/runner/whoami answers the same token check over HTTP, as the hub's probe does.
+// GET /api/runner/whoami answers the same token check over HTTP, as the hub's probe does; GET /api/status answers the
+// project, when the test gives one.
 import {
   AGFLOW_VERSION,
   type HubMessage,
@@ -38,6 +39,8 @@ export interface FakeHubOptions {
   heartbeatAck?: boolean;
   /** Answer whoami with this status instead of the token check (a hub in trouble, say). */
   whoamiStatus?: number;
+  /** GET /api/status: the project it names, or an HTTP status to fail with; 404 when unset. */
+  status?: { name: string; repo: string } | number;
 }
 
 export interface FakeConnection {
@@ -214,6 +217,14 @@ export function startFakeHub(options: FakeHubOptions = {}): FakeHub {
         return accepted
           ? Response.json({ user: 'alice' })
           : Response.json({ error: 'unauthorized' }, { status: 401 });
+      }
+      if (path === '/api/status') {
+        const status = options.status;
+        if (!accepted) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        if (status === undefined || typeof status === 'number') {
+          return Response.json({ error: 'scripted' }, { status: status ?? 404 });
+        }
+        return Response.json({ project: { ...status, paused: false, runnerLeads: false } });
       }
       if (path !== '/api/runner/ws') return new Response('not found', { status: 404 });
       if (!accepted) {

@@ -40,6 +40,7 @@ export * from './profile';
 export * from './queue';
 export * from './recovery';
 export * from './run-dir';
+export * from './runner';
 export * from './seams';
 export * from './stop-ladder';
 export * from './vendor/pins';
