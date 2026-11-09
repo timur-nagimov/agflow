@@ -1,16 +1,21 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { TEST_ACCOUNT_ID, type Vendor, type VendorQuota } from '@agflow/core';
+import { type AttemptFacts, type RawRunnerEvent, TEST_ACCOUNT_ID, type Vendor, type VendorQuota } from '@agflow/core';
+import { getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, startRunnerAttempt } from '../src/attempts';
 import { pendingCommands } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
+import { applyRunnerEvents } from '../src/events-in';
 import { listMessages } from '../src/messages';
+import { seatHolderId } from '../src/hub-state';
 import { getProject, getStaffing, setPaused, setWorkerTarget } from '../src/project';
 import { clearOwnerAway, setOwnerAway, upsertAccountQuota } from '../src/quota';
 import { recordHeartbeatInfo, recordStartRefusal } from '../src/runners';
-import { requestAgents, runTick } from '../src/scheduler';
+import { Scheduler, replaceQuotaWaits, requestAgents, runTick } from '../src/scheduler';
+import { startHub } from '../src/server';
+import { requestSubmission } from '../src/submissions';
 import { getTask, writeTask } from '../src/task-store';
-import { claimTask, createTasks } from '../src/tasks';
-import { addAgent, addRunner, addRunnerAttempt, createTestContext, newTask } from './helpers';
+import { blockTask, claimTask, createTasks, releaseTask, unblockTask } from '../src/tasks';
+import { addAgent, addRunner, addRunnerAttempt, addRunnerLead, createTestContext, newTask } from './helpers';
 import { createTestHub } from './http-helpers';
 
 const MINUTE = 60_000;
@@ -28,11 +33,16 @@ const tick = (ctx: HubContext) =>
 
 const statusOf = (ctx: HubContext, taskId: string) => getTask(ctx, taskId).status;
 
-function exhaust(ctx: HubContext, vendor: Vendor, quota: Partial<VendorQuota>): void {
+/** Reports the vendor's account exhausted, by default alice's on R-1. */
+function exhaust(
+  ctx: HubContext,
+  vendor: Vendor,
+  quota: Partial<VendorQuota>,
+  where: { owner: string; runnerId: string } = { owner: 'alice', runnerId: 'R-1' },
+): void {
   tx(ctx, (emit) =>
     upsertAccountQuota(ctx, emit, {
-      owner: 'alice',
-      runnerId: 'R-1',
+      ...where,
       report: {
         vendor,
         accountId: TEST_ACCOUNT_ID,
@@ -47,6 +57,26 @@ function exhaust(ctx: HubContext, vendor: Vendor, quota: Partial<VendorQuota>): 
       },
     }),
   );
+}
+
+/** Heartbeat facts of a running attempt that fire no stall rule. */
+function factsOf(attemptId: string): AttemptFacts {
+  return {
+    attemptId,
+    fence: { epoch: 1, counter: 1 },
+    phase: 'turn',
+    eventAgeMs: 5_000,
+    tool: null,
+    fsAgeMs: 20_000,
+    commitAgeMs: null,
+    turns: 3,
+    turnsWithoutProgress: 0,
+    repeatedCalls: 0,
+    continuations: 0,
+    vendorErrorMs: 0,
+    activeMs: 90_000,
+    contextUsed: 0.4,
+  };
 }
 
 const leadMessages = (ctx: HubContext) => listMessages(ctx, {}).filter((message) => message.to === 'lead');
@@ -284,5 +314,369 @@ describe('POST /api/staffing', () => {
     expect((await hub.call('POST', '/api/staffing', { user: 'bob', agent: worker, body })).status).toBe(403);
     expect((await hub.call('POST', '/api/staffing', { user: 'alice', body })).status).toBe(403);
     expect(getStaffing(hub.ctx).workerTarget).toBe(3);
+  });
+});
+
+describe('the reconcile step', () => {
+  test('runs every reconcile duty before dispatch, and nothing else', () => {
+    const { ctx, clock } = createTestContext({ leaseMs: 20 * MINUTE, maxWorkers: 8 });
+    const runnerId = addRunner(ctx, { vendors: ['claude', 'codex'] });
+    // A live claim whose M1 lease runs out: the sweep makes it ready, and the same tick dispatches it.
+    const [swept] = tasks(ctx, { title: 'Swept' });
+    claimTask(ctx, swept as string, addAgent(ctx));
+    // A runner attempt whose lease runs out.
+    const lost = addRunnerAttempt(ctx);
+    // One that reports an hour of vendor errors, and one of bob's whose stop timed out.
+    const erring = addRunnerAttempt(ctx);
+    const stopping = addRunnerAttempt(ctx, { owner: 'bob' });
+    // A pending submission, and a pending approval of bob's, so that its expiry marks only bob away; both past their
+    // timeouts by then.
+    const submitting = addRunnerAttempt(ctx);
+    requestSubmission(ctx, submitting.task.id, submitting.agent, { summary: 'Done.', evidence: [] });
+    ctx.db
+      .query(
+        `INSERT INTO approvals (id, attempt_id, fence_epoch, fence_counter, runner_id, owner, task_id, agent_id, kind,
+           summary, detail, status, created_at, expires_at)
+         VALUES ('approval-1', $attemptId, $epoch, $counter, $runnerId, 'bob', $taskId, $agentId, 'command',
+           'bun install', '{}', 'pending', $now, $expiresAt)`,
+      )
+      .run({
+        attemptId: stopping.attempt.id,
+        epoch: stopping.attempt.fence.epoch,
+        counter: stopping.attempt.fence.counter,
+        runnerId: stopping.runner.id,
+        taskId: stopping.task.id,
+        agentId: stopping.agent.id,
+        now: ctx.now(),
+        expiresAt: ctx.now() + ctx.config.approvalMs,
+      });
+    // An exhausted Codex account with an unknown reset, for the probe.
+    exhaust(ctx, 'codex', { resetsAt: null });
+
+    clock.advance(ctx.config.quotaUnknownMs);
+    const later = ctx.now() + ctx.config.runnerLeaseMs;
+    for (const held of [erring, stopping, submitting]) updateAttempt(ctx, held.attempt.id, { leaseExpiresAt: later });
+    updateAttempt(ctx, erring.attempt.id, {
+      facts: { ...factsOf(erring.attempt.id), vendorErrorMs: ctx.config.vendorErrorReplaceMs },
+      factsAt: ctx.now(),
+    });
+    updateAttempt(ctx, stopping.attempt.id, {
+      stopRequested: {
+        cause: 'stop',
+        reason: 'enough',
+        by: 'user:alice',
+        handoff: true,
+        deferred: false,
+        at: ctx.now() - ctx.config.stopGraceMs,
+      },
+    });
+
+    const result = runTick(ctx);
+    expect(result.reconciled).toEqual({
+      leases: [swept],
+      runnerLeases: 1,
+      approvals: 1,
+      stalls: { suspected: [], stopped: [erring.attempt.id] },
+      stops: 1,
+      submissions: 1,
+      probes: 1,
+      quotaWaits: [],
+    });
+    expect(getAttempt(ctx, lost.attempt.id).endReason).toBe('lost');
+    expect(result.started.map((attempt) => [attempt.taskId, attempt.runnerId])).toContainEqual([swept, runnerId]);
+  });
+
+  test('a duty that fails is logged and leaves the other duties and dispatch to run', () => {
+    const { ctx, clock } = createTestContext({ leaseMs: 20 * MINUTE });
+    // A live claim whose M1 lease runs out, which the lease sweep cannot move.
+    const [stuck] = tasks(ctx, { title: 'Stuck' });
+    claimTask(ctx, stuck as string, addAgent(ctx));
+    ctx.db.run(
+      `CREATE TEMP TRIGGER refuse_stale BEFORE UPDATE ON tasks WHEN OLD.id = '${stuck}' AND NEW.status = 'stale'
+       BEGIN SELECT RAISE(ABORT, 'refused for the test'); END`,
+    );
+    // A runner attempt whose lease runs out, and a ready task.
+    const lost = addRunnerAttempt(ctx);
+    clock.advance(ctx.config.runnerLeaseMs + 20 * MINUTE);
+    const [ready] = tasks(ctx, { title: 'Ready' });
+    const logged = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = runTick(ctx);
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(result.reconciled).toMatchObject({ leases: [], runnerLeases: 1 });
+      expect(getAttempt(ctx, lost.attempt.id).endReason).toBe('lost');
+      expect(result.started.map((attempt) => attempt.taskId)).toEqual([ready]);
+    } finally {
+      logged.mockRestore();
+    }
+    expect(statusOf(ctx, stuck as string)).toBe('claimed');
+  });
+});
+
+describe('replaceQuotaWaits', () => {
+  /** A Codex worker on R-1 in quota_wait, its account exhausted until resetIn from now, or with no known reset. */
+  function waiting(resetIn: ((ctx: HubContext) => number) | null) {
+    const { ctx, clock } = createTestContext();
+    const resetsAt = resetIn === null ? null : ctx.now() + resetIn(ctx);
+    const held = addRunnerAttempt(ctx, { vendor: 'codex' });
+    exhaust(ctx, 'codex', { resetsAt });
+    updateAttempt(ctx, held.attempt.id, { status: 'quota_wait', quotaResetsAt: resetsAt });
+    return { ctx, clock, held };
+  }
+
+
+  test('replaces one whose reset is unknown, once a placement with quota exists', () => {
+    const { ctx, held } = waiting(null);
+    // Only the exhausted account: it waits.
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
+    addRunner(ctx, { vendors: ['claude'] });
+    expect(replaceQuotaWaits(ctx)).toEqual([held.attempt.id]);
+    expect(getAttempt(ctx, held.attempt.id).stopRequested).toMatchObject({ cause: 'quota', handoff: false });
+    const stop = pendingCommands(ctx, held.runner.id, 1).find((row) => row.command.kind === 'stop_attempt');
+    expect(stop?.command).toMatchObject({ cause: 'quota', handoff: false });
+    // Recorded once.
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+  });
+
+  test('replaces one whose reset is more than quotaWaitMaxMs away, and leaves a nearer one waiting', () => {
+    const near = waiting((ctx) => ctx.config.quotaWaitMaxMs);
+    addRunner(near.ctx, { vendors: ['claude'] });
+    expect(replaceQuotaWaits(near.ctx)).toEqual([]);
+
+    const far = waiting((ctx) => ctx.config.quotaWaitMaxMs + 1);
+    addRunner(far.ctx, { vendors: ['claude'] });
+    expect(replaceQuotaWaits(far.ctx)).toEqual([far.held.attempt.id]);
+  });
+});
+
+describe('replaceQuotaWaits, when the successor cannot start', () => {
+  /** A Codex worker on R-1 waiting with no known reset, and a Claude runner, R-2, with room. */
+  function replaceable() {
+    const { ctx } = createTestContext();
+    const held = addRunnerAttempt(ctx, { vendor: 'codex' });
+    exhaust(ctx, 'codex', { resetsAt: null });
+    updateAttempt(ctx, held.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
+    addRunner(ctx, { vendors: ['claude'] });
+    return { ctx, held };
+  }
+
+  test('nothing is replaced while the project is paused; a lead keeps the seat', () => {
+    const { ctx, held } = replaceable();
+    const lead = addRunnerLead(ctx);
+    updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
+    addRunner(ctx, { vendors: ['claude'] });
+    setPaused(ctx, true, 'user:alice');
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    expect([getAttempt(ctx, held.attempt.id).stopRequested, getAttempt(ctx, lead.attempt.id).stopRequested]).toEqual([
+      null,
+      null,
+    ]);
+    expect(seatHolderId(ctx)).toBe(lead.agent.id);
+    setPaused(ctx, false, 'user:alice');
+    expect(replaceQuotaWaits(ctx).sort()).toEqual([held.attempt.id, lead.attempt.id].sort());
+  });
+
+  test('a worker is not replaced while the worker target leaves its successor no slot', () => {
+    const { ctx, held } = replaceable();
+    tx(ctx, () => setWorkerTarget(ctx, 0));
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
+    // The successor takes the slot the wait frees.
+    tx(ctx, () => setWorkerTarget(ctx, 1));
+    expect(replaceQuotaWaits(ctx)).toEqual([held.attempt.id]);
+  });
+
+  test('with one free slot, only the older of two waits is replaced', () => {
+    const { ctx, clock } = createTestContext();
+    const older = addRunnerAttempt(ctx, { vendor: 'codex' });
+    clock.advance(1_000);
+    const newer = addRunnerAttempt(ctx, { vendor: 'codex', runnerId: older.runner.id });
+    exhaust(ctx, 'codex', { resetsAt: null });
+    for (const held of [older, newer]) updateAttempt(ctx, held.attempt.id, { status: 'quota_wait' });
+    const claude = addRunner(ctx, { vendors: ['claude'] });
+    ctx.db.query('UPDATE runners SET capacity = 1 WHERE id = $id').run({ id: claude });
+    expect(replaceQuotaWaits(ctx)).toEqual([older.attempt.id]);
+    expect(getAttempt(ctx, newer.attempt.id).stopRequested).toBeNull();
+  });
+
+  test('a lead is replaced once another runner has room, and only with runner leads on', () => {
+    const { ctx } = createTestContext();
+    const lead = addRunnerLead(ctx);
+    updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
+    // Its runner is full: the lead and a worker.
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    addRunner(ctx);
+    ctx.db.run('UPDATE project SET runner_leads = 0 WHERE id = 1');
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    ctx.db.run('UPDATE project SET runner_leads = 1 WHERE id = 1');
+    expect(replaceQuotaWaits(ctx)).toEqual([lead.attempt.id]);
+    expect(getAttempt(ctx, lead.attempt.id).stopRequested).toMatchObject({ cause: 'quota', handoff: false });
+  });
+
+  test("two exhausted Claude accounts with unknown resets do not replace each other's waits", () => {
+    const { ctx, clock } = createTestContext();
+    const held = addRunnerAttempt(ctx);
+    exhaust(ctx, 'claude', { resetsAt: null });
+    updateAttempt(ctx, held.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
+    const bobs = addRunner(ctx, { owner: 'bob' });
+    exhaust(ctx, 'claude', { resetsAt: null }, { owner: 'bob', runnerId: bobs });
+    // Bob's account may take its probing start now, which would only wait in turn.
+    clock.advance(ctx.config.quotaUnknownMs);
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
+  });
+});
+
+describe('the Scheduler', () => {
+  const settle = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Polls until the predicate holds, failing at the deadline; for waits on real timers. */
+  async function until(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs} ms`);
+      await Bun.sleep(5);
+    }
+  }
+
+  test("'auto' ticks every tickMs", async () => {
+    const { ctx } = createTestContext({ tickMs: 20 });
+    addRunner(ctx);
+    const [taskId] = tasks(ctx, { title: 'Parser' });
+    const scheduler = new Scheduler(ctx);
+    scheduler.start();
+    try {
+      expect(scheduler.running).toBe(true);
+      await until(() => statusOf(ctx, taskId as string) === 'claimed');
+    } finally {
+      scheduler.stop();
+    }
+    expect(scheduler.running).toBe(false);
+  });
+
+  test('ticks once more, debounced, after a task gets ready or an attempt ends', async () => {
+    const { ctx } = createTestContext({ tickMs: 60 * MINUTE });
+    addRunner(ctx);
+    tx(ctx, () => setWorkerTarget(ctx, 1));
+    const scheduler = new Scheduler(ctx, { debounceMs: 10 });
+    scheduler.start();
+    try {
+      const [first] = tasks(ctx, { title: 'First' });
+      await until(() => statusOf(ctx, first as string) === 'claimed');
+      const [second] = tasks(ctx, { title: 'Second' });
+      await settle(60);
+      expect(statusOf(ctx, second as string)).toBe('ready');
+      // The first attempt ends lost, which frees the one worker slot; the first waits out its backoff.
+      const attempt = getTask(ctx, first as string).currentAttempt as string;
+      endAttempt(ctx, { attemptId: attempt, trigger: 'lost' });
+      await until(() => statusOf(ctx, second as string) === 'claimed');
+    } finally {
+      scheduler.stop();
+    }
+  });
+
+  test('ticks after a worker goes holding, and after a task is unblocked or released', async () => {
+    const { ctx } = createTestContext({ tickMs: 60 * MINUTE });
+    // A running worker on R-1 holds the one worker slot.
+    const held = addRunnerAttempt(ctx);
+    tx(ctx, () => setWorkerTarget(ctx, 1));
+    const scheduler = new Scheduler(ctx, { debounceMs: 10 });
+    scheduler.start();
+    try {
+      const [waiting] = tasks(ctx, { title: 'Waiting' });
+      await settle(60);
+      expect(statusOf(ctx, waiting as string)).toBe('ready');
+      // Its submission is recorded, so it holds, which frees the slot.
+      writeTask(ctx, held.task.id, { branch: 'agflow/T-1-task' });
+      const submission = requestSubmission(ctx, held.task.id, held.agent, { summary: 'Done.', evidence: [] });
+      const headSha = 'a'.repeat(40);
+      const { fence } = getAttempt(ctx, held.attempt.id);
+      const data = { submissionId: submission.id, ok: true, headSha, remoteHead: headSha, error: null, detail: null };
+      const submitted = { seq: 1, at: 0, type: 'attempt.submitted', attemptId: held.attempt.id, fence, data };
+      const events: RawRunnerEvent[] = [submitted];
+      applyRunnerEvents(ctx, held.runner.id, { outboxEpoch: 'outbox-1', events }, { restoreReplay: false });
+      expect(getAttempt(ctx, held.attempt.id).status).toBe('holding');
+      await until(() => statusOf(ctx, waiting as string) === 'claimed');
+
+      // Unblocked by a person, and released by its live holder: each is dispatched within the debounce.
+      addRunner(ctx);
+      tx(ctx, () => setWorkerTarget(ctx, 3));
+      const [blocked, released] = tasks(ctx, { title: 'Blocked' }, { title: 'Released' });
+      const agent = addAgent(ctx);
+      const other = addAgent(ctx, 'bob');
+      claimTask(ctx, blocked as string, agent);
+      claimTask(ctx, released as string, other);
+      blockTask(ctx, blocked as string, agent, 'needs a key');
+      unblockTask(ctx, blocked as string, 'user:alice', 'the key is in the vault');
+      await until(() => statusOf(ctx, blocked as string) === 'claimed');
+      releaseTask(ctx, released as string, other, 'not mine');
+      await until(() => statusOf(ctx, released as string) === 'claimed');
+    } finally {
+      scheduler.stop();
+    }
+  });
+
+  test('a burst of events makes one extra tick, debounceMs after the first', async () => {
+    const { ctx } = createTestContext({ tickMs: 60 * MINUTE });
+    addRunner(ctx);
+    const scheduler = new Scheduler(ctx, { debounceMs: 30 });
+    let ticks = 0;
+    const once = scheduler.tick.bind(scheduler);
+    scheduler.tick = () => {
+      ticks += 1;
+      return once();
+    };
+    scheduler.start();
+    try {
+      const created = tasks(ctx, { title: 'One' }, { title: 'Two' }, { title: 'Three' });
+      expect(created.map((id) => statusOf(ctx, id))).toEqual(['ready', 'ready', 'ready']);
+      await until(() => ticks > 0);
+      await settle(60);
+      expect(ticks).toBe(1);
+      // The runner's two slots took the first two.
+      expect(created.map((id) => statusOf(ctx, id))).toEqual(['claimed', 'claimed', 'ready']);
+    } finally {
+      scheduler.stop();
+    }
+  });
+
+  test("'manual' starts stopped: tick() runs one tick and start() begins the timer; stop() stops it", async () => {
+    const { ctx } = createTestContext({ tickMs: 20 });
+    addRunner(ctx);
+    const scheduler = new Scheduler(ctx, { debounceMs: 10 });
+    const [one] = tasks(ctx, { title: 'One' });
+    await settle(60);
+    expect(statusOf(ctx, one as string)).toBe('ready');
+    expect(scheduler.tick().started.map((attempt) => attempt.taskId)).toEqual([one]);
+    scheduler.start();
+    scheduler.stop();
+    // Neither the timer nor an extra tick after the event.
+    const [two] = tasks(ctx, { title: 'Two' });
+    await settle(60);
+    expect(statusOf(ctx, two as string)).toBe('ready');
+  });
+
+  test("startHub's scheduler option: 'auto' runs one, 'manual' makes one stopped, false none", async () => {
+    for (const [option, running] of [
+      ['auto', true],
+      ['manual', false],
+    ] as const) {
+      const { ctx } = createTestContext();
+      const hub = startHub(ctx, { scheduler: option, timers: false });
+      expect(hub.scheduler?.running).toBe(running);
+      await hub.stop();
+      expect(hub.scheduler?.running).toBe(false);
+    }
+    const { ctx } = createTestContext();
+    const hub = startHub(ctx, { scheduler: false, timers: false });
+    expect(hub.scheduler).toBeNull();
+    await hub.stop();
+  });
+
+  test('the entry point leaves the lease sweep to the tick', async () => {
+    const main = await Bun.file(new URL('../src/main.ts', import.meta.url)).text();
+    expect(main).not.toContain('sweepLeases');
+    expect(main).toContain("scheduler: 'auto'");
   });
 });

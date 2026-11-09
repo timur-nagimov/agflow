@@ -542,7 +542,7 @@ export function forceRelease(ctx: HubContext, id: string, actor: string, reason:
 }
 
 /**
- * Returns tasks whose lease expired to the pool. Called periodically by the server. A task a runner attempt holds is
+ * Returns tasks whose lease expired to the pool. The scheduler tick runs it (step 1). A task a runner attempt holds is
  * left to its runner lease (design 6.4).
  */
 export function sweepLeases(ctx: HubContext): string[] {

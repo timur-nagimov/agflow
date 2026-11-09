@@ -7,6 +7,7 @@ import { flushDeliveries, watchDeliveries } from './delivery';
 import { Gateway, type LinkSession, type LinkSocket, type RunnerConnection } from './gateway';
 import { createApp } from './http/app';
 import { refreshNeedsLogin } from './runners';
+import { Scheduler } from './scheduler';
 
 export interface StartHubOptions {
   /** 0, the default, binds a free port; HubServer.url names it. */
@@ -14,8 +15,8 @@ export interface StartHubOptions {
   /** 127.0.0.1 by default. */
   hostname?: string | undefined;
   /**
-   * How the scheduler runs: 'auto' on its own timer, 'manual' only when the caller ticks or starts it, false not at
-   * all (the default). This version of the hub has no scheduler yet, so every value runs none.
+   * How the scheduler runs (X-26): 'auto' on its own timer, 'manual' created stopped, so that the caller ticks it or
+   * starts it, false not at all (the default).
    */
   scheduler?: 'auto' | 'manual' | false | undefined;
   /** Keep a lock file next to the database while the hub runs; false by default. This version takes no lock yet. */
@@ -32,8 +33,8 @@ export interface HubServer {
   /** The bound origin, such as http://127.0.0.1:43211. */
   url: string;
   gateway: Gateway;
-  /** The scheduler the options asked for; none in this version. */
-  scheduler: null;
+  /** The scheduler the options asked for; null for scheduler: false. */
+  scheduler: Scheduler | null;
   /** Closes every runner link, stops the timers and the server. */
   stop(): Promise<void>;
 }
@@ -117,11 +118,14 @@ export function startHub(ctx: HubContext, options: StartHubOptions = {}): HubSer
   const timers = options.timers ?? true;
   const timer = timers ? setInterval(() => housekeeping(ctx, gateway), ctx.config.heartbeatMs) : null;
   const stopDeliveries = timers ? watchDeliveries(ctx) : null;
+  const scheduler = options.scheduler ? new Scheduler(ctx) : null;
+  if (options.scheduler === 'auto') scheduler?.start();
   return {
     url: server.url.origin,
     gateway,
-    scheduler: null,
+    scheduler,
     async stop() {
+      scheduler?.stop();
       if (timer) clearInterval(timer);
       stopDeliveries?.();
       gateway.closeAll();

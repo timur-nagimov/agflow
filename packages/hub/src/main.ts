@@ -4,7 +4,6 @@ import { type BackupKind, backupDatabase, checkIntegrity, dailyBackupDue } from 
 import { loadConfig } from './config';
 import { createContext } from './context';
 import { startHub } from './server';
-import { sweepLeases } from './tasks';
 
 const { config, host, port, dbPath, backupDir } = loadConfig(process.env);
 mkdirSync(dirname(dbPath), { recursive: true });
@@ -23,14 +22,7 @@ backup('start');
 // A hub restarted more often than every 24 hours never reaches the timer, so a start also writes a missing daily.
 if (dailyBackupDue(ctx, backupDir)) backup('daily');
 setInterval(() => backup('daily'), 24 * 60 * 60_000);
-setInterval(() => {
-  try {
-    sweepLeases(ctx);
-  } catch (error) {
-    console.error('lease sweep failed', error);
-  }
-}, 30_000);
 
-// The server's own timers sweep sign-ins and dead runner links.
+// The server's own timers sweep sign-ins and dead runner links; its scheduler's tick sweeps the leases, M1's included.
 const hub = startHub(ctx, { port, hostname: host, scheduler: 'auto', dbLock: true, timers: true });
 console.log(`agflow hub for "${config.projectName}" on ${config.publicUrl} (listening on ${new URL(hub.url).host}, sign-in: ${config.auth})`);
