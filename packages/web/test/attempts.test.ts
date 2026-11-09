@@ -34,6 +34,9 @@ import {
   isOpen,
   LOG_KIND_LABELS,
   LOG_KIND_TONES,
+  LOG_TAIL,
+  newestLog,
+  nextTryText,
   noteGroups,
   phaseLabel,
   RUNNER_ACTIONS,
@@ -271,6 +274,20 @@ describe('log kinds', () => {
     expect(LOG_KIND_LABELS.vendor_error).toBe('Vendor error');
     expect(LOG_KIND_TONES.violation).toBe('trouble');
   });
+
+  test("the Task page keeps the log's newest entries", () => {
+    const log = (count: number): AttemptLogEntry[] =>
+      Array.from({ length: count }, (_, index) => ({
+        id: index + 1,
+        attemptId: 'T-42-a3',
+        ts: NOW + index,
+        kind: 'tool',
+        summary: `step ${index + 1}`,
+      }));
+    expect(LOG_TAIL).toBe(8);
+    expect(newestLog(log(10)).map((entry) => entry.id)).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(newestLog(log(2)).map((entry) => entry.id)).toEqual([1, 2]);
+  });
 });
 
 describe('submissions', () => {
@@ -375,6 +392,17 @@ describe('the current attempt and who holds the task', () => {
     // A claim from before M2 has no attempt; its holder is a live chat.
     expect(holderOf(held({ currentAttempt: null }), [])).toBe('live');
     expect(holderOf(held({ status: 'ready', assignee: null, currentAttempt: null }), [])).toBe('nobody');
+  });
+
+  test('the next try after an infra ending shows on a ready task while it is ahead', () => {
+    const at = NOW + 5 * MINUTE;
+    expect(nextTryText({ status: 'ready', nextDispatchAt: at }, NOW)).toBe('in 5 min, after an infrastructure failure');
+    expect(nextTryText({ status: 'ready', nextDispatchAt: at }, at)).toBeNull();
+    expect(nextTryText({ status: 'ready', nextDispatchAt: at }, at + MINUTE)).toBeNull();
+    expect(nextTryText({ status: 'ready', nextDispatchAt: null }, NOW)).toBeNull();
+    // A third ending with the same signature blocks the task for re-plan, and keeps the backoff it set.
+    expect(nextTryText({ status: 'blocked', nextDispatchAt: at }, NOW)).toBeNull();
+    expect(nextTryText({ status: 'cancelled', nextDispatchAt: at }, NOW)).toBeNull();
   });
 
   test('every status but ended is open', () => {

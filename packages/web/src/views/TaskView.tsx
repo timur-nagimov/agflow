@@ -1,7 +1,21 @@
-import type { Task, TaskNote } from '@agflow/core';
+import type { Attempt, SubmissionRecord, Task, TaskNote } from '@agflow/core';
 import { type FormEvent, useState } from 'react';
 import { api } from '../api';
 import {
+  ATTEMPT_STATUS_LABELS,
+  END_REASON_LABELS,
+  FAILURE_CLASS_LABELS,
+  attemptTone,
+  currentAttempt,
+  newestLog,
+  nextTryText,
+  phaseLabel,
+  submissionOutcome,
+  wipText,
+} from '../attempts';
+import {
+  AttemptLink,
+  AttemptLog,
   Composer,
   ErrorBox,
   EventList,
@@ -19,9 +33,12 @@ import {
   NOTE_LABELS,
   TASK_ACTIONS,
   type TaskAction,
+  VENDOR_NAMES,
   actionBody,
   actionHint,
   actionsFor,
+  concernsAttempt,
+  concernsTask,
   duration,
   evidenceText,
   threadTarget,
@@ -33,12 +50,14 @@ import { routeHref } from '../route';
 
 export function TaskView({ id }: { id: string }) {
   const { status } = useHub();
-  const detail = useData(() => api.task(id), [id], { relevant: (event) => event.subject === id });
+  // With 6.17's subjects, the events of the task's attempts name the task too.
+  const detail = useData(() => api.task(id), [id], { relevant: (event) => concernsTask(event, id) });
   if (!detail.data) return detail.error ? <ErrorBox error={detail.error} onRetry={detail.reload} /> : <Loading />;
-  const { task, notes, events, messages } = detail.data;
+  const { task, notes, events, messages, attempts, submissions } = detail.data;
   const repo = status.data?.project.repo;
   const goalVersion = status.data?.goalVersion;
   const thread = threadTarget(task);
+  const current = currentAttempt(task, attempts);
 
   return (
     <div className="page">
@@ -67,6 +86,30 @@ export function TaskView({ id }: { id: string }) {
               <LeaseLeft until={task.leaseExpiresAt} />
             </Fact>
           ) : null}
+          {task.currentAttempt ? (
+            <Fact label="Current attempt">
+              <AttemptLink id={task.currentAttempt} />
+              {current ? ` · ${phaseLabel(current)}` : null}
+            </Fact>
+          ) : null}
+          <Fact label="Work position">
+            {task.workRef ? (
+              <>
+                <code>{task.workRef}</code>
+                {task.workSha ? (
+                  <>
+                    {' at '}
+                    <RepoRef repo={repo} kind="commit" refName={task.workSha} />
+                  </>
+                ) : null}
+              </>
+            ) : (
+              // The hub starts from the configured main branch, whose name the web is not told.
+              'The main branch'
+            )}
+          </Fact>
+          <NextTry task={task} />
+          {task.attemptCount > 0 ? <Fact label="Attempts">{task.attemptCount}</Fact> : null}
           <Fact label="Created">
             {who(task.createdBy)} · <When ts={task.createdAt} />
           </Fact>
@@ -74,13 +117,16 @@ export function TaskView({ id }: { id: string }) {
       </header>
       <Attention task={task} />
       <Actions key={task.status} task={task} onDone={detail.reload} />
+      {attempts.length > 0 ? <Attempts attempts={attempts} current={task.currentAttempt} /> : null}
       <div className="grid-2">
         <div className="stack">
           <Contract task={task} />
           {task.submission ? <Submission task={task} repo={repo} /> : null}
+          {submissions.length > 0 ? <Submissions submissions={submissions} /> : null}
           <Notes notes={notes} />
         </div>
         <div className="stack">
+          {task.currentAttempt ? <CurrentLog attemptId={task.currentAttempt} /> : null}
           <Section title="Thread">
             <MessageList messages={[...messages].reverse()} />
             <Composer to={thread.to} taskId={thread.taskId} placeholder={thread.placeholder} />
@@ -97,6 +143,129 @@ export function TaskView({ id }: { id: string }) {
 function LeaseLeft({ until }: { until: number }) {
   const now = useNow();
   return <>{until > now ? `${duration(until - now)} left` : 'expired'}</>;
+}
+
+/** An infra ending's backoff (design 6.9): no new attempt of a ready task before this time. */
+function NextTry({ task }: { task: Task }) {
+  const text = nextTryText(task, useNow());
+  return text ? <Fact label="Next try">{text}</Fact> : null;
+}
+
+/** Every attempt of the task in the order they ran, each linking its attempt page (design 11). */
+function Attempts({ attempts, current }: { attempts: Attempt[]; current: string | null }) {
+  // The hub lists them newest first.
+  const ordered = [...attempts].reverse();
+  return (
+    <section className="card table-card attempts-card">
+      <header className="card-head">
+        <h2>Attempts</h2>
+      </header>
+      <table className="attempts-table">
+        <thead>
+          <tr>
+            <th>Attempt</th>
+            <th>Agent</th>
+            <th>Vendor and model</th>
+            <th>Runner</th>
+            <th>Status</th>
+            <th>End reason</th>
+            <th>Class</th>
+            <th>Work in progress</th>
+            <th>Started</th>
+            <th>Ended</th>
+          </tr>
+        </thead>
+        <tbody>
+          {ordered.map((attempt) => (
+            <tr key={attempt.id} className={attempt.id === current ? 'attempt-current' : undefined}>
+              <td className="attempt-number">
+                <span className="attempt-name">
+                  <span className={`lamp tone-${attemptTone(attempt)}`} />
+                  <AttemptLink id={attempt.id} />
+                </span>
+              </td>
+              <td className="attempt-agent mono">{attempt.agentId}</td>
+              <td className="attempt-vendor">
+                {VENDOR_NAMES[attempt.vendor]}
+                {attempt.model ? <span className="mono muted"> · {attempt.model}</span> : null}
+              </td>
+              <td className="attempt-runner">{attempt.runnerId ?? <span className="muted">Live chat</span>}</td>
+              <td className="attempt-status">{ATTEMPT_STATUS_LABELS[attempt.status]}</td>
+              <td className="attempt-end">{attempt.endReason ? END_REASON_LABELS[attempt.endReason] : '—'}</td>
+              <td className="attempt-class">{attempt.failureClass ? FAILURE_CLASS_LABELS[attempt.failureClass] : '—'}</td>
+              <td className="attempt-wip mono">{wipText(attempt) ?? '—'}</td>
+              <td className="attempt-started">
+                <When ts={attempt.startedAt} clock />
+              </td>
+              <td className="attempt-ended">{attempt.endedAt ? <When ts={attempt.endedAt} clock /> : '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+/** The newest entries of the current attempt's log. Logging sends no event, so it also reloads on a timer. */
+function CurrentLog({ attemptId }: { attemptId: string }) {
+  const detail = useData(() => api.attempt(attemptId), [attemptId], {
+    relevant: (event) => concernsAttempt(event, attemptId),
+    refreshMs: 30_000,
+  });
+  return (
+    <Section
+      title="Attempt log"
+      className="task-attempt-log"
+      aside={
+        <a className="hint" href={routeHref({ view: 'attempt', id: attemptId })}>
+          The whole log of {attemptId}
+        </a>
+      }
+    >
+      {detail.data ? (
+        <AttemptLog entries={newestLog(detail.data.log)} />
+      ) : detail.error ? (
+        <ErrorBox error={detail.error} onRetry={detail.reload} />
+      ) : (
+        <Loading />
+      )}
+    </Section>
+  );
+}
+
+/** A runner agent's submissions, newest first, each with its outcome in plain words (design 6.13). */
+function Submissions({ submissions }: { submissions: SubmissionRecord[] }) {
+  return (
+    <Section title="Submissions">
+      <ol className="submission-records">
+        {submissions.map((record) => {
+          const outcome = submissionOutcome(record);
+          return (
+            <li key={record.id} className="submission-record">
+              <div className="meta">
+                <span className="submission-id mono">{record.id}</span> · <AttemptLink id={record.attemptId} /> ·{' '}
+                <When ts={record.requestedAt} />
+              </div>
+              <p className={`submission-outcome toned tone-${outcome.tone}`}>{outcome.text}</p>
+              {outcome.detail ? <p className="submission-detail pre muted">{outcome.detail}</p> : null}
+              <p className="pre">
+                <Linked text={record.summary} />
+              </p>
+              {record.evidence.length > 0 ? (
+                <ul className="submission-evidence">
+                  {record.evidence.map((item, index) => (
+                    <li key={index} className="pre">
+                      {item}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </li>
+          );
+        })}
+      </ol>
+    </Section>
+  );
 }
 
 function Attention({ task }: { task: Task }) {

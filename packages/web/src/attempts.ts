@@ -24,7 +24,7 @@ import {
   type TaskNote,
 } from '@agflow/core';
 import type { AgentAction, AgentActionBodies, HandbackSource, Me } from './api';
-import { duration, percent, shortSha, type TaskHolder, type Tone, who } from './format';
+import { duration, percent, shortSha, type TaskHolder, type Tone, untilText, who } from './format';
 
 // ---------------------------------------------------------------------------
 // Labels
@@ -222,6 +222,14 @@ export const LOG_KIND_TONES: Record<AttemptLogEntry['kind'], Tone> = {
   note: 'closed',
 };
 
+/** How many of the current attempt's newest log entries the Task page shows; its attempt page has them all. */
+export const LOG_TAIL = 8;
+
+/** The newest LOG_TAIL entries of a log the hub lists oldest first (design 11, Q8). */
+export function newestLog(log: AttemptLogEntry[]): AttemptLogEntry[] {
+  return log.slice(-LOG_TAIL);
+}
+
 // ---------------------------------------------------------------------------
 // Submissions
 // ---------------------------------------------------------------------------
@@ -292,6 +300,16 @@ export function holderOf(task: Pick<Task, 'status' | 'assignee' | 'currentAttemp
   const current = currentAttempt(task, attempts);
   if (current) return !isOpen(current) ? 'nobody' : current.runnerId ? 'runner' : 'live';
   return isHeld(task.status) && task.assignee ? 'live' : 'nobody';
+}
+
+/**
+ * When the scheduler may next try a task after an infra ending (6.9's backoff), or null. The hub keeps nextDispatchAt
+ * on a task it blocked or a person cancelled, but the scheduler only starts ready tasks, so only those show it, and
+ * only while the time is still ahead.
+ */
+export function nextTryText(task: Pick<Task, 'status' | 'nextDispatchAt'>, now: number): string | null {
+  if (task.status !== 'ready' || task.nextDispatchAt === null || task.nextDispatchAt <= now) return null;
+  return `${untilText(task.nextDispatchAt, now)}, after an infrastructure failure`;
 }
 
 // ---------------------------------------------------------------------------

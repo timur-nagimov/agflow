@@ -432,6 +432,17 @@ label.inline select { width: auto; max-width: 340px; }
 .task-link { font: 500 12.5px/1 var(--mono); white-space: nowrap; }
 .notes { list-style: none; padding: 0; display: grid; gap: 14px; }
 .notes li { display: grid; gap: 4px; }
+.attempts-card .card-head { padding: 10px 16px 0; margin-bottom: 4px; }
+.attempts-table td { white-space: nowrap; }
+.attempt-name { display: inline-flex; align-items: center; gap: 10px; }
+tr.attempt-current td { background: color-mix(in srgb, var(--inset) 60%, transparent); }
+.task-attempt-log .card-head a { font-size: 12.5px; }
+.submission-records { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+.submission-record { display: grid; gap: 4px; }
+.submission-record p { margin: 0; }
+.submission-outcome { font-size: 13.5px; }
+.submission-detail { font: 400 12.5px/1.5 var(--mono); }
+.submission-evidence { margin: 0; padding-left: 18px; font-size: 13px; }
 
 /* ---------- Attempt page ---------- */
 

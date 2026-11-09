@@ -353,6 +353,76 @@ async function main(): Promise<void> {
       await statusIs(page, 'Paused');
     });
 
+    /** A task as the hub has it, through the page's signed-in session. */
+    const taskDetail = (id: string) =>
+      page.evaluate<{
+        task: { workRef: string | null; workSha: string | null };
+        attempts: { id: string; wipSha: string | null }[];
+        submissions: { id: string; headSha: string | null }[];
+      }>(`fetch('/api/tasks/${id}').then((response) => response.json())`);
+    /** The Attempts table's row of an attempt, by its short name. */
+    const attemptRow = (name: string) =>
+      page.locator('.attempts-table tbody tr', { has: page.locator(`.attempt-link:text-is("${name}")`) });
+    const rowCell = async (row: Locator, name: string) => ((await row.locator(`.attempt-${name}`).textContent()) ?? '').trim();
+    await open(page, '#/task/T-8', '.task-head');
+    await check('T-8 shows its current attempt, its work position and its newest log entries', async () => {
+      await page.locator('.task-head .fact a.attempt-link[href="#/attempt/T-8-a1"]').waitFor();
+      const current = await fact('Current attempt');
+      if (current !== 'a1 · Waiting for approval') throw new Error(`the current attempt reads ${current}`);
+      const { task } = await taskDetail('T-8');
+      const position = await fact('Work position');
+      if (!task.workRef || !task.workSha || position !== `${task.workRef} at ${task.workSha.slice(0, 7)}`) {
+        throw new Error(`the work position reads ${position}`);
+      }
+      const log = page.locator('.task-attempt-log .log-text');
+      await log.filter({ hasText: 'Read src/webhooks/stripe.ts' }).waitFor();
+      await log.filter({ hasText: 'The signature check needs the Stripe SDK' }).waitFor();
+      // The log lists newest first, so its first row is the hub's last entry (after the row's kind label).
+      const { log: entries } = await page.evaluate<{ log: { summary: string }[] }>(
+        "fetch('/api/attempts/T-8-a1').then((response) => response.json())",
+      );
+      const newest = entries.at(-1)?.summary;
+      const first = ((await log.first().textContent()) ?? '').trim();
+      if (!newest || !first.endsWith(newest)) throw new Error(`the newest entry reads ${first}, not ${newest}`);
+      await page.locator('.task-attempt-log a[href="#/attempt/T-8-a1"]').waitFor();
+      if ((await fact('Attempts')) !== '1') throw new Error(`the attempt count reads ${await fact('Attempts')}`);
+    });
+    await open(page, '#/task/T-10', '.task-head');
+    await check('T-10 lists attempts a1 (Replaced, its runner, WIP ref and sha) and a2 (Holding), each linking its attempt page', async () => {
+      await waitForCount(page.locator('.attempts-table tbody tr'), 2);
+      const { attempts } = await taskDetail('T-10');
+      const first = attempts.find((attempt) => attempt.id === 'T-10-a1');
+      const cells = {
+        end: await rowCell(attemptRow('a1'), 'end'),
+        runner: await rowCell(attemptRow('a1'), 'runner'),
+        wip: await rowCell(attemptRow('a1'), 'wip'),
+        second: await rowCell(attemptRow('a2'), 'status'),
+      };
+      const wip = `refs/agflow/T-10/a1 at ${first?.wipSha?.slice(0, 7)}`;
+      if (cells.end !== 'Replaced' || cells.runner !== 'R-1' || cells.wip !== wip || cells.second !== 'Holding') {
+        throw new Error(`the rows show ${JSON.stringify(cells)}`);
+      }
+      await attemptRow('a1').locator('a.attempt-link[href="#/attempt/T-10-a1"]').waitFor();
+      await attemptRow('a2').locator('a.attempt-link[href="#/attempt/T-10-a2"]').waitFor();
+      if ((await fact('Attempts')) !== '2') throw new Error(`the attempt count reads ${await fact('Attempts')}`);
+    });
+    await check("T-10's submissions show S-1 refused because the branch needs a merge, and S-2 submitted at its sha; accepting T-10 still works", async () => {
+      const { submissions } = await taskDetail('T-10');
+      const s2 = submissions.find((submission) => submission.id === 'S-2');
+      const record = (id: string) => page.locator('.submission-record', { has: page.locator(`.submission-id:text-is("${id}")`) });
+      const refused = (await record('S-1').locator('.submission-outcome').textContent()) ?? '';
+      if (!refused.startsWith('Refused: someone added commits to the task branch, so it must merge them first')) {
+        throw new Error(`S-1 reads ${refused}`);
+      }
+      await record('S-1').locator('.submission-detail', { hasText: 'someone pushed to agflow/T-10' }).waitFor();
+      const submitted = (await record('S-2').locator('.submission-outcome').textContent()) ?? '';
+      if (!s2?.headSha || submitted !== `Submitted at ${s2.headSha.slice(0, 7)}`) throw new Error(`S-2 reads ${submitted}`);
+      await page.click('.actions button:has-text("Accept")');
+      await page.click('.action-form .confirm-action');
+      await statusIs(page, 'Accepted');
+    });
+    await shot(page, 'task-attempts');
+
     await check('the strip shows how many runners are online', () =>
       page.locator('.strip .readout', { hasText: /^Runners\s*1\/3\s*online$/ }).waitFor(),
     );
