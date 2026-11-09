@@ -18,6 +18,7 @@ import {
   CONNECTIVITY_VARS,
   DEFAULT_TIMINGS,
   isTestMode,
+  isWholeSettings,
   loadRunnerConfig,
   localSettingsEdits,
   type RunnerConfig,
@@ -408,5 +409,62 @@ describe('settings sync', () => {
     const { config: next, pending } = applySettingsEcho(runner, { settings: { capacity: 6 }, version: 2 });
     expect(pending).toEqual({});
     expect(next.capacity).toBe(6);
+  });
+
+  test('with edits in flight, runner.json takes the snapshot with the edits still in flight laid over it', () => {
+    // A drain, then an undrain, both in flight at version 3; the echo of the drain comes, the undrain's is to come.
+    const runner = confirmedAt3();
+    const before = [{ draining: true }, { draining: false }];
+    const after = [{ draining: false }];
+    const { config: next, pending } = applySettingsEcho(runner, { settings: { draining: true }, version: 4 }, {
+      before,
+      after,
+    });
+    expect(next.draining).toBe(false);
+    expect(settingsOf(next)).toMatchObject({ draining: true, version: 4 });
+    expect(pending).toEqual({});
+  });
+
+  test("with edits in flight, only a field or vendor that differs from the view before the echo is pending", () => {
+    const runner = confirmedAt3();
+    const codex = { fiveHour: 0.5, weekly: 0.6 };
+    // The codex ceiling is in flight; keepAwake was edited by other means; the owner's echo changes Claude's ceiling.
+    runner.ceilings = { ...runner.ceilings, codex };
+    runner.keepAwake = 'always';
+    const inFlight = [{ ceilings: { codex } }];
+    const claude = { fiveHour: 0.4, weekly: 0.4 };
+    const { config: next, pending } = applySettingsEcho(
+      runner,
+      { settings: { ceilings: { claude, codex: { fiveHour: 0.85, weekly: 0.85 } } }, version: 4 },
+      { before: inFlight, after: inFlight },
+    );
+    expect(next.ceilings).toEqual({ claude, codex });
+    expect(next.keepAwake).toBe('always');
+    expect(pending).toEqual({ keepAwake: 'always' });
+    expect(settingsOf(next).ceilings).toEqual({ claude, codex: { fiveHour: 0.85, weekly: 0.85 } });
+  });
+
+  test("isWholeSettings: every field, and in each per-vendor record every vendor the snapshot's holds", () => {
+    const snapshot = settingsOf(config());
+    const { version: _version, ...whole } = snapshot;
+    expect(isWholeSettings(whole, snapshot)).toBe(true);
+    // An owner's PATCH may name every field, yet only some vendors: it is not the hub's whole settings.
+    const patch = {
+      capacity: 3,
+      keepAwake: 'off' as const,
+      draining: true,
+      ceilings: { codex: { fiveHour: 0.5, weekly: 0.6 } },
+      allowPaidUsage: { claude: true },
+    };
+    expect(isWholeSettings(patch, snapshot)).toBe(false);
+    expect(isWholeSettings({ ...patch, ceilings: whole.ceilings }, snapshot)).toBe(false);
+    const named = { ...patch, ceilings: whole.ceilings, allowPaidUsage: whole.allowPaidUsage };
+    expect(isWholeSettings(named, snapshot)).toBe(true);
+    // A field left out, or a vendor the snapshot holds; a vendor it does not hold is not needed.
+    const { draining: _draining, ...partial } = whole;
+    expect(isWholeSettings(partial, snapshot)).toBe(false);
+    const codexOnly = { ...snapshot, ceilings: { codex: whole.ceilings.codex }, allowPaidUsage: { codex: false } };
+    expect(isWholeSettings({ ...patch, allowPaidUsage: { codex: true } }, codexOnly)).toBe(true);
+    expect(isWholeSettings({ ...patch, ceilings: { claude: whole.ceilings.claude } }, codexOnly)).toBe(false);
   });
 });

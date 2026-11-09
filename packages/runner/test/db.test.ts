@@ -288,6 +288,208 @@ const stop = (counter: number): RunnerCommand => ({
   keepClone: false,
 });
 
+describe('Outbox settings echoes', () => {
+  type Edit = { capacity?: number; draining?: boolean; keepAwake?: 'off' | 'ac' | 'always' };
+  const edit = (outbox: Outbox, settings: Edit) =>
+    outbox.append({ type: 'runner.settings', data: { settings, baseVersion: 1 } }).seq;
+  const seqsOf = (events: { seq: number }[]) => events.map((event) => event.seq);
+
+  test('settingsInFlight lists every runner.settings no echo has matched, acknowledged or not, across reopening', () => {
+    const db = open();
+    const outbox = new Outbox(db);
+    // runner.json was written with version 10: every mark below counts.
+    outbox.settingsSaved(10);
+    const capacity = edit(outbox, { capacity: 3 });
+    outbox.append({ type: 'runner.state', data: { state: 'ok', detail: null } });
+    const drain = edit(outbox, { draining: true });
+    const again = edit(outbox, { capacity: 3 });
+    outbox.ack(outbox.epoch, drain);
+    const inFlight = (box: Outbox) => seqsOf(box.settingsInFlight());
+    expect(inFlight(outbox)).toEqual([capacity, drain, again]);
+    const answered = (echo: { answered: { seq: number } | null }) => echo.answered?.seq ?? null;
+    // An echo that equals no edit (the owner's) marks none.
+    expect(answered(outbox.markSettingsEcho({ capacity: 4 }, 2))).toBeNull();
+    // An echo marks the oldest edit in flight with its settings, even past an earlier edit in flight.
+    expect(answered(outbox.markSettingsEcho({ draining: true }, 3))).toBe(drain);
+    expect(answered(outbox.markSettingsEcho({ capacity: 3 }, 4))).toBe(capacity);
+    expect(answered(outbox.markSettingsEcho({ draining: true }, 5))).toBeNull();
+    const reopened = reopen(db);
+    const box = new Outbox(reopened);
+    expect(inFlight(box)).toEqual([again]);
+    // The marks of pruned events go.
+    box.ack(box.epoch, again);
+    box.markSettingsEcho({ capacity: 3 }, 6);
+    box.pruneBefore(Number.MAX_SAFE_INTEGER);
+    expect(reopened.meta('settingsEchoed')).toEqual([]);
+    const keepAwake = box.append({
+      type: 'runner.settings',
+      data: { settings: { keepAwake: 'always' }, baseVersion: 2 },
+    });
+    expect(inFlight(box)).toEqual([keepAwake.seq]);
+    expect(answered(box.markSettingsEcho({ keepAwake: 'always' }, 7))).toBe(keepAwake.seq);
+    expect(reopened.meta('settingsEchoed')).toEqual([{ seq: keepAwake.seq, version: 7 }]);
+    expect(inFlight(box)).toEqual([]);
+  });
+
+  test("a mark counts once runner.json's snapshot has its version, and an echo run again marks nothing more", () => {
+    const db = open();
+    let confirmed = 4;
+    const outbox = new Outbox(db, { confirmedVersion: () => confirmed });
+    const first = edit(outbox, { draining: true });
+    const second = edit(outbox, { draining: false });
+    const third = edit(outbox, { draining: true });
+    expect(outbox.markSettingsEcho({ draining: true }, 5).answered?.seq).toBe(first);
+    // runner.json has not taken version 5 yet: the drain is still in flight, though no other echo matches it.
+    expect(seqsOf(outbox.settingsInFlight())).toEqual([first, second, third]);
+    expect(seqsOf(outbox.settingsInFlight(5))).toEqual([second, third]);
+    expect(seqsOf(outbox.settingsUnanswered())).toEqual([second, third]);
+    // The same echo again (the journal's rerun after a restart) answers the same edit, and never the equal third one.
+    expect(outbox.markSettingsEcho({ draining: true }, 5).answered?.seq).toBe(first);
+    expect(db.meta('settingsEchoed')).toEqual([{ seq: first, version: 5 }]);
+    confirmed = 5;
+    expect(seqsOf(outbox.settingsInFlight())).toEqual([second, third]);
+    // The hub's whole settings at the version of an echo that came answer nothing.
+    expect(outbox.markSettingsEcho({ draining: false }, 5)).toEqual({ answered: null, refused: [] });
+    expect(seqsOf(outbox.settingsInFlight())).toEqual([second, third]);
+  });
+
+  test("a probe's echo marks it, and every older edit no echo answered as refused", () => {
+    const db = open();
+    const outbox = new Outbox(db);
+    outbox.settingsSaved(10);
+    const refused = edit(outbox, { capacity: 3 });
+    const applied = edit(outbox, { draining: true });
+    const probe = outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: 1 } });
+    const later = edit(outbox, { capacity: 5 });
+    expect(outbox.markSettingsEcho({ draining: true }, 5).answered?.seq).toBe(applied);
+    const echo = outbox.markSettingsEcho({}, 6);
+    expect(echo.answered?.seq).toBe(probe.seq);
+    expect(seqsOf(echo.refused)).toEqual([refused]);
+    expect(seqsOf(outbox.settingsInFlight())).toEqual([later]);
+    expect(db.meta('settingsEchoed')).toEqual([
+      { seq: applied, version: 5 },
+      { seq: refused, version: 6, refused: true },
+      { seq: probe.seq, version: 6 },
+    ]);
+    // Run again, the echo gives the same refusals and marks nothing more.
+    expect(seqsOf(outbox.markSettingsEcho({}, 6).refused)).toEqual([refused]);
+    expect(db.meta('settingsEchoed')).toHaveLength(3);
+  });
+
+  test('pruneAcked and pruneBefore keep every runner.settings in flight and drop the marks of what they prune', () => {
+    const clock = manualNow();
+    const db = open();
+    let confirmed = 4;
+    const outbox = new Outbox(db, { now: clock.now, confirmedVersion: () => confirmed });
+    outbox.settingsSaved(confirmed);
+    const answered = edit(outbox, { draining: true });
+    const waiting = edit(outbox, { capacity: 3 });
+    const marked = edit(outbox, { keepAwake: 'always' });
+    const state = outbox.append({ type: 'runner.state', data: { state: 'ok', detail: null } }).seq;
+    const unacked = edit(outbox, { keepAwake: 'off' });
+    outbox.ack(outbox.epoch, state);
+    outbox.markSettingsEcho({ draining: true }, 4);
+    // Marked at version 5, which runner.json has not taken yet: still in flight.
+    outbox.markSettingsEcho({ keepAwake: 'always' }, 5);
+    clock.t += 3 * 24 * 60 * 60_000;
+    expect(outbox.pruneAcked(48 * 60 * 60_000)).toBe(2);
+    expect(seqsOf(outbox.eventsAfter(0))).toEqual([waiting, marked, unacked]);
+    expect(db.meta('settingsEchoed')).toEqual([{ seq: marked, version: 5 }]);
+    expect(outbox.pruneBefore(clock.t)).toBe(0);
+    confirmed = 5;
+    outbox.settingsSaved(confirmed);
+    expect(outbox.pruneBefore(clock.t)).toBe(1);
+    expect(seqsOf(outbox.eventsAfter(0))).toEqual([waiting, unacked]);
+    expect(db.meta('settingsEchoed')).toEqual([]);
+    expect(outbox.firstSeq()).toBe(waiting);
+  });
+
+  test("an echo answers only the edits appended before it arrived, a probe's echo too", () => {
+    const db = open();
+    const outbox = new Outbox(db, { confirmedVersion: () => 10 });
+    const before = edit(outbox, { draining: true });
+    const refused = edit(outbox, { capacity: 3 });
+    const probe = outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: 1 } }).seq;
+    // The echoes arrived here, when the outbox's newest seq was the probe's.
+    const arrived = outbox.lastSeq();
+    const after = edit(outbox, { draining: true });
+    const laterProbe = outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: 1 } }).seq;
+    expect(outbox.markSettingsEcho({ draining: true }, 5, arrived).answered?.seq).toBe(before);
+    // An equal echo that arrived as early answers no edit made after it came: it is the owner's.
+    expect(outbox.markSettingsEcho({ draining: true }, 6, arrived)).toEqual({ answered: null, refused: [] });
+    const echo = outbox.markSettingsEcho({}, 7, arrived);
+    expect(echo.answered?.seq).toBe(probe);
+    expect(seqsOf(echo.refused)).toEqual([refused]);
+    expect(seqsOf(outbox.settingsInFlight())).toEqual([after, laterProbe]);
+    // Without a bound, every edit held may be answered.
+    expect(outbox.markSettingsEcho({ draining: true }, 8).answered?.seq).toBe(after);
+  });
+
+  test("pruning keeps no probe: one the hub refused is never echoed, and a later probe's echo answers it", () => {
+    const clock = manualNow();
+    const db = open();
+    const outbox = new Outbox(db, { now: clock.now, confirmedVersion: () => 6 });
+    outbox.settingsSaved(6);
+    const probe = () => outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: 5 } }).seq;
+    const refusedEdit = edit(outbox, { capacity: 3 });
+    const refusedProbe = probe();
+    const lastProbe = probe();
+    const unacked = probe();
+    outbox.ack(outbox.epoch, lastProbe);
+    // The last probe's echo: it answers the oldest probe open, and settles the edit as refused.
+    const echo = outbox.markSettingsEcho({}, 6);
+    expect(echo.answered?.seq).toBe(refusedProbe);
+    expect(seqsOf(echo.refused)).toEqual([refusedEdit]);
+    expect(seqsOf(outbox.settingsInFlight())).toEqual([lastProbe, unacked]);
+    clock.t += 3 * 24 * 60 * 60_000;
+    expect(outbox.pruneAcked(48 * 60 * 60_000)).toBe(3);
+    expect(seqsOf(outbox.eventsAfter(0))).toEqual([unacked]);
+    expect(outbox.pruneBefore(clock.t)).toBe(1);
+    expect(outbox.eventsAfter(0)).toEqual([]);
+    expect(db.meta('settingsEchoed')).toEqual([]);
+  });
+
+  test('without confirmedVersion, an Outbox counts marks up to the version runner.json was last written with', () => {
+    const clock = manualNow();
+    const db = open();
+    let held = 4;
+    // The runtime's, which counts against the snapshot it holds, and one built as M2c's retention builds it.
+    const runtime = new Outbox(db, { now: clock.now, confirmedVersion: () => held });
+    const retention = new Outbox(db, { now: clock.now });
+    expect(seqsOf(retention.settingsInFlight())).toEqual([]);
+    runtime.settingsSaved(4);
+    const drain = edit(runtime, { draining: true });
+    runtime.ack(runtime.epoch, drain);
+    runtime.markSettingsEcho({ draining: true }, 5);
+    // runner.json's write at version 5 failed: the runtime holds version 5, and the file still has version 4.
+    held = 5;
+    expect(seqsOf(runtime.settingsInFlight())).toEqual([]);
+    expect(seqsOf(retention.settingsInFlight())).toEqual([drain]);
+    clock.t += 3 * 24 * 60 * 60_000;
+    // Neither prunes the drain: a restart would read version 4 and find the drain in runner.json, and in flight.
+    expect(retention.pruneAcked(48 * 60 * 60_000)).toBe(0);
+    expect(runtime.pruneAcked(48 * 60 * 60_000)).toBe(0);
+    runtime.settingsSaved(5);
+    expect(seqsOf(retention.settingsInFlight())).toEqual([]);
+    expect(retention.pruneAcked(48 * 60 * 60_000)).toBe(1);
+    expect(db.meta('settingsEchoed')).toEqual([]);
+  });
+
+  test('onAck hears every ack of this epoch with the acknowledged position, and nothing after the unsubscribe', () => {
+    const db = open();
+    const outbox = new Outbox(db);
+    for (const detail of ['a', 'b', 'c']) outbox.append(stateEvent(detail));
+    const heard: number[] = [];
+    const unsubscribe = outbox.onAck((seq) => heard.push(seq));
+    outbox.ack(outbox.epoch, 2);
+    outbox.ack('another-epoch', 3);
+    outbox.ack(outbox.epoch, 1);
+    unsubscribe();
+    outbox.ack(outbox.epoch, 3);
+    expect(heard).toEqual([2, 2]);
+  });
+});
+
 describe('Journal', () => {
   test('records a command as running, joins a resend while it runs and answers the stored result once done', () => {
     const journal = new Journal(open());

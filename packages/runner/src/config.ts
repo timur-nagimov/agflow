@@ -314,13 +314,49 @@ export function localSettingsEdits(config: RunnerConfig): SettingsEdits {
 }
 
 /**
+ * The snapshot with runner.settings edits laid over it in order: what the hub holds once it has applied them. Of the
+ * per-vendor records an edit replaces only the vendors it names.
+ */
+export function settingsAfterEdits(snapshot: RunnerSettings, edits: readonly SettingsEdits[]): RunnerSettings {
+  const result = structuredClone(snapshot);
+  for (const edit of edits) {
+    for (const field of SCALAR_FIELDS) {
+      if (edit[field] !== undefined) Object.assign(result, { [field]: edit[field] });
+    }
+    for (const field of VENDOR_FIELDS) {
+      const given = edit[field];
+      if (given !== undefined) Object.assign(result, { [field]: { ...result[field], ...structuredClone(given) } });
+    }
+  }
+  return result;
+}
+
+/**
+ * Whether settings are the hub's whole settings, as hello's echoes carry them, which set the snapshot whatever came
+ * before: every field named, and in each per-vendor record every vendor the snapshot's record holds. The hub's records
+ * hold every vendor the runner's snapshot does (it stored what the runner reported, and merges vendor by vendor), and
+ * an owner's PATCH that names every field but not those vendors is an edit like any other.
+ */
+export function isWholeSettings(settings: SettingsEdits, snapshot: RunnerSettings): boolean {
+  if (![...SCALAR_FIELDS, ...VENDOR_FIELDS].every((field) => settings[field] !== undefined)) return false;
+  return VENDOR_FIELDS.every((field) => {
+    const given: Partial<Record<Vendor, unknown>> = settings[field] ?? {};
+    return VENDORS.every((vendor) => snapshot[field][vendor] === undefined || given[vendor] !== undefined);
+  });
+}
+
+/**
  * Applies an update_settings echo: it becomes the snapshot, and runner.json takes its values except for pending local
- * edits (fields, or vendors of the per-vendor records, that differed from the old snapshot and differ from the echo),
- * which keep their value and are returned to be sent again.
+ * edits, which keep their value and are returned to be sent again. Both are judged on the edits in flight (X-12):
+ * before is the old snapshot with the edits in flight before the echo laid over it, which runner.json holds unless it
+ * was edited by other means; after is the new snapshot with the edits still in flight laid over it. A field (or a
+ * vendor of the per-vendor records) is pending when runner.json differs from both; any other takes after. With no
+ * edits in flight, before and after are the two snapshots.
  */
 export function applySettingsEcho(
   config: RunnerConfig,
   echo: { settings: SettingsEdits; version: number },
+  inFlight: { before: readonly SettingsEdits[]; after: readonly SettingsEdits[] } = { before: [], after: [] },
 ): { config: RunnerConfig; pending: SettingsEdits } {
   const old = config.confirmedSettings;
   const given = structuredClone(echo.settings);
@@ -332,21 +368,23 @@ export function applySettingsEcho(
     allowPaidUsage: { ...old.allowPaidUsage, ...given.allowPaidUsage },
     version: echo.version,
   };
+  const before = settingsAfterEdits(old, inFlight.before);
+  const after = settingsAfterEdits(snapshot, inFlight.after);
   const local = localSettings(config);
   const pending: Record<string, unknown> = {};
   const next: RunnerConfig = { ...config, confirmedSettings: snapshot };
   for (const field of SCALAR_FIELDS) {
-    if (local[field] !== old[field] && local[field] !== snapshot[field]) pending[field] = local[field];
-    else Object.assign(next, { [field]: snapshot[field] });
+    if (local[field] !== before[field] && local[field] !== after[field]) pending[field] = local[field];
+    else Object.assign(next, { [field]: after[field] });
   }
   for (const field of VENDOR_FIELDS) {
     const merged: Record<string, unknown> = {};
     const kept: Record<string, unknown> = {};
     for (const vendor of VENDORS) {
       const mine = local[field][vendor];
-      const theirs = snapshot[field][vendor];
+      const theirs = after[field][vendor];
       const pendingHere =
-        mine !== undefined && !Bun.deepEquals(mine, old[field][vendor]) && !Bun.deepEquals(mine, theirs);
+        mine !== undefined && !Bun.deepEquals(mine, before[field][vendor]) && !Bun.deepEquals(mine, theirs);
       if (pendingHere) kept[vendor] = structuredClone(mine);
       merged[vendor] = structuredClone(pendingHere || theirs === undefined ? mine : theirs);
     }

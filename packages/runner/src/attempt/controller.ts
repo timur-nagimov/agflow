@@ -22,6 +22,8 @@
 // after an outage, is the turn policy's (turns.ts). A resume (resume.ts) stops a live process first, then prepares
 // the clone the attempt has and resumes its session with the new fence and token. A submission (submit.ts) harvests
 // the clone and pushes the task branch and the WIP ref together; a stop or hold arriving meanwhile ends its retries.
+// An attempt the hub ended (welcome.stop) is stopped without a handoff turn, its new work going to a late-work ref; an
+// agent's prepare_dependencies runs the preparer in its clone under the request's id.
 // A take-over (takeover.ts) stops the agent with a handoff turn, pushes its work, and hands the clone to a person
 // with a .git the runner built; attempt.taken_over takes attempt.exited's place. A cleanup (cleanup.ts) stops a live
 // process, saves the clone's work that is not on the origin as late work, uploads the transcript tail and removes
@@ -38,6 +40,7 @@ import {
   type ExitCause,
   type Fence,
   type InjectedMessage,
+  type RunnerEvent,
   type StartRefusal,
   type StoppedBy,
   lateWorkRef,
@@ -69,7 +72,7 @@ import type { RunnerPaths } from '../paths';
 import type { SerialQueue } from '../queue';
 import { removeAgentTools } from '../run-dir';
 import { boundedWait, findCloneProcesses, type ProcessIdentity } from '../processes';
-import type { DependencyPreparer, Notifier, RunnerHealth } from '../seams';
+import type { DependencyPreparer, Notifier, PrepareOutcome, RunnerHealth } from '../seams';
 import { killAndSweep, runStopLadder } from '../stop-ladder';
 import { vendorBinary } from '../vendor/pins';
 import { clipPushError, EVENTS_AFTER_EXIT_MS, LateWorkRetries, pushWithRetries, uploadTranscriptTail } from './exit';
@@ -247,6 +250,11 @@ export type WipOutcome =
   | { status: 'held'; sha: string }
   | { status: 'failed'; error: string }
   | { status: 'skipped' };
+
+/** What an agent's prepare_dependencies did: the preparation attempt.prepared reported, or a refused fence. */
+export type PrepareRequestOutcome =
+  | { ok: true; prepared: Extract<RunnerEvent, { type: 'attempt.prepared' }>['data'] }
+  | { ok: false; error: 'stale_fence' };
 
 /** What deliver and interrupt give: done, or why not (a fence that is not the attempt's, or no live agent). */
 export type LiveOutcome = { ok: true } | { ok: false; error: 'stale_fence' | 'not_running' };
@@ -770,6 +778,72 @@ export class AttemptController {
     this.standing.ended = true;
     const record = this.deps.store.get(this.attemptId);
     if (record !== null && record.endedAt === null) this.deps.store.update(this.attemptId, { endedAt: Date.now() });
+  }
+
+  /**
+   * welcome.stop for a live process (design 6.4, X-36), after markEnded: the agent is stopped without a handoff turn.
+   * Its final push is refused as the attempt is ended, so its new work goes to a late-work ref, and attempt.exited
+   * reports finalWip null. With no process alive, nothing is stopped or reported: not_running.
+   */
+  stopEnded(reason: string): Promise<StopOutcome> {
+    this.stopArriving();
+    return this.enqueue(async () => {
+      const live = this.live;
+      if (live === null) return { ok: false, error: 'not_running' };
+      return this.stopLive(live, { handoff: false, interruptFirst: false, reason, cause: null });
+    });
+  }
+
+  /**
+   * prepare_dependencies (design 7.7, X-40): an agent's request, which the preparer runs in the attempt's clone with
+   * the command id as requestId; it restores the protected paths itself. attempt.prepared reports the outcome, and a
+   * runner that cannot prepare reports "not available on this runner". The live agent's environment is used; a request
+   * re-run after a restart has no token, and its environment carries none.
+   */
+  prepareRequested(command: { fence: Fence; requestId: string }): Promise<PrepareRequestOutcome> {
+    return this.enqueue(async () => {
+      const { store, preparer, vault, paths } = this.deps;
+      const record = store.get(this.attemptId);
+      const fence = this.currentFence ?? record?.fence ?? null;
+      if (fence === null || compareFence(command.fence, fence) !== 0) return { ok: false, error: 'stale_fence' };
+      const { requestId } = command;
+      const spec = this.current ?? record?.spec ?? null;
+      const clone = this.cloneDir ?? record?.clone ?? null;
+      let outcome: Omit<PrepareOutcome, 'ran'>;
+      try {
+        if (!preparer.available) throw new Error('not available on this runner');
+        if (spec === null || spec.role !== 'worker') throw new Error(`${this.attemptId} is not a worker attempt`);
+        if (clone === null || !cloneExists(clone)) throw new Error(`the clone of ${this.attemptId} is gone`);
+        const agentToken = this.live?.spec.agentToken ?? null;
+        const env = buildAgentEnv({
+          vendor: spec.vendor,
+          spec: { ...spec, agentToken: agentToken ?? '' },
+          clone,
+          tools: paths.agentTools(vault.project, this.attemptId),
+          tmpDir: this.prepared?.tmpDir ?? record?.tmpDir ?? null,
+          config: this.deps.config(),
+          paths,
+        });
+        if (agentToken === null) delete env.AGFLOW_AGENT_TOKEN;
+        const base = this.prepared?.base ?? (await resolveRestoreBase(vault, spec));
+        outcome = await preparer.prepare({
+          attemptId: this.attemptId,
+          vendor: spec.vendor,
+          clone,
+          vault,
+          baseSha: base,
+          env,
+          requestId,
+        });
+      } catch (error) {
+        outcome = { ok: false, error: describe(error), logTail: null };
+      }
+      const { ok, logTail } = outcome;
+      const error = ok ? null : (outcome.error ?? 'the preparation failed');
+      const prepared = { requestId, ok, error, logTail };
+      this.report(fence, { type: 'attempt.prepared', data: prepared });
+      return { ok: true, prepared };
+    });
   }
 
   /** Harvests the clone and pushes its work to the WIP ref if it changed, on the serial queue. */

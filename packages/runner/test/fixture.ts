@@ -193,7 +193,8 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
     }
   }
   const store = new AttemptStore(db);
-  const outbox = new Outbox(db);
+  // As the runtime wires it: settings marks count against the snapshot the runner holds.
+  const outbox = new Outbox(db, { confirmedVersion: () => fixture.config.confirmedSettings.version });
   const controllers: AttemptController[] = [];
   // Every agent still running is killed, and its controller's work waited for, before the files go. Whatever a test
   // left behind, that work stays short: no timer pushes, and a final push makes one try, so a broken origin costs

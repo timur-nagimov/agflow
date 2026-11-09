@@ -20,6 +20,7 @@ export * from './clock';
 export * from './config';
 export * from './db';
 export * from './env';
+export * from './executor';
 export * from './facts';
 export * from './git/clone';
 export * from './git/harvest';

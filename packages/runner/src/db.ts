@@ -75,8 +75,22 @@ export interface RunnerMigration {
   sql: string;
 }
 
+/**
+ * A runner.settings event an update_settings echo answered, with the echo's version: it counts once runner.json's
+ * confirmed snapshot has that version (Outbox.settingsInFlight). refused: a probe's echo showed the hub refused it.
+ */
+export interface SettingsMark {
+  seq: number;
+  version: number;
+  refused?: true;
+}
+
 /** The meta values the runner keeps between runs. */
 export interface RunnerMeta {
+  /** The runner.settings that update_settings echoes answered, of those the outbox keeps (Outbox.markSettingsEcho). */
+  settingsEchoed: SettingsMark[] | null;
+  /** The version of the snapshot runner.json was last written with (Outbox.settingsSaved). */
+  settingsSavedVersion: number | null;
   /** The hub epoch of the last welcome; hello reports it, so a restored hub knows to reconcile. */
   lastHubEpoch: number | null;
   /** The last welcome's wipRefPrefix, for pushes made before the next welcome. */
