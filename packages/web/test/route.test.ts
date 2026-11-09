@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { APPROVALS_ROUTE } from '@agflow/core';
 import { NAV, navViewOf, parseRoute, routeHref } from '../src/route';
 
 describe('routes', () => {
@@ -9,6 +10,7 @@ describe('routes', () => {
     expect(parseRoute('#/task/T-12')).toEqual({ view: 'task', id: 'T-12' });
     expect(parseRoute('#/agents')).toEqual({ view: 'agents' });
     expect(parseRoute('#/runners')).toEqual({ view: 'runners' });
+    expect(parseRoute('#/approvals')).toEqual({ view: 'approvals' });
     expect(parseRoute('#/messages')).toEqual({ view: 'messages' });
     expect(parseRoute('#/timeline')).toEqual({ view: 'timeline' });
     expect(parseRoute('#/knowledge')).toEqual({ view: 'knowledge' });
@@ -34,6 +36,7 @@ describe('routes', () => {
       { view: 'messages' },
       { view: 'knowledge' },
       { view: 'runners' },
+      { view: 'approvals' },
     ] as const) {
       expect(parseRoute(routeHref(route))).toEqual(route);
     }
@@ -43,11 +46,23 @@ describe('routes', () => {
     expect(navViewOf({ view: 'task', id: 'T-1' })).toBe('board');
     expect(navViewOf({ view: 'agents' })).toBe('agents');
     expect(navViewOf({ view: 'runners' })).toBe('runners');
+    expect(navViewOf({ view: 'approvals' })).toBe('approvals');
   });
 
   test('the navigation lists Runners right after Agents', () => {
     const views = NAV.map((item) => item.view);
     expect(views.indexOf('runners')).toBe(views.indexOf('agents') + 1);
     expect(NAV.find((item) => item.view === 'runners')?.label).toBe('Runners');
+  });
+
+  test("the Approvals page is at core's APPROVALS_ROUTE, which runner notifications print", () => {
+    expect(routeHref({ view: 'approvals' })).toBe(APPROVALS_ROUTE);
+    expect(parseRoute(APPROVALS_ROUTE)).toEqual({ view: 'approvals' });
+  });
+
+  test('the navigation lists Approvals right after Runners', () => {
+    const views = NAV.map((item) => item.view);
+    expect(views.indexOf('approvals')).toBe(views.indexOf('runners') + 1);
+    expect(NAV.find((item) => item.view === 'approvals')?.label).toBe('Approvals');
   });
 });

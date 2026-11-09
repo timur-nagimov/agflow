@@ -7,6 +7,7 @@ import { type Hub, HubContext } from './hub';
 import { type Connection, useConnection } from './live';
 import { NAV, type Route, navViewOf, routeHref } from './route';
 import { AgentsView } from './views/AgentsView';
+import { ApprovalsView } from './views/ApprovalsView';
 import { BoardView } from './views/BoardView';
 import { GoalView } from './views/GoalView';
 import { KnowledgeView } from './views/KnowledgeView';
@@ -35,6 +36,9 @@ const runnersChanged = (event: HubEvent) =>
   event.type === 'attempt.ended' ||
   event.type === 'approval.decided';
 
+/** A request raised, decided, expired or voided. */
+const approvalsChanged = (event: HubEvent) => event.type.startsWith('approval.');
+
 const CONNECTION: Record<Connection, { label: string; lamp: string }> = {
   connecting: { label: 'Connecting', lamp: 'tone-active' },
   live: { label: 'Live', lamp: 'tone-done pulse' },
@@ -50,6 +54,9 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const tasks = useData(() => api.tasks(), [], { relevant: taskChanged });
   // Heartbeats (power, disk, last seen) send no event, so the runners also reload on a timer.
   const runners = useData(() => api.runners(), [], { relevant: runnersChanged, refreshMs: 60_000 });
+  // The timer catches an approval.* event missed while the live connection was down;
+  // an expiry arrives as approval.expired.
+  const approvals = useData(() => api.approvals(['pending']), [], { relevant: approvalsChanged, refreshMs: 30_000 });
   const [peopleSeen, setPeopleSeen] = useState(() => Number(localStorage.getItem(SEEN_KEY) ?? 0));
   const markPeopleSeen = useCallback((id: number) => {
     if (id <= Number(localStorage.getItem(SEEN_KEY) ?? 0)) return;
@@ -57,12 +64,13 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     setPeopleSeen(id);
   }, []);
   const hub = useMemo<Hub>(
-    () => ({ me, status, tasks, runners, peopleSeen, markPeopleSeen }),
-    [me, status, tasks, runners, peopleSeen, markPeopleSeen],
+    () => ({ me, status, tasks, runners, approvals, peopleSeen, markPeopleSeen }),
+    [me, status, tasks, runners, approvals, peopleSeen, markPeopleSeen],
   );
   const project = status.data?.project;
   const counts = tasks.data ? columnCounts(tasks.data) : null;
   const unseen = (status.data?.humansInbox ?? []).filter((message) => message.id > peopleSeen).length;
+  const waiting = approvals.data?.length ?? 0;
   const runnerList = runners.data?.runners ?? [];
   const online = runnerList.filter((runner) => runner.state === 'online').length;
   const current = navViewOf(route);
@@ -91,6 +99,11 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                   {item.view === 'goal' && unseen > 0 ? (
                     <span className="badge" title={`${unseen} new message${unseen === 1 ? '' : 's'} for people`}>
                       {unseen}
+                    </span>
+                  ) : null}
+                  {item.view === 'approvals' && waiting > 0 ? (
+                    <span className="badge" title={`${waiting} approval${waiting === 1 ? '' : 's'} waiting for you`}>
+                      {waiting}
                     </span>
                   ) : null}
                 </a>
@@ -168,6 +181,8 @@ function View({ route }: { route: Route }) {
       return <AgentsView />;
     case 'runners':
       return <RunnersView />;
+    case 'approvals':
+      return <ApprovalsView />;
     case 'messages':
       return <MessagesView key={route.to ?? ''} to={route.to} />;
     case 'timeline':

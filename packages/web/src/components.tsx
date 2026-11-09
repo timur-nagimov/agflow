@@ -212,7 +212,9 @@ export function ConfirmButton({
       <button
         className={danger ? 'danger solid' : 'primary'}
         disabled={action.busy}
-        onClick={async () => {
+        onClick={async (event) => {
+          // The confirm button appears where the first button was, so a double-click must not confirm.
+          if (event.detail > 1) return;
           if ((await action.run(onConfirm)).ok) setAsking(false);
         }}
       >

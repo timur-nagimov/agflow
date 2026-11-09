@@ -581,6 +581,39 @@ tr.agent-gone td { color: var(--ink-3); }
 .meter-fill { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: var(--tone); transition: width 0.6s ease; }
 .meter-mark { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--ink); }
 
+/* ---------- Approvals ---------- */
+
+.approval-list { display: grid; gap: 18px; max-width: 920px; }
+.approval-card { display: grid; gap: 12px; border-left: 3px solid var(--active); }
+.approval-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.card .approval-summary {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font: 500 16px/1.3 var(--sans);
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.approval-left { font: 500 12px/1 var(--mono); color: var(--active); white-space: nowrap; }
+.approval-place { margin: 0; font-size: 13px; color: var(--ink-2); }
+.approval-command {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 4px;
+  background: var(--inset);
+  font: 400 13px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.approval-card .facts { margin: 0; }
+.approval-warnings { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; font-size: 13px; color: var(--trouble); }
+.approval-warnings li { display: flex; align-items: baseline; gap: 8px; }
+.approval-warnings li::before { content: '!'; flex: none; font: 700 12px/1 var(--mono); }
+.approval-diff .diff { margin: 0; }
+.approval-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--rule); }
+
 /* ---------- Knowledge ---------- */
 
 .rules { list-style: none; padding: 0; display: grid; gap: 12px; margin-top: 12px; }

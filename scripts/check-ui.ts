@@ -181,7 +181,7 @@ async function main(): Promise<void> {
 
     await open(page, '#/goal', '.charter-text');
     await check('opening the goal clears the badge for messages to people', () =>
-      page.locator('.nav .badge').waitFor({ state: 'detached' }),
+      page.locator('.nav a[href="#/goal"] .badge').waitFor({ state: 'detached' }),
     );
     await check('editing the goal previews the change and saves a new version', async () => {
       await page.click('button:has-text("Edit goal")');
@@ -351,6 +351,78 @@ async function main(): Promise<void> {
       await waitForCount(page.locator('.runner-card'), 2);
       await page.locator('.strip .readout', { hasText: /^Runners\s*1\/2\s*online$/ }).waitFor();
     });
+
+    /** The Approvals item's badge. */
+    const approvalsBadge = page.locator('.nav a[href="#/approvals"] .badge');
+    await check('the Approvals item shows a badge with 2', async () => {
+      await approvalsBadge.filter({ hasText: /^2$/ }).waitFor();
+    });
+    await open(page, '#/approvals', '.approval-card');
+    const request = (summary: string) => page.locator('.approval-card', { hasText: summary });
+    const install = request('Install the Stripe SDK');
+    const fixtures = request('Add signed sample payloads');
+    await check('the npm install request shows the command, cwd, reason, warning, package.json diff and time left', async () => {
+      await waitForCount(page.locator('.approval-card'), 2);
+      const command = (await install.locator('.approval-command').textContent()) ?? '';
+      if (command !== 'npm install stripe@^18.2.0') throw new Error(`the command reads ${command}`);
+      const text = (await install.textContent()) ?? '';
+      const parts = [
+        /\/Users\/demo\/\.agflow\/work\/T-8-a\d+/,
+        'The signature check uses stripe.webhooks.constructEvent',
+        'Approving runs this command outside the sandbox, with network access and write access to all your files',
+        'T-8',
+        'R-1',
+      ];
+      const missing = parts.filter((part) => (typeof part === 'string' ? !text.includes(part) : !part.test(text)));
+      if (missing.length > 0) throw new Error(`it lacks ${missing.join(', ')}`);
+      await install.locator('.diff-add', { hasText: '"stripe": "^18.2.0"' }).first().waitFor();
+      await install.locator('.diff-same', { hasText: 'package.json' }).first().waitFor();
+      const left = (await install.locator('.approval-left').textContent()) ?? '';
+      if (!/^\d+ (min|h)/.test(left) || !left.endsWith('left')) throw new Error(`the time left reads ${left}`);
+    });
+    /** The signed-in person's approvals in one status, as the hub recorded them. */
+    const recorded = (status: string) =>
+      page.evaluate<{ summary: string; decidedBy: string | null }[]>(
+        `fetch('/api/approvals?status=${status}').then((response) => response.json()).then(({ approvals }) => approvals)`,
+      );
+    const holds = (list: { summary: string }[], summary: string) => list.some((entry) => entry.summary.includes(summary));
+    await check('the file change shows its grant-root warning; declining it records a decline, and the badge shows 1', async () => {
+      const warnings = (await fixtures.locator('.approval-warnings').textContent()) ?? '';
+      if (!warnings.includes('write anywhere under this root') || !warnings.includes('/Users/demo/code/acme-fixtures')) {
+        throw new Error(`the warnings: ${warnings}`);
+      }
+      // Decline is the default action.
+      await fixtures.locator('button.primary:text-is("Decline")').click();
+      await waitForCount(page.locator('.approval-card'), 1);
+      await approvalsBadge.filter({ hasText: /^1$/ }).waitFor();
+      const declined = await recorded('declined');
+      const entry = declined.find((approval) => approval.summary.includes('Add signed sample payloads'));
+      if (entry?.decidedBy !== 'user:demo') throw new Error(`the hub records ${JSON.stringify(declined)}`);
+    });
+    // Every decision the page sends, to prove that a click sent none.
+    const decisions: string[] = [];
+    page.on('request', (sent) => {
+      if (sent.method() === 'POST' && sent.url().includes('/api/approvals/')) decisions.push(sent.url());
+    });
+    await check('a double-click on Approve… does not approve the command', async () => {
+      await install.locator('button:text-is("Approve…")').dblclick();
+      await install.locator('button:text-is("Approve and let it run")').waitFor();
+      if (decisions.length > 0) throw new Error(`the page sent ${decisions.join(', ')}`);
+      if (!holds(await recorded('pending'), 'Install the Stripe SDK')) throw new Error('the hub no longer has it pending');
+      await install.locator('button:text-is("Keep")').click();
+    });
+    await check('approving the command needs a second click; then the hub records it, and the badge is gone', async () => {
+      await install.locator('button:text-is("Approve…")').click();
+      await install.locator('button:text-is("Approve and let it run")').waitFor();
+      if (decisions.length > 0) throw new Error(`one click sent ${decisions.join(', ')}`);
+      if (!holds(await recorded('pending'), 'Install the Stripe SDK')) throw new Error('one click approved it');
+      await install.locator('button:text-is("Approve and let it run")').click();
+      await page.locator('.empty-title', { hasText: 'No approvals waiting' }).waitFor();
+      await approvalsBadge.waitFor({ state: 'detached' });
+      if (!holds(await recorded('approved'), 'Install the Stripe SDK')) throw new Error('the hub has not recorded the approval');
+      if (holds(await recorded('declined'), 'Install the Stripe SDK')) throw new Error('the hub recorded a decline');
+    });
+    await shot(page, 'approvals');
 
     await open(page, '#/timeline', '.log');
     await check('live events arrive without reloading', () => page.locator('.log-row.fresh').first().waitFor({ timeout: 12_000 }));
