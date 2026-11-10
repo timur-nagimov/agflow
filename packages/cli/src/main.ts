@@ -6,6 +6,7 @@ import { type Io, stdio } from './io';
 import { joinCommand, leaveCommand } from './join';
 import { loginCommand, logoutCommand, statusCommand } from './login';
 import { mcpCommand } from './mcp/server';
+import { RUNNER_HELP, runnerCommand } from './runner-command';
 
 export const HELP = `agflow ${AGFLOW_VERSION}
 
@@ -17,6 +18,8 @@ Usage:
                                 Connect Claude Code and/or Codex chats in this repository
   agflow leave                  Undo agflow join in this repository
 
+Runners:
+${RUNNER_HELP}
 Run by Claude Code and Codex, not by people:
   agflow mcp --vendor claude|codex
   agflow mcp --vendor claude|codex --runner
@@ -34,6 +37,7 @@ const commands: Record<string, Command> = {
   leave: leaveCommand,
   hook: hookCommand,
   mcp: mcpCommand,
+  runner: runnerCommand,
 };
 
 export async function main(argv: string[], io: Io = stdio): Promise<number> {
