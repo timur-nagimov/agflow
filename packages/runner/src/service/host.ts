@@ -1,6 +1,7 @@
 // The process that runs a runner (design 7.1, X-41): `agflow runner start` in the foreground and `--service` under
 // launchd. One lock holder, one run record, and one exit path for every end: a refusal that needs a person, the hub
 // replacing the link, a stop, or an error.
+import type { Credentials } from '@agflow/core';
 import { createAdapters } from '../adapters';
 import type { AgflowCommand, VendorAdapter } from '../adapters/types';
 import { AttemptStore } from '../attempt-store';
@@ -26,6 +27,7 @@ import { readCliCredentials } from './credentials';
 import { AlreadyRunningError, acquireRunnerLock, type RunnerLock, type RunnerMode } from './lock';
 import { RotatingLog } from './log';
 import { machineMismatch, readMachineId } from './machine';
+import { NeedsLogin } from './needs-login';
 import { createMacNotifier } from './notify';
 import { ServiceRuns } from './runs';
 import { suspendRunner } from './suspend';
@@ -89,6 +91,8 @@ export interface RunnerService {
   readonly mode: RunnerMode;
   /** The running runner; null when the service ended before it started. */
   readonly runner: RunnerHandle | null;
+  /** Login hold and its reason, including the service's initial wait for credentials. */
+  readonly needsLogin: NeedsLogin | null;
   /** Resolves after teardown, once runner.lock, released last, is free. */
   readonly exited: Promise<ServiceExit>;
   /** Suspends agents within timings.suspend, then exits cleanly; concurrent shutdowns get the same exit. */
@@ -160,6 +164,8 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   let health: ServiceHealth | null = null;
   let keepAwake: KeepAwake | null = null;
   let notifier: Notifier | null = null;
+  let needsLogin: NeedsLogin | null = null;
+  let loginReason = 'the hub refused the CLI token';
   let preparer: DependencyPreparer | null = null;
   let sandbox: PrepSandbox | null = null;
   let heartbeatMs: number | null = null;
@@ -228,7 +234,11 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
         // A suspend bounds the step under way, such as a repack, by its deadline (launchd's ExitTimeOut follows).
         return agents === 'suspend' ? within(retention, deadline - performance.now()) : retention;
       });
-      await step(() => control?.stop());
+      await step(async () => {
+        // With no runner yet, teardown can outrun the control request that cancelled the credential wait.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        control?.stop();
+      });
       await step(() => db?.close());
       await step(() => {
         if (runs !== null && runId !== null) runs.finish(runId, exit);
@@ -245,6 +255,9 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     mode,
     get runner() {
       return runner;
+    },
+    get needsLogin() {
+      return needsLogin;
     },
     exited: exited.promise,
     suspend: (reason) => finish({ code: 0, clean: true, reason }, 'info', runner !== null ? 'suspend' : 'stop'),
@@ -286,7 +299,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
         mode,
         startedAt: lock?.owner.startedAt ?? null,
         runnerId: status?.runnerId ?? null,
-        link: status?.link ?? 'idle',
+        link: status?.link ?? (needsLogin?.state().on ? 'needs_login' : 'idle'),
       };
     },
   };
@@ -294,13 +307,29 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   const events: RunnerEvents = {
     link: (state, detail) => {
       logger?.info('runner link', { state, code: detail.code, reason: detail.reason });
+      if (state === 'needs_login') loginReason = detail.reason;
     },
     gap: (gap) => health?.gap(gap),
     welcome: (welcome) => {
       heartbeatMs = welcome.timings.heartbeatMs;
+      needsLogin?.leave();
     },
+    needsLogin: () => needsLogin?.enter(loginReason),
     attemptState: () => keepAwake?.evaluate(),
   };
+
+  // A credentials.json the service cannot read, or catches half-written by agflow login, is waited out like a missing
+  // one, as M2b's link does; the foreground refuses, so a person repairs it without it counting as a crash.
+  function readCredentials(): { credentials: Credentials | null; problem: string | null } {
+    try {
+      return { credentials: readCliCredentials(configDir), problem: null };
+    } catch (error) {
+      if (mode === 'foreground') throw new Refusal(describe(error));
+      logger?.warn('cannot read the CLI credentials', { error: describe(error) });
+      // needs_login adds the sign-in command with the hub's URL.
+      return { credentials: null, problem: describe(error).replace(/; run agflow login$/, '') };
+    }
+  }
 
   // Each await may meet a stop: startup then ends early, and finish releases what it made.
   async function start(): Promise<void> {
@@ -328,10 +357,14 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     if (mismatch !== null) throw new Refusal(mismatch);
     if (ending) return;
     control = startControlServer({ paths, lock, routes });
-    if (readCliCredentials(configDir) === null) throw new Refusal('not signed in; run agflow login --hub <url>');
+    const read = readCredentials();
+    let credentials = read.credentials;
+    if (credentials === null && mode === 'foreground') {
+      throw new Refusal('not signed in; run agflow login --hub <url>');
+    }
     db = openRunnerDb(paths.db);
     store = new AttemptStore(db);
-    const adapters = options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow });
+    let hubUrl = credentials?.hubUrl ?? db.meta('project')?.hubUrl ?? null;
     health = createServiceHealth({
       paths,
       config: () => config,
@@ -363,6 +396,34 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       logger,
       platform: options.platform,
     });
+    needsLogin = new NeedsLogin({
+      health,
+      notifier,
+      logger,
+      runner: () => runner,
+      hubUrl: () => hubUrl,
+      now: () => clock.now(),
+    });
+    if (credentials === null) {
+      needsLogin.enter(read.problem ?? 'not signed in');
+      while (!ending && credentials === null) {
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            clock.clearTimeout(timer);
+            waiting.signal.removeEventListener('abort', done);
+            resolve();
+          };
+          const timer = clock.setTimeout(done, config.timings.loginProbe);
+          waiting.signal.addEventListener('abort', done, { once: true });
+          if (waiting.signal.aborted) done();
+        });
+        if (ending) return;
+        credentials = readCredentials().credentials;
+      }
+      if (ending) return;
+      hubUrl = credentials!.hubUrl;
+    }
+    const adapters = options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow });
     sandbox =
       options.prepSandbox ?? new PrepSandbox({ allowedDomains: standardProfile.network.allowedDomains, logger });
     preparer = await createDependencyPreparer({ paths, store, config: () => config, logger, sandbox });

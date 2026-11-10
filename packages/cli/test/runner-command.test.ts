@@ -89,6 +89,7 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
         paths: runnerPaths(),
         mode: options.mode,
         runner: null,
+        needsLogin: null,
         exited: Promise.resolve(exit),
         suspend: async () => exit,
         stop: async () => exit,

@@ -129,6 +129,17 @@ describe('startRunnerService', () => {
     expect(existsSync(s.paths.socket)).toBe(false);
   });
 
+  test('an unreadable credentials.json is a clean refusal in foreground', async () => {
+    const s = await setupTestService({ noCredentials: true });
+    writeFileSync(join(s.configDir, CREDENTIALS_FILE), '{');
+    const service = await s.start();
+    const exit = await service.exited;
+    expect(exit).toMatchObject({ code: 1, clean: true });
+    expect(exit.reason).toContain('is not valid JSON; run agflow login');
+    expect(lastExit(s.paths)).toMatchObject(exit);
+    expect(existsSync(s.paths.socket)).toBe(false);
+  });
+
   for (const mode of ['foreground', 'service'] as const) {
     test(`a machine mismatch is a clean refusal in ${mode}`, async () => {
       const s = await startTestService({ mode, config: { machineId: 'OTHER' } });
