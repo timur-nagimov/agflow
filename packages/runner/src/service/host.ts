@@ -28,6 +28,7 @@ import { RotatingLog } from './log';
 import { machineMismatch, readMachineId } from './machine';
 import { createMacNotifier } from './notify';
 import { ServiceRuns } from './runs';
+import { suspendRunner } from './suspend';
 import { defaultExec, type Exec } from './system';
 
 /** How the service ended: the process exit code, whether the run counts as clean (task 19's guard), and why. */
@@ -56,8 +57,8 @@ export interface RunnerServiceOptions {
   /** The foreground's terminal, and where lines go before the log exists; stderr by default. */
   terminal?: (line: string) => void;
   /**
-   * The CLI owns its process: SIGTERM and SIGINT stop the service, and an uncaught error ends it unclean. Off for a
-   * host embedded in another process, such as a test.
+   * The CLI owns its process: SIGTERM and SIGINT suspend the service, as SIGHUP does in the foreground, and an uncaught
+   * error ends it unclean. Off for a host embedded in another process, such as a test.
    */
   signals?: boolean;
   lockPollMs?: number;
@@ -90,10 +91,9 @@ export interface RunnerService {
   readonly runner: RunnerHandle | null;
   /** Resolves after teardown, once runner.lock, released last, is free. */
   readonly exited: Promise<ServiceExit>;
-  /**
-   * Stops the agents with no handoff within timings.suspend, then exits cleanly, as SIGTERM and SIGINT do; a second
-   * call gets the same exit.
-   */
+  /** Suspends agents within timings.suspend, then exits cleanly; concurrent shutdowns get the same exit. */
+  suspend(reason: string): Promise<ServiceExit>;
+  /** Stops the agents with no handoff within timings.suspend, then exits cleanly; a second call gets the same exit. */
   stop(reason: string): Promise<ServiceExit>;
 }
 
@@ -101,10 +101,10 @@ export interface RunnerService {
 class Refusal extends Error {}
 
 /**
- * How teardown ends the agents: a stop without a handoff (a link that ended for good, a refusal, a stop, a signal), or
- * only the kill after an uncaught error.
+ * How teardown ends the agents: a suspend (SIGTERM, SIGINT, POST /suspend), a stop without a handoff (a link that
+ * ended for good, a refusal, a stop), or only the kill after an uncaught error.
  */
-type AgentsEnd = 'stop' | 'kill';
+type AgentsEnd = 'suspend' | 'stop' | 'kill';
 
 /** Waits for work up to ms; past that, teardown goes on and the work finishes unobserved. */
 async function within(work: Promise<unknown>, ms: number): Promise<void> {
@@ -200,7 +200,13 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
         retentionTimer = null;
       });
       const active = runner;
-      if (agents === 'stop' && active !== null) {
+      if (agents === 'suspend' && active !== null && logger !== null) {
+        const result = await suspendRunner(active, {
+          deadlineMs: Math.max(0, deadline - performance.now()),
+          logger,
+        });
+        logger.info('runner suspend finished', { ...result });
+      } else if (agents === 'stop' && active !== null) {
         // runner.close leaves agents running, and under launchd nothing restarts this runner after a link end or a
         // refusal to recover them (X-41). The hub resends commands held meanwhile after a later welcome.
         await step(async () => {
@@ -217,7 +223,11 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       await step(() => runner?.close());
       await step(() => health?.close());
       await step(() => keepAwake?.close());
-      await step(() => retention);
+      await step(() => {
+        if (retention === null) return;
+        // A suspend bounds the step under way, such as a repack, by its deadline (launchd's ExitTimeOut follows).
+        return agents === 'suspend' ? within(retention, deadline - performance.now()) : retention;
+      });
       await step(() => control?.stop());
       await step(() => db?.close());
       await step(() => {
@@ -237,29 +247,38 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       return runner;
     },
     exited: exited.promise,
+    suspend: (reason) => finish({ code: 0, clean: true, reason }, 'info', runner !== null ? 'suspend' : 'stop'),
     stop: (reason) => finish({ code: 0, clean: true, reason }, 'info'),
   };
 
-  const onTerm = () => void service.stop('received SIGTERM');
-  const onInt = () => void service.stop('received SIGINT');
+  const onTerm = () => void service.suspend('received SIGTERM');
+  const onInt = () => void service.suspend('received SIGINT');
+  // A closed terminal tab hangs up a foreground runner; its agents run in their own sessions and never see it.
+  const onHup = () => void service.suspend('received SIGHUP');
+  const hangup = options.signals === true && mode === 'foreground';
   // The runner's state is unknown after an uncaught error: its agents are killed, not stopped.
   const onError = (error: unknown) => void finish(failure(error), 'error', 'kill');
   function removeHandlers() {
     if (!options.signals) return;
     process.off('SIGTERM', onTerm);
     process.off('SIGINT', onInt);
+    if (hangup) process.off('SIGHUP', onHup);
     process.off('uncaughtException', onError);
     process.off('unhandledRejection', onError);
   }
   if (options.signals) {
     process.on('SIGTERM', onTerm);
     process.on('SIGINT', onInt);
+    if (hangup) process.on('SIGHUP', onHup);
     process.on('uncaughtException', onError);
     process.on('unhandledRejection', onError);
   }
 
   // The control socket's routes; the commands of later tasks add theirs here.
   const routes: ControlRoutes = {
+    'POST /suspend': () => {
+      void service.suspend('suspend requested');
+    },
     'GET /health': () => {
       const status = runner?.status();
       return {
@@ -318,6 +337,8 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       config: () => config,
       heartbeatMs: () => heartbeatMs ?? config.timings.heartbeat,
       stopAgents: (cause, options) => {
+        // health.close stops its timer; status/heartbeat reads and an in-flight sample can still evaluate guards.
+        if (ending) return Promise.resolve([]);
         if (runner === null) throw new Error('the runner is not running yet');
         return runner.stopAgents(cause, options);
       },

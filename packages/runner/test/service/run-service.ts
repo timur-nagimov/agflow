@@ -1,6 +1,7 @@
-// A child-process service for tests (host.test.ts, and task 17's suspend): the fake adapters on the AGFLOW_HOME and
-// AGFLOW_CONFIG_DIR its parent prepared, with the process handlers on. It prints 'online' once the hub has it, and
-// AGFLOW_TEST_FAILURE=exception|rejection then throws, so the parent can check the unclean exit.
+// A child-process service for host.test.ts (the CLI's signal tests use packages/cli/test/run-runner-start.ts): the
+// fake adapters on the AGFLOW_HOME and AGFLOW_CONFIG_DIR its parent prepared, with the process handlers on. It prints
+// 'online' once the hub has it, and AGFLOW_TEST_FAILURE=exception|rejection then throws, so the parent can check the
+// unclean exit.
 import { loadRunnerConfig } from '../../src/config';
 import { runnerPaths } from '../../src/paths';
 import { startRunnerService } from '../../src/service/host';

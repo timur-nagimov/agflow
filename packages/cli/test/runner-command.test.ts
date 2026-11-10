@@ -1,13 +1,19 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { getAttempt } from '@agflow/hub/src/attempt-store';
 import { findRunnerByKey } from '@agflow/hub/src/runners';
+import { createTasks } from '@agflow/hub/src/tasks';
+import { newTask } from '@agflow/hub/test/helpers';
+import { openRunnerDb } from '@agflow/runner/src/db';
+import { Outbox } from '@agflow/runner/src/outbox';
 import { runnerPaths } from '@agflow/runner/src/paths';
 import type { RunnerServiceOptions } from '@agflow/runner/src/service/host';
 import { readLockOwner } from '@agflow/runner/src/service/lock';
 import { readMachineId } from '@agflow/runner/src/service/machine';
 import { ServiceRuns } from '@agflow/runner/src/service/runs';
 import { waitFor } from '@agflow/runner/test/fixture';
+import { startRunnerAttempt } from '@agflow/runner/test/hub-fixture';
 import { afterThisTest, cleanupRunnerSetups, tempDir } from '@agflow/runner/test/runner-setup';
 import { setupTestService } from '@agflow/runner/test/service-helpers';
 import { parseArgs } from '../src/args';
@@ -84,6 +90,7 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
         mode: options.mode,
         runner: null,
         exited: Promise.resolve(exit),
+        suspend: async () => exit,
         stop: async () => exit,
       }));
       const argv = ['runner', 'start', ...(mode === 'service' ? ['--service'] : [])];
@@ -134,4 +141,67 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
     expect(await stderr).toContain('received SIGTERM');
     expect(readFileSync(s.paths.runnerLog, 'utf8')).toContain('received SIGTERM');
   }, 30_000);
+
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+    for (const mode of ['foreground', 'service'] as const) {
+      // Only a foreground runner has a terminal to close.
+      if (signal === 'SIGHUP' && mode === 'service') continue;
+      test(`start suspends a running attempt on ${signal} in ${mode} and exits 0 with a clean run`, async () => {
+        const s = await setupTestService();
+        const flags = mode === 'service' ? ['--service'] : [];
+        const child = Bun.spawn([process.execPath, join(import.meta.dir, 'run-runner-start.ts'), ...flags], {
+          env: { ...process.env, AGFLOW_HOME: s.paths.home, AGFLOW_CONFIG_DIR: s.configDir },
+          stdin: 'ignore',
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        afterThisTest(async () => {
+          if (child.exitCode === null) child.kill('SIGKILL');
+          await child.exited;
+        });
+        const stdout = new Response(child.stdout).text();
+        const stderr = new Response(child.stderr).text();
+        const row = await waitFor(() => {
+          if (child.exitCode !== null) throw new Error(`runner exited before hello (code ${child.exitCode})`);
+          const row = findRunnerByKey(s.hub.ctx, s.config.runnerKey);
+          return row?.state === 'online' ? row : null;
+        });
+        const [task] = createTasks(s.hub.ctx, [newTask()], 'user:alice');
+        const { attempt } = startRunnerAttempt(s.hub.ctx, {
+          runnerId: row.id,
+          taskId: task!.id,
+          role: 'worker',
+          vendor: 'codex',
+        });
+        await waitFor(() => getAttempt(s.hub.ctx, attempt.id).status === 'running');
+        child.kill(signal);
+        expect(await child.exited).toBe(0);
+        const db = openRunnerDb(s.paths.db);
+        const exits = (() => {
+          try {
+            return new Outbox(db).eventsAfter(0).filter((event) => event.type === 'attempt.exited');
+          } finally {
+            db.close();
+          }
+        })();
+        expect(exits).toEqual([
+          expect.objectContaining({
+            attemptId: attempt.id,
+            data: expect.objectContaining({ cause: 'suspend', handoffWritten: false }),
+          }),
+        ]);
+        expect(new ServiceRuns(s.paths).lastExit({ running: false })).toMatchObject({
+          code: 0,
+          clean: true,
+          reason: `received ${signal}`,
+        });
+        expect(readLockOwner(s.paths)).toBeNull();
+        expect(existsSync(s.paths.socket)).toBe(false);
+        const log = readFileSync(s.paths.runnerLog, 'utf8');
+        expect(log.indexOf('runner suspend finished')).toBeLessThan(log.indexOf(`info received ${signal}`));
+        expect(await stdout).toBe('');
+        await stderr;
+      }, 60_000);
+    }
+  }
 });

@@ -125,6 +125,15 @@ export function fakeServiceAdapters() {
   );
 }
 
+/** A fake Codex agent whose turn sleeps for two minutes: an attempt that runs until something stops it. */
+export function sleepingServiceAdapter() {
+  return new FakeAdapter({
+    vendor: 'codex',
+    skipAuthChecks: true,
+    script: { turns: [[{ do: 'sleep', ms: 120_000 }]] },
+  });
+}
+
 /** Each service gets a fresh manager: sandbox initialization is cached by manager identity. */
 export function fakePrepSandbox(overrides: Partial<SandboxBackend> = {}): PrepSandbox {
   return new PrepSandbox({
