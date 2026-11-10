@@ -66,6 +66,7 @@ describe('agflow runner', () => {
     const { io, out, err } = capture();
     expect(await main(['help'], io)).toBe(0);
     expect(RUNNER_HELP).toContain('agflow runner start [--service]');
+    expect(RUNNER_HELP).toContain('agflow runner setup [--yes] [--relogin] [--no-service]');
     expect(RUNNER_HELP).toContain('agflow runner drain');
     expect(RUNNER_HELP).toContain('agflow runner undrain');
     expect(RUNNER_HELP).toContain('agflow runner install');
@@ -86,6 +87,13 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
     ]);
     expect({ code, stderr }).toEqual({ code: 0, stderr: '' });
     expect(JSON.parse(stdout)).toEqual([]);
+  });
+
+  test('setup rejects extra positional arguments', async () => {
+    const { io, out, err } = capture();
+    expect(await main(['runner', 'setup', 'extra'], io)).toBe(2);
+    expect(err.join('')).toContain('usage: agflow runner setup [--yes] [--relogin] [--no-service]');
+    expect(out).toEqual([]);
   });
 
   test('start rejects extra positional arguments', async () => {

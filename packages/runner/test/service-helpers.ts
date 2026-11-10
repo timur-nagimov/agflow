@@ -43,20 +43,22 @@ export interface TestServiceOptions {
   host?: Partial<RunnerServiceOptions>;
 }
 
+/** The in-process hub over a local bare origin, both removed after the test; packages without testkit use it too. */
+export async function startOriginHub(): Promise<TestHub> {
+  const origin = await originRepo({ 'README.md': '# demo\n', 'src/app.ts': 'app\n' });
+  afterThisTest(() => origin.remove());
+  const hub = startTestHub({ config: { projectName: 'demo', projectRepo: origin.path } });
+  afterThisTest(() => hub.stop());
+  return hub;
+}
+
 /**
  * A short AGFLOW_HOME (runner.sock must fit in 104 bytes) with a test runner.json, and a CLI config directory signed in
  * to the hub: the same files for an in-process host (start) and for run-service.ts in a child. Everything is removed
  * after the test.
  */
 export async function setupTestService(options: TestServiceOptions = {}) {
-  let hub = options.hub;
-  if (!hub) {
-    const origin = await originRepo({ 'README.md': '# demo\n', 'src/app.ts': 'app\n' });
-    afterThisTest(() => origin.remove());
-    hub = startTestHub({ config: { projectName: 'demo', projectRepo: origin.path } });
-    const ownedHub = hub;
-    afterThisTest(() => ownedHub.stop());
-  }
+  const hub = options.hub ?? (await startOriginHub());
   const home = mkdtempSync('/tmp/agf-');
   afterThisTest(() => rmSync(home, { recursive: true, force: true }));
   const paths = runnerPaths(home);

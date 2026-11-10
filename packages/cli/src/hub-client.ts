@@ -4,6 +4,7 @@ import {
   BRIDGE_VERSION,
   type RunnerSubmitInputSchema,
   type StaffingInputSchema,
+  WhoamiResponseSchema,
 } from '@agflow/core';
 import type {
   Agent,
@@ -146,6 +147,11 @@ export class HubClient {
   }
   pollCliLogin(code: string) {
     return this.request<CliLoginPoll>('GET', `/api/cli-login/poll?code=${q(code)}`);
+  }
+
+  // Runner
+  async runnerWhoami() {
+    return WhoamiResponseSchema.parse(await this.request('GET', '/api/runner/whoami'));
   }
 
   // Live sessions (hooks)

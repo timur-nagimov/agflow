@@ -11,10 +11,13 @@ import { type ParsedArgs, UsageError } from './args';
 import type { Io } from './io';
 import type { Command } from './main';
 import { configDir } from './paths';
+import type { RunnerSetupDeps } from './runner-setup';
 import { selfCommand } from './self';
 
 /** The runner subcommands' lines in main.ts's HELP; each subcommand adds its own. */
-export const RUNNER_HELP = `  agflow runner start [--service]
+export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-service]
+                                Set up this laptop's runner: sign-in, runner.json, binaries, logins and the service
+  agflow runner start [--service]
                                 Run this laptop's runner in the foreground (--service for launchd)
   agflow runner drain            Stop accepting new attempts
   agflow runner undrain          Accept new attempts and clear the crash-loop guard
@@ -26,6 +29,7 @@ export async function runnerCommand(
   args: ParsedArgs,
   io: Io,
   deps: {
+    setup?: Partial<RunnerSetupDeps>;
     startRunnerService?: typeof startRunnerService;
     installService?: typeof installService;
     env?: Record<string, string | undefined>;
@@ -50,6 +54,13 @@ export async function runnerCommand(
       return 0;
     };
   const commands: Record<string, Command> = {
+    setup: async (args, io) => {
+      if (args.positional.length > 2) {
+        throw new UsageError('usage: agflow runner setup [--yes] [--relogin] [--no-service]');
+      }
+      const { runnerSetup } = await import('./runner-setup');
+      return runnerSetup(args, io, deps.setup);
+    },
     // The host logs and prints every reason; the exit code is the ServiceExit's.
     start: async (args, io) => {
       if (args.positional.length > 2) throw new UsageError('usage: agflow runner start [--service]');
