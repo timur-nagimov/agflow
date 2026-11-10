@@ -2,8 +2,16 @@
 // process group, find what still runs in a directory, wait for a process to go. The ps and lsof readers are M2b's
 // (X-42); only this file follows their names, and it adds the tree walk, the signals and the waits.
 import { realpathSync } from 'node:fs';
+import { constants } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
-import { findCloneProcesses, listProcesses as psRows, type PsRow } from '@agflow/runner/src/processes';
+import {
+  findCloneProcesses,
+  PS_COLUMNS,
+  PS_ENV,
+  parsePs,
+  listProcesses as psRows,
+  type PsRow,
+} from '@agflow/runner/src/processes';
 
 /** One process as ps shows it: pid, ppid, pgid, stat (T when stopped, Z for a zombie), lstart and command. */
 export type ProcessInfo = PsRow;
@@ -145,3 +153,56 @@ export async function waitUntilGone(pid: number, options: WaitOptions = {}): Pro
     await Bun.sleep(options.intervalMs ?? 50);
   }
 }
+
+// --- Tracked processes ----------------------------------------------------------------------------------------------
+
+/** The hub and runner processes the harness started that still run. */
+const tracked = new Set<Bun.Subprocess>();
+let hooked = false;
+
+/**
+ * Tracks a hub or runner process until it exits. If the test process ends first (afterAll never ran: Ctrl-C, SIGTERM
+ * or SIGHUP, a crash, a timed-out hook), an exit hook kills it and everything under it, frozen trees included: spawned
+ * processes outlive bun, and a SIGSTOPped tree would stay stopped for good.
+ */
+export function trackProcess(proc: Bun.Subprocess): void {
+  tracked.add(proc);
+  void proc.exited.then(() => tracked.delete(proc));
+  if (hooked) return;
+  hooked = true;
+  process.on('exit', killTracked);
+  for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.once(name, () => {
+      killTracked();
+      process.exit(128 + constants.signals[name]);
+    });
+  }
+}
+
+/**
+ * Synchronously, as an exit hook must: from one ps snapshot, SIGCONT and SIGKILL every descendant of a tracked
+ * process, then SIGKILL the tracked process itself.
+ */
+function killTracked(): void {
+  const live = [...tracked].filter((proc) => proc.exitCode === null && proc.signalCode === null);
+  if (live.length === 0) return;
+  const ps = Bun.spawnSync(['ps', '-A', '-o', PS_COLUMNS], { env: { ...process.env, ...PS_ENV } });
+  const rows = parsePs(ps.stdout.toString());
+  for (const proc of live) {
+    for (const row of descendantsIn(rows, proc.pid)) {
+      quietly(row.pid, 'SIGCONT');
+      quietly(row.pid, 'SIGKILL');
+    }
+    quietly(proc.pid, 'SIGCONT');
+    quietly(proc.pid, 'SIGKILL');
+  }
+}
+
+function quietly(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // Gone already, or never ours.
+  }
+}
+

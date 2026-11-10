@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   descendantsOf,
@@ -221,3 +221,51 @@ describe('waitUntilGone', () => {
     expect(await isAlive(long.pid)).toBe(true);
   });
 });
+
+describe('trackProcess', () => {
+  const PROC = join(import.meta.dir, '../src/harness/proc.ts');
+
+  /**
+   * A bun process that tracks a frozen tree, as a cluster tracks a frozen runner, writes the pids it froze, and then
+   * ends as `how` says, without any afterAll.
+   */
+  async function endTracking(how: 'exit' | 'SIGTERM'): Promise<number[]> {
+    const dir = tmpDir('agflow-track-');
+    const script = join(dir, 'track.ts');
+    const end = how === 'exit' ? 'process.exit(0);' : "process.kill(process.pid, 'SIGTERM'); await Bun.sleep(60_000);";
+    writeFileSync(
+      script,
+      [
+        `import { freezeTree, trackProcess } from ${JSON.stringify(PROC)};`,
+        "const root = Bun.spawn(['sh', '-c', 'sleep 41 & sleep 42 & wait'], { stdin: 'ignore' });",
+        'trackProcess(root);',
+        'await Bun.sleep(300);',
+        'const frozen = await freezeTree(root.pid);',
+        `await Bun.write(${JSON.stringify(join(dir, 'frozen'))}, frozen.join(' ') + '\\n');`,
+        end,
+      ].join('\n'),
+    );
+    const tracker = Bun.spawn([process.execPath, script], { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' });
+    const code = await tracker.exited;
+    const frozen = readFileSync(join(dir, 'frozen'), 'utf8').trim().split(' ').map(Number);
+    for (const pid of frozen) pids.add(pid);
+    expect({ code, stderr: await new Response(tracker.stderr).text() }).toEqual({
+      code: how === 'exit' ? 0 : 143,
+      stderr: '',
+    });
+    return frozen;
+  }
+
+  test('a tracked tree, frozen, is killed when the process exits without closing it', async () => {
+    const frozen = await endTracking('exit');
+    expect(frozen.length).toBe(3);
+    for (const pid of frozen) await waitUntilGone(pid, { timeoutMs: 5_000 });
+  });
+
+  test('a tracked tree, frozen, is killed when SIGTERM ends the process, which exits 128 + 15', async () => {
+    const frozen = await endTracking('SIGTERM');
+    expect(frozen.length).toBe(3);
+    for (const pid of frozen) await waitUntilGone(pid, { timeoutMs: 5_000 });
+  });
+});
+

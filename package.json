@@ -23,7 +23,8 @@
     "check:claude-sandbox": "AGFLOW_SMOKE=1 AGFLOW_SANDBOX_CHECKS=1 bun test packages/runner/test/claude-sandbox",
     "gen:codex-protocol": "bun packages/runner/scripts/gen-codex-protocol.ts",
     "smoke:codex": "AGFLOW_SMOKE=1 bun test packages/runner/test/codex",
-    "check:codex-sandbox": "AGFLOW_SMOKE=1 AGFLOW_SANDBOX_CHECKS=1 bun test packages/runner/test/codex/real/sandbox.test.ts"
+    "check:codex-sandbox": "AGFLOW_SMOKE=1 AGFLOW_SANDBOX_CHECKS=1 bun test packages/runner/test/codex/real/sandbox.test.ts",
+    "e2e": "AGFLOW_E2E=1 caffeinate -i bun test --timeout 600000 packages/testkit/e2e"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",

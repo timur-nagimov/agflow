@@ -29,7 +29,15 @@ import { VENDOR_PINS, vendorBinary } from '@agflow/runner/src/vendor/pins';
 import { linkClaudeBinary } from '../anthropic/binary';
 import { E2E_PLATFORM } from './env';
 import type { Models } from './models';
-import { descendantsOf, freezeTree, processesInDir, signalGroup, thawTree, waitUntilGone } from './proc';
+import {
+  descendantsOf,
+  freezeTree,
+  processesInDir,
+  signalGroup,
+  thawTree,
+  trackProcess,
+  waitUntilGone,
+} from './proc';
 
 const CLI_MAIN = join(import.meta.dir, '../../../cli/src/main.ts');
 
@@ -365,6 +373,7 @@ function createRunnerProcess(home: RunnerHome): RunnerProcess {
     }
     proc = started;
     frozen = false;
+    trackProcess(started);
     try {
       await untilStarted(started, options.online !== false, timeoutMs);
     } catch (error) {

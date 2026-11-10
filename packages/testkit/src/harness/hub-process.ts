@@ -5,6 +5,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { join } from 'node:path';
 import type { BackupKind } from '../../../hub/src/backup';
 import type { HubConfig } from '../../../hub/src/context';
+import { trackProcess } from './proc';
 
 const HUB_SRC = join(import.meta.dir, '../../../hub/src');
 const MAIN = join(HUB_SRC, 'main.ts');
@@ -197,6 +198,7 @@ function createHubProcess(options: HubProcessOptions, port: number): HubProcess 
     log(`--- harness: starting the hub at ${new Date().toISOString()}`);
     const started = spawn([MAIN], env);
     proc = started;
+    trackProcess(started);
     const deadline = Date.now() + startTimeoutMs;
     while (!(await answers())) {
       if (started.exitCode !== null || started.signalCode !== null) {
