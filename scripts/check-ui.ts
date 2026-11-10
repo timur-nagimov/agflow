@@ -105,8 +105,13 @@ async function main(): Promise<void> {
   current = page;
   const consoleErrors: string[] = [];
   page.on('console', (message) => {
-    // 400 and 401 answers are expected: a bad commit SHA, and /api/me before sign-in.
-    if (message.type() === 'error' && !/status of 40[01]/.test(message.text())) consoleErrors.push(message.text());
+    // 400 and 401 answers are expected: a bad commit SHA and /api/me before sign-in. The only 409 allowed is the faked
+    // take-over refusal; any other one is a page error.
+    const fakedRefusal =
+      /status of 409/.test(message.text()) && new URL(message.location().url, base).pathname === '/api/tasks/T-8/takeover';
+    if (message.type() === 'error' && !/status of 40[01]/.test(message.text()) && !fakedRefusal) {
+      consoleErrors.push(message.text());
+    }
   });
 
   try {
@@ -361,8 +366,8 @@ async function main(): Promise<void> {
     /** A task as the hub has it, through the page's signed-in session. */
     const taskDetail = (id: string) =>
       page.evaluate<{
-        task: { workRef: string | null; workSha: string | null };
-        attempts: { id: string; wipSha: string | null }[];
+        task: { status: string; blockedKind: string | null; workRef: string | null; workSha: string | null };
+        attempts: { id: string; wipSha: string | null; takeover: { ref: string } | null }[];
         submissions: { id: string; headSha: string | null }[];
       }>(`fetch('/api/tasks/${id}').then((response) => response.json())`);
     /** The Attempts table's row of an attempt, by its short name. */
@@ -645,6 +650,127 @@ async function main(): Promise<void> {
       if (holds(await recorded('declined'), 'Install the Stripe SDK')) throw new Error('the hub recorded a decline');
     });
     await shot(page, 'approvals');
+
+    // The take-over runs after the approvals checks: its stop voids the approvals still pending.
+    await open(page, '#/task/T-8', '.task-head');
+    const runnerPanel = page.locator('.actions-card .runner-actions-panel');
+    const takeoverCard = page.locator('.takeover-card');
+    // The demo's runner never refuses a take-over, so the page gets the hub's 409 from a fake answer instead.
+    const takeoverRoute = (url: URL) => url.pathname === '/api/tasks/T-8/takeover';
+    await check("view test (fake api): a refused take-over shows the hub's reason and offers Stop and hold", async () => {
+      const message = 'a submission of T-8 is being pushed; wait for it, or stop and hold';
+      await page.route(takeoverRoute, (route) =>
+        route.fulfill({ status: 409, json: { error: 'submission_pending', message } }),
+      );
+      try {
+        await runnerPanel.locator('.actions button:text-is("Take over")').click();
+        await runnerPanel.locator('.action-form .confirm-action:text-is("Take over")').click();
+        const refused = runnerPanel.locator('.takeover-refused');
+        await refused.locator('p', { hasText: 'A submission is being pushed' }).waitFor();
+        await refused.locator('p', { hasText: message }).waitFor();
+        await refused.locator('button:text-is("Stop and hold")').click();
+        await runnerPanel.locator('.action-form .confirm-action:text-is("Stop and hold")').waitFor();
+        await runnerPanel.locator('.action-form button:text-is("Never mind")').click();
+      } finally {
+        await page.unroute(takeoverRoute);
+      }
+      const { task } = await taskDetail('T-8');
+      if (task.status === 'blocked') throw new Error(`the hub has T-8 ${task.blockedKind}`);
+    });
+    await check("taking over T-8 asks first; then T-8 reads 'Taken over' and shows both commands with Copy buttons", async () => {
+      await runnerPanel.locator('.actions button:text-is("Take over")').click();
+      const confirm = runnerPanel.locator('.action-form .confirm-action:text-is("Take over")');
+      await confirm.waitFor();
+      if ((await taskDetail('T-8')).task.status === 'blocked') throw new Error('one click took it over');
+      await confirm.click();
+      await statusIs(page, 'Taken over');
+      const local = takeoverCard.locator('pre[aria-label="The command on the runner\'s laptop"]');
+      const anywhere = takeoverCard.locator('pre[aria-label="The command for anywhere"]');
+      await local.waitFor();
+      if (!((await local.textContent()) ?? '').includes('--resume session-T-8-a1')) throw new Error(`local: ${await local.textContent()}`);
+      if (!((await anywhere.textContent()) ?? '').startsWith('git fetch origin refs/agflow/T-8/a1')) {
+        throw new Error(`anywhere: ${await anywhere.textContent()}`);
+      }
+      await waitForCount(takeoverCard.locator('.command-block button:text-is("Copy")'), 2);
+    });
+    await shot(page, 'task-takeover');
+    await check('a taken-over task offers Hand back, not Unblock', async () => {
+      const buttons = await page.locator('.actions-card button, .takeover-card button').allTextContents();
+      if (!buttons.includes('Hand back from the clone') || !buttons.includes('Hand back from a ref')) {
+        throw new Error(`the page offers ${buttons.join(', ')}`);
+      }
+      if (buttons.includes('Unblock')) throw new Error('the page offers Unblock');
+      if ((await runnerPanel.count()) !== 0) throw new Error('the page still offers runner actions');
+    });
+    // A hand-back from the demo's clone ends at once, so a pending one and a refused one come from fake answers.
+    const taskRoute = (url: URL) => url.pathname === '/api/tasks/T-8';
+    await check("view test (fake api): a pending clone hand-back shows 'Handing back…' and no Hand back; a refused one shows why and offers it again; a failed take-over shows the runner's error; one in progress shows 'Taking over…'", async () => {
+      let takeover: Record<string, unknown> = { handingBack: { by: 'user:demo', at: Date.now() }, error: null };
+      let preparing = false;
+      await page.route(taskRoute, async (route) => {
+        const response = await route.fetch();
+        const detail = (await response.json()) as {
+          task: { currentAttempt: string };
+          attempts: { id: string; status: string; takeover: object | null }[];
+        };
+        const current = detail.attempts.find((attempt) => attempt.id === detail.task.currentAttempt);
+        if (current?.takeover) Object.assign(current.takeover, takeover);
+        // While the runner prepares, the attempt still runs and has no take-over record yet.
+        if (current && preparing) Object.assign(current, { status: 'running', takeover: null });
+        await route.fulfill({ response, json: detail });
+      });
+      try {
+        await page.reload();
+        await takeoverCard.locator('.handing-back', { hasText: 'Handing back…' }).waitFor();
+        if ((await takeoverCard.locator('button', { hasText: 'Hand back' }).count()) !== 0) throw new Error('it offers Hand back');
+        takeover = { handingBack: null, error: 'process_running: pids 4121, 4188 still run in the clone' };
+        // The refusal is a command result and sends no event, so the panel's own reload has to bring it in.
+        await takeoverCard.locator('.handback-refused', { hasText: 'pids 4121, 4188 still run in the clone' }).waitFor({ timeout: 15_000 });
+        await takeoverCard.locator('button:text-is("Hand back from the clone")').waitFor();
+        takeover = { handingBack: null, local: null, error: 'clone_failed: git clone --shared exited 128' };
+        await page.reload();
+        await takeoverCard.locator('p.error', { hasText: 'could not ready its clone: clone_failed' }).waitFor();
+        await waitForCount(takeoverCard.locator('pre[aria-label]'), 1);
+        await takeoverCard.locator('pre[aria-label="The command for anywhere"]').waitFor();
+        preparing = true;
+        await page.reload();
+        await takeoverCard.locator('.taking-over', { hasText: 'Taking over…' }).waitFor();
+        const offered = await takeoverCard.locator('button, pre').count();
+        if (offered !== 0) throw new Error(`while taking over it offers ${offered} commands or buttons`);
+      } finally {
+        await page.unroute(taskRoute);
+      }
+      await page.reload();
+      await takeoverCard.locator('pre[aria-label="The command for anywhere"]').waitFor();
+    });
+    await check('handing T-8 back from the prefilled take-over ref with a 40-hex sha makes it Ready (or Claimed by the next agent), and its first attempt reads Taken over', async () => {
+      await takeoverCard.locator('button:text-is("Hand back from a ref")').click();
+      const form = takeoverCard.locator('.handback-form');
+      const ref = await form.locator('input[name=ref]').inputValue();
+      const { attempts } = await taskDetail('T-8');
+      const expected = attempts.find((attempt) => attempt.id === 'T-8-a1')?.takeover?.ref;
+      if (!expected || ref !== expected) throw new Error(`the ref reads ${ref}, not ${expected}`);
+      const confirm = form.locator('.confirm-action');
+      await form.locator('input[name=sha]').fill('3f2a9c1');
+      if (!(await confirm.isDisabled())) throw new Error('a short sha can be sent');
+      const sha = '3f2a9c1d'.repeat(5);
+      await form.locator('input[name=sha]').fill(sha);
+      await confirm.click();
+      await page.locator('.task-head .chip', { hasText: /^(Ready|Claimed|Working)$/ }).waitFor();
+      const { task } = await taskDetail('T-8');
+      if (task.workRef !== ref || task.workSha !== sha) throw new Error(`the work position is ${task.workRef} at ${task.workSha}`);
+      await attemptRow('a1').locator('.attempt-end', { hasText: /^Taken over$/ }).waitFor();
+    });
+    await open(page, '#/task/T-9', '.task-head');
+    await check('T-9, whose runner is offline, offers no Take over; Stop and hold makes T-9 Paused', async () => {
+      await runnerPanel.locator('.actions button').first().waitFor();
+      const offered = await runnerPanel.locator('.actions button').allTextContents();
+      if (offered.join(',') !== 'Stop,Stop and hold,Replace') throw new Error(`it offers ${offered.join(', ')}`);
+      await runnerPanel.locator('.actions button:text-is("Stop and hold")').click();
+      await runnerPanel.locator('.action-form textarea').fill('R-2 is away; hold this until bob is back.');
+      await runnerPanel.locator('.action-form .confirm-action:text-is("Stop and hold")').click();
+      await statusIs(page, 'Paused');
+    });
 
     await open(page, '#/timeline', '.log');
     await check('live events arrive without reloading', () => page.locator('.log-row.fresh').first().waitFor({ timeout: 12_000 }));

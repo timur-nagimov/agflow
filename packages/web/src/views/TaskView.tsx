@@ -7,8 +7,8 @@ import {
   type Task,
   type TaskNote,
 } from '@agflow/core';
-import { type FormEvent, useState } from 'react';
-import { api } from '../api';
+import { type FormEvent, useEffect, useState } from 'react';
+import { type HandbackSource, api } from '../api';
 import {
   ATTEMPT_STATUS_LABELS,
   END_REASON_LABELS,
@@ -16,18 +16,22 @@ import {
   type NoteGroup,
   attemptLabel,
   attemptTone,
+  canHandBack,
   currentAttempt,
+  handbackSource,
   holderOf,
   newestLog,
   nextTryText,
   noteGroups,
   phaseLabel,
   submissionOutcome,
+  takeoverState,
   wipText,
 } from '../attempts';
 import {
   AttemptLink,
   AttemptLog,
+  CommandBlock,
   Composer,
   ErrorBox,
   EventList,
@@ -140,6 +144,15 @@ export function TaskView({ id }: { id: string }) {
         </dl>
       </header>
       <Attention task={task} />
+      {takeoverState(task, current).kind !== 'none' ? (
+        <TakeoverPanel
+          task={task}
+          attempt={current}
+          runner={runner}
+          runnersLoaded={runners.data !== undefined}
+          onDone={detail.reload}
+        />
+      ) : null}
       <Actions
         key={task.status}
         task={task}
@@ -335,6 +348,203 @@ function Attention({ task }: { task: Task }) {
     );
   }
   return null;
+}
+
+/** A refused clone hand-back is a command result, which sends no event, so a taken-over task also reloads this often. */
+const TAKEOVER_REFRESH_MS = 10_000;
+
+/**
+ * A task a person took over (design 6.12). While the runner stops the agent and readies its clone, the take-over is in
+ * progress; then come the commands to go on with the work, on the runner's laptop and anywhere, and the hand-back.
+ * Without a local command only the one for anywhere shows, and a take-over that failed shows the runner's error. A
+ * refused hand-back from the clone shows Attempt.takeover.error, and the hand-back is offered again (X-37); while one
+ * is on its way the page says so and offers none (X-49). Until the runners have loaded, a missing runner is not yet
+ * an offline one, so the hand-back waits for them.
+ */
+function TakeoverPanel({
+  task,
+  attempt,
+  runner,
+  runnersLoaded,
+  onDone,
+}: {
+  task: Task;
+  attempt: Attempt | null;
+  runner: Runner | null;
+  runnersLoaded: boolean;
+  onDone: () => void;
+}) {
+  const { me } = useHub();
+  useEffect(() => {
+    const timer = setInterval(onDone, TAKEOVER_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [onDone]);
+  const state = takeoverState(task, attempt);
+  const allowed = canHandBack(task, attempt, runner, me);
+  const person = attempt?.stopRequested?.by ?? null;
+  const runnerId = attempt?.runnerId ?? null;
+
+  return (
+    <Section title="Take-over" className="takeover takeover-card">
+      {state.kind === 'preparing' ? (
+        <p className="taking-over">
+          <span className="lamp tone-active pulse" /> Taking over… The runner is stopping the agent: it writes a handoff
+          note, pushes its work and readies its clone for you. The commands show here once it reports.
+        </p>
+      ) : null}
+      {state.kind === 'failed' ? (
+        <p className="error pre">
+          The runner could not ready its clone: {state.error}. The agent's work is pushed, so go on from it anywhere.
+        </p>
+      ) : null}
+      {state.kind === 'unrecorded' ? (
+        <p className="muted">The attempt ended before its runner reported the commands to go on with the work.</p>
+      ) : null}
+      {state.kind === 'ready' && state.local ? (
+        <>
+          <h3>On the runner's laptop</h3>
+          <CommandBlock label="The command on the runner's laptop" command={state.local} />
+        </>
+      ) : null}
+      {state.kind === 'ready' || state.kind === 'failed' ? (
+        <>
+          <h3>Anywhere</h3>
+          <CommandBlock label="The command for anywhere" command={state.anywhere} />
+          <p className="hint">
+            It pushes your work to <code>{state.ref}</code>. Hand the task back from that ref when you are done, or from
+            the runner's clone if you worked there.
+          </p>
+        </>
+      ) : null}
+      {state.kind === 'ready' && state.handbackError ? (
+        <p className="handback-refused warn-text pre">
+          The hand-back from the clone was refused: {state.handbackError}. Stop what still runs there, then hand it back
+          again.
+        </p>
+      ) : null}
+      {state.kind === 'handing_back' ? (
+        <p className="handing-back">
+          <span className="lamp tone-active pulse" /> Handing back… {who(state.by)} asked the runner for the clone's work{' '}
+          <When ts={state.at} />. The task stays taken over until the runner pushes it, or the hub stops waiting.
+        </p>
+      ) : null}
+      {!runnersLoaded ? null : allowed ? (
+        <HandBackForm
+          taskId={task.id}
+          takeoverRef={attempt?.takeover?.ref ?? ''}
+          runner={runner}
+          runnerId={runnerId}
+          onDone={onDone}
+        />
+      ) : state.kind !== 'preparing' && state.kind !== 'handing_back' && person ? (
+        <p className="muted">
+          Only {who(person)} hands it back while {runnerId ?? 'its runner'} is online.
+        </p>
+      ) : null}
+    </Section>
+  );
+}
+
+/** The runner states without a link to the hub (hub lead.ts UNLINKED): a hand_back cannot reach such a runner. */
+const UNLINKED: ReadonlySet<Runner['state']> = new Set(['offline', 'needs_login', 'incompatible']);
+
+/**
+ * Hands a taken-over task back (design 6.12): from the runner's clone, which the runner harvests and pushes, or from a
+ * ref the person pushed, prefilled with the take-over ref (X-22). A ref needs the full 40-hex sha of its commit,
+ * because the next runner may fetch it by sha (X-24).
+ */
+function HandBackForm({
+  taskId,
+  takeoverRef,
+  runner,
+  runnerId,
+  onDone,
+}: {
+  taskId: string;
+  takeoverRef: string;
+  runner: Runner | null;
+  runnerId: string | null;
+  onDone: () => void;
+}) {
+  const [open, setOpen] = useState<'clone' | 'ref' | null>(null);
+  const [ref, setRef] = useState(takeoverRef);
+  const [sha, setSha] = useState('');
+  const action = useAction();
+  const source: HandbackSource | null = open === 'clone' ? 'clone' : open === 'ref' ? handbackSource({ ref, sha }) : null;
+  // Only a runner without a link makes the task go ready at once; a crash_loop or disk_low runner still gets the
+  // hand_back, so the task waits for what its clone pushes, as with an online one.
+  const unlinked = runner === null || UNLINKED.has(runner.state);
+
+  const choose = (next: 'clone' | 'ref') => {
+    setOpen(open === next ? null : next);
+    setRef(takeoverRef);
+    setSha('');
+    action.clearError();
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!source) return;
+    if ((await action.run(() => api.handBack(taskId, source))).ok) {
+      setOpen(null);
+      onDone();
+    }
+  };
+
+  return (
+    <div className="handback">
+      <div className="actions">
+        <button aria-pressed={open === 'clone'} onClick={() => choose('clone')}>
+          Hand back from the clone
+        </button>
+        <button aria-pressed={open === 'ref'} onClick={() => choose('ref')}>
+          Hand back from a ref
+        </button>
+      </div>
+      {open ? (
+        <form className="action-form handback-form" onSubmit={submit}>
+          {open === 'clone' ? (
+            <p>
+              {unlinked
+                ? `${runnerId ?? 'Its runner'} is not online, so the task goes back to Ready at once, from its last ` +
+                  'pushed work; what is in the clone follows as late work once the runner is back.'
+                : 'The runner pushes everything in its clone, your commits and uncommitted changes, and the task goes ' +
+                  'back to Ready from there. Close the agent and your tools in the clone first. If the runner does ' +
+                  "not answer in time, the task goes back to Ready from its last pushed work, and the clone's work " +
+                  'follows as late work.'}
+            </p>
+          ) : (
+            <>
+              <label>
+                The ref you pushed
+                <input name="ref" className="mono" value={ref} onChange={(event) => setRef(event.target.value)} />
+              </label>
+              <label>
+                The full sha of its commit (git rev-parse HEAD)
+                <input
+                  name="sha"
+                  className="mono"
+                  value={sha}
+                  placeholder="40 hex characters"
+                  onChange={(event) => setSha(event.target.value)}
+                  autoFocus
+                />
+              </label>
+            </>
+          )}
+          <div className="row">
+            <button className="confirm-action primary" disabled={!source || action.busy}>
+              {open === 'clone' ? 'Hand back from the clone' : 'Hand back from this ref'}
+            </button>
+            <button type="button" onClick={() => setOpen(null)}>
+              Never mind
+            </button>
+          </div>
+          {action.error ? <p className="error">{action.error}</p> : null}
+        </form>
+      ) : null}
+    </div>
+  );
 }
 
 /**

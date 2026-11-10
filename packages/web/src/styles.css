@@ -576,6 +576,11 @@ tr:has(+ .agent-actions-row) td { border-bottom-color: transparent; }
 .agent-actions-row td { padding-top: 0; background: color-mix(in srgb, var(--inset) 50%, transparent); }
 .runner-actions-panel { display: grid; gap: 10px; padding: 12px 0 4px; }
 .runner-actions-panel p { margin: 0; font-size: 13px; }
+.takeover-card h3 { margin: 6px 0 0; }
+.takeover-card p { margin: 0; }
+.taking-over .lamp, .handing-back .lamp { margin-right: 6px; vertical-align: 1px; }
+.handback { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid var(--rule); }
+.handback-form input { width: 100%; }
 .takeover-refused { display: grid; gap: 8px; justify-items: start; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--trouble) 45%, var(--rule)); border-radius: 4px; }
 
 /* ---------- Runners ---------- */

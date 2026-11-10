@@ -35,8 +35,9 @@ function send(agentId: string, action: RunnerAction, reason: string): Promise<At
  * as runnerActionsFor offers them. Each asks first: a stop or replace for its reason, interrupt and take-over for a
  * second click. A form stays usable only while its action is still offered: the hub checks less than X-34's rule, so
  * a form opened before the agent's state changed must not send. A refused take-over shows why, reloads the page's
- * data, and offers Stop and hold instead when that is still offered; an accepted one opens the attempt's page, which
- * shows the commands once the runner prepared them. What an accepted stop or replace did comes from the hub's answer.
+ * data, and offers Stop and hold instead when that is still offered; an accepted one opens the task's page, which
+ * shows the take-over in progress, then the commands and the hand-back. What an accepted stop or replace did comes
+ * from the hub's answer.
  */
 export function RunnerActions({
   agentId,
@@ -77,10 +78,8 @@ export function RunnerActions({
       if (!attempt.taskId) return;
       const taskId = attempt.taskId;
       const outcome = await action.run(() => api.takeOver(taskId));
-      if (outcome.ok) {
-        window.location.hash = routeHref({ view: 'attempt', id: outcome.value });
-        return;
-      }
+      // From the Agents page this opens the task; on the task's own page the hash stays, and the reload shows it.
+      if (outcome.ok) window.location.hash = routeHref({ view: 'task', id: taskId });
       // A refusal means the page's view of the agent was stale.
       setOpen(null);
       onDone();
