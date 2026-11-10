@@ -19,6 +19,7 @@ Usage:
 
 Run by Claude Code and Codex, not by people:
   agflow mcp --vendor claude|codex
+  agflow mcp --vendor claude|codex --runner
   agflow hook session-start|user-prompt-submit|stop|wait-inbox --vendor claude|codex [--role worker|lead]
   agflow hook brief --runner
 `;

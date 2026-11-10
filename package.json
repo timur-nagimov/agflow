@@ -11,7 +11,7 @@
     "restore": "bun packages/hub/src/restore.ts",
     "smoke:hub": "bun scripts/smoke-hub.ts",
     "smoke:cli": "bun packages/cli/scripts/smoke.ts",
-    "build:cli": "bun build --compile packages/cli/src/main.ts --outfile dist/agflow",
+    "build:cli": "bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv packages/cli/src/main.ts --outfile dist/agflow",
     "verify:real-clis": "bun packages/cli/scripts/verify-real-clis.ts",
     "demo": "bun scripts/demo-hub.ts",
     "check:ui": "bun scripts/check-ui.ts",
