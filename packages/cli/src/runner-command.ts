@@ -5,6 +5,8 @@
 // the runner's module graph. A static-string import() is still bundled by `bun build --compile`.
 import type { startRunnerService } from '@agflow/runner/src/service/host';
 import type { installService } from '@agflow/runner/src/service/launchd';
+import type { RunnerStatusReport } from '@agflow/runner/src/service/status';
+import type { Exec } from '@agflow/runner/src/service/system';
 import { type ParsedArgs, UsageError } from './args';
 import type { Io } from './io';
 import type { Command } from './main';
@@ -17,13 +19,22 @@ export const RUNNER_HELP = `  agflow runner start [--service]
   agflow runner drain            Stop accepting new attempts
   agflow runner undrain          Accept new attempts and clear the crash-loop guard
   agflow runner install          Install and start the LaunchAgent that runs the runner at login
+  agflow runner status [--json]  Show the runner's status and attempts
 `;
 
 export async function runnerCommand(
   args: ParsedArgs,
   io: Io,
-  deps: { startRunnerService?: typeof startRunnerService; installService?: typeof installService } = {},
+  deps: {
+    startRunnerService?: typeof startRunnerService;
+    installService?: typeof installService;
+    env?: Record<string, string | undefined>;
+    exec?: Exec;
+    uid?: number;
+    home?: string;
+  } = {},
 ): Promise<number> {
+  const env = deps.env ?? process.env;
   const drainingCommand =
     (draining: boolean): Command =>
     async (args, io) => {
@@ -51,6 +62,44 @@ export async function runnerCommand(
         signals: true,
       });
       return (await service.exited).code;
+    },
+    status: async (args, io) => {
+      if (args.positional.length > 2 || (args.flags.json !== undefined && args.flags.json !== true)) {
+        throw new UsageError('usage: agflow runner status [--json]');
+      }
+      try {
+        const { offlineStatus, formatStatus, launchdDisabled, LOGIN_ITEMS_WARNING } = await import(
+          '@agflow/runner/src/service/status'
+        );
+        const { LAUNCHD_LABEL } = await import('@agflow/runner/src/service/launchd');
+        const { controlRequest, ControlUnavailableError } = await import('@agflow/runner/src/service/control');
+        const { runnerPaths } = await import('@agflow/runner/src/paths');
+        const paths = runnerPaths();
+        const options = {
+          paths, exec: deps.exec, uid: deps.uid, home: deps.home, label: LAUNCHD_LABEL,
+          launchd: env.AGFLOW_TEST !== '1',
+        };
+        let report: RunnerStatusReport;
+        try {
+          report = await controlRequest<RunnerStatusReport>(paths, 'GET', '/status', undefined, { timeoutMs: 3_000 });
+        } catch (error) {
+          if (!(error instanceof ControlUnavailableError)) throw error;
+          report = await offlineStatus(options);
+        }
+        if (
+          options.launchd &&
+          report.running &&
+          (await launchdDisabled(options)) === true &&
+          !report.warnings.includes(LOGIN_ITEMS_WARNING)
+        ) {
+          report.warnings.push(LOGIN_ITEMS_WARNING);
+        }
+        io.out(args.flags.json === true ? `${JSON.stringify(report, null, 2)}\n` : formatStatus(report));
+        return report.running ? 0 : 1;
+      } catch (error) {
+        io.err(`agflow: ${error instanceof Error ? error.message : String(error)}\n`);
+        return 1;
+      }
     },
     drain: drainingCommand(true),
     undrain: drainingCommand(false),

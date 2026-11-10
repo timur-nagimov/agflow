@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import { getAttempt } from '@agflow/hub/src/attempt-store';
 import { findRunnerByKey, getRunner } from '@agflow/hub/src/runners';
 import { createTasks } from '@agflow/hub/src/tasks';
 import { newTask } from '@agflow/hub/test/helpers';
+import { AttemptStore } from '@agflow/runner/src/attempt-store';
 import { loadRunnerConfig, RunnerConfigSchema, saveRunnerConfig } from '@agflow/runner/src/config';
 import { openRunnerDb } from '@agflow/runner/src/db';
 import { Outbox } from '@agflow/runner/src/outbox';
@@ -13,6 +14,7 @@ import type { RunnerServiceOptions } from '@agflow/runner/src/service/host';
 import {
   installRefusal,
   type installService as installRunnerService,
+  plistPath,
   installService as realInstallService,
 } from '@agflow/runner/src/service/launchd';
 import { acquireRunnerLock, readLockOwner } from '@agflow/runner/src/service/lock';
@@ -21,7 +23,7 @@ import { ServiceRuns } from '@agflow/runner/src/service/runs';
 import { waitFor } from '@agflow/runner/test/fixture';
 import { startRunnerAttempt } from '@agflow/runner/test/hub-fixture';
 import { afterThisTest, cleanupRunnerSetups, tempDir } from '@agflow/runner/test/runner-setup';
-import { recordingExec, setupTestService } from '@agflow/runner/test/service-helpers';
+import { recordingExec, setupTestService, sleepingServiceAdapter } from '@agflow/runner/test/service-helpers';
 import { parseArgs } from '../src/args';
 import { main } from '../src/main';
 import { configDir } from '../src/paths';
@@ -67,6 +69,7 @@ describe('agflow runner', () => {
     expect(RUNNER_HELP).toContain('agflow runner drain');
     expect(RUNNER_HELP).toContain('agflow runner undrain');
     expect(RUNNER_HELP).toContain('agflow runner install');
+    expect(RUNNER_HELP).toContain('agflow runner status [--json]');
     expect(out.join('')).toContain(RUNNER_HELP);
     expect(err).toEqual([]);
   });
@@ -327,4 +330,164 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
       }, 60_000);
     }
   }
+});
+
+for (const running of [false, true]) {
+  test(`status in injected test mode never consults launchd (running: ${running})`, async () => {
+    const s = await setupTestService();
+    process.env.AGFLOW_HOME = s.paths.home;
+    if (running) await s.start();
+    const exec = recordingExec([], { stdout: '"dev.agflow.runner" => disabled' });
+    const home = tempDir('agf-home-');
+    const plist = plistPath({ home });
+    mkdirSync(dirname(plist), { recursive: true });
+    writeFileSync(plist, 'installed');
+    const { io, out } = capture();
+    expect(await runnerCommand(parseArgs(['runner', 'status', '--json']), io, {
+      env: { AGFLOW_TEST: '1' }, exec, home, uid: 501,
+    })).toBe(running ? 0 : 1);
+    const report = JSON.parse(out.join(''));
+    expect(report.warnings).toEqual([]);
+    if (!running) expect(report).toMatchObject({ disabled: null, plistInstalled: false });
+    expect(exec.calls).toEqual([]);
+  });
+}
+
+describe('agflow runner status', () => {
+  test('rejects extra arguments and non-boolean --json', async () => {
+    for (const argv of [
+      ['runner', 'status', 'extra'],
+      ['runner', 'status', '--json', 'extra'],
+    ]) {
+      const { io, err } = capture();
+      expect(await main(argv, io)).toBe(2);
+      expect(err.join('')).toContain('usage: agflow runner status [--json]');
+    }
+  });
+
+  test('reports a live attempt, recorded group, kept clone and Login Items without exposing tokens', async () => {
+    const adapter = sleepingServiceAdapter();
+    let agentToken = '';
+    const start = adapter.start.bind(adapter);
+    adapter.start = async (launch) => {
+      agentToken = launch.env.AGFLOW_AGENT_TOKEN!;
+      return start(launch);
+    };
+    const s = await setupTestService({ config: { capacity: 2 }, host: { adapters: [adapter] } });
+    process.env.AGFLOW_HOME = s.paths.home;
+    const service = await s.start();
+    await waitFor(() => service.runner?.status().link === 'online');
+    const runnerId = service.runner!.status().runnerId!;
+    const [task] = createTasks(s.hub.ctx, [newTask()], 'user:alice');
+    const started = startRunnerAttempt(s.hub.ctx, {
+      runnerId,
+      taskId: task!.id,
+      role: 'worker',
+      vendor: 'codex',
+    });
+    await waitFor(() =>
+      service.runner!.status().attempts.some((a) => a.attemptId === started.attempt.id && a.phase === 'turn'),
+    );
+    await service.runner!.changeSettings({ draining: true });
+    const db = openRunnerDb(s.paths.db);
+    try {
+      const store = new AttemptStore(db);
+      // A running attempt with a stale pushError still works in its clone; only the ended one keeps a clone.
+      const stale = store.update(started.attempt.id, { pushError: 'stale push error' });
+      expect(existsSync(stale.clone!)).toBe(true);
+      const kept = tempDir('agf-kept-');
+      const ended = store.create(
+        { ...stale.spec, attemptId: `${stale.attemptId}-kept` },
+        { clone: kept, tmpDir: null, cliVersion: null },
+      );
+      store.update(ended.attemptId, { state: 'ended', endedAt: Date.now(), pushError: 'final push refused' });
+      const group = store.processes(started.attempt.id)[0]!;
+      const exec = recordingExec([
+        {
+          argv: ['launchctl', 'print-disabled', 'gui/501'],
+          result: { stdout: 'disabled services = {\n  "dev.agflow.runner" => disabled\n}' },
+        },
+      ]);
+      const deps = { env: {}, exec, uid: 501, home: tempDir('agf-home-') };
+      const human = capture();
+      expect(await runnerCommand(parseArgs(['runner', 'status']), human.io, deps)).toBe(0);
+      const text = human.out.join('');
+      expect(text).toMatch(/^State\s+ok$/m);
+      expect(text).toMatch(/^Draining\s+true$/m);
+      expect(text).toMatch(/^Capacity\s+2, free slots: 1$/m);
+      expect(text).toContain(`Kept clone     ${ended.attemptId} ${kept}: final push refused`);
+      expect(text).not.toContain('stale push error');
+      for (const value of [runnerId, started.attempt.id, task!.id, 'worker', 'codex', 'turn', 'Login Items']) {
+        expect(text).toContain(value);
+      }
+      const json = capture();
+      expect(await runnerCommand(parseArgs(['runner', 'status', '--json']), json.io, deps)).toBe(0);
+      const report = JSON.parse(json.out.join(''));
+      expect(report).toMatchObject({ running: true, runnerId, state: 'ok', capacity: 2, freeSlots: 1, draining: true });
+      expect(report.keptClones).toEqual([{ attemptId: ended.attemptId, clone: kept, error: 'final push refused' }]);
+      expect(report.warnings).toHaveLength(1);
+      expect(agentToken).toStartWith('agt_');
+      expect(json.out.join('')).not.toContain(agentToken);
+      expect(json.out.join('')).not.toContain(s.hub.token);
+      expect(json.out.join('')).not.toContain('agt_');
+      expect(json.out.join('')).not.toContain('agentToken');
+      expect(human.err).toEqual([]);
+      expect(json.err).toEqual([]);
+      store.update(started.attempt.id, { pushError: null });
+      expect(group).toBeDefined();
+      expect(report.attempts[0]).toMatchObject({
+        attemptId: started.attempt.id,
+        pid: group.pid,
+        pgid: group.pgid,
+        lstart: group.lstart,
+        ageMs: expect.any(Number),
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  test('without a socket prints best effort, installation, exit time and 20 log lines and exits 1', async () => {
+    const s = await setupTestService();
+    process.env.AGFLOW_HOME = s.paths.home;
+    const home = tempDir('agf-home-');
+    const plist = plistPath({ home });
+    mkdirSync(dirname(plist), { recursive: true });
+    writeFileSync(plist, 'installed');
+    const at = 1_700_000_000_000;
+    const runs = new ServiceRuns(s.paths, { now: () => at });
+    const id = runs.start({ pid: 42, mode: 'service' });
+    runs.finish(id, { code: 0, clean: true, reason: 'incompatible protocol' });
+    writeFileSync(s.paths.runnerLog, Array.from({ length: 30 }, (_, i) => `log-line-${i}\n`).join(''));
+    const exec = recordingExec([
+      { argv: ['launchctl', 'print-disabled', 'gui/501'], result: { stdout: '"dev.agflow.runner" => true' } },
+    ]);
+    for (const flags of [[], ['--json']]) {
+      const { io, out, err } = capture();
+      expect(await runnerCommand(parseArgs(['runner', 'status', ...flags]), io, { env: {}, exec, uid: 501, home })).toBe(1);
+      const text = out.join('');
+      expect(text).toContain('incompatible protocol');
+      expect(text).toContain('Login Items');
+      expect(text).toContain('log-line-10');
+      expect(text).toContain('log-line-29');
+      expect(text).not.toContain('log-line-9');
+      if (flags.length) {
+        expect(JSON.parse(text)).toMatchObject({
+          running: false,
+          bestEffort: true,
+          plistInstalled: true,
+          disabled: true,
+          lastExit: { at, reason: 'incompatible protocol' },
+          warnings: [expect.any(String)],
+        });
+        expect(JSON.parse(text).logLines).toHaveLength(20);
+      } else {
+        expect(text).toContain('best effort');
+        expect(text).toContain('installed');
+        expect(text).toContain(new Date(at).toISOString());
+      }
+      expect(err).toEqual([]);
+    }
+    expect(exec.calls).toHaveLength(2);
+  });
 });

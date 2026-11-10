@@ -1,6 +1,7 @@
 // The process that runs a runner (design 7.1, X-41): `agflow runner start` in the foreground and `--service` under
 // launchd. One lock holder, one run record, and one exit path for every end: a refusal that needs a person, the hub
 // replacing the link, a stop, or an error.
+import { existsSync } from 'node:fs';
 import type { Credentials } from '@agflow/core';
 import { createAdapters } from '../adapters';
 import type { AgflowCommand, VendorAdapter } from '../adapters/types';
@@ -31,6 +32,7 @@ import { machineMismatch, readMachineId } from './machine';
 import { NeedsLogin } from './needs-login';
 import { createMacNotifier } from './notify';
 import { ServiceRuns } from './runs';
+import { buildStatusReport } from './status';
 import { suspendRunner } from './suspend';
 import { defaultExec, type Exec } from './system';
 
@@ -162,6 +164,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   let store: AttemptStore | null = null;
   let runner: RunnerHandle | null = null;
   let config: RunnerConfig;
+  let hubUrl: string | null = null;
   const clock = options.clock ?? systemClock;
   let health: ServiceHealth | null = null;
   let keepAwake: KeepAwake | null = null;
@@ -295,6 +298,28 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
 
   // The control socket's routes; the commands of later tasks add theirs here.
   const routes: ControlRoutes = {
+    'GET /status': () => {
+      const status = runner?.status() ?? null;
+      const records = store?.list() ?? [];
+      return buildStatusReport({
+        status,
+        owner: lock!.owner,
+        config,
+        hubUrl,
+        health: status?.state ?? health?.state() ?? { state: 'ok', detail: null },
+        heartbeat: health?.heartbeat() ?? { power: null, disk: null, acceptingUntil: null },
+        needsLogin: needsLogin?.state() ?? { on: false, reason: null, since: null },
+        keepAwakeHeld: keepAwake?.isHeld() ?? false,
+        dependencyPrep: preparer?.available ?? false,
+        records,
+        existingClones: records.flatMap((record) =>
+          record.clone !== null && (record.pushError !== null || record.lateWorkSha !== null) && existsSync(record.clone)
+            ? [record.clone]
+            : [],
+        ),
+        now: clock.now(),
+      });
+    },
     'POST /drain': () => changeDraining(true),
     'POST /undrain': () => changeDraining(false),
     'POST /suspend': () => {
@@ -385,7 +410,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     }
     db = openRunnerDb(paths.db);
     store = new AttemptStore(db);
-    let hubUrl = credentials?.hubUrl ?? db.meta('project')?.hubUrl ?? null;
+    hubUrl = credentials?.hubUrl ?? db.meta('project')?.hubUrl ?? null;
     health = createServiceHealth({
       paths,
       config: () => config,
