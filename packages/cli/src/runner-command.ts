@@ -13,6 +13,7 @@ import type { Io } from './io';
 import type { Command } from './main';
 import { configDir } from './paths';
 import type { RunnerSetupDeps } from './runner-setup';
+import type { RunnerUninstallDeps } from './runner-uninstall';
 import { selfCommand } from './self';
 
 /** The runner subcommands' lines in main.ts's HELP; each subcommand adds its own. */
@@ -25,6 +26,8 @@ export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-serv
   agflow runner drain            Stop accepting new attempts
   agflow runner undrain          Accept new attempts and clear the crash-loop guard
   agflow runner install          Install and start the LaunchAgent that runs the runner at login
+  agflow runner uninstall [--purge]
+                                Stop, log out, retire and remove the LaunchAgent; --purge deletes local runner data
   agflow runner status [--json]  Show the runner's status and attempts
 `;
 
@@ -33,6 +36,7 @@ export async function runnerCommand(
   io: Io,
   deps: {
     setup?: Partial<RunnerSetupDeps>;
+    uninstall?: Partial<RunnerUninstallDeps>;
     startRunnerService?: typeof startRunnerService;
     installService?: typeof installService;
     env?: Record<string, string | undefined>;
@@ -160,6 +164,16 @@ export async function runnerCommand(
         io.err(`agflow: ${error instanceof Error ? error.message : String(error)}\n`);
         return 1;
       }
+    },
+    uninstall: async (args, io) => {
+      if (args.positional.length > 2 || (args.flags.purge !== undefined && args.flags.purge !== true)) {
+        throw new UsageError('usage: agflow runner uninstall [--purge]');
+      }
+      const { uninstallRunner } = await import('./runner-uninstall');
+      return uninstallRunner(args, io, {
+        exec: deps.exec, uid: deps.uid, home: deps.home, ...deps.uninstall,
+        env: deps.uninstall?.env ?? env,
+      });
     },
   };
   const name = args.positional[1];

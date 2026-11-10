@@ -2,6 +2,7 @@ import {
   type AgentStopInputSchema,
   BRIDGE_HEADER,
   BRIDGE_VERSION,
+  type RunnerRetireInputSchema,
   type RunnerSubmitInputSchema,
   type StaffingInputSchema,
   WhoamiResponseSchema,
@@ -152,6 +153,10 @@ export class HubClient {
   // Runner
   async runnerWhoami() {
     return WhoamiResponseSchema.parse(await this.request('GET', '/api/runner/whoami'));
+  }
+  retireRunner(runnerKey: string) {
+    const body: z.input<typeof RunnerRetireInputSchema> = { runnerKey };
+    return this.request<{ ok: boolean }>('POST', '/api/runner/retire', body);
   }
 
   // Live sessions (hooks)
