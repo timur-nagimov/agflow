@@ -1,15 +1,16 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getAttempt } from '@agflow/hub/src/attempt-store';
-import { findRunnerByKey } from '@agflow/hub/src/runners';
+import { findRunnerByKey, getRunner } from '@agflow/hub/src/runners';
 import { createTasks } from '@agflow/hub/src/tasks';
 import { newTask } from '@agflow/hub/test/helpers';
+import { loadRunnerConfig } from '@agflow/runner/src/config';
 import { openRunnerDb } from '@agflow/runner/src/db';
 import { Outbox } from '@agflow/runner/src/outbox';
 import { runnerPaths } from '@agflow/runner/src/paths';
 import type { RunnerServiceOptions } from '@agflow/runner/src/service/host';
-import { readLockOwner } from '@agflow/runner/src/service/lock';
+import { acquireRunnerLock, readLockOwner } from '@agflow/runner/src/service/lock';
 import { readMachineId } from '@agflow/runner/src/service/machine';
 import { ServiceRuns } from '@agflow/runner/src/service/runs';
 import { waitFor } from '@agflow/runner/test/fixture';
@@ -35,6 +36,7 @@ beforeEach(() => {
   }
 });
 afterEach(cleanupRunnerSetups);
+setDefaultTimeout(60_000);
 
 function capture() {
   const out: string[] = [];
@@ -57,6 +59,8 @@ describe('agflow runner', () => {
     const { io, out, err } = capture();
     expect(await main(['help'], io)).toBe(0);
     expect(RUNNER_HELP).toContain('agflow runner start [--service]');
+    expect(RUNNER_HELP).toContain('agflow runner drain');
+    expect(RUNNER_HELP).toContain('agflow runner undrain');
     expect(out.join('')).toContain(RUNNER_HELP);
     expect(err).toEqual([]);
   });
@@ -80,6 +84,54 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
     expect(await main(['runner', 'start', 'extra'], io)).toBe(2);
     expect(err.join('')).toContain('agflow runner start');
   });
+
+  test('drain and undrain reach the running service and print one line each', async () => {
+    const s = await setupTestService();
+    process.env.AGFLOW_HOME = s.paths.home;
+    const service = await s.start();
+    await waitFor(() => service.runner?.status().link === 'online');
+    const id = service.runner!.status().runnerId!;
+    for (const command of ['drain', 'undrain']) {
+      const { io, out, err } = capture();
+      expect(await runnerCommand(parseArgs(['runner', command]), io)).toBe(0);
+      expect(loadRunnerConfig(s.paths.config).draining).toBe(command === 'drain');
+      await waitFor(() => getRunner(s.hub.ctx, id).draining === (command === 'drain'));
+      expect(out).toEqual([command === 'drain' ? 'the runner is draining\n' : 'the runner is undrained\n']);
+      expect(err).toEqual([]);
+    }
+  });
+
+  for (const command of ['drain', 'undrain']) {
+    test(`${command} while stopped prints where it saved the edit`, async () => {
+      const s = await setupTestService({ config: { draining: command === 'undrain' } });
+      process.env.AGFLOW_HOME = s.paths.home;
+      const { io, out, err } = capture();
+      expect(await runnerCommand(parseArgs(['runner', command]), io)).toBe(0);
+      expect(loadRunnerConfig(s.paths.config).draining).toBe(command === 'drain');
+      expect(out).toEqual([`${command}ed in runner.json; the hub hears it after the next start\n`]);
+      expect(err).toEqual([]);
+      expect(readLockOwner(s.paths)).toBeNull();
+    });
+
+    test(`${command} rejects extra positional arguments`, async () => {
+      const { io, out, err } = capture();
+      expect(await main(['runner', command, 'extra'], io)).toBe(2);
+      expect(err.join('')).toContain(`usage: agflow runner ${command}`);
+      expect(out).toEqual([]);
+    });
+
+    test(`${command} reports an unreachable lock holder and exits 1`, async () => {
+      const s = await setupTestService();
+      process.env.AGFLOW_HOME = s.paths.home;
+      const lock = await acquireRunnerLock(s.paths, { mode: 'foreground' });
+      afterThisTest(() => lock.release());
+      const { io, out, err } = capture();
+      expect(await main(['runner', command], io)).toBe(1);
+      expect(out).toEqual([]);
+      expect(err.join('')).toStartWith(`agflow: runner.lock is held by pid ${process.pid}`);
+      expect(err.join('')).toContain('agflow runner status');
+    });
+  }
 
   for (const mode of ['foreground', 'service'] as const) {
     test(`start passes CLI paths, terminal and signals in ${mode} and returns the host exit code`, async () => {

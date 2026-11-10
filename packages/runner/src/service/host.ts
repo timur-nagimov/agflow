@@ -6,7 +6,7 @@ import { createAdapters } from '../adapters';
 import type { AgflowCommand, VendorAdapter } from '../adapters/types';
 import { AttemptStore } from '../attempt-store';
 import { type ClockSource, systemClock } from '../clock';
-import { isTestMode, loadRunnerConfig, type RunnerConfig } from '../config';
+import { editLocalSettings, isTestMode, loadRunnerConfig, type RunnerConfig, saveRunnerConfig } from '../config';
 import { openRunnerDb, type RunnerDb } from '../db';
 import type { FetchFn } from '../hub-http';
 import { Journal } from '../journal';
@@ -24,6 +24,7 @@ import { createRunner, type RunnerEvents, type RunnerHandle, type RunnerOptions 
 import type { DependencyPreparer, Notifier } from '../seams';
 import { type ControlRoutes, type ControlServer, startControlServer } from './control';
 import { readCliCredentials } from './credentials';
+import { applyCrashLoopGuard } from './drain';
 import { AlreadyRunningError, acquireRunnerLock, type RunnerLock, type RunnerMode } from './lock';
 import { RotatingLog } from './log';
 import { machineMismatch, readMachineId } from './machine';
@@ -160,6 +161,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   let db: RunnerDb | null = null;
   let store: AttemptStore | null = null;
   let runner: RunnerHandle | null = null;
+  let config: RunnerConfig;
   const clock = options.clock ?? systemClock;
   let health: ServiceHealth | null = null;
   let keepAwake: KeepAwake | null = null;
@@ -174,6 +176,10 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   const sweeping = new AbortController();
   let ending = false;
   let suspendMs = 0;
+  // The guard's verdict at start: createRunner then drains through changeSettings unless an undrain came first.
+  let crashLoop = false;
+  // While a --service start waits for credentials.json it holds the lock and runner.json, but has no runner yet.
+  let awaitingCredentials = false;
 
   // A person must act: exit 0 under launchd so KeepAlive does not loop, 1 in the foreground.
   const refusal = (reason: string): ServiceExit => ({ code: mode === 'service' ? 0 : 1, clean: true, reason });
@@ -289,6 +295,8 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
 
   // The control socket's routes; the commands of later tasks add theirs here.
   const routes: ControlRoutes = {
+    'POST /drain': () => changeDraining(true),
+    'POST /undrain': () => changeDraining(false),
     'POST /suspend': () => {
       void service.suspend('suspend requested');
     },
@@ -303,6 +311,20 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       };
     },
   };
+  async function changeDraining(draining: boolean): Promise<void> {
+    if (runner !== null) await runner.changeSettings({ draining });
+    else if (awaitingCredentials) {
+      // The wait can last until the owner signs in: runner.json takes the edit, which createRunner then starts from,
+      // and M2b sends it after the first welcome.
+      config = editLocalSettings(config, { draining }).config;
+      saveRunnerConfig(paths.config, config);
+    } else throw new Error('the runner is starting; try again');
+    if (draining) return;
+    runs!.forgetUnclean({ current: runId! });
+    health!.setCrashLoop(null);
+    crashLoop = false;
+  }
+
   // One observer object keeps operations attached across reconnects.
   const events: RunnerEvents = {
     link: (state, detail) => {
@@ -345,7 +367,6 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     logger.info('runner service starting', { pid: process.pid, mode });
     runs = new ServiceRuns(paths);
     runId = runs.start({ pid: process.pid, mode });
-    let config: RunnerConfig;
     try {
       config = loadRunnerConfig(paths.config);
       suspendMs = config.timings.suspend;
@@ -382,6 +403,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       clock,
       logger,
     });
+    crashLoop = applyCrashLoopGuard({ runs, config, health, logger });
     keepAwake = new KeepAwake({
       mode: () => runner?.status().settings.keepAwake ?? config.keepAwake,
       power: () => health?.power() ?? null,
@@ -406,6 +428,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     });
     if (credentials === null) {
       needsLogin.enter(read.problem ?? 'not signed in');
+      awaitingCredentials = true;
       while (!ending && credentials === null) {
         await new Promise<void>((resolve) => {
           const done = () => {
@@ -420,6 +443,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
         if (ending) return;
         credentials = readCredentials().credentials;
       }
+      awaitingCredentials = false;
       if (ending) return;
       hubUrl = credentials!.hubUrl;
     }
@@ -446,6 +470,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       fetch: options.fetch,
       tmpRoot: options.tmpRoot,
     });
+    if (crashLoop) await runner.changeSettings({ draining: true });
     health.start();
     keepAwake.evaluate();
     const retentionInput = {

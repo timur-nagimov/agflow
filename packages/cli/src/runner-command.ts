@@ -13,6 +13,8 @@ import { selfCommand } from './self';
 /** The runner subcommands' lines in main.ts's HELP; each subcommand adds its own. */
 export const RUNNER_HELP = `  agflow runner start [--service]
                                 Run this laptop's runner in the foreground (--service for launchd)
+  agflow runner drain            Stop accepting new attempts
+  agflow runner undrain          Accept new attempts and clear the crash-loop guard
 `;
 
 export async function runnerCommand(
@@ -20,6 +22,20 @@ export async function runnerCommand(
   io: Io,
   deps: { startRunnerService?: typeof startRunnerService } = {},
 ): Promise<number> {
+  const drainingCommand =
+    (draining: boolean): Command =>
+    async (args, io) => {
+      const name = draining ? 'drain' : 'undrain';
+      if (args.positional.length > 2) throw new UsageError(`usage: agflow runner ${name}`);
+      const { drainRunner, undrainRunner } = await import('@agflow/runner/src/service/drain');
+      const result = await (draining ? drainRunner : undrainRunner)();
+      io.out(
+        result.via === 'runner'
+          ? `the runner is ${draining ? 'draining' : 'undrained'}\n`
+          : `${name}ed in runner.json; the hub hears it after the next start\n`,
+      );
+      return 0;
+    };
   const commands: Record<string, Command> = {
     // The host logs and prints every reason; the exit code is the ServiceExit's.
     start: async (args, io) => {
@@ -34,6 +50,8 @@ export async function runnerCommand(
       });
       return (await service.exited).code;
     },
+    drain: drainingCommand(true),
+    undrain: drainingCommand(false),
   };
   const name = args.positional[1];
   const command = name !== undefined && Object.hasOwn(commands, name) ? commands[name] : undefined;
