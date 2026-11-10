@@ -1,12 +1,132 @@
-// Shared service test helpers: recorded commands and isolated vendor CLIs.
+// Shared service test helpers: recorded commands, isolated vendor CLIs, and the service host against the in-process
+// hub.
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { Vendor } from '@agflow/core';
-import type { RunnerPaths } from '../src/paths';
+import { CREDENTIALS_FILE, type Vendor } from '@agflow/core';
+import { FakeAdapter, originRepo } from '@agflow/testkit';
+import { AttemptStore } from '../src/attempt-store';
+import { type RunnerConfigInput, RunnerConfigSchema, saveRunnerConfig } from '../src/config';
+import { openRunnerDb } from '../src/db';
+import { type RunnerPaths, runnerPaths } from '../src/paths';
+import { killGroup } from '../src/processes';
+import { removeAgentTools } from '../src/run-dir';
+import { type RunnerServiceOptions, startRunnerService } from '../src/service/host';
 import type { Exec, ExecOptions, ExecResult } from '../src/service/system';
 import { vendorBinary } from '../src/vendor/pins';
+import { FIXTURE_AGFLOW, fixtureCliVersion } from './fixture';
+import { startTestHub, type TestHub } from './hub-fixture';
+import { afterThisTest, tempDir } from './runner-setup';
+
+export interface TestServiceOptions {
+  /** A hub another service of the test already uses; a new one over a local bare origin by default. */
+  hub?: TestHub;
+  /** runner.json fields over the test runner's. */
+  config?: Partial<RunnerConfigInput>;
+  /** Leaves credentials.json out of the CLI's config directory. */
+  noCredentials?: boolean;
+  /** The foreground by default. */
+  mode?: RunnerServiceOptions['mode'];
+  /** Host options over the helper's: the fake adapters, MACHINE-1 and a capturing terminal. */
+  host?: Partial<RunnerServiceOptions>;
+}
+
+/**
+ * A short AGFLOW_HOME (runner.sock must fit in 104 bytes) with a test runner.json, and a CLI config directory signed in
+ * to the hub: the same files for an in-process host (start) and for run-service.ts in a child. Everything is removed
+ * after the test.
+ */
+export async function setupTestService(options: TestServiceOptions = {}) {
+  let hub = options.hub;
+  if (!hub) {
+    const origin = await originRepo({ 'README.md': '# demo\n', 'src/app.ts': 'app\n' });
+    afterThisTest(() => origin.remove());
+    hub = startTestHub({ config: { projectName: 'demo', projectRepo: origin.path } });
+    const ownedHub = hub;
+    afterThisTest(() => ownedHub.stop());
+  }
+  const home = mkdtempSync('/tmp/agf-');
+  afterThisTest(() => rmSync(home, { recursive: true, force: true }));
+  const paths = runnerPaths(home);
+  afterThisTest(() => {
+    if (!existsSync(paths.vaults)) return;
+    for (const entry of readdirSync(paths.vaults).filter((name) => name.endsWith('.agent'))) {
+      for (const attempt of readdirSync(join(paths.vaults, entry))) {
+        removeAgentTools(join(paths.vaults, entry, attempt));
+      }
+    }
+  });
+  const configDir = tempDir('agf-cli-');
+  if (!options.noCredentials) {
+    writeFileSync(join(configDir, CREDENTIALS_FILE), JSON.stringify(hub.credentials), { mode: 0o600 });
+  }
+  const config = RunnerConfigSchema.parse({
+    runnerKey: `rk_${crypto.randomUUID()}`,
+    machineId: 'MACHINE-1',
+    name: 'laptop',
+    test: { skipAuthChecks: true, allowShortTimings: true },
+    ...options.config,
+  });
+  saveRunnerConfig(paths.config, config);
+  const tmpRoot = mkdtempSync('/tmp/ag');
+  afterThisTest(() => rmSync(tmpRoot, { recursive: true, force: true }));
+  const terminal: string[] = [];
+  const start = async (overrides: Partial<RunnerServiceOptions> = {}) => {
+    const host = { ...options.host, ...overrides };
+    const service = await startRunnerService({
+      paths,
+      configDir,
+      mode: options.mode ?? 'foreground',
+      machineId: async () => 'MACHINE-1',
+      agflow: FIXTURE_AGFLOW,
+      cliVersion: fixtureCliVersion,
+      terminal: (line) => terminal.push(line),
+      tmpRoot,
+      adapters: host.createAdapters ? undefined : fakeServiceAdapters(),
+      ...host,
+    });
+    afterThisTest(async () => {
+      try {
+        // The host owns its db, so cleanup uses a separate reader even after the host has ended.
+        if (existsSync(paths.db)) {
+          const db = openRunnerDb(paths.db);
+          try {
+            for (const group of new AttemptStore(db).processes()) await killGroup(group, 'SIGKILL');
+          } finally {
+            db.close();
+          }
+        }
+      } finally {
+        await service.stop('test cleanup');
+      }
+    });
+    return service;
+  };
+  return { hub, paths, configDir, config, terminal, tmpRoot, start };
+}
+
+/** A fake adapter per vendor whose agents play one empty turn. */
+export function fakeServiceAdapters() {
+  return (['claude', 'codex'] as const).map(
+    (vendor) => new FakeAdapter({ vendor, skipAuthChecks: true, script: { turns: [[]] } }),
+  );
+}
+
+/** The files of setupTestService and a service started on them. */
+export async function startTestService(options: TestServiceOptions = {}) {
+  const setup = await setupTestService(options);
+  return { ...setup, service: await setup.start() };
+}
 
 export interface ExecCall {
   argv: string[];
