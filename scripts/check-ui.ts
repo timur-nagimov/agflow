@@ -173,6 +173,14 @@ async function main(): Promise<void> {
       const ids = await page.locator('.task-card .task-id').allTextContents();
       for (const id of ['T-3', 'T-4', 'T-6', 'T-7', 'T-8']) if (!ids.includes(id)) throw new Error(`${id} missing`);
     });
+    /** A task's card on the board. */
+    const taskCard = (id: string) => page.locator('.task-card', { has: page.locator(`.task-id:text-is("${id}")`) });
+    await check('the board marks T-11 live chat only, and T-10, on its second attempt, with its attempt number', async () => {
+      await taskCard('T-11').locator('.live-only', { hasText: 'Live chat only' }).waitFor();
+      if ((await page.locator('.task-card .live-only').count()) !== 1) throw new Error('another card is marked live chat only');
+      await taskCard('T-10').locator('.attempt-count', { hasText: /^attempt 2$/ }).waitFor();
+      if ((await taskCard('T-8').locator('.attempt-count').count()) !== 0) throw new Error('T-8, on its first attempt, shows a number');
+    });
     await check('a person can create a task', async () => {
       await page.click('button:has-text("New task")');
       await page.fill('.new-task input >> nth=0', 'Export invoices as CSV');
@@ -607,6 +615,10 @@ async function main(): Promise<void> {
       const left = (await install.locator('.approval-left').textContent()) ?? '';
       if (!/^\d+ (min|h)/.test(left) || !left.endsWith('left')) throw new Error(`the time left reads ${left}`);
     });
+    // Both approvals are decided below, so the phone check gets them back from this answer.
+    const pendingApprovals = await page.evaluate<unknown>(
+      "fetch('/api/approvals?status=pending').then((response) => response.json())",
+    );
     /** The signed-in person's approvals in one status, as the hub recorded them. */
     const recorded = (status: string) =>
       page.evaluate<{ summary: string; decidedBy: string | null }[]>(
@@ -775,6 +787,55 @@ async function main(): Promise<void> {
     await open(page, '#/timeline', '.log');
     await check('live events arrive without reloading', () => page.locator('.log-row.fresh').first().waitFor({ timeout: 12_000 }));
     await shot(page, 'timeline');
+    /** The type and subject of every event the timeline shows. */
+    const rows = () =>
+      page
+        .locator('.log-row')
+        .evaluateAll((items) => items.map((item) => ({ type: item.getAttribute('data-type') ?? '', subject: item.getAttribute('data-subject') })));
+    const filtered = async (label: string, prefixes: string[]) => {
+      await page.click(`.filters .filter:text-is("${label}")`);
+      await page.locator(`.filters .filter[aria-pressed="true"]:text-is("${label}")`).waitFor();
+      const shown = await rows();
+      if (shown.length === 0) throw new Error(`the ${label} filter shows nothing`);
+      const other = shown.filter((row) => !prefixes.some((prefix) => row.type.startsWith(prefix)));
+      if (other.length > 0) throw new Error(`the ${label} filter shows ${other.map((row) => row.type).join(', ')}`);
+      return shown;
+    };
+    await check('the Runners filter shows runner events, and the Attempts filter shows attempt events', async () => {
+      const runners = await filtered('Runners', ['runner.', 'account.']);
+      if (!runners.some((row) => row.type === 'runner.retired')) throw new Error("R-3's retirement is missing");
+      const attempts = await filtered('Attempts', ['attempt.', 'submission.', 'approval.']);
+      if (!attempts.some((row) => row.type === 'attempt.started')) throw new Error('no attempt started');
+      await page.click('.filters .filter:text-is("All")');
+    });
+    await check("a runner card's Events link shows only that runner's events, and an attempt page's Events link only that attempt's events", async () => {
+      await open(page, '#/runners', '.runner-card');
+      await card('R-1').locator('a.events-link').click();
+      await page.waitForURL(/#\/timeline\?subject=R-1$/);
+      await page.locator('.timeline-subject', { hasText: 'R-1' }).waitFor();
+      await page.locator('.log-row').first().waitFor();
+      const runnerRows = await rows();
+      if (runnerRows.some((row) => row.subject !== 'R-1')) throw new Error(`R-1's events include ${JSON.stringify(runnerRows)}`);
+      // T-10's first attempt: its task's events, kept to those of the attempt.
+      await open(page, '#/attempt/T-10-a1', '.attempt-head');
+      await page.locator('.attempt-head a.events-link').click();
+      await page.waitForURL(/#\/timeline\?subject=T-10-a1$/);
+      await page.locator('.log-row').first().waitFor();
+      const expected = await page.evaluate<number>(
+        "fetch('/api/events?subject=T-10&latest=1&limit=200').then((response) => response.json())" +
+          ".then(({ events }) => events.filter((event) => event.data.attemptId === 'T-10-a1').length)",
+      );
+      const all = await page.evaluate<number>(
+        "fetch('/api/events?subject=T-10&latest=1&limit=200').then((response) => response.json()).then(({ events }) => events.length)",
+      );
+      const attemptRows = await rows();
+      if (attemptRows.some((row) => row.subject !== 'T-10')) throw new Error(`T-10-a1's events include ${JSON.stringify(attemptRows)}`);
+      if (attemptRows.length !== expected || expected === all) {
+        throw new Error(`it shows ${attemptRows.length} events; the hub has ${expected} of T-10-a1 among T-10's ${all}`);
+      }
+      await page.click('.page-meta a:text-is("Show everything")');
+      await page.waitForURL(/#\/timeline$/);
+    });
 
     await open(page, '#/goal', '.charter-text');
     const leadCard = page.locator('.lead-card');
@@ -824,12 +885,41 @@ async function main(): Promise<void> {
     });
 
     await page.setViewportSize({ width: 390, height: 844 });
-    await open(page, '#/board', '.board');
-    await check('the layout fits a phone screen', async () => {
+    /** Fails when the page is wider than the phone's screen. */
+    const fitsPhone = async () => {
       const width = await page.evaluate<number>('document.documentElement.scrollWidth');
       if (width > 390) throw new Error(`the page is ${width}px wide`);
-    });
+    };
+    await open(page, '#/board', '.board');
+    await check('the layout fits a phone screen', fitsPhone);
     await shot(page, 'phone-board');
+    // An approval card, with its full command, cwd, warnings and diff, is the widest M2 content. Both T-8 approvals are
+    // decided by now, so the Approvals page gets them as they were while pending, from a fake answer.
+    const approvalsRoute = (url: URL) => url.pathname === '/api/approvals';
+    await page.route(approvalsRoute, (route) =>
+      route.request().method() === 'GET' ? route.fulfill({ json: pendingApprovals }) : route.fallback(),
+    );
+    await check('the Runners page, the Approvals page with its approval cards and a task page with attempts fit a phone screen', async () => {
+      try {
+        for (const [hash, selector, name] of [
+          ['#/runners', '.runner-card', 'phone-runners'],
+          ['#/approvals', '.approval-card', 'phone-approvals'],
+          ['#/task/T-10', '.attempts-table', 'phone-task-attempts'],
+        ] as const) {
+          // A new hash keeps the page and its loaded data, so a reload fetches the approvals from the fake answer.
+          await page.goto(`${base}/${hash}`);
+          await page.reload();
+          await page.waitForSelector(selector);
+          if (hash === '#/approvals') await waitForCount(page.locator('.approval-card'), 2);
+          await fitsPhone().catch((error: Error) => {
+            throw new Error(`${hash}: ${error.message}`);
+          });
+          await shot(page, name);
+        }
+      } finally {
+        await page.unroute(approvalsRoute);
+      }
+    });
     await page.setViewportSize({ width: 1440, height: 900 });
 
     await check('signing out shows the sign-in page', async () => {
@@ -837,7 +927,7 @@ async function main(): Promise<void> {
       await page.locator('input[autocomplete=username]').waitFor();
     });
 
-    await check('no errors in the page', async () => {
+    await check('the final check finds no page errors after every M2 page', async () => {
       const errors = [...(await page.evaluate<string[]>('window.__agflowErrors')), ...consoleErrors];
       if (errors.length > 0) throw new Error(errors.join(' | '));
     });

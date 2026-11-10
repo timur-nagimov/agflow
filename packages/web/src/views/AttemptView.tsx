@@ -64,6 +64,9 @@ export function AttemptView({ id }: { id: string }) {
         <div className="task-head-top">
           <span className="task-id big">{attempt.id}</span>
           <span className={`chip tone-${attemptTone(attempt)}`}>{statusText}</span>
+          <a className="events-link" href={routeHref({ view: 'timeline', subject: attempt.id })}>
+            Events
+          </a>
         </div>
         <h1 className="page-title">
           {attempt.taskId

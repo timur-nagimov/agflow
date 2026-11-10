@@ -1,4 +1,4 @@
-import type { Task, TaskKind } from '@agflow/core';
+import { type Task, type TaskKind, isClosed, liveChatOnly } from '@agflow/core';
 import { type FormEvent, useState } from 'react';
 import { api } from '../api';
 import { Empty, ErrorBox, Field, Loading, PageHead, StatusChip } from '../components';
@@ -86,6 +86,17 @@ function TaskCard({ task }: { task: Task }) {
         </span>
         {task.kind !== 'code' ? <span>{task.kind}</span> : null}
         {task.assignee ? <span className="mono">{task.assignee}</span> : null}
+        {task.attemptCount > 1 ? (
+          <span className="attempt-count" title={`${task.attemptCount} attempts so far`}>
+            attempt {task.attemptCount}
+          </span>
+        ) : null}
+        {/* Core's rule, as the scheduler applies it (design 6.6); a closed task needs no agent any more. */}
+        {!isClosed(task.status) && liveChatOnly(task) ? (
+          <span className="chip tone-wait live-only" title="Runner agents may not change its owned paths">
+            Live chat only
+          </span>
+        ) : null}
       </div>
       {task.status === 'blocked' && task.blockedReason ? <p className="task-note">{task.blockedReason}</p> : null}
     </a>

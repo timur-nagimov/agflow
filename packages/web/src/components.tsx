@@ -329,7 +329,12 @@ export function EventList({ events }: { events: HubEvent[] }) {
   return (
     <ol className="log">
       {events.map((event) => (
-        <li key={event.id} className={`log-row tone-${eventTone(event.type, event.data)}${event.id > firstSeen ? ' fresh' : ''}`}>
+        <li
+          key={event.id}
+          className={`log-row tone-${eventTone(event.type, event.data)}${event.id > firstSeen ? ' fresh' : ''}`}
+          data-type={event.type}
+          data-subject={event.subject ?? undefined}
+        >
           <span className="log-mark" />
           <When ts={event.ts} clock />
           <span className="log-text">

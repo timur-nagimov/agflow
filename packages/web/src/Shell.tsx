@@ -197,7 +197,7 @@ function View({ route }: { route: Route }) {
     case 'messages':
       return <MessagesView key={route.to ?? ''} to={route.to} />;
     case 'timeline':
-      return <TimelineView />;
+      return <TimelineView key={route.subject ?? ''} subject={route.subject} />;
     case 'knowledge':
       return <KnowledgeView />;
   }

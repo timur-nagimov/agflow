@@ -1,4 +1,4 @@
-import { TARGET_PATTERN, parseAttemptId } from '@agflow/core';
+import { type HubEvent, TARGET_PATTERN, parseAttemptId } from '@agflow/core';
 
 export type Route =
   | { view: 'board' }
@@ -11,7 +11,8 @@ export type Route =
   /** At core's APPROVALS_ROUTE, which runner notifications print; route.test.ts compares the two (X-48). */
   | { view: 'approvals' }
   | { view: 'messages'; to?: string }
-  | { view: 'timeline' }
+  /** Optionally the events of one runner or one attempt (X-23); timelineQuery says how they are asked for. */
+  | { view: 'timeline'; subject?: string }
   | { view: 'knowledge' };
 
 export type NavView = Exclude<Route['view'], 'task' | 'attempt'>;
@@ -28,6 +29,13 @@ export const NAV: { view: NavView; label: string }[] = [
 ];
 
 const TASK_ID = /^T-\d+$/;
+/** Core's RunnerIdSchema, repeated because the web takes no values from core's zod modules (X-48); the test compares. */
+const RUNNER_ID = /^R-\d+$/;
+
+/** A subject the timeline can follow: a runner, or an attempt, a lead's included. */
+function isTimelineSubject(subject: string): boolean {
+  return RUNNER_ID.test(subject) || parseAttemptId(subject) !== null;
+}
 
 /** Reads a route from a location hash such as "#/task/T-12", "#/attempt/T-12-a2" or "#/messages?to=lead". */
 export function parseRoute(hash: string): Route {
@@ -38,9 +46,12 @@ export function parseRoute(hash: string): Route {
     case 'agents':
     case 'runners':
     case 'approvals':
-    case 'timeline':
     case 'knowledge':
       return { view };
+    case 'timeline': {
+      const subject = new URLSearchParams(search).get('subject');
+      return subject && isTimelineSubject(subject) ? { view, subject } : { view };
+    }
     case 'messages': {
       const to = new URLSearchParams(search).get('to');
       return to && TARGET_PATTERN.test(to) ? { view, to } : { view };
@@ -62,6 +73,8 @@ export function routeHref(route: Route): string {
       return `#/attempt/${route.id}`;
     case 'messages':
       return route.to ? `#/messages?to=${encodeURIComponent(route.to)}` : '#/messages';
+    case 'timeline':
+      return route.subject ? `#/timeline?subject=${encodeURIComponent(route.subject)}` : '#/timeline';
     default:
       return `#/${route.view}`;
   }
@@ -77,4 +90,20 @@ export function navViewOf(route: Route): NavView {
     default:
       return route.view;
   }
+}
+
+/**
+ * How the timeline asks for a subject's events (design 6.17, X-23). A runner's and a lead attempt's events carry them
+ * as their subject. A task attempt's carry its task, so they are asked for by the task and kept by data.attemptId.
+ */
+export function timelineQuery(subject: string): { subject: string; attemptId: string | null } {
+  const taskId = parseAttemptId(subject)?.taskId ?? null;
+  return taskId === null ? { subject, attemptId: null } : { subject: taskId, attemptId: subject };
+}
+
+/** Whether an event belongs to the timeline's subject, for the live events that arrive while it is open. */
+export function inTimelineSubject(event: Pick<HubEvent, 'subject' | 'data'>, subject: string): boolean {
+  const query = timelineQuery(subject);
+  if (event.subject !== query.subject) return false;
+  return query.attemptId === null || event.data.attemptId === query.attemptId;
 }

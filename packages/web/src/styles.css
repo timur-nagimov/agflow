@@ -401,6 +401,8 @@ label.inline select { width: auto; max-width: 340px; }
   transition: transform 0.12s ease, border-color 0.12s ease;
 }
 .task-card:hover { text-decoration: none; transform: translateY(-1px); border-color: var(--rule-strong); border-left-color: var(--tone); }
+.events-link { margin-left: auto; font-size: 12.5px; white-space: nowrap; }
+.timeline-subject { font-size: 12.5px; }
 .task-card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .task-id { font: 500 12px/1 var(--mono); color: var(--ink-2); }
 .task-id.big { font-size: 15px; color: var(--ink); }

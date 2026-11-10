@@ -5,6 +5,7 @@ import { Empty, ErrorBox, Fact, Field, Loading, Meter, PageHead } from '../compo
 import { VENDOR_NAMES } from '../format';
 import { useAction, useNow } from '../hooks';
 import { useHub } from '../hub';
+import { routeHref } from '../route';
 import {
   KEEP_AWAKE_LABELS,
   type QuotaMeter,
@@ -92,6 +93,9 @@ function RunnerCard({
         <span className="runner-id">{runner.id}</span>
         <h2 className="runner-name">{runner.name}</h2>
         <span className={`chip tone-${tone}`}>{RUNNER_STATE_LABELS[runner.state]}</span>
+        <a className="events-link" href={routeHref({ view: 'timeline', subject: runner.id })}>
+          Events
+        </a>
       </header>
       {why ? <p className="runner-why">{why}</p> : null}
       {accepting ? <p className="runner-why warn-text">It {accepting}</p> : null}
