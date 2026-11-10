@@ -1,15 +1,31 @@
 // Shared pieces of the local sandbox checks (design 5, 15, 7.6; X-20): their gate, the probe scripts the model runs
 // through real sandboxed Bash calls, the same scripts run outside for comparison, a throwaway keychain, and the table
 // of what each check expected and observed, which the suites print.
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { afterToolResult, bashTool, reply, rules, type ScriptRule, userSays } from '@agflow/testkit/src/anthropic';
+import {
+  type AnthropicRequest,
+  type AnthropicToolResult,
+  afterToolResult,
+  bashTool,
+  reply,
+  rules,
+  type ScriptRule,
+  type ToolUseBlock,
+  userSays,
+} from '@agflow/testkit/src/anthropic';
+import { claudeProjectDir } from '../../src/adapters/claude/paths';
+import { CLAUDE_WEAKENED_AUTO } from '../../src/adapters/claude/preflight';
+import type { AgentEvent } from '../../src/adapters/types';
+import type { RunnerConfig } from '../../src/config';
 import {
   type ClaudeSmoke,
   type ClaudeSmokeGate,
   type ClaudeSmokeGateOptions,
+  type ClaudeSmokeOptions,
   claudeSmokeGate,
+  startClaudeSmoke,
 } from '../claude-real/harness';
 
 /** check:claude-sandbox sets both: the checks are real-CLI suites too. */
@@ -39,6 +55,49 @@ export function sandboxGate(options: ClaudeSmokeGateOptions & { platform?: strin
   const platform = options.platform ?? process.platform;
   if (platform !== 'darwin') return { run: false, bin: null, reason: `the sandbox checks need macOS, not ${platform}` };
   return claudeSmokeGate({ ...options, switches: SANDBOX_SWITCHES });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Profiles
+
+export type ProfileName = RunnerConfig['profile'];
+
+export const PROFILES: readonly ProfileName[] = ['standard', 'auto'];
+
+export interface ProfileSmoke {
+  smoke: ClaudeSmoke;
+  /** The permission mode the profile's sessions run in: auto only where the account offers it. */
+  permissionMode: 'acceptEdits' | 'auto';
+  /** Why the profile's checks do not run: the auto profile on an account that does not offer auto (X-29). */
+  skipped: string | null;
+}
+
+/**
+ * A harness in the profile. For auto, preflight first asks the scripted server's account whether it offers auto mode,
+ * as the runner does, and a table row reports what it said; without auto the checks are skipped, and the live run
+ * covers them. A preflight that is not ready fails instead, and so does a skipped run whose CLI left the isolation.
+ */
+export async function startProfileSmoke(
+  profile: ProfileName,
+  table: CheckTable,
+  options: ClaudeSmokeOptions = {},
+): Promise<ProfileSmoke> {
+  const smoke = await startClaudeSmoke({ ...options, profile });
+  if (profile !== 'auto') return { smoke, permissionMode: 'acceptEdits', skipped: null };
+  const preflight = await smoke.adapter.preflight();
+  // Preflight falls back to the standard handshake when the auto one fails, so only a ready one tells.
+  if (!preflight.facts.ready) throw new Error(`preflight is not ready: ${preflight.facts.problem}`);
+  const offered = preflight.weakened.includes(CLAUDE_WEAKENED_AUTO);
+  const skipped = offered ? null : "the scripted server's account does not offer auto mode; the live run covers it";
+  const problems = smoke.isolationProblems();
+  if (problems.length > 0) throw new Error(`preflight's CLI left the isolation: ${problems.join('; ')}`);
+  table.add({
+    check: "auto mode offered by the scripted server's account",
+    expected: 'offered',
+    observed: offered ? 'offered' : 'not offered',
+    skipped,
+  });
+  return { smoke, permissionMode: offered ? 'auto' : 'acceptEdits', skipped };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -95,6 +154,51 @@ function shellQuote(word: string): string {
   return /^[\w./:@-]+$/.test(word) ? word : `'${word.replaceAll("'", `'\\''`)}'`;
 }
 
+/** A tool call the model makes: fixed, or built from the result of the call before it (null for the first). */
+export type AgentStep = ToolUseBlock | ((previous: AnthropicToolResult | null) => ToolUseBlock);
+
+export interface AgentRun {
+  /** Each step's tool result, as the model saw it, in order. */
+  results: AnthropicToolResult[];
+  /** Every event of the session, which ended after the turn. */
+  events: AgentEvent[];
+}
+
+/**
+ * Has the model make the tool calls one after another in one new session's turn, each once the result of the one
+ * before it came back, and returns the results it saw. The session ends with the turn.
+ */
+export async function runAgentSteps(smoke: ClaudeSmoke, steps: AgentStep[]): Promise<AgentRun> {
+  const tag = crypto.randomUUID().slice(0, 8);
+  const prompt = `Run the sandbox steps ${tag}.`;
+  const idOf = (index: number) => `toolu_step_${tag}_${index + 1}`;
+  const ids = steps.map((_, index) => idOf(index));
+  const call = (index: number, request: AnthropicRequest) => {
+    const step = steps[index];
+    if (step === undefined) throw new Error(`there is no step ${index + 1}`);
+    const previous = request.toolResults.find((result) => result.toolUseId === idOf(index - 1)) ?? null;
+    return reply({ ...(typeof step === 'function' ? step(previous) : step), id: idOf(index) });
+  };
+  // Each result asks for the next call; the last one ends the turn.
+  const script: ScriptRule[] = ids.map((id, index) => ({
+    when: afterToolResult(id),
+    reply: (request) => (index + 1 < ids.length ? call(index + 1, request) : reply('The steps ran.')),
+  }));
+  smoke.server.setHandler(rules(...script, { when: userSays(prompt), reply: (request) => call(0, request) }));
+  const session = await smoke.start({ prompt });
+  const ended = await session.next('turn_ended', () => true, { timeoutMs: PROBE_TOOL_TIMEOUT_MS * steps.length });
+  await session.session.close();
+  await session.ended;
+  if (ended.outcome !== 'completed') throw new Error(`the steps' turn ended ${ended.outcome}: ${ended.error}`);
+  const results = ids.map((id, index) => {
+    const answered = smoke.server.requests.find((request) => afterToolResult(id)(request));
+    const result = answered?.toolResults.find((candidate) => candidate.toolUseId === id);
+    if (!result) throw new Error(`step ${index + 1} got no result`);
+    return result;
+  });
+  return { results, events: session.events };
+}
+
 /**
  * Has the model run the commands through the Bash tool, one call after another in one turn, from the clone with the
  * probe scripts copied in, and returns every PROBE line the results carried. A result without one (a permission
@@ -104,30 +208,27 @@ export async function runAsAgent(smoke: ClaudeSmoke, commands: string[]): Promis
   const directory = join(smoke.clone, CLONE_PROBES);
   mkdirSync(directory, { recursive: true });
   for (const script of readdirSync(PROBES)) copyFileSync(join(PROBES, script), join(directory, script));
-  const prompt = `Run the sandbox probes ${crypto.randomUUID().slice(0, 8)}.`;
-  const ids = commands.map((_, index) => `toolu_probe_${index + 1}`);
-  const call = (index: number) =>
-    reply(bashTool({ command: commands[index] ?? '', id: ids[index], timeoutMs: PROBE_TOOL_TIMEOUT_MS }));
-  // Each result asks for the next command; the last one ends the turn.
-  const script: ScriptRule[] = ids.map((id, index) => ({
-    when: afterToolResult(id),
-    reply: index + 1 < ids.length ? call(index + 1) : reply('The probes ran.'),
-  }));
-  smoke.server.setHandler(rules(...script, { when: userSays(prompt), reply: call(0) }));
-  const session = await smoke.start({ prompt });
-  const ended = await session.next('turn_ended', () => true, { timeoutMs: PROBE_TOOL_TIMEOUT_MS * commands.length });
-  await session.session.close();
-  await session.ended;
-  if (ended.outcome !== 'completed') throw new Error(`the probe turn ended ${ended.outcome}: ${ended.error}`);
-  const results: ProbeResults = new Map();
-  for (const [index, id] of ids.entries()) {
-    const answered = smoke.server.requests.find((request) => afterToolResult(id)(request));
-    const text = answered?.toolResults.find((result) => result.toolUseId === id)?.text;
-    const parsed = parseProbes(text ?? '');
-    if (parsed.size === 0) throw new Error(`\`${commands[index]}\` printed no probe line: ${text ?? 'no result'}`);
-    for (const [label, result] of parsed) results.set(label, result);
+  const { results } = await runAgentSteps(
+    smoke,
+    commands.map((command) => bashTool({ command, timeoutMs: PROBE_TOOL_TIMEOUT_MS })),
+  );
+  const probes: ProbeResults = new Map();
+  for (const [index, { text }] of results.entries()) {
+    const parsed = parseProbes(text);
+    if (parsed.size === 0) throw new Error(`\`${commands[index]}\` printed no probe line: ${text}`);
+    for (const [label, result] of parsed) probes.set(label, result);
   }
-  return results;
+  return probes;
+}
+
+/** Another attempt's session: a transcript holding a secret, in its own project directory under the Claude home. */
+export function otherTranscript(smoke: ClaudeSmoke): { path: string; secret: string } {
+  const other = claudeProjectDir(smoke.claudeHome, join(smoke.root, 'other-clone'));
+  mkdirSync(other, { recursive: true });
+  const secret = `agflow-other-transcript-${crypto.randomUUID()}`;
+  const path = join(other, `${crypto.randomUUID()}.jsonl`);
+  writeFileSync(path, `${JSON.stringify({ type: 'user', message: { role: 'user', content: secret } })}\n`);
+  return { path, secret };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
