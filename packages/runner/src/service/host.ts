@@ -11,6 +11,7 @@ import { editLocalSettings, isTestMode, loadRunnerConfig, type RunnerConfig, sav
 import { openRunnerDb, type RunnerDb } from '../db';
 import type { FetchFn } from '../hub-http';
 import { Journal } from '../journal';
+import { sameHubUrl, type WelcomeMessage } from '../link';
 import { createServiceHealth, type ServiceHealth } from '../ops/health';
 import { KeepAwake } from '../ops/keep-awake';
 import type { PowerSample } from '../ops/power';
@@ -23,6 +24,7 @@ import { standardProfile } from '../profile';
 import { killRegisteredGroups } from '../recovery';
 import { createRunner, type RunnerEvents, type RunnerHandle, type RunnerOptions } from '../runner';
 import type { DependencyPreparer, Notifier } from '../seams';
+import { runServiceChecks } from './checks';
 import { type ControlRoutes, type ControlServer, startControlServer } from './control';
 import { readCliCredentials } from './credentials';
 import { applyCrashLoopGuard } from './drain';
@@ -87,6 +89,8 @@ export interface RunnerServiceOptions {
   caffeinate?: string;
   /** Shared preparation sandbox; checked once at service start. */
   prepSandbox?: PrepSandbox;
+  /** Setup checks wait up to 30 s for the first hub welcome. */
+  checksWelcomeTimeoutMs?: number;
 }
 
 export interface RunnerService {
@@ -140,6 +144,10 @@ function describe(error: unknown): string {
 export async function startRunnerService(options: RunnerServiceOptions): Promise<RunnerService> {
   const paths = options.paths ?? runnerPaths();
   const { mode, configDir, agflow } = options;
+  const credentialsProvider = () => readCliCredentials(configDir);
+  const firstWelcome = Promise.withResolvers<WelcomeMessage>();
+  let currentWelcome: WelcomeMessage | null = null;
+  let adapters: VendorAdapter[] = [];
   const terminal =
     options.terminal ??
     ((line: string) => {
@@ -154,6 +162,8 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   };
   const exited = Promise.withResolvers<ServiceExit>();
   const initialized = Promise.withResolvers<void>();
+  // The runner once createRunner returns; null when the service ends before that.
+  const runnerUp = Promise.withResolvers<RunnerHandle | null>();
   const waiting = new AbortController();
   let lock: RunnerLock | null = null;
   let logger: RotatingLog | null = null;
@@ -191,6 +201,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   function finish(input: ServiceExit, level: 'info' | 'error', agents: AgentsEnd = 'stop'): Promise<ServiceExit> {
     if (ending) return exited.promise;
     ending = true;
+    runnerUp.resolve(null);
     const deadline = performance.now() + suspendMs;
     waiting.abort();
     // A retention sweep under way stops before its next step, so teardown waits only for the step it is in.
@@ -298,6 +309,44 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
 
   // The control socket's routes; the commands of later tasks add theirs here.
   const routes: ControlRoutes = {
+    'POST /checks': async () => {
+      // Setup asks right after install, while the socket already answers but the runner may still be starting: the
+      // wait for it counts against the welcome's budget.
+      const budgetMs = options.checksWelcomeTimeoutMs ?? 30_000;
+      const startedAt = performance.now();
+      const waited = runner === null;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const ready =
+        runner ??
+        (await Promise.race([
+          runnerUp.promise,
+          new Promise<'timeout'>((resolve) => {
+            timer = setTimeout(() => resolve('timeout'), budgetMs);
+          }),
+        ]).finally(() => clearTimeout(timer)));
+      if (ready === null) throw new Error('the runner service is stopping');
+      if (ready === 'timeout') {
+        const login = needsLogin?.state();
+        const state = login?.on ? `needs_login: ${login.reason}; run agflow login` : 'still starting';
+        throw new Error(`the runner did not start within ${budgetMs / 1000} s (${state})`);
+      }
+      return runServiceChecks({
+        runner: ready,
+        welcome: currentWelcome === null ? firstWelcome.promise : Promise.resolve(currentWelcome),
+        adapters,
+        sandbox: sandbox!,
+        // Pinned like createRunner's: a sign-in to another hub must not pass the checks of this runner's.
+        credentials: () => {
+          const current = credentialsProvider();
+          return current !== null && hubUrl !== null && sameHubUrl(current.hubUrl, hubUrl) ? current : null;
+        },
+        hubUrl,
+        fetch: options.fetch,
+        exec: options.exec ?? defaultExec,
+        platform: options.platform ?? process.platform,
+        welcomeTimeoutMs: waited ? Math.max(0, Math.round(budgetMs - (performance.now() - startedAt))) : budgetMs,
+      });
+    },
     'GET /status': () => {
       const status = runner?.status() ?? null;
       const records = store?.list() ?? [];
@@ -358,6 +407,8 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     },
     gap: (gap) => health?.gap(gap),
     welcome: (welcome) => {
+      currentWelcome = welcome;
+      firstWelcome.resolve(welcome);
       heartbeatMs = welcome.timings.heartbeatMs;
       needsLogin?.leave();
     },
@@ -472,7 +523,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       if (ending) return;
       hubUrl = credentials!.hubUrl;
     }
-    const adapters = options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow });
+    adapters = options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow });
     sandbox =
       options.prepSandbox ?? new PrepSandbox({ allowedDomains: standardProfile.network.allowedDomains, logger });
     preparer = await createDependencyPreparer({ paths, store, config: () => config, logger, sandbox });
@@ -483,7 +534,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       paths,
       config,
       db,
-      credentials: () => readCliCredentials(configDir),
+      credentials: credentialsProvider,
       adapters,
       cliVersion: options.cliVersion,
       agflow,
@@ -495,6 +546,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       fetch: options.fetch,
       tmpRoot: options.tmpRoot,
     });
+    runnerUp.resolve(runner);
     if (crashLoop) await runner.changeSettings({ draining: true });
     health.start();
     keepAwake.evaluate();
