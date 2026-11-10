@@ -3,7 +3,7 @@ import { claudeTestEnv } from '../src/anthropic/env';
 import { UNSCRIPTED_TEXT } from '../src/anthropic/server';
 import { DEFAULT_REPLY_TEXT } from '../src/codex/replies';
 import { codexTestConfig } from '../src/codex/test-config';
-import { type Models, startModels } from '../src/harness/models';
+import { callIdsIn, type Models, sessionOf, startModels } from '../src/harness/models';
 import { CLOSING_TEXT, type Program, type Programs, shell, tool } from '../src/harness/playbook';
 
 const started: Models[] = [];
@@ -25,10 +25,16 @@ type Block = Record<string, unknown>;
 type Message = { role: string; content: string | Block[] };
 
 /** A Claude main-loop request, sent as the CLI sends it (without streaming, to read the reply at once). */
-async function claude(target: Models, system: string, messages: Message[], tools = ['Bash']): Promise<Block> {
+async function claude(
+  target: Models,
+  system: string,
+  messages: Message[],
+  tools = ['Bash'],
+  headers: Record<string, string> = {},
+): Promise<Block> {
   const response = await fetch(`${target.anthropic.url}/v1/messages?beta=true`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-api-key': 'k' },
+    headers: { 'content-type': 'application/json', 'x-api-key': 'k', ...headers },
     body: JSON.stringify({
       model: 'claude-test',
       max_tokens: 1024,
@@ -170,6 +176,34 @@ describe('startModels', () => {
     expect(cluster.sawText('T-1-a2', 'MARK-CODEX-CALL')).toBe(false);
     expect(cluster.sawText('T-1-a2', 'MARK-CODEX-WORDS')).toBe(false);
     expect(cluster.requestsFor('T-1-a3')).toEqual([]);
+  });
+
+  test("sessionOf and callIdsIn read a request's session or thread and the model's own calls", async () => {
+    const cluster = await models({ 'T-1-a1': PROGRAM, 'T-1-a2': PROGRAM });
+    const system = `Primary working directory: ${clone('T-1-a1')}`;
+    await claude(cluster, system, [{ role: 'user', content: 'Start.' }]);
+    await claude(
+      cluster,
+      system,
+      [
+        { role: 'user', content: 'Start.' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'e2e-s0', name: 'Bash', input: { command: 'true' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'e2e-s0', content: 'done' }] },
+      ],
+      ['Bash'],
+      { 'x-claude-code-session-id': 'session-1' },
+    );
+    await codex(cluster, [
+      environment(clone('T-1-a2')),
+      user('Start.'),
+      { type: 'custom_tool_call', name: 'exec', call_id: 'e2e-s0', input: '' },
+      { type: 'custom_tool_call_output', call_id: 'e2e-s0', output: [{ type: 'input_text', text: 'exit 0' }] },
+    ]);
+    const [first, second] = cluster.requestsFor('T-1-a1');
+    const [thread] = cluster.requestsFor('T-1-a2');
+    if (!first || !second || !thread) throw new Error('a request was not recorded');
+    expect([sessionOf(first), sessionOf(second), sessionOf(thread)]).toEqual([null, 'session-1', 'thread-1']);
+    expect([callIdsIn(first), callIdsIn(second), callIdsIn(thread)]).toEqual([[], ['e2e-s0'], ['e2e-s0']]);
   });
 
   test('addPrograms adds programs for later requests and keeps the others', async () => {

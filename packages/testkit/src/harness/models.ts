@@ -27,6 +27,26 @@ export type RecordedRequest =
   | (Recorded & { vendor: 'claude'; request: AnthropicRequest })
   | (Recorded & { vendor: 'codex'; request: ResponsesRequest });
 
+/** The session (Claude) or thread (Codex) the request belongs to; null when it names none. */
+export function sessionOf(request: RecordedRequest): string | null {
+  return request.vendor === 'claude' ? request.request.sessionId : request.request.threadId;
+}
+
+/** The ids of the model's own tool calls in the history the request carries, oldest first. */
+export function callIdsIn(request: RecordedRequest): string[] {
+  if (request.vendor === 'claude') {
+    return request.request.messages.flatMap((message) =>
+      message.blocks.flatMap((block) => (block.type === 'tool_use' ? [block.id] : [])),
+    );
+  }
+  const input = Array.isArray(request.request.body.input) ? (request.request.body.input as unknown[]) : [];
+  return input.flatMap((item) => {
+    const entry = item as Record<string, unknown> | null;
+    const type = typeof entry?.type === 'string' ? entry.type : '';
+    return type.endsWith('_call') && typeof entry?.call_id === 'string' ? [entry.call_id] : [];
+  });
+}
+
 export interface Models {
   anthropic: ScriptedAnthropic;
   responses: ResponsesServer;
