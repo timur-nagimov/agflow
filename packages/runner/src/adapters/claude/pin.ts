@@ -18,9 +18,10 @@ export function claudePin(platform: string = vendorPlatform()): ClaudePin | null
 }
 
 /**
- * Whether the sandbox's denyWrite of the shared /tmp/claude holds on this pin. It held on 2.1.285 in the feasibility
- * probe; check:claude-sandbox re-checks it for each pin and sets this to false if it fails, which makes preflight list
- * '/tmp/claude' as weakened (X-29). Nothing is probed at run time.
+ * Whether the sandbox's denyWrite of the shared /tmp/claude (and /private/tmp/claude) holds on this pin. Settled for
+ * 2.1.285 by check:claude-sandbox (test/claude-sandbox/writes.test.ts), where sandboxed writes to both were refused;
+ * that check fails whenever this disagrees with the sandbox, so a new pin sets it to what it saw. False makes
+ * preflight list '/tmp/claude' as weakened (X-29). Nothing is probed at run time.
  */
 export const TMP_CLAUDE_DENYWRITE_ENFORCED = true;
 
