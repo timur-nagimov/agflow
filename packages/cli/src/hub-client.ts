@@ -1,22 +1,34 @@
+import {
+  type AgentStopInputSchema,
+  BRIDGE_HEADER,
+  BRIDGE_VERSION,
+  type RunnerSubmitInputSchema,
+  type StaffingInputSchema,
+} from '@agflow/core';
 import type {
   Agent,
   AgentRole,
+  Attempt,
   GoalNote,
   GoalVersion,
   HubEvent,
   HubStatus,
+  LeadNote,
   LiveInbox,
   LivePeek,
   Message,
   NewTaskInput,
+  PrepareRequest,
   SearchResult,
   StopCheckResult,
+  SubmissionRecord,
   Task,
   TaskDetail,
   TaskPatch,
   TaskStatus,
   Vendor,
 } from '@agflow/core';
+import type { z } from 'zod';
 
 export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -25,6 +37,8 @@ export class HubClientError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    /** The reason of the hub's body: the attempt's end reason for 401 attempt_ended, null when it gave none. */
+    readonly reason: string | null = null,
   ) {
     super(message);
     this.name = 'HubClientError';
@@ -48,6 +62,11 @@ export interface SubmitBody {
   headSha?: string | undefined;
 }
 
+/** A runner agent's submit: the runner pushes the branch the hub gave its attempt, so it names no branch or head. */
+export type RunnerSubmitBody = z.input<typeof RunnerSubmitInputSchema>;
+export type StaffingBody = z.input<typeof StaffingInputSchema>;
+export type AgentStopBody = z.input<typeof AgentStopInputSchema>;
+
 export interface MessageBody {
   to: string;
   body: string;
@@ -56,6 +75,9 @@ export interface MessageBody {
 }
 
 const q = encodeURIComponent;
+
+/** The hub takes every bearer with this prefix for a runner agent's token (design 6.5). */
+const AGENT_TOKEN_PREFIX = 'agt_';
 
 export class HubClient {
   readonly baseUrl: string;
@@ -72,10 +94,17 @@ export class HubClient {
     this.timeoutMs = options.timeoutMs ?? 15_000;
   }
 
+  /** Whether the bearer is a runner agent's token, which names the agent itself. */
+  get viaAgentToken(): boolean {
+    return this.token?.startsWith(AGENT_TOKEN_PREFIX) ?? false;
+  }
+
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const headers: Record<string, string> = { accept: 'application/json' };
+    // The bridge header tells the hub this client can start a live claim from a WIP ref (design 10).
+    const headers: Record<string, string> = { accept: 'application/json', [BRIDGE_HEADER]: String(BRIDGE_VERSION) };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
-    if (this.agentId) headers['x-agflow-agent'] = this.agentId;
+    // The hub refuses X-Agflow-Agent next to an agent token.
+    if (this.agentId && !this.viaAgentToken) headers['x-agflow-agent'] = this.agentId;
     if (body !== undefined) headers['content-type'] = 'application/json';
     let response: Response;
     try {
@@ -97,11 +126,12 @@ export class HubClient {
       json = null;
     }
     if (!response.ok) {
-      const error = (json ?? {}) as { error?: string; message?: string };
+      const error = (json ?? {}) as { error?: string; message?: string; reason?: unknown };
       throw new HubClientError(
         response.status,
         error.error ?? 'http_error',
         error.message ?? `${method} ${path} failed with HTTP ${response.status}`,
+        typeof error.reason === 'string' ? error.reason : null,
       );
     }
     return json as T;
@@ -196,6 +226,20 @@ export class HubClient {
     return this.request<{ task: Task }>('POST', `/api/tasks/${q(id)}/release`, { reason });
   }
 
+  // A runner agent (design 6.13, 7.7): a submit the runner pushes, and dependency preparation, each polled until done
+  submitWork(id: string, body: RunnerSubmitBody) {
+    return this.request<{ submission: SubmissionRecord }>('POST', `/api/tasks/${q(id)}/submit`, body);
+  }
+  submission(id: string) {
+    return this.request<{ submission: SubmissionRecord }>('GET', `/api/submissions/${q(id)}`);
+  }
+  requestPrepare() {
+    return this.request<{ request: PrepareRequest }>('POST', '/api/prepare', {});
+  }
+  prepareRequest(id: string) {
+    return this.request<{ request: PrepareRequest }>('GET', `/api/prepare/${q(id)}`);
+  }
+
   // Lead
   createTasks(tasks: NewTaskInput[]) {
     return this.request<{ tasks: Task[] }>('POST', '/api/tasks', { tasks });
@@ -220,5 +264,20 @@ export class HubClient {
   }
   addGoalNote(text: string) {
     return this.request<GoalNote>('POST', '/api/goal/notes', { text });
+  }
+  staffing(body: StaffingBody) {
+    return this.request<{ running: number; target: number }>('POST', '/api/staffing', body);
+  }
+  stopAgent(agentId: string, body: AgentStopBody) {
+    return this.request<{ attempt: Attempt }>('POST', `/api/agents/${q(agentId)}/stop`, body);
+  }
+  replaceAgent(agentId: string, reason: string) {
+    return this.request<{ attempt: Attempt }>('POST', `/api/agents/${q(agentId)}/replace`, { reason });
+  }
+  leadHandoff(note: string) {
+    return this.request<{ ok: true }>('POST', '/api/lead/handoff', { note });
+  }
+  leadNotes() {
+    return this.request<{ notes: LeadNote[] }>('GET', '/api/lead/notes');
   }
 }

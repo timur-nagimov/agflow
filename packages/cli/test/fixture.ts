@@ -1,11 +1,12 @@
 import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { AgentRole, Vendor } from '@agflow/core';
+import type { Agent, AgentRole, Attempt, Task, Vendor } from '@agflow/core';
 import { startLiveSession } from '@agflow/hub/src/agents';
-import { createSession } from '@agflow/hub/src/auth';
+import { createSession, mintAgentToken } from '@agflow/hub/src/auth';
 import { HUB_RUNNER_DEFAULTS, type HubConfig, type HubContext, createContext } from '@agflow/hub/src/context';
 import { type App, createApp } from '@agflow/hub/src/http/app';
+import { type RunnerAttemptOptions, addRunnerAttempt, addRunnerLead } from '@agflow/hub/test/helpers';
 import { type FetchFn, HubClient } from '../src/hub-client';
 
 export const HUB_URL = 'http://hub.test';
@@ -17,6 +18,22 @@ export interface LiveAgent {
   client: HubClient;
 }
 
+/** An agent on a runner, as its bridge sees it: the attempt and the agent token the runner gave it. */
+export interface RunnerAgent {
+  agent: Agent;
+  attempt: Attempt;
+  /** The task the attempt holds; null for a lead. */
+  task: Task | null;
+  token: string;
+  /** A client with the agent token as its bearer, as `agflow mcp --runner` makes one. */
+  client: HubClient;
+}
+
+export interface RunnerAgentOptions extends RunnerAttemptOptions {
+  /** A lead holds the seat on a runner of its own, so it takes none of the worker's options. */
+  role?: AgentRole | undefined;
+}
+
 export interface HubFixture {
   ctx: HubContext;
   app: App;
@@ -26,6 +43,8 @@ export interface HubFixture {
   client(user?: string, agentId?: string): HubClient;
   /** Registers a live session the way the SessionStart hook does; the returned client is already bound. */
   liveAgent(user?: string, role?: AgentRole, vendor?: Vendor): LiveAgent;
+  /** A runner worker holding a task (a new one by default), or the runner lead holding the seat, with a minted token. */
+  runnerAgent(options?: RunnerAgentOptions): RunnerAgent;
 }
 
 let sessions = 0;
@@ -67,7 +86,13 @@ export function hubFixture(overrides: Partial<HubConfig> = {}): HubFixture {
     const started = startLiveSession(ctx, user, { vendor, sessionId, role });
     return { agentId: started.agent.id, sessionId, helloCode: started.helloCode, client: client(user, started.agent.id) };
   };
-  return { ctx, app, clock, fetch: fetchFn, tokenFor, client, liveAgent };
+  const runnerAgent = ({ role, ...options }: RunnerAgentOptions = {}): RunnerAgent => {
+    const started = role === 'lead' ? { ...addRunnerLead(ctx), task: null } : addRunnerAttempt(ctx, options);
+    const token = mintAgentToken(ctx, started.attempt);
+    const agentClient = new HubClient({ baseUrl: HUB_URL, token, fetch: fetchFn });
+    return { agent: started.agent, attempt: started.attempt, task: started.task, token, client: agentClient };
+  };
+  return { ctx, app, clock, fetch: fetchFn, tokenFor, client, liveAgent, runnerAgent };
 }
 
 /** Extracts the hello code from a brief. */
