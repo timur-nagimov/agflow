@@ -70,10 +70,10 @@ export function hub(ctx: ToolContext): HubClient {
   return ctx.client;
 }
 
-/** The client acting as this chat's agent; requires hello first. */
+/** The client acting as this chat's agent: after hello, or with a runner's agent token, which names the agent itself. */
 export function asAgent(ctx: ToolContext): HubClient {
   const client = hub(ctx);
-  if (!ctx.state.agentId) throw new ToolError('Call the agflow tool hello first, with the code from your agflow brief.');
+  if (!ctx.state.agentId && !client.viaAgentToken) throw new ToolError('Call the agflow tool hello first, with the code from your agflow brief.');
   return client;
 }
 
