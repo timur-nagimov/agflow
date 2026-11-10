@@ -4,6 +4,7 @@
 // when it runs: every other command, the hooks Claude Code and Codex run on each prompt above all, must not pay for
 // the runner's module graph. A static-string import() is still bundled by `bun build --compile`.
 import type { startRunnerService } from '@agflow/runner/src/service/host';
+import type { installService } from '@agflow/runner/src/service/launchd';
 import { type ParsedArgs, UsageError } from './args';
 import type { Io } from './io';
 import type { Command } from './main';
@@ -15,12 +16,13 @@ export const RUNNER_HELP = `  agflow runner start [--service]
                                 Run this laptop's runner in the foreground (--service for launchd)
   agflow runner drain            Stop accepting new attempts
   agflow runner undrain          Accept new attempts and clear the crash-loop guard
+  agflow runner install          Install and start the LaunchAgent that runs the runner at login
 `;
 
 export async function runnerCommand(
   args: ParsedArgs,
   io: Io,
-  deps: { startRunnerService?: typeof startRunnerService } = {},
+  deps: { startRunnerService?: typeof startRunnerService; installService?: typeof installService } = {},
 ): Promise<number> {
   const drainingCommand =
     (draining: boolean): Command =>
@@ -52,6 +54,24 @@ export async function runnerCommand(
     },
     drain: drainingCommand(true),
     undrain: drainingCommand(false),
+    install: async (args, io) => {
+      if (args.positional.length > 2) throw new UsageError('usage: agflow runner install');
+      try {
+        const install = deps.installService ?? (await import('@agflow/runner/src/service/launchd')).installService;
+        const { runnerPaths } = await import('@agflow/runner/src/paths');
+        const result = await install({
+          paths: runnerPaths(),
+          agflow: selfCommand(),
+          env: process.env,
+          log: (line) => io.err(`${line}\n`),
+        });
+        io.out(`installed ${result.plistPath}; the runner starts as ${result.target}\n`);
+        return 0;
+      } catch (error) {
+        io.err(`agflow: ${error instanceof Error ? error.message : String(error)}\n`);
+        return 1;
+      }
+    },
   };
   const name = args.positional[1];
   const command = name !== undefined && Object.hasOwn(commands, name) ? commands[name] : undefined;

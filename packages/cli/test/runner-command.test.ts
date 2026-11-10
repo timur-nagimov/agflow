@@ -1,22 +1,27 @@
 import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { getAttempt } from '@agflow/hub/src/attempt-store';
 import { findRunnerByKey, getRunner } from '@agflow/hub/src/runners';
 import { createTasks } from '@agflow/hub/src/tasks';
 import { newTask } from '@agflow/hub/test/helpers';
-import { loadRunnerConfig } from '@agflow/runner/src/config';
+import { loadRunnerConfig, RunnerConfigSchema, saveRunnerConfig } from '@agflow/runner/src/config';
 import { openRunnerDb } from '@agflow/runner/src/db';
 import { Outbox } from '@agflow/runner/src/outbox';
 import { runnerPaths } from '@agflow/runner/src/paths';
 import type { RunnerServiceOptions } from '@agflow/runner/src/service/host';
+import {
+  installRefusal,
+  type installService as installRunnerService,
+  installService as realInstallService,
+} from '@agflow/runner/src/service/launchd';
 import { acquireRunnerLock, readLockOwner } from '@agflow/runner/src/service/lock';
 import { readMachineId } from '@agflow/runner/src/service/machine';
 import { ServiceRuns } from '@agflow/runner/src/service/runs';
 import { waitFor } from '@agflow/runner/test/fixture';
 import { startRunnerAttempt } from '@agflow/runner/test/hub-fixture';
 import { afterThisTest, cleanupRunnerSetups, tempDir } from '@agflow/runner/test/runner-setup';
-import { setupTestService } from '@agflow/runner/test/service-helpers';
+import { recordingExec, setupTestService } from '@agflow/runner/test/service-helpers';
 import { parseArgs } from '../src/args';
 import { main } from '../src/main';
 import { configDir } from '../src/paths';
@@ -61,6 +66,7 @@ describe('agflow runner', () => {
     expect(RUNNER_HELP).toContain('agflow runner start [--service]');
     expect(RUNNER_HELP).toContain('agflow runner drain');
     expect(RUNNER_HELP).toContain('agflow runner undrain');
+    expect(RUNNER_HELP).toContain('agflow runner install');
     expect(out.join('')).toContain(RUNNER_HELP);
     expect(err).toEqual([]);
   });
@@ -83,6 +89,70 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
     const { io, err } = capture();
     expect(await main(['runner', 'start', 'extra'], io)).toBe(2);
     expect(err.join('')).toContain('agflow runner start');
+  });
+
+  test('install rejects extra positional arguments', async () => {
+    const { io, out, err } = capture();
+    expect(await main(['runner', 'install', 'extra'], io)).toBe(2);
+    expect(err.join('')).toContain('usage: agflow runner install');
+    expect(out).toEqual([]);
+  });
+
+  test('install passes runner paths, the absolute source command and environment, and prints its result', async () => {
+    const { io, out, err } = capture();
+    const result = { plistPath: '/scratch/agent.plist', target: 'gui/501/dev.agflow.runner', warnings: ['warning'] };
+    const installService = mock(async (options: Parameters<typeof installRunnerService>[0]) => {
+      expect(options.paths.home).toBe(process.env.AGFLOW_HOME!);
+      expect(options.agflow).toEqual(selfCommand());
+      expect(isAbsolute(options.agflow.command)).toBe(true);
+      // The source form may put Bun options before main.ts; the installer checks its own paths.
+      expect(options.agflow.args.at(-1)).toBe(MAIN);
+      expect(options.env).toBe(process.env);
+      options.log?.('pins ready');
+      options.log?.('warning');
+      return result;
+    });
+    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService })).toBe(0);
+    expect(installService).toHaveBeenCalledTimes(1);
+    expect(err).toEqual(['pins ready\n', 'warning\n']);
+    expect(out).toEqual(['installed /scratch/agent.plist; the runner starts as gui/501/dev.agflow.runner\n']);
+  });
+
+  test('install reports failures on stderr and exits 1', async () => {
+    const { io, out, err } = capture();
+    const installService = async () => {
+      throw new Error('bootstrap failed');
+    };
+    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService })).toBe(1);
+    expect(out).toEqual([]);
+    expect(err).toEqual(['agflow: bootstrap failed\n']);
+  });
+
+  test('install refuses test mode through the real installer before touching launchd', async () => {
+    const paths = runnerPaths();
+    saveRunnerConfig(
+      paths.config,
+      RunnerConfigSchema.parse({
+        runnerKey: 'rk_install',
+        machineId: 'MACHINE-1',
+        name: 'laptop',
+        test: {},
+      }),
+    );
+    const message = installRefusal(loadRunnerConfig(paths.config));
+    // The real installer, with launchd, the LaunchAgents folder and the pins kept to scratch should it ever pass.
+    const exec = recordingExec();
+    const installPins = mock(async () => ({ claude: '/fake/claude', codex: '/fake/codex' }));
+    const home = tempDir('agf-home-');
+    const installService = (options: Parameters<typeof installRunnerService>[0]) =>
+      realInstallService({ ...options, exec, home, uid: 501, installPins });
+    const { io, out, err } = capture();
+    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService })).toBe(1);
+    expect(out).toEqual([]);
+    expect(err).toEqual([`agflow: ${message}\n`]);
+    expect(exec.calls).toEqual([]);
+    expect(installPins).not.toHaveBeenCalled();
+    expect(existsSync(join(home, 'Library'))).toBe(false);
   });
 
   test('drain and undrain reach the running service and print one line each', async () => {
