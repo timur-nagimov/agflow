@@ -16,6 +16,12 @@ const VENDORS: readonly Vendor[] = VendorSchema.options;
 /** The one platform M2 pins vendor binaries for, so the one the e2e suite runs on. */
 export const E2E_PLATFORM = 'darwin-arm64';
 
+/**
+ * Each e2e test's timeout: `bun run e2e` passes it as --timeout, and every e2e file sets it as its default, because a
+ * file's setDefaultTimeout overrides the flag.
+ */
+export const E2E_TEST_TIMEOUT_MS = 600_000;
+
 /** Locating both binaries runs each candidate's --version; a cold first run on macOS takes seconds. */
 const PREREQS_TIMEOUT_MS = 60_000;
 

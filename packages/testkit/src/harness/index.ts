@@ -6,3 +6,4 @@ export * from './models';
 export * from './person';
 export * from './playbook';
 export * from './proc';
+export * from './runner-process';
