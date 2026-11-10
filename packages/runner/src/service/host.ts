@@ -35,6 +35,7 @@ import { NeedsLogin } from './needs-login';
 import { createMacNotifier } from './notify';
 import { ServiceRuns } from './runs';
 import { buildStatusReport } from './status';
+import { drainAndStopAgents, stopReason } from './stop';
 import { suspendRunner } from './suspend';
 import { defaultExec, type Exec } from './system';
 
@@ -91,6 +92,9 @@ export interface RunnerServiceOptions {
   prepSandbox?: PrepSandbox;
   /** Setup checks wait up to 30 s for the first hub welcome. */
   checksWelcomeTimeoutMs?: number;
+  /** Ack budgets for an explicit runner stop; 60 s for drain and 30 s for exits by default. */
+  stopDrainAckMs?: number;
+  stopExitsAckMs?: number;
 }
 
 export interface RunnerService {
@@ -106,6 +110,8 @@ export interface RunnerService {
   suspend(reason: string): Promise<ServiceExit>;
   /** Stops the agents with no handoff within timings.suspend, then exits cleanly; a second call gets the same exit. */
   stop(reason: string): Promise<ServiceExit>;
+  /** Drains, hands off and pushes agents, then exits cleanly (POST /stop). */
+  runnerStop(reason: string): Promise<ServiceExit>;
 }
 
 /** A start refused for a reason a person must fix (X-41). */
@@ -113,9 +119,9 @@ class Refusal extends Error {}
 
 /**
  * How teardown ends the agents: a suspend (SIGTERM, SIGINT, POST /suspend), a stop without a handoff (a link that
- * ended for good, a refusal, a stop), or only the kill after an uncaught error.
+ * ended for good, a refusal, a stop), an explicit runner stop with a handoff, or only the kill after an uncaught error.
  */
-type AgentsEnd = 'suspend' | 'stop' | 'kill';
+type AgentsEnd = 'suspend' | 'stop' | 'runner_stop' | 'kill';
 
 /** Waits for work up to ms; past that, teardown goes on and the work finishes unobserved. */
 async function within(work: Promise<unknown>, ms: number): Promise<void> {
@@ -226,7 +232,20 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
         retentionTimer = null;
       });
       const active = runner;
-      if (agents === 'suspend' && active !== null && logger !== null) {
+      let restoreDraining = false;
+      if (agents === 'runner_stop' && active !== null && logger !== null) {
+        const stopLogger = logger;
+        await step(async () => {
+          restoreDraining = !active.status().settings.draining;
+          const result = await drainAndStopAgents(active, {
+            logger: stopLogger,
+            drainAckMs: options.stopDrainAckMs,
+            exitsAckMs: options.stopExitsAckMs,
+          });
+          stopLogger.info('runner stop finished', { ...result });
+          exit = { ...exit, reason: describe(stopReason(exit.reason, result)) };
+        });
+      } else if (agents === 'suspend' && active !== null && logger !== null) {
         const result = await suspendRunner(active, {
           deadlineMs: Math.max(0, deadline - performance.now()),
           logger,
@@ -247,6 +266,12 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       if (logger) logger[level](exit.reason);
       else print(exit.reason);
       await step(() => runner?.close());
+      await step(() => {
+        if (!restoreDraining) return;
+        // The stop's drain is temporary. Save an offline edit under our lock for the next welcome to send.
+        const saved = loadRunnerConfig(paths.config);
+        saveRunnerConfig(paths.config, editLocalSettings(saved, { draining: false }).config);
+      });
       await step(() => health?.close());
       await step(() => keepAwake?.close());
       await step(() => {
@@ -282,6 +307,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     exited: exited.promise,
     suspend: (reason) => finish({ code: 0, clean: true, reason }, 'info', runner !== null ? 'suspend' : 'stop'),
     stop: (reason) => finish({ code: 0, clean: true, reason }, 'info'),
+    runnerStop: (reason) => finish({ code: 0, clean: true, reason }, 'info', runner !== null ? 'runner_stop' : 'stop'),
   };
 
   const onTerm = () => void service.suspend('received SIGTERM');
@@ -371,6 +397,9 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     },
     'POST /drain': () => changeDraining(true),
     'POST /undrain': () => changeDraining(false),
+    'POST /stop': () => {
+      void service.runnerStop('runner stop requested');
+    },
     'POST /suspend': () => {
       void service.suspend('suspend requested');
     },

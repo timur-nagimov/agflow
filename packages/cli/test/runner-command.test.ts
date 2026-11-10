@@ -67,6 +67,8 @@ describe('agflow runner', () => {
     expect(await main(['help'], io)).toBe(0);
     expect(RUNNER_HELP).toContain('agflow runner start [--service]');
     expect(RUNNER_HELP).toContain('agflow runner setup [--yes] [--relogin] [--no-service]');
+    expect(RUNNER_HELP).toContain('agflow runner stop');
+    expect(RUNNER_HELP).toContain('agflow runner restart');
     expect(RUNNER_HELP).toContain('agflow runner drain');
     expect(RUNNER_HELP).toContain('agflow runner undrain');
     expect(RUNNER_HELP).toContain('agflow runner install');
@@ -226,6 +228,7 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
         exited: Promise.resolve(exit),
         suspend: async () => exit,
         stop: async () => exit,
+        runnerStop: async () => exit,
       }));
       const argv = ['runner', 'start', ...(mode === 'service' ? ['--service'] : [])];
       expect(await runnerCommand(parseArgs(argv), io, { startRunnerService })).toBe(3);
@@ -498,4 +501,93 @@ describe('agflow runner status', () => {
     }
     expect(exec.calls).toHaveLength(2);
   });
+});
+
+for (const command of ['stop', 'restart']) {
+  test(`${command} rejects extra positional arguments`, async () => {
+    const { io, out, err } = capture();
+    expect(await main(['runner', command, 'extra'], io)).toBe(2);
+    expect(err.join('')).toContain(`usage: agflow runner ${command}`);
+    expect(out).toEqual([]);
+  });
+}
+
+test('runner stop reaches the service and boots out and disables its LaunchAgent', async () => {
+  const s = await setupTestService();
+  process.env.AGFLOW_HOME = s.paths.home;
+  const service = await s.start();
+  await waitFor(() => service.runner?.status().link === 'online');
+  const exec = recordingExec();
+  const { io, out, err } = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home: tempDir('agf-home-') })).toBe(
+    0,
+  );
+  expect(await service.exited).toMatchObject({ code: 0, clean: true });
+  expect(out.join('')).toContain('the runner stopped');
+  expect(out.join('')).toContain('booted out and disabled');
+  expect(out.join('')).toContain('agflow runner install');
+  expect(out.join('')).toContain('agflow runner start');
+  expect(err.join('')).toContain('stopping the runner');
+  expect(err.join('')).toContain('the runner exited: runner stop requested');
+  expect(exec.calls.map((call) => call.argv)).toEqual([
+    ['launchctl', 'print', 'gui/501/dev.agflow.runner'],
+    ['launchctl', 'bootout', 'gui/501/dev.agflow.runner'],
+    ['launchctl', 'disable', 'gui/501/dev.agflow.runner'],
+  ]);
+});
+
+test('runner restart prints its result and kickstarts a loaded service with no live runner', async () => {
+  const exec = recordingExec();
+  const { io, out } = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'restart']), io, { env: {}, exec, uid: 501 })).toBe(0);
+  expect(out).toEqual(['the runner restarted under launchd\n']);
+  expect(exec.calls.map((call) => call.argv)).toEqual([
+    ['launchctl', 'print', 'gui/501/dev.agflow.runner'],
+    ['launchctl', 'kickstart', '-k', 'gui/501/dev.agflow.runner'],
+  ]);
+});
+
+test('runner stop without a runner or loaded job explains how to bring it back', async () => {
+  const exec = recordingExec([], { exitCode: 1 });
+  const { io, out } = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home: tempDir('agf-home-') })).toBe(
+    0,
+  );
+  expect(out.join('')).toContain('no runner was running; no LaunchAgent was loaded');
+  expect(out.join('')).toContain('agflow runner install or agflow runner start');
+  expect(exec.calls).toHaveLength(1);
+});
+
+test('runner stop disables an installed LaunchAgent that is not loaded', async () => {
+  const home = tempDir('agf-home-');
+  mkdirSync(dirname(plistPath({ home })), { recursive: true });
+  writeFileSync(plistPath({ home }), 'installed');
+  const exec = recordingExec([{ argv: ['launchctl', 'print', 'gui/501/dev.agflow.runner'], result: { exitCode: 1 } }]);
+  const { io, out } = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home })).toBe(0);
+  expect(out.join('')).toContain('no runner was running; the installed LaunchAgent was not loaded and is now disabled');
+  expect(exec.calls.map((call) => call.argv[1])).toEqual(['print', 'disable']);
+});
+
+test('runner stop reports an unreachable lock holder without touching launchd', async () => {
+  const s = await setupTestService();
+  process.env.AGFLOW_HOME = s.paths.home;
+  const lock = await acquireRunnerLock(s.paths, { mode: 'foreground' });
+  afterThisTest(() => lock.release());
+  const exec = recordingExec();
+  const { io, out } = capture();
+  await expect(
+    runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home: tempDir('agf-home-') }),
+  ).rejects.toThrow(`runner.lock is held by pid ${process.pid}`);
+  expect(out).toEqual([]);
+  expect(exec.calls).toEqual([]);
+});
+
+test('stop and restart pass the injected test environment through to operations', async () => {
+  const exec = recordingExec();
+  const deps = { exec, env: { AGFLOW_TEST: '1' }, home: tempDir('agf-home-'), uid: 501 };
+  const { io } = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, deps)).toBe(0);
+  await expect(runnerCommand(parseArgs(['runner', 'restart']), io, deps)).rejects.toThrow('no runner service is loaded');
+  expect(exec.calls).toEqual([]);
 });

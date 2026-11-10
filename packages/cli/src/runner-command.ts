@@ -3,6 +3,7 @@
 // agflow command (selfCommand) and the directory of its credentials (configDir). Each subcommand loads its modules
 // when it runs: every other command, the hooks Claude Code and Codex run on each prompt above all, must not pay for
 // the runner's module graph. A static-string import() is still bundled by `bun build --compile`.
+import { homedir } from 'node:os';
 import type { startRunnerService } from '@agflow/runner/src/service/host';
 import type { installService } from '@agflow/runner/src/service/launchd';
 import type { RunnerStatusReport } from '@agflow/runner/src/service/status';
@@ -19,6 +20,8 @@ export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-serv
                                 Set up this laptop's runner: sign-in, runner.json, binaries, logins and the service
   agflow runner start [--service]
                                 Run this laptop's runner in the foreground (--service for launchd)
+  agflow runner stop             Hand off agents and stop and disable the LaunchAgent
+  agflow runner restart          Suspend agents and restart the runner under launchd
   agflow runner drain            Stop accepting new attempts
   agflow runner undrain          Accept new attempts and clear the crash-loop guard
   agflow runner install          Install and start the LaunchAgent that runs the runner at login
@@ -111,6 +114,32 @@ export async function runnerCommand(
         io.err(`agflow: ${error instanceof Error ? error.message : String(error)}\n`);
         return 1;
       }
+    },
+    stop: async (args, io) => {
+      if (args.positional.length > 2) throw new UsageError('usage: agflow runner stop');
+      const { stopRunner } = await import('@agflow/runner/src/service/stop');
+      const result = await stopRunner({
+        env,
+        exec: deps.exec,
+        uid: deps.uid,
+        home: deps.home ?? homedir(),
+        log: (line) => io.err(`${line}\n`),
+      });
+      const launchd = result.bootedOut
+        ? 'the LaunchAgent was booted out and disabled'
+        : result.disabled
+          ? 'the installed LaunchAgent was not loaded and is now disabled'
+          : 'no LaunchAgent was loaded';
+      io.out(`${result.wasRunning ? 'the runner stopped' : 'no runner was running'}; ${launchd}\n`);
+      io.out('run agflow runner install or agflow runner start to bring it back\n');
+      return 0;
+    },
+    restart: async (args, io) => {
+      if (args.positional.length > 2) throw new UsageError('usage: agflow runner restart');
+      const { restartRunner } = await import('@agflow/runner/src/service/stop');
+      await restartRunner({ env, exec: deps.exec, uid: deps.uid, log: (line) => io.err(`${line}\n`) });
+      io.out('the runner restarted under launchd\n');
+      return 0;
     },
     drain: drainingCommand(true),
     undrain: drainingCommand(false),
