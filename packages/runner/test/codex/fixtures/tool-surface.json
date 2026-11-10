@@ -1,0 +1,59 @@
+{
+  "model": "gpt-6.1-sol",
+  "namespaces": [
+    {
+      "name": "functions",
+      "tools": ["exec", "wait", "request_user_input", "request_user_input_async"]
+    },
+    {
+      "name": "clock",
+      "tools": ["sleep"]
+    },
+    {
+      "name": "collaboration",
+      "tools": ["followup_task", "interrupt_agent", "list_agents", "send_message", "spawn_agent", "wait_agent"]
+    }
+  ],
+  "described": [
+    "apply_patch",
+    "create_goal",
+    "exec_command",
+    "get_goal",
+    "list_mcp_resource_templates",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "update_goal",
+    "view_image",
+    "write_stdin",
+    "clock__curr_time"
+  ],
+  "available": [
+    "apply_patch",
+    "clock__curr_time",
+    "create_goal",
+    "exec_command",
+    "get_goal",
+    "list_mcp_resource_templates",
+    "list_mcp_resources",
+    "mcp__agflow__ack_messages",
+    "mcp__agflow__check_inbox",
+    "mcp__agflow__declare_blocked",
+    "mcp__agflow__declare_impossible",
+    "mcp__agflow__get_brief",
+    "mcp__agflow__get_goal",
+    "mcp__agflow__get_task",
+    "mcp__agflow__hello",
+    "mcp__agflow__list_tasks",
+    "mcp__agflow__prepare_dependencies",
+    "mcp__agflow__release_task",
+    "mcp__agflow__report_progress",
+    "mcp__agflow__search",
+    "mcp__agflow__send_message",
+    "mcp__agflow__submit",
+    "mcp__agflow__write_handoff",
+    "read_mcp_resource",
+    "update_goal",
+    "view_image",
+    "write_stdin"
+  ]
+}
