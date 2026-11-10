@@ -19,7 +19,9 @@ import { AttemptStore } from '../src/attempt-store';
 import { type RunnerConfigInput, RunnerConfigSchema, saveRunnerConfig } from '../src/config';
 import { openRunnerDb } from '../src/db';
 import { type RunnerPaths, runnerPaths } from '../src/paths';
+import { PrepSandbox, type SandboxBackend } from '../src/prep/sandbox';
 import { killGroup } from '../src/processes';
+import { standardProfile } from '../src/profile';
 import { removeAgentTools } from '../src/run-dir';
 import { type RunnerServiceOptions, startRunnerService } from '../src/service/host';
 import type { Exec, ExecOptions, ExecResult } from '../src/service/system';
@@ -93,6 +95,7 @@ export async function setupTestService(options: TestServiceOptions = {}) {
       terminal: (line) => terminal.push(line),
       tmpRoot,
       adapters: host.createAdapters ? undefined : fakeServiceAdapters(),
+      ...fakeServiceOperations(),
       ...host,
     });
     afterThisTest(async () => {
@@ -120,6 +123,35 @@ export function fakeServiceAdapters() {
   return (['claude', 'codex'] as const).map(
     (vendor) => new FakeAdapter({ vendor, skipAuthChecks: true, script: { turns: [[]] } }),
   );
+}
+
+/** Each service gets a fresh manager: sandbox initialization is cached by manager identity. */
+export function fakePrepSandbox(overrides: Partial<SandboxBackend> = {}): PrepSandbox {
+  return new PrepSandbox({
+    allowedDomains: standardProfile.network.allowedDomains,
+    manager: {
+      initialize: async () => {},
+      isSupportedPlatform: () => true,
+      checkDependencies: () => ({ errors: [], warnings: [] }),
+      wrapWithSandboxArgv: async (command) => ({ argv: ['/bin/sh', '-c', command], env: {} }),
+      cleanupAfterCommand: () => {},
+      ...overrides,
+    },
+  });
+}
+
+/** Safe machine operations for both in-process services and the child-process host fixture. */
+export function fakeServiceOperations(): Partial<RunnerServiceOptions> {
+  return {
+    prepSandbox: fakePrepSandbox(),
+    power: async () => ({ source: 'ac', batteryPercent: 100, lowPowerMode: false }),
+    freeBytes: () => 100_000_000_000,
+    usage: { current: () => 1_000_000 },
+    exec: recordingExec(),
+    platform: 'linux',
+    // Fake CLIs use the darwin pin versions on every test host.
+    retentionPlatform: 'darwin-arm64',
+  };
 }
 
 /** The files of setupTestService and a service started on them. */

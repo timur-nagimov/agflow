@@ -5,7 +5,7 @@ import { loadRunnerConfig } from '../../src/config';
 import { runnerPaths } from '../../src/paths';
 import { startRunnerService } from '../../src/service/host';
 import { FIXTURE_AGFLOW, fixtureCliVersion } from '../fixture';
-import { fakeServiceAdapters } from '../service-helpers';
+import { fakeServiceAdapters, fakeServiceOperations } from '../service-helpers';
 
 const paths = runnerPaths();
 const configDir = process.env.AGFLOW_CONFIG_DIR;
@@ -18,6 +18,7 @@ const service = await startRunnerService({
   mode,
   machineId: async () => loadRunnerConfig(paths.config).machineId,
   adapters: fakeServiceAdapters(),
+  ...fakeServiceOperations(),
   agflow: FIXTURE_AGFLOW,
   cliVersion: fixtureCliVersion,
   signals: true,

@@ -102,9 +102,10 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
   }
 
   test('start says hello to the hub and exits cleanly on SIGTERM', async () => {
-    const s = await setupTestService({ config: { machineId: await readMachineId() } });
+    // The real host reads this Mac's free space for its disk guard; test mode keeps its notifier silent.
+    const s = await setupTestService({ config: { machineId: await readMachineId(), minFreeGb: 0 } });
     const child = Bun.spawn([process.execPath, MAIN, 'runner', 'start'], {
-      env: { ...process.env, AGFLOW_HOME: s.paths.home, AGFLOW_CONFIG_DIR: s.configDir },
+      env: { ...process.env, AGFLOW_HOME: s.paths.home, AGFLOW_CONFIG_DIR: s.configDir, AGFLOW_TEST: '1' },
       stdin: 'ignore',
       stdout: 'pipe',
       stderr: 'pipe',

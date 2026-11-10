@@ -4,18 +4,31 @@
 import { createAdapters } from '../adapters';
 import type { AgflowCommand, VendorAdapter } from '../adapters/types';
 import { AttemptStore } from '../attempt-store';
-import { loadRunnerConfig, type RunnerConfig } from '../config';
+import { type ClockSource, systemClock } from '../clock';
+import { isTestMode, loadRunnerConfig, type RunnerConfig } from '../config';
 import { openRunnerDb, type RunnerDb } from '../db';
 import type { FetchFn } from '../hub-http';
+import { Journal } from '../journal';
+import { createServiceHealth, type ServiceHealth } from '../ops/health';
+import { KeepAwake } from '../ops/keep-awake';
+import type { PowerSample } from '../ops/power';
+import { RETENTION, sweepRetention } from '../ops/retention';
+import { Outbox } from '../outbox';
 import { type RunnerPaths, runnerPaths } from '../paths';
+import { createDependencyPreparer } from '../prep/preparer';
+import { PrepSandbox } from '../prep/sandbox';
+import { standardProfile } from '../profile';
 import { killRegisteredGroups } from '../recovery';
 import { createRunner, type RunnerEvents, type RunnerHandle, type RunnerOptions } from '../runner';
+import type { DependencyPreparer, Notifier } from '../seams';
 import { type ControlRoutes, type ControlServer, startControlServer } from './control';
 import { readCliCredentials } from './credentials';
 import { AlreadyRunningError, acquireRunnerLock, type RunnerLock, type RunnerMode } from './lock';
 import { RotatingLog } from './log';
 import { machineMismatch, readMachineId } from './machine';
+import { createMacNotifier } from './notify';
 import { ServiceRuns } from './runs';
+import { defaultExec, type Exec } from './system';
 
 /** How the service ended: the process exit code, whether the run counts as clean (task 19's guard), and why. */
 export interface ServiceExit {
@@ -50,6 +63,24 @@ export interface RunnerServiceOptions {
   lockPollMs?: number;
   fetch?: FetchFn;
   tmpRoot?: string;
+  /** Operations' timers; runner heartbeats retain their own clock. */
+  clock?: ClockSource;
+  /** Retention's age checks; Date.now by default. */
+  now?: () => number;
+  /** Retention pin table; native vendorPlatform() by default. Tests may install another platform's fake pins. */
+  retentionPlatform?: string;
+  /** Notification command runner; defaultExec by default. */
+  exec?: Exec;
+  /** Notification and keep-awake platform; process.platform by default. */
+  platform?: NodeJS.Platform;
+  /** Machine samplers; pmset, diskFreeBytes and AgflowUsage by default. */
+  power?: () => Promise<PowerSample | null>;
+  freeBytes?: () => number | null;
+  usage?: { current(): number };
+  /** Keep-awake command; /usr/bin/caffeinate on macOS by default. */
+  caffeinate?: string;
+  /** Shared preparation sandbox; checked once at service start. */
+  prepSandbox?: PrepSandbox;
 }
 
 export interface RunnerService {
@@ -125,6 +156,16 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
   let db: RunnerDb | null = null;
   let store: AttemptStore | null = null;
   let runner: RunnerHandle | null = null;
+  const clock = options.clock ?? systemClock;
+  let health: ServiceHealth | null = null;
+  let keepAwake: KeepAwake | null = null;
+  let notifier: Notifier | null = null;
+  let preparer: DependencyPreparer | null = null;
+  let sandbox: PrepSandbox | null = null;
+  let heartbeatMs: number | null = null;
+  let retentionTimer: unknown = null;
+  let retention: Promise<void> | null = null;
+  const sweeping = new AbortController();
   let ending = false;
   let suspendMs = 0;
 
@@ -137,6 +178,8 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     ending = true;
     const deadline = performance.now() + suspendMs;
     waiting.abort();
+    // A retention sweep under way stops before its next step, so teardown waits only for the step it is in.
+    sweeping.abort();
     void (async () => {
       // A signal can arrive while the lock is awaited or createRunner runs: nothing is released beneath startup.
       await initialized.promise;
@@ -152,6 +195,10 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
         }
       };
       // Every step runs; the lock goes last, so no second runner starts while this one still holds anything.
+      await step(() => {
+        if (retentionTimer !== null) clock.clearInterval(retentionTimer);
+        retentionTimer = null;
+      });
       const active = runner;
       if (agents === 'stop' && active !== null) {
         // runner.close leaves agents running, and under launchd nothing restarts this runner after a link end or a
@@ -168,6 +215,9 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       if (logger) logger[level](exit.reason);
       else print(exit.reason);
       await step(() => runner?.close());
+      await step(() => health?.close());
+      await step(() => keepAwake?.close());
+      await step(() => retention);
       await step(() => control?.stop());
       await step(() => db?.close());
       await step(() => {
@@ -221,11 +271,16 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       };
     },
   };
-  // What the host hears from the runner; the operations of later tasks listen here.
+  // One observer object keeps operations attached across reconnects.
   const events: RunnerEvents = {
     link: (state, detail) => {
       logger?.info('runner link', { state, code: detail.code, reason: detail.reason });
     },
+    gap: (gap) => health?.gap(gap),
+    welcome: (welcome) => {
+      heartbeatMs = welcome.timings.heartbeatMs;
+    },
+    attemptState: () => keepAwake?.evaluate(),
   };
 
   // Each await may meet a stop: startup then ends early, and finish releases what it made.
@@ -258,6 +313,41 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
     db = openRunnerDb(paths.db);
     store = new AttemptStore(db);
     const adapters = options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow });
+    health = createServiceHealth({
+      paths,
+      config: () => config,
+      heartbeatMs: () => heartbeatMs ?? config.timings.heartbeat,
+      stopAgents: (cause, options) => {
+        if (runner === null) throw new Error('the runner is not running yet');
+        return runner.stopAgents(cause, options);
+      },
+      onSample: () => keepAwake?.evaluate(),
+      samplePower: options.power,
+      freeBytes: options.freeBytes,
+      usage: options.usage,
+      clock,
+      logger,
+    });
+    keepAwake = new KeepAwake({
+      mode: () => runner?.status().settings.keepAwake ?? config.keepAwake,
+      power: () => health?.power() ?? null,
+      attempts: () => runner?.status().attempts ?? [],
+      command: options.caffeinate,
+      platform: options.platform,
+      clock,
+      logger,
+    });
+    notifier = createMacNotifier(options.exec ?? defaultExec, {
+      testMode: isTestMode(config),
+      logger,
+      platform: options.platform,
+    });
+    sandbox =
+      options.prepSandbox ?? new PrepSandbox({ allowedDomains: standardProfile.network.allowedDomains, logger });
+    preparer = await createDependencyPreparer({ paths, store, config: () => config, logger, sandbox });
+    // A sample before the runner starts: the first admission and the first heartbeat already see the battery.
+    await health.sample();
+    if (ending) return;
     runner = await createRunner({
       paths,
       config,
@@ -266,11 +356,42 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       adapters,
       cliVersion: options.cliVersion,
       agflow,
+      health,
+      notifier,
+      preparer,
       logger,
       events,
       fetch: options.fetch,
       tmpRoot: options.tmpRoot,
     });
+    health.start();
+    keepAwake.evaluate();
+    const retentionInput = {
+      paths,
+      outbox: new Outbox(db),
+      journal: new Journal(db),
+      store,
+      vaults: [runner.vault],
+      adapters: new Map(adapters.map((adapter) => [adapter.vendor, adapter])),
+      eventRetentionMs: config.timings.eventRetention,
+      now: options.now,
+      platform: options.retentionPlatform,
+      logger,
+      signal: sweeping.signal,
+    };
+    const sweep = () => {
+      if (ending || retention !== null) return;
+      retention = sweepRetention(retentionInput)
+        .then((result) => {
+          if (result.ran) logger?.info('retention sweep finished', { ...result });
+        })
+        .catch((error) => logger?.error('retention sweep failed', { error: describe(error) }))
+        .finally(() => {
+          retention = null;
+        });
+    };
+    sweep();
+    retentionTimer = clock.setInterval(sweep, RETENTION.checkIntervalMs);
     void runner.done.then((end) => {
       if (end.kind === 'refused' || end.kind === 'incompatible') return finish(refusal(end.reason), 'error');
       // 4409: another process with this key took over, which is no fault of this one.
