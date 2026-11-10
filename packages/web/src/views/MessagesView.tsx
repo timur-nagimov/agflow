@@ -13,8 +13,9 @@ export function MessagesView({ to }: { to?: string }) {
   const agents = useData(() => api.agents(), [], { relevant: (event) => event.type.startsWith('agent.') });
   const [filter, setFilter] = useState(to ?? 'everything');
   const [target, setTarget] = useState(to ?? 'lead');
-  const leadId = status.data?.lead?.id ?? null;
-  const options = targetOptions(agents.data ?? [], tasks.data ?? [], to);
+  // The lead is whoever holds the seat (X-45), live chat or runner agent.
+  const leadId = status.data?.leadSeat.agentId ?? null;
+  const options = targetOptions(agents.data ?? [], tasks.data ?? [], leadId, to);
   const shown = (messages.data ?? []).filter((message) => inConversation(message, filter, leadId)).reverse();
   const chat = useRef<HTMLElement>(null);
   const newestShown = shown.at(-1)?.id;

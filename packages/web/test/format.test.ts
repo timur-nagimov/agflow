@@ -6,6 +6,7 @@ import {
   type HubEvent,
   type HubEventCategory,
   type HubEventType,
+  type LeadSeat,
   type MessageView,
   type Submission,
   type Task,
@@ -34,6 +35,8 @@ import {
   eventTone,
   groupTasks,
   inConversation,
+  leadBanner,
+  leadSeatSummary,
   mergeEvents,
   NOTE_LABELS,
   NOTE_TONES,
@@ -320,9 +323,20 @@ describe('people, agents and targets', () => {
     const options = targetOptions(
       [agent(), agent({ id: 'A-5', status: 'gone' })],
       [task({ id: 'T-1' }), task({ id: 'T-2', status: 'merged' })],
+      null,
     );
     expect(options.map((option) => option.value)).toEqual(['lead', 'all', 'humans', 'agent:A-2', 'task:T-1']);
-    expect(targetOptions([], [], 'agent:A-5').at(-1)).toEqual({ value: 'agent:A-5', label: 'A-5' });
+    expect(targetOptions([], [], null, 'agent:A-5').at(-1)).toEqual({ value: 'agent:A-5', label: 'A-5' });
+  });
+
+  test('target options name the seat holder as the lead, not agents with the lead role (X-45)', () => {
+    const agents = [agent({ id: 'A-1', role: 'lead', label: 'lead chat' }), agent({ id: 'A-7', origin: 'runner' })];
+    const labels = (leadId: string | null) =>
+      targetOptions(agents, [], leadId)
+        .filter((option) => option.value.startsWith('agent:'))
+        .map((option) => option.label);
+    expect(labels('A-7')).toEqual(['A-1 · bob · lead chat', 'A-7 · bob · lead']);
+    expect(labels(null)).toEqual(['A-1 · bob · lead chat', 'A-7 · bob']);
   });
 
   test('a conversation includes messages both ways', () => {
@@ -337,6 +351,9 @@ describe('people, agents and targets', () => {
     expect(inConversation(fromLead, 'lead', 'A-1')).toBe(true);
     expect(inConversation(aboutTask, 'task:T-4', null)).toBe(true);
     expect(inConversation(fromLead, 'everything', null)).toBe(true);
+    // The lead is whoever holds the seat: a former lead's messages leave the lead conversation with the seat.
+    expect(inConversation(fromLead, 'lead', 'A-7')).toBe(false);
+    expect(inConversation(fromLead, 'lead', null)).toBe(false);
   });
 
   test('delivery state is summarised', () => {
@@ -366,6 +383,84 @@ describe('people, agents and targets', () => {
       }),
     ).toBe('Read by A-2 · delivered to A-3');
     expect(deliveryLabel({ ...message, to: 'humans' })).toBe('');
+  });
+});
+
+describe('the lead seat', () => {
+  const empty: LeadSeat = {
+    kind: 'none',
+    agentId: null,
+    attemptId: null,
+    runnerId: null,
+    since: null,
+    wakeups: 0,
+    runnerLeads: true,
+  };
+  const onRunner: LeadSeat = {
+    kind: 'runner',
+    agentId: 'A-9',
+    attemptId: 'lead-a2',
+    runnerId: 'R-1',
+    since: 1_000,
+    wakeups: 3,
+    runnerLeads: true,
+  };
+  const live: LeadSeat = { ...empty, kind: 'live', agentId: 'A-1', since: 1_000 };
+
+  test('a live seat names the chat and its person', () => {
+    expect(leadSeatSummary(live, agent({ id: 'A-1', user: 'alice', role: 'lead', label: 'lead chat' }))).toBe(
+      "A-1 in alice's live chat “lead chat”",
+    );
+    expect(leadSeatSummary(live, agent({ id: 'A-1', user: 'bob', role: 'lead' }))).toBe("A-1 in bob's live chat");
+    // Before the agents have loaded, the chat is named by its agent alone.
+    expect(leadSeatSummary(live, null)).toBe('A-1 in a live chat');
+  });
+
+  test('a runner seat names the agent, the runner and the wake-ups since its last rotation', () => {
+    expect(leadSeatSummary(onRunner, null)).toBe('A-9 on R-1, 3 wake-ups since its last rotation');
+    expect(leadSeatSummary({ ...onRunner, wakeups: 1 }, null)).toBe('A-9 on R-1, 1 wake-up since its last rotation');
+    expect(leadSeatSummary({ ...onRunner, wakeups: 0 }, null)).toBe('A-9 on R-1, no wake-ups since its last rotation');
+  });
+
+  test('an empty seat says so', () => {
+    expect(leadSeatSummary(empty, null)).toBe('Nobody holds the lead seat');
+    expect(leadSeatSummary({ ...empty, runnerLeads: false }, null)).toBe('Nobody holds the lead seat');
+  });
+
+  test('the no-lead banner shows only while the seat is empty', () => {
+    expect(leadBanner(onRunner, false)).toBeNull();
+    expect(leadBanner(live, false)).toBeNull();
+    expect(leadBanner({ ...live, runnerLeads: false }, false)).toBeNull();
+    expect(leadBanner(onRunner, true)).toBeNull();
+  });
+
+  test('with runner leads on, the banner says a runner starts a lead once one has a free slot', () => {
+    const banner = leadBanner(empty, false);
+    expect(banner?.command).toBeNull();
+    expect(`${banner?.title} ${banner?.text}`).toBe(
+      'No lead right now. Runner leads are on, so a runner starts one as soon as it has a free slot.',
+    );
+  });
+
+  test('while the project is paused, the banner says no runner starts a lead until it is resumed', () => {
+    // A paused project skips the lead seat (design 6.6), so the free-slot promise would be wrong.
+    const banner = leadBanner(empty, true);
+    expect(banner?.command).toBeNull();
+    expect(`${banner?.title} ${banner?.text}`).toBe(
+      'No lead right now. The project is paused, so no runner starts a lead until it is resumed.',
+    );
+  });
+
+  test('with runner leads off, the banner gives the agflow join --role lead instructions', () => {
+    const banner = leadBanner({ ...empty, runnerLeads: false }, false);
+    // A live chat may join a paused project too, so pausing does not change these instructions.
+    expect(leadBanner({ ...empty, runnerLeads: false }, true)).toEqual(banner);
+    expect(banner?.title).toBe('No lead is connected.');
+    expect(banner?.text).toBe(
+      "Runner leads are off, so a live chat leads: in the project's repository, start a new Claude Code or Codex chat " +
+        'after running',
+    );
+    expect(banner?.command).toBe('agflow join --role lead');
   });
 });
 

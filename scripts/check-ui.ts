@@ -777,6 +777,44 @@ async function main(): Promise<void> {
     await shot(page, 'timeline');
 
     await open(page, '#/goal', '.charter-text');
+    const leadCard = page.locator('.lead-card');
+    const noLead = page.locator('.banner.no-lead');
+    type Seat = { kind: string; agentId: string | null; attemptId: string | null; runnerId: string | null; runnerLeads: boolean };
+    const seatNow = () =>
+      page.evaluate<Seat>("fetch('/api/status').then((response) => response.json()).then((status) => status.leadSeat)");
+    const firstSeat = await seatNow();
+    await check('the Goal page shows the lead on R-1 with its wake-ups', async () => {
+      if (firstSeat.kind !== 'runner' || firstSeat.runnerId !== 'R-1') throw new Error(`the seat: ${JSON.stringify(firstSeat)}`);
+      const summary = ((await leadCard.locator('.lead-summary').textContent()) ?? '').trim();
+      const expected = new RegExp(`^${firstSeat.agentId} on R-1, (no|\\d+) wake-ups? since its last rotation$`);
+      if (!expected.test(summary)) throw new Error(`the Lead section says ${summary}`);
+      const wakeups = (await leadCard.locator('.fact', { has: page.locator('dt:text-is("Wake-ups")') }).locator('dd').textContent()) ?? '';
+      if (!/^\d+$/.test(wakeups)) throw new Error(`the wake-ups read ${wakeups}`);
+      await leadCard.locator(`a.attempt-link[href="#/attempt/${firstSeat.attemptId}"]`).waitFor();
+      if ((await noLead.count()) !== 0) throw new Error('the no-lead banner shows while a lead holds the seat');
+    });
+    await check('turning runner leads off asks first; then the seat empties and the no-lead banner appears', async () => {
+      await leadCard.locator('button:text-is("Turn runner leads off")').click();
+      const confirm = leadCard.locator('button:text-is("Turn off and rotate the lead out")');
+      await confirm.waitFor();
+      if (!(await seatNow()).runnerLeads) throw new Error('one click turned them off');
+      await confirm.click();
+      // The runner lead writes its handoff and exits; then the seat is empty.
+      await noLead.filter({ hasText: 'agflow join --role lead' }).waitFor({ timeout: 20_000 });
+      await leadCard.locator('.lead-summary', { hasText: 'Nobody holds the lead seat' }).waitFor();
+      const seat = await seatNow();
+      if (seat.kind !== 'none' || seat.runnerLeads) throw new Error(`the seat: ${JSON.stringify(seat)}`);
+    });
+    await check('turning them back on starts a new runner lead, and the banner goes', async () => {
+      await leadCard.locator('button:text-is("Turn runner leads on")').click();
+      await noLead.waitFor({ state: 'detached', timeout: 20_000 });
+      const seat = await seatNow();
+      if (seat.kind !== 'runner' || !seat.attemptId?.startsWith('lead-') || seat.attemptId === firstSeat.attemptId) {
+        throw new Error(`the seat: ${JSON.stringify(seat)}`);
+      }
+      await leadCard.locator('.lead-summary', { hasText: `${seat.agentId} on ${seat.runnerId}` }).waitFor();
+    });
+    await shot(page, 'goal-lead');
     await check('pausing shows a banner, and resuming from it removes the banner', async () => {
       await page.click('button:has-text("Pause everything")');
       await page.click('button:has-text("Pause all work")');

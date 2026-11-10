@@ -516,6 +516,12 @@ tr.attempt-current td { background: color-mix(in srgb, var(--inset) 60%, transpa
 
 /* ---------- Goal ---------- */
 
+.lead-card { display: grid; gap: 10px; }
+.lead-summary { margin: 0; font-size: 14.5px; }
+.lead-summary .lamp { margin-right: 6px; vertical-align: 1px; }
+.lead-card .facts { margin: 0; }
+.runner-leads { display: grid; gap: 8px; justify-items: start; padding-top: 12px; border-top: 1px solid var(--rule); }
+.runner-leads p { margin: 0; font-size: 13.5px; }
 .charter-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 28px; align-items: start; }
 .charter { padding: 34px 40px; }
 .charter-text {

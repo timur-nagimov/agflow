@@ -1,10 +1,12 @@
-import { type GoalNote, type GoalVersion, diffGoal } from '@agflow/core';
+import { type GoalNote, type GoalVersion, type LeadSeat, diffGoal } from '@agflow/core';
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import {
+  AttemptLink,
   ConfirmButton,
   DiffView,
   Empty,
+  Fact,
   Linked,
   ErrorBox,
   Loading,
@@ -13,9 +15,10 @@ import {
   Section,
   When,
 } from '../components';
-import { who } from '../format';
+import { leadSeatSummary, who } from '../format';
 import { useAction, useData } from '../hooks';
 import { useHub } from '../hub';
+import { routeHref } from '../route';
 
 export function GoalView() {
   const { status, peopleSeen, markPeopleSeen } = useHub();
@@ -71,6 +74,7 @@ export function GoalView() {
           Describe what the project should achieve. The lead turns the goal into tasks and re-plans whenever it changes.
         </Empty>
       )}
+      {status.data ? <Lead seat={status.data.leadSeat} paused={status.data.project.paused} onChange={status.reload} /> : null}
       {forPeople.length > 0 ? (
         <Section title="Messages for people">
           <MessageList messages={forPeople} newAfter={seenAtOpen} />
@@ -105,6 +109,82 @@ function Charter({ goal, notes }: { goal: GoalVersion; notes: GoalNote[] }) {
         )}
       </aside>
     </div>
+  );
+}
+
+const SEAT_KINDS: Record<LeadSeat['kind'], string> = { live: 'A live chat', runner: 'A runner', none: 'Empty' };
+
+/**
+ * The lead seat (design 6.11, 11): a live chat or a runner agent, on which runner, since when, and its wake-ups since
+ * its last rotation; and the 'runner leads' switch. Turning runner leads off asks first: it rotates a runner lead out
+ * with a lead handoff, and the seat then waits for a live chat. The hub sends no event for the switch itself, so the
+ * status is reloaded after it.
+ */
+function Lead({ seat, paused, onChange }: { seat: LeadSeat; paused: boolean; onChange: () => void }) {
+  const agents = useData(() => api.agents(), [], { relevant: (event) => event.type.startsWith('agent.') });
+  const holder = agents.data?.find((agent) => agent.id === seat.agentId) ?? null;
+  const action = useAction();
+  const turnOn = async () => {
+    if ((await action.run(() => api.setRunnerLeads(true))).ok) onChange();
+  };
+  const turnOff = async () => {
+    await api.setRunnerLeads(false);
+    onChange();
+  };
+
+  return (
+    <Section title="Lead" className="lead-card">
+      <p className="lead-summary">
+        <span className={`lamp tone-${seat.kind === 'none' ? 'trouble' : 'done'}`} /> {leadSeatSummary(seat, holder)}
+      </p>
+      <dl className="facts">
+        <Fact label="Seat">{SEAT_KINDS[seat.kind]}</Fact>
+        {seat.runnerId ? (
+          <Fact label="Runner">
+            <a href={routeHref({ view: 'runners' })}>{seat.runnerId}</a>
+          </Fact>
+        ) : null}
+        {seat.attemptId ? (
+          <Fact label="Attempt">
+            <AttemptLink id={seat.attemptId} />
+          </Fact>
+        ) : null}
+        {seat.since !== null ? (
+          <Fact label="Since">
+            <When ts={seat.since} />
+          </Fact>
+        ) : null}
+        {seat.kind === 'runner' ? <Fact label="Wake-ups">{seat.wakeups}</Fact> : null}
+      </dl>
+      <div className="runner-leads">
+        <p>
+          <b>Runner leads are {seat.runnerLeads ? 'on' : 'off'}.</b>{' '}
+          {seat.runnerLeads
+            ? paused
+              ? 'Whenever the seat is empty, a runner with a free slot starts a lead, once the project is resumed.'
+              : 'Whenever the seat is empty, a runner with a free slot starts a lead.'
+            : 'No runner starts a lead; the seat waits for a live chat.'}
+        </p>
+        {seat.runnerLeads ? (
+          <ConfirmButton
+            label="Turn runner leads off"
+            confirm={seat.kind === 'runner' ? 'Turn off and rotate the lead out' : 'Turn runner leads off'}
+            danger
+            onConfirm={turnOff}
+          />
+        ) : (
+          <button disabled={action.busy} onClick={() => void turnOn()}>
+            Turn runner leads on
+          </button>
+        )}
+        {seat.runnerLeads && seat.kind === 'runner' ? (
+          <p className="hint">
+            Turning them off rotates the runner lead out: it writes a lead handoff, and a live chat can take the seat.
+          </p>
+        ) : null}
+        {action.error ? <p className="error">{action.error}</p> : null}
+      </div>
+    </Section>
   );
 }
 

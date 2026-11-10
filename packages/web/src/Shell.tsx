@@ -1,7 +1,7 @@
 import type { HubEvent } from '@agflow/core';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { type Me, api } from './api';
-import { COLUMNS, type ColumnKey, columnCounts } from './format';
+import { COLUMNS, type ColumnKey, columnCounts, leadBanner } from './format';
 import { useAction, useData, useRoute } from './hooks';
 import { type Hub, HubContext } from './hub';
 import { type Connection, useConnection } from './live';
@@ -17,9 +17,11 @@ import { RunnersView } from './views/RunnersView';
 import { TaskView } from './views/TaskView';
 import { TimelineView } from './views/TimelineView';
 
+/** The lead seat moves with lead.* events (design 6.17), which the banner and the Goal page's Lead section follow. */
 const statusChanged = (event: HubEvent) =>
   event.type.startsWith('project.') ||
   event.type.startsWith('agent.') ||
+  event.type.startsWith('lead.') ||
   event.type === 'goal.updated' ||
   event.type === 'message.sent';
 const taskChanged = (event: HubEvent) => event.type.startsWith('task.');
@@ -75,6 +77,7 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const runnerList = runners.data?.runners ?? [];
   const online = runnerList.filter((runner) => runner.state === 'online').length;
   const current = navViewOf(route);
+  const noLead = status.data ? leadBanner(status.data.leadSeat, status.data.project.paused) : null;
 
   useEffect(() => {
     document.title = project ? `${project.name} · agflow` : 'agflow';
@@ -155,10 +158,15 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               <ResumeButton />
             </div>
           ) : null}
-          {status.data && !status.data.lead ? (
-            <div className="banner info" role="status">
-              <b>No lead is connected.</b> In the project's repository run <code>agflow join --role lead</code>, then start a
-              new Claude Code or Codex chat there.
+          {noLead ? (
+            <div className="banner info no-lead" role="status">
+              <b>{noLead.title}</b> {noLead.text}
+              {noLead.command ? (
+                <>
+                  {' '}
+                  <code>{noLead.command}</code>.
+                </>
+              ) : null}
             </div>
           ) : null}
           <main className="content">

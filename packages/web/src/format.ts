@@ -4,6 +4,7 @@ import {
   type Evidence,
   type HubEvent,
   type HubEventType,
+  type LeadSeat,
   type Message,
   type MessageView,
   type NewTaskInput,
@@ -357,8 +358,11 @@ export interface TargetOption {
   label: string;
 }
 
-/** Who a person can write to: the lead, everyone, people, connected agents and open task threads. */
-export function targetOptions(agents: Agent[], tasks: Task[], current?: string): TargetOption[] {
+/**
+ * Who a person can write to: the lead, everyone, people, connected agents and open task threads. The agent holding
+ * the lead seat (`leadId`, HubStatus.leadSeat) is marked as the lead; an agent's lead role says nothing since M2 (X-45).
+ */
+export function targetOptions(agents: Agent[], tasks: Task[], leadId: string | null, current?: string): TargetOption[] {
   const options: TargetOption[] = [
     { value: 'lead', label: 'The lead' },
     { value: 'all', label: 'Everyone' },
@@ -367,7 +371,7 @@ export function targetOptions(agents: Agent[], tasks: Task[], current?: string):
       .filter((agent) => agent.status !== 'gone')
       .map((agent) => ({
         value: `agent:${agent.id}`,
-        label: `${agent.id} · ${agent.user}${agent.role === 'lead' ? ' · lead' : ''}${agent.label ? ` · ${agent.label}` : ''}`,
+        label: `${agent.id} · ${agent.user}${agent.id === leadId ? ' · lead' : ''}${agent.label ? ` · ${agent.label}` : ''}`,
       })),
     ...tasks
       .filter((task) => !isClosed(task.status))
@@ -379,13 +383,63 @@ export function targetOptions(agents: Agent[], tasks: Task[], current?: string):
   return options;
 }
 
-/** True when a message belongs to the conversation with a target. */
+/** True when a message belongs to the conversation with a target; the lead's are those of the seat holder (`leadId`). */
 export function inConversation(message: Message, target: string, leadId: string | null): boolean {
   if (target === 'everything' || message.to === target) return true;
   if (target === 'lead') return leadId !== null && message.from === `agent:${leadId}`;
   if (target.startsWith('agent:')) return message.from === target;
   if (target.startsWith('task:')) return message.taskId === target.slice(5);
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// The lead seat (design 6.11, 11)
+// ---------------------------------------------------------------------------
+
+/**
+ * Who holds the lead seat, in one line: a live chat with its person (from the seat holder's agent, once loaded), or a
+ * runner agent with its runner and the wake-ups since its last rotation.
+ */
+export function leadSeatSummary(seat: LeadSeat, holder: Pick<Agent, 'id' | 'user' | 'label'> | null): string {
+  if (seat.kind === 'none' || seat.agentId === null) return 'Nobody holds the lead seat';
+  if (seat.kind === 'live') {
+    if (holder?.id !== seat.agentId) return `${seat.agentId} in a live chat`;
+    return `${seat.agentId} in ${holder.user}'s live chat${holder.label ? ` “${holder.label}”` : ''}`;
+  }
+  const wakeups = seat.wakeups === 0 ? 'no wake-ups' : `${seat.wakeups} wake-up${seat.wakeups === 1 ? '' : 's'}`;
+  return `${seat.agentId} on ${seat.runnerId ?? 'a runner'}, ${wakeups} since its last rotation`;
+}
+
+export interface LeadBanner {
+  title: string;
+  text: string;
+  /** The command that ends the text, which a person runs to lead from a chat. */
+  command: string | null;
+}
+
+/**
+ * The shell's banner while the lead seat is empty, or null while it is held. With runner leads on, the scheduler
+ * seats a lead on the next runner with a free slot, except while the project is paused, when it skips the lead seat
+ * (design 6.6); with them off, only a person's live chat can take the seat.
+ */
+export function leadBanner(seat: LeadSeat, paused: boolean): LeadBanner | null {
+  if (seat.kind !== 'none') return null;
+  if (seat.runnerLeads) {
+    return {
+      title: 'No lead right now.',
+      text: paused
+        ? 'The project is paused, so no runner starts a lead until it is resumed.'
+        : 'Runner leads are on, so a runner starts one as soon as it has a free slot.',
+      command: null,
+    };
+  }
+  return {
+    title: 'No lead is connected.',
+    text:
+      "Runner leads are off, so a live chat leads: in the project's repository, start a new Claude Code or Codex chat " +
+      'after running',
+    command: 'agflow join --role lead',
+  };
 }
 
 export function deliveryLabel(message: Message & Partial<Pick<MessageView, 'deliveries'>>): string {
