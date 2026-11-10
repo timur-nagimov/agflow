@@ -7,6 +7,7 @@ import {
   TargetSchema,
   TaskIdSchema,
   TaskPatchSchema,
+  branchEpoch,
   formatMessages,
   isHeld,
   isTaskBranch,
@@ -16,7 +17,22 @@ import {
 import { z } from 'zod';
 import { repoRoot } from '../git';
 import type { HubClient } from '../hub-client';
-import { assertTaskBranch, prepareTaskWorktree, pushTaskBranch, removeTaskWorktree, taskWorktreePath } from './task-git';
+import {
+  type StartPoint,
+  type TaskWorktree,
+  type WorkPosition,
+  assertTaskBranch,
+  describePosition,
+  describeStart,
+  followWorkPosition,
+  positionMissingFrom,
+  prepareTaskWorktree,
+  pushTaskBranch,
+  remoteCommitsMissingFrom,
+  removeTaskWorktree,
+  taskWorktreePath,
+  workPositionOf,
+} from './task-git';
 
 export interface ToolState {
   agentId: string | null;
@@ -97,6 +113,72 @@ export const lines = (parts: Array<string | false | null | undefined | 0>) => pa
 
 /** Where a chat that holds a task works. claim_task and resume_claim both end with it. */
 const workInside = (path: string, branch: string) => `Work only inside ${path} (branch ${branch}). Commit there; submit pushes the branch.`;
+
+/** How a worktree came to be on the branch: the lines of a claim answer that say where the work stands. */
+interface StartFacts {
+  branch: string;
+  worktree: TaskWorktree;
+  start: StartPoint | null;
+  /** A newer work position the claim answer named that the branch could not be moved to. */
+  unfollowed: WorkPosition | null;
+  /** The work position an existing branch lacks. */
+  missing: StartPoint | null;
+  /** Origin's head of the task branch, when it has commits a created branch lacks. */
+  remoteAhead: string | null;
+}
+
+const describeSwitched = (from: string): string => (/^[0-9a-f]{40}$/.test(from) ? `a detached HEAD at ${from.slice(0, 7)}` : `branch ${from}`);
+
+/** Where the branch started, and what it lacks (design 10, Live-chat claims); null when there is nothing to say. */
+function startNote({ branch, worktree, start, unfollowed, missing, remoteAhead }: StartFacts): string | null {
+  return (
+    lines([
+      worktree.switchedFrom !== null &&
+        `The worktree was on ${describeSwitched(worktree.switchedFrom)}; agflow switched it to ${branch}, keeping its commits and changes.`,
+      start && `Started from ${describeStart(start)}.`,
+      unfollowed &&
+        `The task's work position moved to ${describePosition(unfollowed)} during the claim, and agflow could not fetch it, so your branch stays where it started. ` +
+          `Fetch and merge it before you go on: git fetch origin ${unfollowed.ref ?? unfollowed.sha} && git merge ${unfollowed.sha ?? 'FETCH_HEAD'}`,
+      missing &&
+        `Your branch ${branch} does not contain the task's work position, ${describeStart(missing)}. Merge it before you go on: git merge ${missing.sha}`,
+      remoteAhead &&
+        `origin/${branch} (at ${remoteAhead.slice(0, 7)}) has commits your branch lacks, pushed after the work position was taken. ` +
+          `Merge them before you submit, or the push is refused: git merge origin/${branch}`,
+    ]) || null
+  );
+}
+
+/**
+ * Prepares the worktree, then makes the claim; a refusal by the hub undoes what was prepared. A created branch that
+ * the claim answer finds behind a newer work position moves to it before any work starts. The claim stands once the
+ * hub has made it, so that move is best effort: when it fails, the answer says how to take the position by hand.
+ */
+async function claimInWorktree(
+  root: string,
+  task: Task,
+  branch: string,
+  claim: () => Promise<{ task: Task }>,
+): Promise<{ claimed: Task; worktree: TaskWorktree; startLine: string | null }> {
+  const prepared = workPositionOf(task);
+  const worktree = prepareTaskWorktree(root, task.id, branch, prepared);
+  let claimed: Task;
+  try {
+    claimed = (await claim()).task;
+  } catch (error) {
+    removeTaskWorktree(root, worktree, branch);
+    throw error;
+  }
+  const now = workPositionOf(claimed);
+  let start = worktree.start;
+  let unfollowed: WorkPosition | null = null;
+  try {
+    start = followWorkPosition(root, worktree, prepared, now) ?? start;
+  } catch {
+    unfollowed = now;
+  }
+  const facts = { branch, worktree, start, unfollowed, missing: positionMissingFrom(root, worktree, now), remoteAhead: remoteCommitsMissingFrom(worktree) };
+  return { claimed, worktree, startLine: startNote(facts) };
+}
 
 export const sharedTools: ToolDef[] = [
   defineTool(
@@ -204,7 +286,8 @@ export const workerTools: ToolDef[] = [
     { id: TaskIdSchema },
     async ({ id }, ctx) => {
       const client = asAgent(ctx);
-      const { branch } = (await client.task(id)).task;
+      const held = (await client.task(id)).task;
+      const { branch } = held;
       if (!isTaskBranch(id, branch)) {
         const { task } = await client.resumeClaim(id);
         return `You now hold ${task.id}${task.branch ? ` (branch ${task.branch})` : ''}.`;
@@ -212,15 +295,8 @@ export const workerTools: ToolDef[] = [
       // As in claim_task, the worktree comes first, so that a refusal by the hub leaves nothing behind.
       const root = repoRoot(ctx.cwd);
       if (!root) throw new ToolError(`${ctx.cwd} is not inside a git repository, so agflow cannot create the worktree for ${id}.`);
-      const worktree = prepareTaskWorktree(root, id, branch);
-      let task: Task;
-      try {
-        task = (await client.resumeClaim(id)).task;
-      } catch (error) {
-        removeTaskWorktree(root, worktree, branch);
-        throw error;
-      }
-      return lines([`You now hold ${task.id} (branch ${branch}).`, workInside(worktree.path, branch)]);
+      const { claimed, worktree, startLine } = await claimInWorktree(root, held, branch, () => client.resumeClaim(id));
+      return lines([`You now hold ${claimed.id} (branch ${branch}).`, startLine, workInside(worktree.path, branch)]);
     },
   ),
   defineTool(
@@ -279,21 +355,21 @@ export const gitTools: ToolDef[] = [
       const client = asAgent(ctx);
       const root = repoRoot(ctx.cwd);
       if (!root) throw new ToolError(`${ctx.cwd} is not inside a git repository, so agflow cannot create the task branch.`);
-      const { task } = await client.task(id);
+      const [{ task }, { epoch }] = await Promise.all([client.task(id), client.status()]);
       // The hub keeps the branch name a claim last gave it, and any agent can give it any valid name (say
       // "production"). Only a name inside this task's own namespace is used; any other is replaced, and the
-      // claim below stores the replacement on the hub. Live chats name branches as M1 did, without an epoch.
-      const branch = isTaskBranch(task.id, task.branch) ? task.branch : taskBranchName(task.id, task.title, 1);
-      const worktree = prepareTaskWorktree(root, task.id, branch);
-      let claimed: Task;
-      try {
-        claimed = (await client.claim(id, branch)).task;
-      } catch (error) {
-        removeTaskWorktree(root, worktree, branch);
-        throw error;
-      }
+      // claim below stores the replacement on the hub. From epoch 2 (after a restore) names carry the epoch, and a
+      // branch named before it is not reused, so nothing collides with what existed before (design 6.14). At epoch 1
+      // every recorded name is current: an M1 name such as agflow/T-1-e2-parser (title "E2: parser") only looks
+      // like an epoch-2 one.
+      const branch =
+        isTaskBranch(task.id, task.branch) && (epoch === 1 || branchEpoch(task.branch) === epoch)
+          ? task.branch
+          : taskBranchName(task.id, task.title, epoch);
+      const { claimed, worktree, startLine } = await claimInWorktree(root, task, branch, () => client.claim(id, branch));
       return lines([
         `You hold ${claimed.id}: ${claimed.title}`,
+        startLine,
         workInside(worktree.path, branch),
         labelled('Objective:', claimed.objective),
         `Acceptance criteria:\n${acceptanceLines(claimed)}`,
