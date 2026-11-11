@@ -1,7 +1,10 @@
 import type { Agent } from '@agflow/core';
 import type { Context } from 'hono';
 import { z } from 'zod';
+import { resolveAgentToken } from '../auth';
+import type { HubContext } from '../context';
 import { badRequest, forbidden, unauthorized, unsupportedMediaType } from '../errors';
+import { holdsSeat } from '../hub-state';
 import type { AppEnv, Principal } from './app';
 
 export type Ctx = Context<AppEnv>;
@@ -50,14 +53,42 @@ export function agentOf(c: Ctx): Agent {
   return p.agent;
 }
 
-export function leadOrHuman(c: Ctx): Principal {
+/**
+ * The agent acting on a held task, with the agent token it called with (null for a live agent). The holder test
+ * resolves the token again inside its transaction (requireHolder).
+ */
+export function holderOf(c: Ctx): { agent: Agent; token: string | null } {
+  const p = principal(c);
+  return { agent: agentOf(c), token: p.via === 'agent' ? p.token : null };
+}
+
+/**
+ * A person in the web UI, or the agent holding the lead seat, live or on a runner (design 6.11). A runner lead's
+ * token is resolved again, since leadBody calls this once more after a body that may arrive after a re-fence.
+ */
+export function leadOrHuman(c: Ctx, ctx: HubContext): Principal {
   const p = principal(c);
   if (p.agent) {
-    if (p.agent.role !== 'lead') throw forbidden('only the lead or a person can do this');
+    if (p.via === 'agent') resolveAgentToken(ctx, p.token);
+    if (!holdsSeat(ctx, p.agent.id)) throw forbidden('only the lead or a person can do this');
     return p;
   }
   if (p.via !== 'web') throw forbidden('agents must call hello first; people use the web UI');
   return p;
+}
+
+/**
+ * leadOrHuman for a route with a body: checked before the body is read, so others are refused at once, and again
+ * once it has arrived, because the seat can move, or the lead's token stop working, while it streams in.
+ */
+export async function leadBody<S extends z.ZodType>(
+  c: Ctx,
+  ctx: HubContext,
+  schema: S,
+): Promise<{ lead: Principal; body: z.output<S> }> {
+  leadOrHuman(c, ctx);
+  const body = await readBody(c, schema);
+  return { lead: leadOrHuman(c, ctx), body };
 }
 
 export function agentOrHuman(c: Ctx): Principal {

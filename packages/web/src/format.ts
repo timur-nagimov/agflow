@@ -3,6 +3,8 @@ import {
   type BlockedKind,
   type Evidence,
   type HubEvent,
+  type HubEventType,
+  type LeadSeat,
   type Message,
   type MessageView,
   type NewTaskInput,
@@ -10,6 +12,7 @@ import {
   type TaskKind,
   type TaskNote,
   type TaskStatus,
+  type Vendor,
   canTransition,
   isClosed,
   isHeld,
@@ -39,9 +42,32 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   failed: 'Failed',
 };
 
-/** A task blocked only by unfinished dependencies is waiting, not in trouble. */
+/** What a blocked task reads as on its chip; an agent's block and an impossible task both read Blocked. */
+export const BLOCKED_LABELS: Record<BlockedKind, string> = {
+  deps: 'Waiting',
+  agent: 'Blocked',
+  impossible: 'Blocked',
+  takeover: 'Taken over',
+  replan: 'Re-plan',
+  paused: 'Paused',
+  branch_moved: 'Branch moved',
+  policy: 'Refused',
+};
+
+/** The heading of a blocked task's attention card. */
+export const BLOCKED_TITLES: Record<BlockedKind, string> = {
+  deps: 'Waiting on other tasks',
+  agent: 'Blocked',
+  impossible: 'The agent says this cannot be done as written',
+  takeover: 'Taken over by a person',
+  replan: 'Its attempts kept failing: re-plan it',
+  paused: 'Stopped and held by a person',
+  branch_moved: 'The task branch moved outside agflow',
+  policy: 'The vendor refused this work on policy grounds',
+};
+
 export function statusLabel(status: TaskStatus, blockedKind: BlockedKind | null = null): string {
-  return status === 'blocked' && blockedKind === 'deps' ? 'Waiting' : STATUS_LABELS[status];
+  return status === 'blocked' && blockedKind ? BLOCKED_LABELS[blockedKind] : STATUS_LABELS[status];
 }
 
 export function toneOf(status: TaskStatus, blockedKind: BlockedKind | null = null): Tone {
@@ -61,7 +87,8 @@ export function toneOf(status: TaskStatus, blockedKind: BlockedKind | null = nul
     case 'merged':
       return 'done';
     case 'blocked':
-      return blockedKind === 'deps' ? 'wait' : 'trouble';
+      // A task waiting only on dependencies is not in trouble, and a taken-over one is being worked on by a person.
+      return blockedKind === 'deps' ? 'wait' : blockedKind === 'takeover' ? 'active' : 'trouble';
     case 'rejected':
     case 'stale':
     case 'failed':
@@ -75,9 +102,9 @@ export type ColumnKey = 'todo' | 'doing' | 'review' | 'attention' | 'done' | 'cl
 
 export const COLUMNS: { key: ColumnKey; label: string; tone: Tone; hint: string }[] = [
   { key: 'todo', label: 'To do', tone: 'wait', hint: 'Ready to claim, or waiting on other tasks.' },
-  { key: 'doing', label: 'In progress', tone: 'active', hint: 'Claimed by an agent.' },
+  { key: 'doing', label: 'In progress', tone: 'active', hint: 'Claimed by an agent, or taken over by a person.' },
   { key: 'review', label: 'In review', tone: 'review', hint: 'Submitted and waiting for the lead or a person.' },
-  { key: 'attention', label: 'Needs attention', tone: 'trouble', hint: 'Blocked by an agent, rejected or stale.' },
+  { key: 'attention', label: 'Needs attention', tone: 'trouble', hint: 'Blocked, paused, rejected or stale.' },
   { key: 'done', label: 'Done', tone: 'done', hint: 'Accepted or merged.' },
   { key: 'closed', label: 'Closed', tone: 'closed', hint: 'Cancelled or failed.' },
 ];
@@ -88,7 +115,7 @@ export function columnOf(task: Pick<Task, 'status' | 'blockedKind'>): ColumnKey 
     case 'ready':
       return 'todo';
     case 'blocked':
-      return task.blockedKind === 'deps' ? 'todo' : 'attention';
+      return task.blockedKind === 'deps' ? 'todo' : task.blockedKind === 'takeover' ? 'doing' : 'attention';
     case 'claimed':
     case 'working':
       return 'doing';
@@ -206,29 +233,51 @@ export const TASK_ACTIONS: Record<TaskAction, ActionSpec> = {
   },
 };
 
-/** The actions a person can take on a task in its current status. */
-export function actionsFor(task: Pick<Task, 'status'>): TaskAction[] {
+/** Who works on a task: a runner agent, a live chat, or nobody. */
+export type TaskHolder = 'runner' | 'live' | 'nobody';
+
+/**
+ * The actions a person can take on a task in its current status. On a task a runner agent holds, Release claim
+ * becomes the agent's Stop (design 11), which the runner actions offer; a taken-over task is handed back instead of
+ * unblocked (6.12). Without a holder the M1 actions apply.
+ */
+export function actionsFor(task: Pick<Task, 'status' | 'blockedKind'>, holder?: TaskHolder): TaskAction[] {
   const actions: TaskAction[] = [];
   if (task.status === 'submitted') actions.push('accept', 'reject');
   if (task.status === 'accepted') actions.push('merged');
-  if (task.status === 'blocked') actions.push('unblock');
-  if (task.status === 'claimed' || task.status === 'working') actions.push('release');
+  if (task.status === 'blocked' && task.blockedKind !== 'takeover') actions.push('unblock');
+  if ((task.status === 'claimed' || task.status === 'working') && holder !== 'runner') actions.push('release');
   if (canTransition(task.status, 'cancelled')) actions.push('cancel');
   return actions;
 }
 
+const BLOCKED_HINTS: Partial<Record<BlockedKind, string>> = {
+  takeover: 'A person has taken this over. Hand it back when the work is ready, or cancel it.',
+  paused: 'A person stopped and held this. Unblock it to let an agent go on from its last work, or cancel it.',
+  replan: 'Its attempts kept failing. Split, clarify or amend it, then unblock it; or cancel it.',
+  branch_moved: 'Its branch moved outside agflow. Unblock it to go on from the new head, or cancel it.',
+  policy: 'The vendor refused this work. Change the task before you unblock it, or cancel it.',
+};
+
 /** One line telling a person what the actions are for in the task's current status. */
-export function actionHint(task: Pick<Task, 'status' | 'assignee' | 'submission'>): string {
+export function actionHint(
+  task: Pick<Task, 'status' | 'blockedKind' | 'assignee' | 'submission'>,
+  holder?: TaskHolder,
+): string {
   switch (task.status) {
     case 'submitted':
       return `${task.submission?.by ?? 'The agent'} submitted this for review. Accept it, or reject it with feedback.`;
     case 'accepted':
       return 'Accepted. Merge its branch, then mark it merged.';
     case 'blocked':
-      return 'Unblock it once the problem is solved, or cancel it.';
+      return (
+        (task.blockedKind && BLOCKED_HINTS[task.blockedKind]) ?? 'Unblock it once the problem is solved, or cancel it.'
+      );
     case 'claimed':
     case 'working':
-      return `${task.assignee ?? 'An agent'} is working on this. Release the claim only if the agent is stuck or gone.`;
+      return holder === 'runner'
+        ? `${task.assignee ?? 'A runner agent'} is working on this on a runner. Stop it only if it is stuck, or take it over to work on it yourself.`
+        : `${task.assignee ?? 'An agent'} is working on this. Release the claim only if the agent is stuck or gone.`;
     default:
       return '';
   }
@@ -256,9 +305,16 @@ export interface ThreadTarget {
  * it. Once the work is handed in, or the task is finished or closed, nobody reads the thread any more,
  * although `assignee` stays set. A message then goes to the lead, who reviews the task.
  */
-export function threadTarget(task: Pick<Task, 'id' | 'status' | 'assignee'>): ThreadTarget {
+export function threadTarget(task: Pick<Task, 'id' | 'status' | 'blockedKind' | 'assignee'>): ThreadTarget {
   if (isHeld(task.status)) {
     return { to: `task:${task.id}`, placeholder: `Write to ${task.assignee ?? 'the agent'}, who holds this task…` };
+  }
+  // The person who took the task over works outside agflow and reads no thread; the agent after the hand-back does.
+  if (task.status === 'blocked' && task.blockedKind === 'takeover') {
+    return {
+      to: `task:${task.id}`,
+      placeholder: 'A person has taken this task over; the next agent to work on it gets your message…',
+    };
   }
   if (task.status === 'draft' || task.status === 'ready' || task.status === 'blocked') {
     return { to: `task:${task.id}`, placeholder: 'Nobody holds this task; the next agent to claim it gets your message…' };
@@ -302,8 +358,11 @@ export interface TargetOption {
   label: string;
 }
 
-/** Who a person can write to: the lead, everyone, people, connected agents and open task threads. */
-export function targetOptions(agents: Agent[], tasks: Task[], current?: string): TargetOption[] {
+/**
+ * Who a person can write to: the lead, everyone, people, connected agents and open task threads. The agent holding
+ * the lead seat (`leadId`, HubStatus.leadSeat) is marked as the lead; an agent's lead role says nothing since M2 (X-45).
+ */
+export function targetOptions(agents: Agent[], tasks: Task[], leadId: string | null, current?: string): TargetOption[] {
   const options: TargetOption[] = [
     { value: 'lead', label: 'The lead' },
     { value: 'all', label: 'Everyone' },
@@ -312,7 +371,7 @@ export function targetOptions(agents: Agent[], tasks: Task[], current?: string):
       .filter((agent) => agent.status !== 'gone')
       .map((agent) => ({
         value: `agent:${agent.id}`,
-        label: `${agent.id} · ${agent.user}${agent.role === 'lead' ? ' · lead' : ''}${agent.label ? ` · ${agent.label}` : ''}`,
+        label: `${agent.id} · ${agent.user}${agent.id === leadId ? ' · lead' : ''}${agent.label ? ` · ${agent.label}` : ''}`,
       })),
     ...tasks
       .filter((task) => !isClosed(task.status))
@@ -324,13 +383,63 @@ export function targetOptions(agents: Agent[], tasks: Task[], current?: string):
   return options;
 }
 
-/** True when a message belongs to the conversation with a target. */
+/** True when a message belongs to the conversation with a target; the lead's are those of the seat holder (`leadId`). */
 export function inConversation(message: Message, target: string, leadId: string | null): boolean {
   if (target === 'everything' || message.to === target) return true;
   if (target === 'lead') return leadId !== null && message.from === `agent:${leadId}`;
   if (target.startsWith('agent:')) return message.from === target;
   if (target.startsWith('task:')) return message.taskId === target.slice(5);
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// The lead seat (design 6.11, 11)
+// ---------------------------------------------------------------------------
+
+/**
+ * Who holds the lead seat, in one line: a live chat with its person (from the seat holder's agent, once loaded), or a
+ * runner agent with its runner and the wake-ups since its last rotation.
+ */
+export function leadSeatSummary(seat: LeadSeat, holder: Pick<Agent, 'id' | 'user' | 'label'> | null): string {
+  if (seat.kind === 'none' || seat.agentId === null) return 'Nobody holds the lead seat';
+  if (seat.kind === 'live') {
+    if (holder?.id !== seat.agentId) return `${seat.agentId} in a live chat`;
+    return `${seat.agentId} in ${holder.user}'s live chat${holder.label ? ` “${holder.label}”` : ''}`;
+  }
+  const wakeups = seat.wakeups === 0 ? 'no wake-ups' : `${seat.wakeups} wake-up${seat.wakeups === 1 ? '' : 's'}`;
+  return `${seat.agentId} on ${seat.runnerId ?? 'a runner'}, ${wakeups} since its last rotation`;
+}
+
+export interface LeadBanner {
+  title: string;
+  text: string;
+  /** The command that ends the text, which a person runs to lead from a chat. */
+  command: string | null;
+}
+
+/**
+ * The shell's banner while the lead seat is empty, or null while it is held. With runner leads on, the scheduler
+ * seats a lead on the next runner with a free slot, except while the project is paused, when it skips the lead seat
+ * (design 6.6); with them off, only a person's live chat can take the seat.
+ */
+export function leadBanner(seat: LeadSeat, paused: boolean): LeadBanner | null {
+  if (seat.kind !== 'none') return null;
+  if (seat.runnerLeads) {
+    return {
+      title: 'No lead right now.',
+      text: paused
+        ? 'The project is paused, so no runner starts a lead until it is resumed.'
+        : 'Runner leads are on, so a runner starts one as soon as it has a free slot.',
+      command: null,
+    };
+  }
+  return {
+    title: 'No lead is connected.',
+    text:
+      "Runner leads are off, so a live chat leads: in the project's repository, start a new Claude Code or Codex chat " +
+      'after running',
+    command: 'agflow join --role lead',
+  };
 }
 
 export function deliveryLabel(message: Message & Partial<Pick<MessageView, 'deliveries'>>): string {
@@ -353,12 +462,121 @@ const count = (value: unknown, noun: string): string => {
   const n = Array.isArray(value) ? value.length : 0;
   return `${n} ${noun}${n === 1 ? '' : 's'}`;
 };
+const list = (value: unknown): string => (Array.isArray(value) ? value.map(String).join(', ') : '');
+/** Codes such as failed_to_start, in words. */
+const words = (value: unknown): string => text(value).replaceAll('_', ' ');
+const sha7 = (value: unknown): string => shortSha(text(value));
+const vendorName = (value: unknown): string => (value === 'claude' || value === 'codex' ? VENDOR_NAMES[value] : text(value));
+/** How long after the event a time in its data is ('2 h'), or '' without one. */
+const later = (event: HubEvent, value: unknown): string =>
+  typeof value === 'number' && value > event.ts ? duration(value - event.ts) : '';
+
+function quotaSentence(owner: string, vendor: string, quota: unknown, event: HubEvent): string {
+  const q = (quota ?? {}) as { state?: unknown; resetsAt?: unknown; windows?: { fiveHour?: unknown; weekly?: unknown } };
+  const of = `${owner}'s ${vendor} quota`;
+  if (q.state === 'exhausted') {
+    const reset = later(event, q.resetsAt);
+    return reset ? `${of} ran out; it resets ${reset} later` : `${of} ran out`;
+  }
+  const windows = [
+    typeof q.windows?.fiveHour === 'number' ? `${percent(q.windows.fiveHour)} of the 5-hour window` : '',
+    typeof q.windows?.weekly === 'number' ? `${percent(q.windows.weekly)} of the week` : '',
+  ].filter(Boolean);
+  return q.state === 'ok' && windows.length > 0 ? `${of}: ${windows.join(', ')}` : `${of} is unknown`;
+}
+
+type Sentence = (d: Record<string, unknown>, by: string, on: string, event: HubEvent) => string;
+
+/**
+ * The sentences of the event types M2 adds (design 6.17), keyed by core's HubEventType, so a type core adds and this
+ * table misses fails the typecheck. Each reads only the data keys core's HUB_EVENT_TYPES records for its type, which
+ * the unit test checks. Attempt events name the attempt from data.attemptId; their subject is the task (or, for a
+ * lead attempt, the attempt itself).
+ */
+const M2_SENTENCES: Record<HubEventType, Sentence> = {
+  'runner.online': (d, _by, on) => `${text(d.runnerId) || on} came online`,
+  'runner.offline': (d, _by, on) =>
+    d.state === 'needs_login'
+      ? `${text(d.runnerId) || on} went offline: its login no longer verifies, so it needs agflow login`
+      : `${text(d.runnerId) || on} went offline`,
+  'runner.updated': (d, by, on) =>
+    `${by} changed ${text(d.runnerId) || on}'s settings${Array.isArray(d.fields) ? ` (${list(d.fields)})` : ''}`,
+  'runner.retired': (d, by, on) => `${by} retired ${text(d.runnerId) || on}`,
+  'runner.event_rejected': (d, _by, on) =>
+    `The hub refused ${text(d.type)} #${String(d.seq)} from ${text(d.runnerId) || on}: ${text(d.error)}`,
+  'account.quota_changed': (d, _by, on, event) => quotaSentence(on, vendorName(d.vendor), d.quota, event),
+  'account.owner_away': (d, _by, on) =>
+    `${on} seems away: an approval timed out, so their ${vendorName(d.vendor)} account takes no new work until they act`,
+  'attempt.started': (d) =>
+    `${text(d.attemptId)} started: ${text(d.agentId)}, a ${vendorName(d.vendor)} ${text(d.role)}${
+      d.runnerId ? ` on ${text(d.runnerId)}` : ' in a live chat'
+    }`,
+  'attempt.running': (d) => `${text(d.attemptId)} is running`,
+  'attempt.quota_wait': (d, _by, _on, event) => {
+    const reset = later(event, d.resetsAt);
+    return `${text(d.attemptId)} is waiting for quota${reset ? `; it resets ${reset} later` : ''}`;
+  },
+  // A task attempt holds while its submission is reviewed; a lead's holds once its process exits, until a delivery.
+  'attempt.holding': (d) =>
+    d.submissionId
+      ? `${text(d.attemptId)} is holding while ${text(d.submissionId)} is reviewed`
+      : `${text(d.attemptId)} is holding until its next message`,
+  'attempt.resumed': (d) => `${text(d.attemptId)} resumed${d.reason ? `: ${text(d.reason)}` : ''}`,
+  'attempt.ended': (d) => `${text(d.attemptId)} ended: ${words(d.endReason)}`,
+  'attempt.wip': (d) =>
+    `${text(d.attemptId)} pushed work in progress at ${sha7(d.sha)}${
+      Array.isArray(d.stripped) && d.stripped.length > 0 ? `, without ${count(d.stripped, 'protected path')}` : ''
+    }`,
+  'attempt.violation': (d) => `${text(d.attemptId)} changed protected paths (${text(d.phase)}): ${list(d.paths)}`,
+  'attempt.late_work': (d) => `${text(d.attemptId)} pushed late work at ${sha7(d.sha)}`,
+  'attempt.prepared': (d) =>
+    d.ok
+      ? `Dependencies are ready for ${text(d.attemptId)}`
+      : `Preparing dependencies for ${text(d.attemptId)} failed: ${text(d.error)}`,
+  'agent.stalled': (d) => `${text(d.agentId)} stalled on ${text(d.attemptId)}: ${text(d.reason)}`,
+  'agent.stopped': (d, by) =>
+    `${by} ${d.cause === 'stop_hold' ? 'stopped and held' : 'stopped'} ${text(d.agentId)} on ${text(d.attemptId)}: ${text(d.reason)}`,
+  'agent.replaced': (d, by) => `${by} replaced ${text(d.agentId)} on ${text(d.attemptId)}: ${text(d.reason)}`,
+  'approval.requested': (d) => `${text(d.agentId)} asked for approval on ${text(d.attemptId)}: ${text(d.summary)}`,
+  'approval.decided': (d, by) =>
+    `${by} ${d.decision === 'approve' ? 'approved' : 'declined'} ${text(d.agentId)}'s request: ${text(d.summary)}`,
+  'approval.expired': (d) => `${text(d.agentId)}'s request expired unanswered and was declined: ${text(d.summary)}`,
+  'approval.voided': (d) => `${text(d.agentId)}'s request no longer applies: ${text(d.summary)}`,
+  'lead.seat_changed': (d) => {
+    if (d.kind === 'none' || !d.agentId) return 'The lead seat is empty';
+    return `${text(d.agentId)} took the lead seat ${d.kind === 'runner' ? `on ${text(d.runnerId)}` : 'in a live chat'}`;
+  },
+  'lead.rotated': (d) => `The lead ${text(d.agentId)} rotated out: ${text(d.reason)}`,
+  'submission.pending': (d) => `${text(d.attemptId)} is submitting ${text(d.submissionId)}`,
+  'submission.recorded': (d) =>
+    `${text(d.attemptId)} submitted ${text(d.submissionId)} at ${sha7(d.headSha)}${d.branch ? ` on ${text(d.branch)}` : ''}`,
+  'submission.failed': (d) => `${text(d.submissionId)} from ${text(d.attemptId)} failed: ${text(d.error)}`,
+  'task.taken_over': (d, by, on) => `${who(text(d.person)) || by} took ${text(d.taskId) || on} over from ${text(d.attemptId)}`,
+  'task.handed_back': (d, by, on) =>
+    `${by} handed ${text(d.taskId) || on} back from ${d.source === 'clone' ? "the runner's clone" : text(d.ref)}${
+      d.sha ? ` at ${sha7(d.sha)}` : ''
+    }`,
+  'task.refs_deleted': (d, _by, on) => `${text(d.runnerId)} deleted ${count(d.refs, 'ref')} of ${text(d.taskId) || on}`,
+  'guard.plan_change': (d) =>
+    `${text(d.agentId)} called ${text(d.call)} on ${list(d.taskIds)}: ${String(d.count)} plan changes in the last hour`,
+  'guard.dispatch_paused': (d, _by, _on, event) => {
+    const pause = later(event, d.until);
+    return `Worker dispatch paused${pause ? ` for ${pause}` : ''} after ${String(d.count)} plan changes in an hour by ${text(d.agentId)}`;
+  },
+  'system.recovery_started': (d) =>
+    `The hub was down for ${duration(typeof d.gapMs === 'number' ? d.gapMs : 0)}; it recovers before it starts new work`,
+  'system.recovery_ended': () => 'The hub finished recovering',
+  'system.restored': (d) => `The hub was restored from a backup (epoch ${String(d.epoch)})`,
+};
+
+const isM2Type = (type: string): type is HubEventType => Object.hasOwn(M2_SENTENCES, type);
 
 /** One plain sentence per event, for the timeline and task histories. */
 export function describeEvent(event: HubEvent): string {
   const by = who(event.actor);
   const on = event.subject ?? '';
   const d = event.data;
+  if (isM2Type(event.type)) return M2_SENTENCES[event.type](d, by, on, event);
   switch (event.type) {
     case 'task.created':
       return `${by} created ${on} “${text(d.title)}”`;
@@ -379,7 +597,8 @@ export function describeEvent(event: HubEvent): string {
     case 'task.stale':
       return `${on} went stale: ${text(d.holder) || 'its agent'} stopped responding`;
     case 'task.ready':
-      return `${on} is ready`;
+      // Only the hub's hand-back fallback gives a reason: the runner had no link, or the clone's push timed out (X-49).
+      return d.reason ? `${on} is ready again without the clone's work: ${text(d.reason)}` : `${on} is ready`;
     case 'task.blocked':
       return d.reason ? `${by} reported ${on} blocked: ${text(d.reason)}` : `${on} is waiting on other tasks`;
     case 'task.impossible':
@@ -395,7 +614,7 @@ export function describeEvent(event: HubEvent): string {
     case 'task.returned':
       return `${on} went back to ${text(d.to)} for another try`;
     case 'task.merged':
-      return `${by} marked ${on} merged${d.sha ? ` at ${text(d.sha).slice(0, 7)}` : ''}`;
+      return `${by} marked ${on} merged${d.sha ? ` at ${sha7(d.sha)}` : ''}`;
     case 'task.cancelled':
       return `${by} cancelled ${on}: ${text(d.reason)}`;
     case 'goal.updated':
@@ -425,8 +644,31 @@ export function describeEvent(event: HubEvent): string {
   }
 }
 
-export function eventTone(type: string): Tone {
+/** Attempt endings that went wrong; the others are a person's or the ladder's decision. */
+const TROUBLED_ENDINGS = new Set(['crashed', 'lost', 'stalled']);
+
+/** The tone of an attempt.ended event. A refused start (failed_to_start with no failure class, X-3) only waits. */
+function endingTone(data: Record<string, unknown>): Tone {
+  if (data.endReason === 'accepted') return 'done';
+  if (data.endReason === 'failed_to_start') return data.failureClass === null ? 'wait' : 'trouble';
+  return TROUBLED_ENDINGS.has(text(data.endReason)) ? 'trouble' : 'closed';
+}
+
+/** The tone of an event; a few M2 types take theirs from the data (an attempt's end reason, a quota's state). */
+export function eventTone(type: string, data: Record<string, unknown> = {}): Tone {
   switch (type) {
+    case 'attempt.ended':
+      return endingTone(data);
+    case 'attempt.prepared':
+      return data.ok ? 'active' : 'trouble';
+    case 'approval.decided':
+      return data.decision === 'approve' ? 'done' : 'closed';
+    case 'account.quota_changed':
+      return (data.quota as { state?: unknown } | null)?.state === 'exhausted' ? 'trouble' : 'wait';
+    case 'lead.seat_changed':
+      return data.kind === 'none' ? 'wait' : 'active';
+    case 'task.handed_back':
+    case 'system.recovery_ended':
     case 'task.accepted':
     case 'task.merged':
     case 'project.resumed':
@@ -434,6 +676,9 @@ export function eventTone(type: string): Tone {
     case 'task.submitted':
     case 'goal.updated':
     case 'goal.note_added':
+    case 'submission.recorded':
+    case 'attempt.holding':
+    case 'approval.requested':
       return 'review';
     case 'task.claimed':
     case 'task.working':
@@ -441,6 +686,13 @@ export function eventTone(type: string): Tone {
     case 'task.handoff_written':
     case 'task.claim_transferred':
     case 'task.returned':
+    case 'runner.online':
+    case 'attempt.started':
+    case 'attempt.running':
+    case 'attempt.resumed':
+    case 'attempt.wip':
+    case 'submission.pending':
+    case 'task.taken_over':
       return 'active';
     case 'task.rejected':
     case 'task.blocked':
@@ -448,33 +700,60 @@ export function eventTone(type: string): Tone {
     case 'task.stale':
     case 'guard.tripped':
     case 'project.paused':
+    case 'runner.event_rejected':
+    case 'account.owner_away':
+    case 'attempt.violation':
+    case 'attempt.late_work':
+    case 'agent.stalled':
+    case 'approval.expired':
+    case 'submission.failed':
+    case 'guard.dispatch_paused':
       return 'trouble';
     case 'task.cancelled':
     case 'message.delivered':
     case 'message.acknowledged':
+    case 'runner.retired':
+    case 'agent.stopped':
+    case 'approval.voided':
+    case 'task.refs_deleted':
       return 'closed';
     default:
       return 'wait';
   }
 }
 
-export type EventCategory = 'goal' | 'tasks' | 'messages' | 'agents' | 'project';
+export type EventCategory = 'goal' | 'tasks' | 'attempts' | 'runners' | 'messages' | 'agents' | 'project';
 
 export const EVENT_CATEGORIES: { key: EventCategory; label: string }[] = [
   { key: 'goal', label: 'Goal' },
   { key: 'tasks', label: 'Tasks' },
+  { key: 'attempts', label: 'Attempts' },
+  { key: 'runners', label: 'Runners' },
   { key: 'messages', label: 'Messages' },
   { key: 'agents', label: 'Agents' },
   { key: 'project', label: 'Project' },
 ];
 
+/** The timeline filter an event type belongs to, by its prefix; system and guard events are the project's. */
 export function categoryOf(type: string): EventCategory {
   const prefix = type.slice(0, type.indexOf('.'));
   if (prefix === 'task') return 'tasks';
   if (prefix === 'goal') return 'goal';
+  if (prefix === 'attempt' || prefix === 'submission' || prefix === 'approval') return 'attempts';
+  if (prefix === 'runner' || prefix === 'account') return 'runners';
   if (prefix === 'message' || prefix === 'rule') return 'messages';
-  if (prefix === 'agent') return 'agents';
+  if (prefix === 'agent' || prefix === 'lead') return 'agents';
   return 'project';
+}
+
+/** An event about a task: its subject is the task, or its data names it (the events of the task's attempts). */
+export function concernsTask(event: Pick<HubEvent, 'subject' | 'data'>, taskId: string): boolean {
+  return event.subject === taskId || event.data.taskId === taskId;
+}
+
+/** An event about an attempt: its data names it, or it is a lead attempt's event, whose subject is the attempt. */
+export function concernsAttempt(event: Pick<HubEvent, 'subject' | 'data'>, attemptId: string): boolean {
+  return event.data.attemptId === attemptId || event.subject === attemptId;
 }
 
 /** Merges live and loaded events without duplicates, newest first. */
@@ -500,6 +779,13 @@ export function ago(ts: number, now: number): string {
   return `${Math.floor(elapsed / DAY)} d ago`;
 }
 
+/** How long until a time to come: "in 12 min", or "now" once it has passed. */
+export function untilText(ts: number, now: number): string {
+  const left = ts - now;
+  if (left <= 0) return 'now';
+  return left < MINUTE ? 'in under a minute' : `in ${duration(left)}`;
+}
+
 /** A short duration such as "1 h 20 min" or "3 d 4 h". */
 export function duration(ms: number): string {
   const minutes = Math.max(0, Math.round(ms / MINUTE));
@@ -518,7 +804,34 @@ export const NOTE_LABELS: Record<TaskNote['kind'], string> = {
   progress: 'Progress',
   handoff: 'Handoff',
   release: 'Released',
+  restatement: 'Restatement',
+  late_work: 'Late work',
 };
+
+/** Late work arrived after its attempt ended and needs a look; a restatement is for the reader to check. */
+export const NOTE_TONES: Record<TaskNote['kind'], Tone> = {
+  progress: 'active',
+  handoff: 'wait',
+  release: 'closed',
+  restatement: 'review',
+  late_work: 'trouble',
+};
+
+// ---------------------------------------------------------------------------
+// Shared words
+// ---------------------------------------------------------------------------
+
+export const VENDOR_NAMES: Record<Vendor, string> = { claude: 'Claude Code', codex: 'Codex' };
+
+/** A fraction 0..1 as a whole percent: 0.423 is "42%". */
+export function percent(fraction: number): string {
+  return `${Math.round(fraction * 100)}%`;
+}
+
+/** The 7 characters of a commit sha that people recognise. */
+export function shortSha(sha: string): string {
+  return sha.slice(0, 7);
+}
 
 export function evidenceText(evidence: Evidence): string {
   switch (evidence.kind) {

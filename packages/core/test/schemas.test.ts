@@ -25,6 +25,7 @@ import {
   SubmitInputSchema,
   TaskPatchSchema,
   UpdateGoalInputSchema,
+  VendorHintSchema,
 } from '../src/schemas';
 import { parseTarget } from '../src/targets';
 
@@ -70,6 +71,29 @@ describe('NewTaskSchema', () => {
 
   test('requires at least one acceptance criterion', () => {
     expect(NewTaskSchema.safeParse({ title: 't', objective: 'o', acceptance: [] }).success).toBe(false);
+  });
+});
+
+describe('vendorHint', () => {
+  const task = { title: 't', objective: 'o', acceptance: [{ id: 'A1', assertion: 'a' }] };
+
+  test("new tasks and patches take 'claude', 'codex' or null", () => {
+    for (const vendorHint of ['claude', 'codex', null] as const) {
+      expect(VendorHintSchema.parse(vendorHint)).toBe(vendorHint);
+      expect(NewTaskSchema.parse({ ...task, vendorHint }).vendorHint).toBe(vendorHint);
+      expect(TaskPatchSchema.parse({ vendorHint })).toEqual({ vendorHint });
+    }
+  });
+
+  test('any other value is refused', () => {
+    for (const vendorHint of ['gemini', 'Claude', '', 1]) {
+      expect([vendorHint, NewTaskSchema.safeParse({ ...task, vendorHint }).success]).toEqual([vendorHint, false]);
+      expect([vendorHint, TaskPatchSchema.safeParse({ vendorHint }).success]).toEqual([vendorHint, false]);
+    }
+  });
+
+  test('a task created without a hint has none', () => {
+    expect('vendorHint' in NewTaskSchema.parse(task)).toBe(false);
   });
 });
 

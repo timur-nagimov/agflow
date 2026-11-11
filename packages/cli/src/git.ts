@@ -98,13 +98,3 @@ export function removeExclude(root: string, pattern: string): void {
     .filter((line) => line !== pattern);
   writeFileSync(file, kept.join('\n'));
 }
-
-export function slugify(text: string): string {
-  const slug = text
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40)
-    .replace(/-+$/g, '');
-  return slug || 'task';
-}

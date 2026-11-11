@@ -2,6 +2,7 @@ import { AckInputSchema, SendMessageInputSchema } from '@agflow/core';
 import { buildBrief } from '../brief';
 import type { HubContext } from '../context';
 import { badRequest, forbidden } from '../errors';
+import { holdsSeat } from '../hub-state';
 import { ackMessages, listMessages, listStandingRules, removeStandingRule, sendMessage, takeInbox } from '../messages';
 import type { App } from './app';
 import { actor, agentOf, agentOrHuman, human, intParam, principal, readBody } from './util';
@@ -22,7 +23,9 @@ export function mountMessageRoutes(app: App, ctx: HubContext): void {
     const p = agentOrHuman(c);
     const input = await readBody(c, SendMessageInputSchema);
     if (input.standingRule && p.agent) throw forbidden('only people can set standing rules');
-    if (input.to === 'all' && p.agent && p.agent.role !== 'lead') throw forbidden('only the lead or a person can message everyone');
+    if (input.to === 'all' && p.agent && !holdsSeat(ctx, p.agent.id)) {
+      throw forbidden('only the lead or a person can message everyone');
+    }
     const message = sendMessage(ctx, {
       from: actor(p),
       to: input.to,

@@ -64,4 +64,22 @@ describe('project and status routes', () => {
     expect(status.json).toMatchObject({ goalVersion: 0, counts: { ready: 2 }, activeAgents: 1, humansInbox: [] });
     expect(status.json.lead.id).toBe(lead.id);
   });
+
+  test('the project lets the scheduler start leads on runners by default', async () => {
+    const hub = createTestHub();
+    expect((await hub.call('GET', '/api/project', { user: 'bob' })).json.runnerLeads).toBe(true);
+    expect((await hub.call('GET', '/api/status', { user: 'bob' })).json.project.runnerLeads).toBe(true);
+  });
+
+  test('status names the lead seat and the hub epoch, and keeps the lead', async () => {
+    const hub = createTestHub();
+    const seat = { attemptId: null, runnerId: null, since: null, wakeups: 0, runnerLeads: true };
+    const before = await hub.call('GET', '/api/status', { user: 'bob', via: 'web' });
+    expect(before.json).toMatchObject({ lead: null, leadSeat: { kind: 'none', agentId: null, ...seat }, epoch: 1 });
+    const lead = addAgent(hub.ctx, 'alice', 'lead');
+    const after = await hub.call('GET', '/api/status', { user: 'bob', via: 'web' });
+    expect(after.json.lead).toMatchObject({ id: lead.id, role: 'lead' });
+    expect(after.json.leadSeat).toEqual({ kind: 'live', agentId: lead.id, ...seat, since: hub.ctx.now() });
+    expect(after.json.epoch).toBe(1);
+  });
 });

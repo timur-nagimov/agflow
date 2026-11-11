@@ -4,6 +4,7 @@ import { ACTIVE_MS, getAgent } from '../src/agents';
 import { HubError } from '../src/errors';
 import { listEvents } from '../src/events';
 import { listMessages, takeInbox } from '../src/messages';
+import { writeTask } from '../src/task-store';
 import {
   acceptTask,
   blockTask,
@@ -152,6 +153,18 @@ describe('reviewing', () => {
     submitTask(ctx, b.id, other, { summary: 'Done.', evidence: [] });
     updateTask(ctx, a.id, { ownedPaths: ['src/auth/**', 'docs/auth.md'] }, 'user:alice');
     expect(rejectTask(ctx, a.id, 'user:alice', 'Redo.')).toMatchObject({ status: 'ready', assignee: null, feedback: 'Redo.' });
+    expect(getAgent(ctx, author.id).currentTask).toBeNull();
+  });
+
+  test('rejected work returns to the pool when sending it back would overlap a task a person holds', () => {
+    const { ctx } = createTestContext();
+    const author = addAgent(ctx);
+    const [a, b] = createTasks(ctx, [newTask({ ownedPaths: ['src/auth/**'] }), newTask({ ownedPaths: ['docs/**'] })], 'user:alice');
+    claimTask(ctx, a.id, author);
+    submitTask(ctx, a.id, author, { summary: 'Done.', evidence: [] });
+    writeTask(ctx, b.id, { status: 'blocked', blockedKind: 'takeover', blockedReason: 'alice took it over' });
+    updateTask(ctx, a.id, { ownedPaths: ['src/auth/**', 'docs/auth.md'] }, 'user:alice');
+    expect(rejectTask(ctx, a.id, 'user:alice', 'Redo.')).toMatchObject({ status: 'ready', assignee: null });
     expect(getAgent(ctx, author.id).currentTask).toBeNull();
   });
 

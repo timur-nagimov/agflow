@@ -133,4 +133,37 @@ describe('task routes', () => {
     const mine = await hub.call('GET', `/api/tasks?assignee=${worker.id}`, { user: 'bob', via: 'web' });
     expect(mine.json.tasks.map((task: { id: string }) => task.id)).toEqual(['T-1']);
   });
+
+  test('task answers carry the attempt fields, empty until a task has attempts', async () => {
+    const hub = createTestHub();
+    const worker = addAgent(hub.ctx, 'bob');
+    const [task] = createTasks(hub.ctx, [newTask()], 'user:alice');
+    const asWorker = { user: 'bob', agent: worker.id };
+    const empty = { currentAttempt: null, attemptCount: 0, workRef: null, workSha: null, nextDispatchAt: null };
+    expect((await hub.call('GET', '/api/tasks', { user: 'alice', via: 'web' })).json.tasks[0]).toMatchObject(empty);
+    // A live claim is an attempt too (design 6.4).
+    await hub.call('POST', `/api/tasks/${task.id}/claim`, { ...asWorker, body: {} });
+    await hub.call('POST', `/api/tasks/${task.id}/progress`, { ...asWorker, body: { note: 'halfway' } });
+    await hub.call('POST', `/api/tasks/${task.id}/submit`, { ...asWorker, body: { summary: 'done' } });
+    const live = { ...empty, currentAttempt: 'T-1-a1', attemptCount: 1 };
+    expect((await hub.call('GET', '/api/tasks', { user: 'alice', via: 'web' })).json.tasks[0]).toMatchObject(live);
+    const detail = await hub.call('GET', `/api/tasks/${task.id}`, { user: 'alice', via: 'web' });
+    expect(detail.json.task).toMatchObject({ ...live, submission: { by: worker.id, attemptId: 'T-1-a1', submissionId: null } });
+    expect(detail.json).toMatchObject({ attempts: [{ id: 'T-1-a1', runnerId: null, status: 'holding' }], submissions: [] });
+    expect(detail.json.notes.map((note: { kind: string; attemptId: string | null }) => [note.kind, note.attemptId])).toEqual([
+      ['progress', 'T-1-a1'],
+    ]);
+  });
+
+  test('a submission recorded before M2 reads with no attempt and no submission id', async () => {
+    const hub = createTestHub();
+    const worker = addAgent(hub.ctx, 'bob');
+    const [task] = createTasks(hub.ctx, [newTask()], 'user:alice');
+    const m1 = { summary: 'done', evidence: [], branch: null, headSha: null, submittedAt: 1, by: worker.id };
+    hub.ctx.db
+      .query("UPDATE tasks SET status = 'submitted', submission = $submission WHERE id = $id")
+      .run({ submission: JSON.stringify(m1), id: task.id });
+    const detail = await hub.call('GET', `/api/tasks/${task.id}`, { user: 'alice', via: 'web' });
+    expect(detail.json.task.submission).toEqual({ ...m1, attemptId: null, submissionId: null });
+  });
 });

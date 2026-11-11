@@ -3,17 +3,18 @@ import { Database } from 'bun:sqlite';
 import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { backupDatabase, checkIntegrity, dailyBackupDue } from '../src/backup';
+import { type BackupKind, backupDatabase, checkIntegrity, dailyBackupDue } from '../src/backup';
 import { createTasks } from '../src/tasks';
 import { createTestContext, newTask } from './helpers';
 
-const DAY = 24 * 60 * 60_000;
+const HOUR = 60 * 60_000;
+const DAY = 24 * HOUR;
 
 function backupDir(): string {
   return mkdtempSync(join(tmpdir(), 'agflow-backup-'));
 }
 
-function snapshots(dir: string, kind: 'daily' | 'start'): string[] {
+function snapshots(dir: string, kind: BackupKind): string[] {
   return readdirSync(dir)
     .filter((name) => name.startsWith(`agflow-${kind}-`))
     .sort();
@@ -31,8 +32,8 @@ describe('backups', () => {
     const { ctx } = createTestContext();
     createTasks(ctx, [newTask({ title: 'Saved' })], 'user:alice');
     const dir = backupDir();
-    const daily = backupDatabase(ctx, dir, 'daily');
-    const start = backupDatabase(ctx, dir, 'start');
+    const daily = backupDatabase(ctx, dir, 'daily').file;
+    const start = backupDatabase(ctx, dir, 'start').file;
     expect(basename(daily)).toBe('agflow-daily-2026-10-26.db');
     expect(basename(start)).toBe('agflow-start-2026-10-26T12-00-00-000Z.db');
     expect(readdirSync(dir).sort()).toEqual([basename(daily), basename(start)]);
@@ -46,7 +47,7 @@ describe('backups', () => {
     backupDatabase(ctx, dir, 'daily');
     createTasks(ctx, [newTask({ title: 'Later' })], 'user:alice');
     clock.advance(6 * 60 * 60_000);
-    const file = backupDatabase(ctx, dir, 'daily');
+    const { file } = backupDatabase(ctx, dir, 'daily');
     expect(readdirSync(dir)).toEqual(['agflow-daily-2026-10-26.db']);
     expect(taskCount(file)).toBe(1);
   });
@@ -84,6 +85,36 @@ describe('backups', () => {
       'agflow-start-2026-11-04T12-08-00-000Z.db',
       'agflow-start-2026-11-04T12-09-00-000Z.db',
     ]);
+  });
+
+  test('hourly snapshots are named per UTC hour; the newest 24 are kept, and daily and start ones untouched', () => {
+    const { ctx, clock } = createTestContext();
+    const dir = backupDir();
+    backupDatabase(ctx, dir, 'start');
+    backupDatabase(ctx, dir, 'daily');
+    const first = backupDatabase(ctx, dir, 'hourly');
+    expect(basename(first.file)).toBe('agflow-hourly-2026-10-26T12.db');
+    // A second one within the hour replaces it.
+    clock.advance(30 * 60_000);
+    backupDatabase(ctx, dir, 'hourly');
+    expect(snapshots(dir, 'hourly')).toEqual(['agflow-hourly-2026-10-26T12.db']);
+    for (let hour = 0; hour < 25; hour++) {
+      clock.advance(HOUR);
+      backupDatabase(ctx, dir, 'hourly');
+    }
+    const hourly = snapshots(dir, 'hourly');
+    expect(hourly).toHaveLength(24);
+    expect([hourly[0], hourly.at(-1)]).toEqual(['agflow-hourly-2026-10-26T14.db', 'agflow-hourly-2026-10-27T13.db']);
+    expect(snapshots(dir, 'daily')).toEqual(['agflow-daily-2026-10-26.db']);
+    expect(snapshots(dir, 'start')).toEqual(['agflow-start-2026-10-26T12-00-00-000Z.db']);
+  });
+
+  test('a backup reports how long it took', () => {
+    const { ctx } = createTestContext();
+    const backup = backupDatabase(ctx, backupDir(), 'hourly');
+    expect(Number.isInteger(backup.durationMs)).toBe(true);
+    expect(backup.durationMs).toBeGreaterThanOrEqual(0);
+    expect(taskCount(backup.file)).toBe(0);
   });
 
   test('a failed backup leaves no temporary file and keeps the earlier snapshots', () => {

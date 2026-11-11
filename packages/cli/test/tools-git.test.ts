@@ -1,11 +1,24 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { NewTaskSchema } from '@agflow/core';
+import { BRIDGE_VERSION, NewTaskSchema } from '@agflow/core';
 import { getAgent } from '@agflow/hub/src/agents';
+import { writeTask } from '@agflow/hub/src/task-store';
 import { claimTask, createTasks, getTask, rejectTask, releaseTask, submitTask, sweepLeases } from '@agflow/hub/src/tasks';
+import { type FetchFn, HubClient } from '../src/hub-client';
 import { type ToolContext, allTools } from '../src/mcp/tools';
-import { type HubFixture, type LiveAgent, cloneOf, forged, hubFixture, pushedRepo, run, standingForgeries, tempRepo } from './fixture';
+import {
+  HUB_URL,
+  type HubFixture,
+  type LiveAgent,
+  cloneOf,
+  forged,
+  hubFixture,
+  pushedRepo,
+  run,
+  standingForgeries,
+  tempRepo,
+} from './fixture';
 
 const newTask = (title: string) => NewTaskSchema.parse({ title, objective: `Do ${title}`, acceptance: [{ id: 'A1', assertion: 'works' }] });
 const call = (name: string, args: Record<string, unknown>, ctx: ToolContext) => {
@@ -371,5 +384,299 @@ describe('submit without the right to push', () => {
     commitAll(worktree, 'two');
     await expect(call('submit', { task_id: 'T-1', summary: 'Once more' }, alice)).rejects.toThrow('You do not hold T-1: it is submitted');
     expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-parser'], repo.origin)).toBe(head);
+  });
+});
+
+describe('live claims from the work position', () => {
+  /** A commit with one file, made in another clone and pushed to `ref` on the origin only, as a runner pushes a WIP. */
+  const pushWork = (repo: { dir: string; origin: string }, ref: string, file: string, from = 'main'): string => {
+    const clone = join(repo.dir, `wip-${file}`);
+    if (!existsSync(clone)) {
+      run(['git', 'clone', '--quiet', repo.origin, clone], repo.dir);
+      run(['git', 'config', 'user.email', 'runner@example.com'], clone);
+      run(['git', 'config', 'user.name', 'Runner'], clone);
+    }
+    run(['git', 'fetch', '--quiet', 'origin', `+${from === 'main' ? 'refs/heads/main' : from}:refs/start`], clone);
+    run(['git', 'checkout', '--quiet', '--detach', 'refs/start'], clone);
+    writeFileSync(join(clone, file), `${file}\n`);
+    commitAll(clone, file);
+    run(['git', 'push', '--quiet', 'origin', `HEAD:${ref}`], clone);
+    return run(['git', 'rev-parse', 'HEAD'], clone);
+  };
+  const worktreeOf = (root: string) => join(root, '.worktrees', 'agflow', 'T-1');
+  /** Alice's chat in `cwd`, with `meanwhile` run as her claim of T-1 reaches the hub, so only the claim answer sees it. */
+  const racing = (hub: HubFixture, cwd: string, meanwhile: () => void): ToolContext => {
+    const live = hub.liveAgent('alice');
+    const fetchFn: FetchFn = async (input, init) => {
+      if (init?.method === 'POST' && String(input).endsWith('/api/tasks/T-1/claim')) meanwhile();
+      return hub.fetch(input, init);
+    };
+    const client = new HubClient({ baseUrl: HUB_URL, token: hub.tokenFor('alice'), agentId: live.agentId, fetch: fetchFn });
+    return { client, state: { agentId: live.agentId, role: 'worker' }, cwd };
+  };
+
+  test('a task whose work position is a WIP ref is claimed on a branch at that commit, and the answer says so', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const sha = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: sha });
+    const answer = await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root));
+    expect(answer).toContain(`Started from refs/agflow/T-1/a1 at ${sha.slice(0, 7)}.`);
+    expect(answer).toContain(`Work only inside ${worktreeOf(repo.root)} (branch agflow/T-1-parser)`);
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(sha);
+    expect(run(['git', 'branch', '--show-current'], worktreeOf(repo.root))).toBe('agflow/T-1-parser');
+    expect(readFileSync(join(worktreeOf(repo.root), 'wip.txt'), 'utf8')).toBe('wip.txt\n');
+    expect(getTask(hub.ctx, 'T-1')).toMatchObject({ status: 'claimed', branch: 'agflow/T-1-parser' });
+  });
+
+  test('a position given only as a SHA is fetched by its SHA', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const sha = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    expect(run(['git', 'cat-file', '-t', sha], repo.origin)).toBe('commit');
+    expect(() => run(['git', 'cat-file', '-e', sha], repo.root)).toThrow();
+    writeTask(hub.ctx, 'T-1', { workRef: null, workSha: sha });
+    expect(await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root))).toContain(`Started from ${sha.slice(0, 7)}.`);
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(sha);
+  });
+
+  test('without a position the M1 behaviour is unchanged: the pushed task branch, or the default branch', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser'), newTask('Lexer')], 'user:alice');
+    const pushed = pushWork(repo, 'refs/heads/agflow/T-1-parser', 'pushed.txt');
+    const bob = getAgent(hub.ctx, hub.liveAgent('bob').agentId);
+    claimTask(hub.ctx, 'T-1', bob, 'agflow/T-1-parser');
+    releaseTask(hub.ctx, 'T-1', bob, 'end of day');
+    expect(getTask(hub.ctx, 'T-1')).toMatchObject({ workRef: null, workSha: null });
+    const alice = as(hub.liveAgent('alice'), repo.root);
+    expect(await call('claim_task', { id: 'T-1' }, alice)).not.toContain('Started from');
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(pushed);
+    await call('release_task', { task_id: 'T-1', reason: 'not now' }, alice);
+    expect(await call('claim_task', { id: 'T-2' }, alice)).not.toContain('Started from');
+    expect(run(['git', 'rev-parse', 'HEAD'], join(repo.root, '.worktrees', 'agflow', 'T-2'))).toBe(run(['git', 'rev-parse', 'main'], repo.origin));
+  });
+
+  test('when the claim answer names a newer position than the one prepared, the new branch moves to it', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const first = pushWork(repo, 'refs/agflow/T-1/a1', 'first.txt');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: first });
+    let newer = '';
+    // A runner's WIP lands between the task read and the claim, so only the claim answer names it.
+    const alice = racing(hub, repo.root, () => {
+      newer = pushWork(repo, 'refs/agflow/T-1/a2', 'second.txt', 'refs/agflow/T-1/a1');
+      writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a2', workSha: newer });
+    });
+    const answer = await call('claim_task', { id: 'T-1' }, alice);
+    expect(answer).toContain(`Started from refs/agflow/T-1/a2 at ${newer.slice(0, 7)}.`);
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(newer);
+    expect(run(['git', 'branch', '--show-current'], worktreeOf(repo.root))).toBe('agflow/T-1-parser');
+    expect(existsSync(join(worktreeOf(repo.root), 'second.txt'))).toBe(true);
+  });
+
+  test('with HubStatus.epoch 2 a new branch carries the epoch, and a recorded epoch-1 branch is not reused', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const bob = getAgent(hub.ctx, hub.liveAgent('bob').agentId);
+    claimTask(hub.ctx, 'T-1', bob, 'agflow/T-1-parser');
+    releaseTask(hub.ctx, 'T-1', bob, 'end of day');
+    hub.ctx.db.run('UPDATE project SET epoch = 2');
+    const answer = await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root));
+    expect(answer).toContain('(branch agflow/T-1-e2-parser)');
+    expect(run(['git', 'branch', '--show-current'], worktreeOf(repo.root))).toBe('agflow/T-1-e2-parser');
+    expect(getTask(hub.ctx, 'T-1').branch).toBe('agflow/T-1-e2-parser');
+  });
+
+  test('a newer position in the claim answer that cannot be fetched leaves the claim made, and the answer says how to take it', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const first = pushWork(repo, 'refs/agflow/T-1/a1', 'first.txt');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: first });
+    const late = 'b'.repeat(40);
+    const alice = racing(hub, repo.root, () => writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a9-late-1', workSha: late }));
+    const answer = await call('claim_task', { id: 'T-1' }, alice);
+    expect(answer).toContain(`Started from refs/agflow/T-1/a1 at ${first.slice(0, 7)}.`);
+    expect(answer).toContain(
+      "The task's work position moved to refs/agflow/T-1/a9-late-1 at bbbbbbb during the claim, and agflow could not fetch it, so your branch stays where it started. " +
+        `Fetch and merge it before you go on: git fetch origin refs/agflow/T-1/a9-late-1 && git merge ${late}`,
+    );
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(first);
+    expect(getTask(hub.ctx, 'T-1')).toMatchObject({ status: 'claimed', assignee: alice.state.agentId });
+  });
+
+  test("the hub's SHA wins over a work ref that has moved since", async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const recorded = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    const moved = pushWork(repo, 'refs/agflow/T-1/a1', 'later.txt', 'refs/agflow/T-1/a1');
+    expect(run(['git', 'rev-parse', 'refs/agflow/T-1/a1'], repo.origin)).toBe(moved);
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: recorded });
+    expect(await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root))).toContain(`Started from refs/agflow/T-1/a1 at ${recorded.slice(0, 7)}.`);
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(recorded);
+  });
+
+  test('a task branch pushed on top of the position is where the claim starts, and a newer position it holds already moves nothing', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const wip = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    const middle = pushWork(repo, 'refs/heads/agflow/T-1-parser', 'pushed.txt', 'refs/agflow/T-1/a1');
+    const top = pushWork(repo, 'refs/heads/agflow/T-1-parser', 'more.txt', 'refs/heads/agflow/T-1-parser');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: wip });
+    const alice = racing(hub, repo.root, () => writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a2', workSha: middle }));
+    const answer = await call('claim_task', { id: 'T-1' }, alice);
+    expect(answer).toContain(`Started from refs/heads/agflow/T-1-parser at ${top.slice(0, 7)}.`);
+    expect(answer).not.toContain('has commits your branch lacks');
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(top);
+  });
+
+  test('a task branch on origin that lacks the position: the claim starts from the position, and the answer says to merge the branch before submit', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    // Bob pushed the task branch by hand and released it; a runner's WIP from main became the position later.
+    const pushed = pushWork(repo, 'refs/heads/agflow/T-1-parser', 'pushed.txt');
+    const wip = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: wip });
+    const alice = as(hub.liveAgent('alice'), repo.root);
+    const answer = await call('claim_task', { id: 'T-1' }, alice);
+    expect(answer).toContain(`Started from refs/agflow/T-1/a1 at ${wip.slice(0, 7)}.`);
+    expect(answer).toContain(
+      `origin/agflow/T-1-parser (at ${pushed.slice(0, 7)}) has commits your branch lacks, pushed after the work position was taken. ` +
+        'Merge them before you submit, or the push is refused: git merge origin/agflow/T-1-parser',
+    );
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(wip);
+    run(['git', 'merge', '--quiet', '--no-edit', 'origin/agflow/T-1-parser'], worktreeOf(repo.root));
+    await call('submit', { task_id: 'T-1', summary: 'Parser added' }, alice);
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-parser'], repo.origin)).toBe(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root)));
+  });
+
+  test('at epoch 1 a recorded M1 branch that only looks like an epoch-2 name is reused, from its pushed head', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('E2: parser')], 'user:alice');
+    const bob = getAgent(hub.ctx, hub.liveAgent('bob').agentId);
+    // M1's names had no "t-" guard: the title "E2: parser" gave agflow/T-1-e2-parser.
+    claimTask(hub.ctx, 'T-1', bob, 'agflow/T-1-e2-parser');
+    const pushed = pushWork(repo, 'refs/heads/agflow/T-1-e2-parser', 'bobs.txt');
+    releaseTask(hub.ctx, 'T-1', bob, 'end of day');
+    expect(await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root))).toContain('(branch agflow/T-1-e2-parser)');
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(pushed);
+    expect(getTask(hub.ctx, 'T-1').branch).toBe('agflow/T-1-e2-parser');
+  });
+
+  test('at epoch 2 a recorded epoch-2 branch is reused, not renamed', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    hub.ctx.db.run('UPDATE project SET epoch = 2');
+    const bob = getAgent(hub.ctx, hub.liveAgent('bob').agentId);
+    claimTask(hub.ctx, 'T-1', bob, 'agflow/T-1-e2-old-name');
+    releaseTask(hub.ctx, 'T-1', bob, 'end of day');
+    expect(await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root))).toContain('(branch agflow/T-1-e2-old-name)');
+    expect(getTask(hub.ctx, 'T-1').branch).toBe('agflow/T-1-e2-old-name');
+  });
+
+  test("after a restore the person's worktree on the epoch-1 branch is switched to the epoch-2 one, work kept, and submit pushes it", async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const alice = as(hub.liveAgent('alice'), repo.root);
+    await call('claim_task', { id: 'T-1' }, alice);
+    writeFileSync(join(worktreeOf(repo.root), 'committed.txt'), 'committed\n');
+    commitAll(worktreeOf(repo.root), 'committed');
+    const before = run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root));
+    writeFileSync(join(worktreeOf(repo.root), 'uncommitted.txt'), 'uncommitted\n');
+    await call('release_task', { task_id: 'T-1', reason: 'end of day' }, alice);
+    hub.ctx.db.run('UPDATE project SET epoch = 2');
+    const answer = await call('claim_task', { id: 'T-1' }, alice);
+    expect(answer).toContain('The worktree was on branch agflow/T-1-parser; agflow switched it to agflow/T-1-e2-parser, keeping its commits and changes.');
+    expect(answer).toContain(`Work only inside ${worktreeOf(repo.root)} (branch agflow/T-1-e2-parser)`);
+    expect(run(['git', 'branch', '--show-current'], worktreeOf(repo.root))).toBe('agflow/T-1-e2-parser');
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(before);
+    expect(readFileSync(join(worktreeOf(repo.root), 'uncommitted.txt'), 'utf8')).toBe('uncommitted\n');
+    expect(getTask(hub.ctx, 'T-1').branch).toBe('agflow/T-1-e2-parser');
+    commitAll(worktreeOf(repo.root), 'uncommitted');
+    const head = run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root));
+    expect(await call('submit', { task_id: 'T-1', summary: 'Parser added' }, alice)).toContain(`at ${head.slice(0, 7)} on agflow/T-1-e2-parser`);
+    expect(run(['git', 'rev-parse', 'refs/heads/agflow/T-1-e2-parser'], repo.origin)).toBe(head);
+  });
+
+  test('a refused claim switches an existing worktree back and deletes the branch it created', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const alice = as(hub.liveAgent('alice'), repo.root);
+    await call('claim_task', { id: 'T-1' }, alice);
+    await call('release_task', { task_id: 'T-1', reason: 'end of day' }, alice);
+    hub.ctx.db.run('UPDATE project SET epoch = 2');
+    claimTask(hub.ctx, 'T-1', getAgent(hub.ctx, hub.liveAgent('bob').agentId), 'agflow/T-1-e2-parser', BRIDGE_VERSION);
+    await expect(call('claim_task', { id: 'T-1' }, alice)).rejects.toThrow('not ready');
+    expect(run(['git', 'branch', '--show-current'], worktreeOf(repo.root))).toBe('agflow/T-1-parser');
+    expect(run(['git', 'branch', '--list', 'agflow/T-1-e2-parser'], repo.root)).toBe('');
+  });
+
+  test('resume_claim creates its worktree from the work position too', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const sha = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: sha });
+    await call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root));
+    // Alice's other chat, in a clone that has never fetched the WIP ref, takes the claim over.
+    const clone = cloneOf(repo, 'second');
+    const answer = await call('resume_claim', { id: 'T-1' }, as(hub.liveAgent('alice'), clone));
+    expect(answer).toContain(`Started from refs/agflow/T-1/a1 at ${sha.slice(0, 7)}.`);
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(clone))).toBe(sha);
+    expect(readFileSync(join(worktreeOf(clone), 'wip.txt'), 'utf8')).toBe('wip.txt\n');
+  });
+
+  test('a refused claim still removes the worktree and the branch it created', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const sha = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: sha });
+    claimTask(hub.ctx, 'T-1', getAgent(hub.ctx, hub.liveAgent('bob').agentId), 'agflow/T-1-parser', BRIDGE_VERSION);
+    await expect(call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root))).rejects.toThrow('not ready');
+    expect(existsSync(worktreeOf(repo.root))).toBe(false);
+    expect(run(['git', 'branch', '--list', 'agflow/T-1-parser'], repo.root)).toBe('');
+  });
+
+  test('a position that cannot be fetched refuses the claim before the hub hears of it', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: 'a'.repeat(40) });
+    await expect(call('claim_task', { id: 'T-1' }, as(hub.liveAgent('alice'), repo.root))).rejects.toThrow(
+      `could not fetch the task's work position (refs/agflow/T-1/a1 at aaaaaaa) from origin`,
+    );
+    expect(existsSync(worktreeOf(repo.root))).toBe(false);
+    expect(getTask(hub.ctx, 'T-1').status).toBe('ready');
+  });
+
+  test('an existing branch is kept, and the answer says when it lacks the work position', async () => {
+    const hub = hubFixture();
+    const repo = tempRepo();
+    createTasks(hub.ctx, [newTask('Parser')], 'user:alice');
+    const alice = as(hub.liveAgent('alice'), repo.root);
+    await call('claim_task', { id: 'T-1' }, alice);
+    const before = run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root));
+    await call('release_task', { task_id: 'T-1', reason: 'end of day' }, alice);
+    // A runner went on from main meanwhile; its WIP is the task's position now.
+    const sha = pushWork(repo, 'refs/agflow/T-1/a1', 'wip.txt');
+    writeTask(hub.ctx, 'T-1', { workRef: 'refs/agflow/T-1/a1', workSha: sha });
+    const answer = await call('claim_task', { id: 'T-1' }, alice);
+    expect(answer).toContain(
+      `Your branch agflow/T-1-parser does not contain the task's work position, refs/agflow/T-1/a1 at ${sha.slice(0, 7)}. Merge it before you go on: git merge ${sha}`,
+    );
+    expect(run(['git', 'rev-parse', 'HEAD'], worktreeOf(repo.root))).toBe(before);
   });
 });

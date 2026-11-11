@@ -1,25 +1,46 @@
 import type { HubEvent } from '@agflow/core';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { type Me, api } from './api';
-import { COLUMNS, type ColumnKey, columnCounts } from './format';
+import { COLUMNS, type ColumnKey, columnCounts, leadBanner } from './format';
 import { useAction, useData, useRoute } from './hooks';
 import { type Hub, HubContext } from './hub';
 import { type Connection, useConnection } from './live';
 import { NAV, type Route, navViewOf, routeHref } from './route';
 import { AgentsView } from './views/AgentsView';
+import { ApprovalsView } from './views/ApprovalsView';
+import { AttemptView } from './views/AttemptView';
 import { BoardView } from './views/BoardView';
 import { GoalView } from './views/GoalView';
 import { KnowledgeView } from './views/KnowledgeView';
 import { MessagesView } from './views/MessagesView';
+import { RunnersView } from './views/RunnersView';
 import { TaskView } from './views/TaskView';
 import { TimelineView } from './views/TimelineView';
 
+/** The lead seat moves with lead.* events (design 6.17), which the banner and the Goal page's Lead section follow. */
 const statusChanged = (event: HubEvent) =>
   event.type.startsWith('project.') ||
   event.type.startsWith('agent.') ||
+  event.type.startsWith('lead.') ||
   event.type === 'goal.updated' ||
   event.type === 'message.sent';
 const taskChanged = (event: HubEvent) => event.type.startsWith('task.');
+/**
+ * A runner's state or settings, a shared account's quota, or an attempt that takes or frees one of its slots: started
+ * and resumed take one, holding and ended free it. An approval decision also clears its owner's away marks, which
+ * emits no account event.
+ */
+const runnersChanged = (event: HubEvent) =>
+  event.type.startsWith('runner.') ||
+  event.type.startsWith('account.') ||
+  event.type === 'attempt.started' ||
+  event.type === 'attempt.resumed' ||
+  event.type === 'attempt.holding' ||
+  event.type === 'attempt.ended' ||
+  event.type === 'approval.decided';
+
+/** A request raised, decided, expired or voided. */
+const approvalsChanged = (event: HubEvent) => event.type.startsWith('approval.');
 
 const CONNECTION: Record<Connection, { label: string; lamp: string }> = {
   connecting: { label: 'Connecting', lamp: 'tone-active' },
@@ -34,6 +55,11 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const connection = useConnection();
   const status = useData(() => api.status(), [], { relevant: statusChanged, refreshMs: 60_000 });
   const tasks = useData(() => api.tasks(), [], { relevant: taskChanged });
+  // Heartbeats (power, disk, last seen) send no event, so the runners also reload on a timer.
+  const runners = useData(() => api.runners(), [], { relevant: runnersChanged, refreshMs: 60_000 });
+  // The timer catches an approval.* event missed while the live connection was down;
+  // an expiry arrives as approval.expired.
+  const approvals = useData(() => api.approvals(['pending']), [], { relevant: approvalsChanged, refreshMs: 30_000 });
   const [peopleSeen, setPeopleSeen] = useState(() => Number(localStorage.getItem(SEEN_KEY) ?? 0));
   const markPeopleSeen = useCallback((id: number) => {
     if (id <= Number(localStorage.getItem(SEEN_KEY) ?? 0)) return;
@@ -41,13 +67,17 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     setPeopleSeen(id);
   }, []);
   const hub = useMemo<Hub>(
-    () => ({ me, status, tasks, peopleSeen, markPeopleSeen }),
-    [me, status, tasks, peopleSeen, markPeopleSeen],
+    () => ({ me, status, tasks, runners, approvals, peopleSeen, markPeopleSeen }),
+    [me, status, tasks, runners, approvals, peopleSeen, markPeopleSeen],
   );
   const project = status.data?.project;
   const counts = tasks.data ? columnCounts(tasks.data) : null;
   const unseen = (status.data?.humansInbox ?? []).filter((message) => message.id > peopleSeen).length;
+  const waiting = approvals.data?.length ?? 0;
+  const runnerList = runners.data?.runners ?? [];
+  const online = runnerList.filter((runner) => runner.state === 'online').length;
   const current = navViewOf(route);
+  const noLead = status.data ? leadBanner(status.data.leadSeat, status.data.project.paused) : null;
 
   useEffect(() => {
     document.title = project ? `${project.name} · agflow` : 'agflow';
@@ -73,6 +103,11 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                   {item.view === 'goal' && unseen > 0 ? (
                     <span className="badge" title={`${unseen} new message${unseen === 1 ? '' : 's'} for people`}>
                       {unseen}
+                    </span>
+                  ) : null}
+                  {item.view === 'approvals' && waiting > 0 ? (
+                    <span className="badge" title={`${waiting} approval${waiting === 1 ? '' : 's'} waiting for you`}>
+                      {waiting}
                     </span>
                   ) : null}
                 </a>
@@ -110,6 +145,11 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 Agents <b>{status.data.activeAgents}</b>
               </a>
             ) : null}
+            {runnerList.length > 0 ? (
+              <a className="readout" href={routeHref({ view: 'runners' })}>
+                Runners <b>{`${online}/${runnerList.length}`}</b> online
+              </a>
+            ) : null}
             {counts ? <Progress counts={counts} /> : null}
           </header>
           {project?.paused ? (
@@ -118,10 +158,15 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
               <ResumeButton />
             </div>
           ) : null}
-          {status.data && !status.data.lead ? (
-            <div className="banner info" role="status">
-              <b>No lead is connected.</b> In the project's repository run <code>agflow join --role lead</code>, then start a
-              new Claude Code or Codex chat there.
+          {noLead ? (
+            <div className="banner info no-lead" role="status">
+              <b>{noLead.title}</b> {noLead.text}
+              {noLead.command ? (
+                <>
+                  {' '}
+                  <code>{noLead.command}</code>.
+                </>
+              ) : null}
             </div>
           ) : null}
           <main className="content">
@@ -141,12 +186,18 @@ function View({ route }: { route: Route }) {
       return <GoalView />;
     case 'task':
       return <TaskView key={route.id} id={route.id} />;
+    case 'attempt':
+      return <AttemptView key={route.id} id={route.id} />;
     case 'agents':
       return <AgentsView />;
+    case 'runners':
+      return <RunnersView />;
+    case 'approvals':
+      return <ApprovalsView />;
     case 'messages':
       return <MessagesView key={route.to ?? ''} to={route.to} />;
     case 'timeline':
-      return <TimelineView />;
+      return <TimelineView key={route.subject ?? ''} subject={route.subject} />;
     case 'knowledge':
       return <KnowledgeView />;
   }

@@ -1,6 +1,16 @@
-import type { AgentStatus, BlockedKind, DiffLine, HubEvent, Message, MessageView, TaskStatus } from '@agflow/core';
-import { type FormEvent, type KeyboardEvent, type ReactNode, useRef, useState } from 'react';
+import type {
+  AgentStatus,
+  AttemptLogEntry,
+  BlockedKind,
+  DiffLine,
+  HubEvent,
+  Message,
+  MessageView,
+  TaskStatus,
+} from '@agflow/core';
+import { type FormEvent, type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import { api } from './api';
+import { LOG_KIND_LABELS, LOG_KIND_TONES, attemptLabel } from './attempts';
 import {
   actorKind,
   ago,
@@ -11,6 +21,7 @@ import {
   splitTaskMentions,
   statusLabel,
   targetLabel,
+  type Tone,
   toneOf,
   who,
 } from './format';
@@ -46,6 +57,15 @@ export function TaskLink({ id }: { id: string }) {
   return (
     <a className="task-link" href={routeHref({ view: 'task', id })}>
       {id}
+    </a>
+  );
+}
+
+/** An attempt's short name ('a3', 'lead a5'), linked to its page; the full id is in the title. */
+export function AttemptLink({ id }: { id: string }) {
+  return (
+    <a className="attempt-link" href={routeHref({ view: 'attempt', id })} title={id}>
+      {attemptLabel(id)}
     </a>
   );
 }
@@ -90,6 +110,56 @@ export function PageHead({ title, meta, actions }: { title: ReactNode; meta?: Re
       </div>
       {actions ? <div className="page-actions">{actions}</div> : null}
     </header>
+  );
+}
+
+/** One labelled fact in a <dl className="facts">. */
+export function Fact({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="fact">
+      <dt>{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  );
+}
+
+/**
+ * A bar for a fraction 0..1 with a mark at a limit, such as a quota window against its ceiling. An unknown value
+ * draws no fill; `text` says it in words, for the eye and for screen readers.
+ */
+export function Meter({
+  label,
+  value,
+  mark,
+  tone,
+  text,
+}: {
+  label: string;
+  value: number | null;
+  mark: number;
+  tone: Tone;
+  text: string;
+}) {
+  const share = (fraction: number) => `${Math.round(Math.min(1, Math.max(0, fraction)) * 1000) / 10}%`;
+  return (
+    <div className={`meter tone-${tone}`}>
+      <div className="meter-head">
+        <span className="meter-label">{label}</span>
+        <span className="meter-text">{text}</span>
+      </div>
+      <div
+        className="meter-bar"
+        role="meter"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={value === null ? undefined : Math.round(value * 100)}
+        aria-valuetext={text}
+      >
+        {value === null ? null : <span className="meter-fill" style={{ width: share(value) }} />}
+        <span className="meter-mark" style={{ left: share(mark) }} />
+      </div>
+    </div>
   );
 }
 
@@ -161,7 +231,9 @@ export function ConfirmButton({
       <button
         className={danger ? 'danger solid' : 'primary'}
         disabled={action.busy}
-        onClick={async () => {
+        onClick={async (event) => {
+          // The confirm button appears where the first button was, so a double-click must not confirm.
+          if (event.detail > 1) return;
           if ((await action.run(onConfirm)).ok) setAsking(false);
         }}
       >
@@ -187,6 +259,67 @@ export function DiffView({ lines }: { lines: DiffLine[] }) {
   );
 }
 
+/** An attempt's log, newest first, as the runner reported it. */
+export function AttemptLog({ entries }: { entries: AttemptLogEntry[] }) {
+  if (entries.length === 0) return <p className="muted">Nothing logged yet.</p>;
+  return (
+    <ol className="log attempt-log">
+      {[...entries].reverse().map((entry) => (
+        <li key={entry.id} className={`log-row tone-${LOG_KIND_TONES[entry.kind]}`}>
+          <span className="log-mark" />
+          <When ts={entry.ts} clock />
+          <span className="log-text">
+            <span className="log-kind">{LOG_KIND_LABELS[entry.kind]}</span>
+            <Linked text={entry.summary} />
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/**
+ * A command to run, with a Copy button. Where the clipboard API is missing, as on a hub served over plain http, Copy
+ * selects the command instead, for the person to copy themselves.
+ */
+export function CommandBlock({ command, label }: { command: string; label: string }) {
+  const code = useRef<HTMLElement>(null);
+  const [done, setDone] = useState<'copied' | 'selected' | null>(null);
+  useEffect(() => {
+    if (done === null) return;
+    const timer = setTimeout(() => setDone(null), 2500);
+    return () => clearTimeout(timer);
+  }, [done]);
+
+  const select = () => {
+    const selection = window.getSelection();
+    if (!code.current || !selection) return;
+    selection.selectAllChildren(code.current);
+    setDone('selected');
+  };
+  const copy = async () => {
+    if (!navigator.clipboard) return select();
+    try {
+      await navigator.clipboard.writeText(command);
+      setDone('copied');
+    } catch {
+      select();
+    }
+  };
+
+  return (
+    <div className="command-block">
+      <pre aria-label={label}>
+        <code ref={code}>{command}</code>
+      </pre>
+      <button className="small" onClick={() => void copy()}>
+        {done === 'copied' ? 'Copied' : 'Copy'}
+      </button>
+      {done === 'selected' ? <span className="hint">Selected: press ⌘C or Ctrl+C to copy it.</span> : null}
+    </div>
+  );
+}
+
 export function EventList({ events }: { events: HubEvent[] }) {
   // Events newer than the first render arrived live; they flash once.
   const seen = useRef<number | null>(null);
@@ -196,7 +329,12 @@ export function EventList({ events }: { events: HubEvent[] }) {
   return (
     <ol className="log">
       {events.map((event) => (
-        <li key={event.id} className={`log-row tone-${eventTone(event.type)}${event.id > firstSeen ? ' fresh' : ''}`}>
+        <li
+          key={event.id}
+          className={`log-row tone-${eventTone(event.type, event.data)}${event.id > firstSeen ? ' fresh' : ''}`}
+          data-type={event.type}
+          data-subject={event.subject ?? undefined}
+        >
           <span className="log-mark" />
           <When ts={event.ts} clock />
           <span className="log-text">

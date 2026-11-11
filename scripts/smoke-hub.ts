@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readdirSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { connectFakeRunnerWs } from '../packages/hub/test/fake-runner';
 
 const dir = mkdtempSync(join(tmpdir(), 'agflow-smoke-'));
 const port = 8799;
@@ -65,7 +67,29 @@ try {
   if (goal.status !== 200 || status.goalVersion !== 1 || status.project.name !== 'smoke') {
     throw new Error(`unexpected result: goal ${goal.status}, status ${JSON.stringify(status)}`);
   }
-  console.log('smoke test passed: hub started, snapshots written, dev sign-in worked, goal v1 saved');
+  // A CLI token, as agflow login gets one: alice approves the code in the browser, and the CLI polls for it.
+  const code = randomUUID();
+  const approve = await fetch(`${base}/api/cli-login/approve`, {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ code, label: 'smoke' }),
+  });
+  const poll = (await (await fetch(`${base}/api/cli-login/poll?code=${code}`)).json()) as { token?: string };
+  if (approve.status !== 200 || !poll.token) throw new Error(`CLI sign-in failed: approve ${approve.status}`);
+  const token = poll.token;
+  const bearer = { authorization: `Bearer ${token}` };
+  const whoami = (await (await fetch(`${base}/api/runner/whoami`, { headers: bearer })).json()) as { user?: string };
+  if (whoami.user !== 'alice') throw new Error(`unexpected whoami: ${JSON.stringify(whoami)}`);
+  // A runner links over a WebSocket with that token; FakeRunner speaks the protocol (X-25).
+  const runner = await connectFakeRunnerWs(base, { token, name: 'smoke-runner' });
+  const welcome = runner.welcome;
+  runner.disconnect();
+  if (!welcome?.runnerId) throw new Error(`the runner link got no welcome: ${JSON.stringify(runner.closedWith)}`);
+  // Still the two snapshots: the first hourly one comes an hour after start.
+  const after = readdirSync(join(dir, 'backups')).sort();
+  if (after.join() !== backups.join()) throw new Error(`unexpected backups after start: ${after.join(', ')}`);
+  const passed = 'smoke test passed: hub started, snapshots written, dev sign-in worked, goal v1 saved';
+  console.log(`${passed}, runner ${welcome.runnerId} linked`);
 } finally {
   hub.kill();
 }

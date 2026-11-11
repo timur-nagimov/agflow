@@ -1,0 +1,289 @@
+{
+  "configRequirements/read": {
+    "requirements": {
+      "modelProvider": null,
+      "modelProviders": null,
+      "allowedLoginMethods": [
+        "api",
+        "chatgpt"
+      ],
+      "cliAuthCredentialsStore": null,
+      "chatgptBaseUrl": null,
+      "additionalDeveloperInstructions": null,
+      "allowedApprovalPolicies": null,
+      "allowedApprovalsReviewers": null,
+      "allowedSandboxModes": [
+        "read-only",
+        "workspace-write"
+      ],
+      "allowedWindowsSandboxImplementations": null,
+      "allowedPermissionProfiles": null,
+      "defaultPermissions": null,
+      "allowedWebSearchModes": null,
+      "allowManagedHooksOnly": null,
+      "allowBrowserAndComputerUse": null,
+      "allowAppshots": null,
+      "allowRemoteControl": false,
+      "computerUse": null,
+      "browserUse": null,
+      "inAppBrowser": null,
+      "featureRequirements": {
+        "browser_use_external": false,
+        "computer_use": false
+      },
+      "hooks": null,
+      "enforceResidency": null,
+      "network": null,
+      "application": null,
+      "autoReview": null,
+      "models": null,
+      "sqliteHome": null,
+      "logDir": null,
+      "modelCatalogJson": null,
+      "checkForUpdateOnStartup": null,
+      "allowLoginShell": null,
+      "feedback": null
+    }
+  },
+  "config/read": {
+    "config": {
+      "model": null,
+      "review_model": null,
+      "model_context_window": null,
+      "model_auto_compact_token_limit": null,
+      "model_auto_compact_token_limit_scope": null,
+      "model_provider": null,
+      "approval_policy": null,
+      "approvals_reviewer": null,
+      "sandbox_mode": null,
+      "sandbox_workspace_write": null,
+      "forced_chatgpt_workspace_id": null,
+      "forced_login_method": null,
+      "web_search": null,
+      "tools": null,
+      "instructions": null,
+      "developer_instructions": null,
+      "compact_prompt": null,
+      "model_reasoning_effort": null,
+      "model_reasoning_summary": null,
+      "model_verbosity": null,
+      "service_tier": null,
+      "analytics": {
+        "enabled": false
+      },
+      "apps": null,
+      "browser_use": null,
+      "computer_use": null,
+      "desktop": null,
+      "mcp_servers": {},
+      "background_terminal_max_timeout": 300000,
+      "oss_provider": null,
+      "history": {
+        "persistence": "save-all",
+        "max_bytes": null
+      },
+      "disable_paste_burst": null,
+      "otel": null,
+      "include_collaboration_mode_instructions": true,
+      "features": {
+        "network_proxy": null,
+        "apps": false,
+        "hooks": false,
+        "plugins": false,
+        "remote_plugin": false,
+        "shell_snapshot": false,
+        "api_key_model_discovery": false,
+        "auth_elicitation": true,
+        "background_paginated_rollout_migration": false,
+        "codex_apps_mcp_2026_07_28": false,
+        "mcp_2026_07_28": false,
+        "memories": false,
+        "mentions_v2": true,
+        "remote_control": false,
+        "tool_suggest": true,
+        "windows_sandbox_service": false
+      },
+      "auto_review": null,
+      "cloud": null,
+      "apps_mcp_product_sku": null,
+      "projects": null,
+      "tui": null,
+      "permissions": null,
+      "model_post_turn_compact_threshold_percent": null,
+      "notice": null,
+      "default_permissions": null,
+      "model_catalog_json": null,
+      "plugins": {},
+      "include_environment_context": true,
+      "hooks": null,
+      "feedback": {
+        "enabled": false
+      },
+      "experimental_realtime_ws_model": null,
+      "suppress_unstable_features_warning": null,
+      "plan_mode_reasoning_effort": null,
+      "goals": null,
+      "include_permissions_instructions": true,
+      "profiles": {},
+      "cli_auth_credentials_store": "file",
+      "project_doc_fallback_filenames": [],
+      "experimental_realtime_ws_startup_context": null,
+      "show_raw_agent_reasoning": null,
+      "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+      "orchestrator": null,
+      "include_apps_instructions": true,
+      "mcp_oauth_callback_port": null,
+      "experimental_realtime_ws_base_url": null,
+      "responses_api_metadata": null,
+      "experimental_thread_store": null,
+      "memories": null,
+      "project_root_markers": [
+        ".git"
+      ],
+      "thread_unload_delay_secs": null,
+      "audio": null,
+      "windows": null,
+      "log_dir": null,
+      "hide_agent_reasoning": false,
+      "mcp_optional_startup_grace_ms": null,
+      "experimental_thread_store_endpoint": null,
+      "check_for_update_on_startup": null,
+      "mcp_oauth_credentials_store": "auto",
+      "realtime": null,
+      "allow_symlinked_codex_home": null,
+      "sqlite_home": null,
+      "skills": null,
+      "shell_environment_policy": {
+        "inherit": null,
+        "ignore_default_excludes": null,
+        "exclude": null,
+        "set": null,
+        "include_only": null,
+        "filters": null,
+        "experimental_use_profile": null
+      },
+      "js_repl_node_module_dirs": null,
+      "tool_output_token_limit": null,
+      "project_doc_max_bytes": 32768,
+      "personality": null,
+      "experimental_realtime_ws_backend_prompt": null,
+      "file_opener": "vscode",
+      "agents": null,
+      "model_providers": {},
+      "ghost_snapshot": null,
+      "experimental_realtime_webrtc_call_base_url": null,
+      "notify": null,
+      "mcp_oauth_callback_url": null,
+      "js_repl_node_path": null,
+      "experimental_compact_prompt_file": null,
+      "mcp_enterprise_managed_auth": null,
+      "allow_login_shell": false,
+      "experimental_realtime_start_instructions": null,
+      "openai_base_url": null,
+      "marketplaces": {},
+      "experimental_use_unified_exec_tool": null,
+      "tool_suggest": null,
+      "model_instructions_file": null,
+      "profile": null
+    },
+    "origins": {
+      "features.plugins": {
+        "name": {
+          "type": "sessionFlags"
+        },
+        "version": "sha256:d47f87f47edd070b61fec7c22bd77f058fe6b30812b948a6e4fac1acafcd7b28"
+      },
+      "features.hooks": {
+        "name": {
+          "type": "sessionFlags"
+        },
+        "version": "sha256:d47f87f47edd070b61fec7c22bd77f058fe6b30812b948a6e4fac1acafcd7b28"
+      },
+      "features.remote_plugin": {
+        "name": {
+          "type": "sessionFlags"
+        },
+        "version": "sha256:d47f87f47edd070b61fec7c22bd77f058fe6b30812b948a6e4fac1acafcd7b28"
+      },
+      "feedback.enabled": {
+        "name": {
+          "type": "legacyManagedConfigTomlFromMdm"
+        },
+        "version": "sha256:ebae05b01e67547947deb9495ec852e063a45d02e280937b3255e87d5781a527"
+      },
+      "features.apps": {
+        "name": {
+          "type": "sessionFlags"
+        },
+        "version": "sha256:d47f87f47edd070b61fec7c22bd77f058fe6b30812b948a6e4fac1acafcd7b28"
+      },
+      "features.shell_snapshot": {
+        "name": {
+          "type": "sessionFlags"
+        },
+        "version": "sha256:d47f87f47edd070b61fec7c22bd77f058fe6b30812b948a6e4fac1acafcd7b28"
+      },
+      "allow_login_shell": {
+        "name": {
+          "type": "sessionFlags"
+        },
+        "version": "sha256:d47f87f47edd070b61fec7c22bd77f058fe6b30812b948a6e4fac1acafcd7b28"
+      },
+      "analytics.enabled": {
+        "name": {
+          "type": "legacyManagedConfigTomlFromMdm"
+        },
+        "version": "sha256:ebae05b01e67547947deb9495ec852e063a45d02e280937b3255e87d5781a527"
+      }
+    },
+    "layers": [
+      {
+        "name": {
+          "type": "legacyManagedConfigTomlFromMdm"
+        },
+        "version": "sha256:ebae05b01e67547947deb9495ec852e063a45d02e280937b3255e87d5781a527",
+        "config": {
+          "analytics": {
+            "enabled": false
+          },
+          "feedback": {
+            "enabled": false
+          }
+        }
+      },
+      {
+        "name": {
+          "type": "sessionFlags"
+        },
+        "version": "sha256:d47f87f47edd070b61fec7c22bd77f058fe6b30812b948a6e4fac1acafcd7b28",
+        "config": {
+          "features": {
+            "shell_snapshot": false,
+            "hooks": false,
+            "apps": false,
+            "plugins": false,
+            "remote_plugin": false
+          },
+          "allow_login_shell": false
+        }
+      },
+      {
+        "name": {
+          "type": "user",
+          "file": "/private/var/folders/1s/pzpgw10j22z7x5f6xgc98jdh0000gn/T/m2e-record-preflight-JXPkSb/codex-home/config.toml",
+          "profile": null
+        },
+        "version": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "config": {}
+      },
+      {
+        "name": {
+          "type": "system",
+          "file": "/etc/codex/config.toml"
+        },
+        "version": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "config": {}
+      }
+    ]
+  }
+}

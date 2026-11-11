@@ -1,0 +1,204 @@
+{
+  "commandExecutionCompleted": {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "commandExecution",
+        "id": "exec-8f8c7fbc-92f3-4974-844e-06d183d29164",
+        "pluginId": null,
+        "scriptPath": null,
+        "command": "/bin/zsh -c 'echo hi > probe.txt && cat probe.txt'",
+        "cwd": "/private/tmp/m2e-probe/run-code/clone",
+        "processId": "63721",
+        "source": "unifiedExecStartup",
+        "status": "completed",
+        "commandActions": [
+          {
+            "type": "unknown",
+            "command": "echo hi > probe.txt && cat probe.txt"
+          }
+        ],
+        "aggregatedOutput": "hi\n",
+        "exitCode": 0,
+        "durationMs": 0
+      },
+      "threadId": "01a1834e-1e1e-70e1-9be0-0526ebc6edc5",
+      "turnId": "01a1834e-1e72-7dc3-a690-387cd7adfaf9",
+      "completedAtMs": 1793204297579
+    }
+  },
+  "commandApprovalRequest": {
+    "method": "item/commandExecution/requestApproval",
+    "params": {
+      "kind": "command",
+      "threadId": "01a1834e-598f-77a1-bd86-8d6cd93820d0",
+      "turnId": "01a1834e-59c1-7440-866e-35e5a9e684e6",
+      "itemId": "exec-9e66d3d2-19e1-4d20-82a2-7d0b6df5bfb8",
+      "startedAtMs": 1793204312644,
+      "environmentId": "local",
+      "reason": "probe needs to write outside",
+      "command": "/bin/zsh -c 'touch /tmp/m2e-probe/outside.txt; echo done'",
+      "cwd": "/private/tmp/m2e-probe/run-esc/clone",
+      "commandActions": [
+        {
+          "type": "unknown",
+          "command": "touch /tmp/m2e-probe/outside.txt; echo done"
+        }
+      ],
+      "proposedExecpolicyAmendment": [
+        "touch",
+        "/tmp/m2e-probe/outside.txt"
+      ],
+      "availableDecisions": [
+        "accept",
+        {
+          "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": [
+              "touch",
+              "/tmp/m2e-probe/outside.txt"
+            ]
+          }
+        },
+        "cancel"
+      ]
+    }
+  },
+  "serverRequestResolved": {
+    "method": "serverRequest/resolved",
+    "params": {
+      "threadId": "01a1834e-598f-77a1-bd86-8d6cd93820d0",
+      "requestId": 0
+    }
+  },
+  "commandExecutionDeclined": {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "commandExecution",
+        "id": "exec-9e66d3d2-19e1-4d20-82a2-7d0b6df5bfb8",
+        "pluginId": null,
+        "scriptPath": null,
+        "command": "/bin/zsh -c 'touch /tmp/m2e-probe/outside.txt; echo done'",
+        "cwd": "/private/tmp/m2e-probe/run-esc/clone",
+        "processId": null,
+        "source": "agent",
+        "status": "declined",
+        "commandActions": [
+          {
+            "type": "unknown",
+            "command": "touch /tmp/m2e-probe/outside.txt; echo done"
+          }
+        ],
+        "aggregatedOutput": null,
+        "exitCode": null,
+        "durationMs": null
+      },
+      "threadId": "01a1834e-598f-77a1-bd86-8d6cd93820d0",
+      "turnId": "01a1834e-59c1-7440-866e-35e5a9e684e6",
+      "completedAtMs": 1793204312650
+    }
+  },
+  "tokenUsageUpdated": {
+    "method": "thread/tokenUsage/updated",
+    "params": {
+      "threadId": "01a1834e-598f-77a1-bd86-8d6cd93820d0",
+      "turnId": "01a1834e-59c1-7440-866e-35e5a9e684e6",
+      "tokenUsage": {
+        "total": {
+          "totalTokens": 210,
+          "inputTokens": 200,
+          "cachedInputTokens": 0,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 10,
+          "reasoningOutputTokens": 0
+        },
+        "last": {
+          "totalTokens": 105,
+          "inputTokens": 100,
+          "cachedInputTokens": 0,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 5,
+          "reasoningOutputTokens": 0
+        },
+        "modelContextWindow": 258400
+      }
+    }
+  },
+  "mcpToolCallFailed": {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "mcpToolCall",
+        "id": "exec-918dda78-263a-49a2-8f23-1f7ed728ace3",
+        "server": "agflow",
+        "tool": "submit",
+        "status": "failed",
+        "arguments": {
+          "note": "x"
+        },
+        "appContext": null,
+        "mcpAppUi": null,
+        "pluginId": null,
+        "readOnlyHint": null,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "refused: dirty"
+            }
+          ],
+          "structuredContent": null,
+          "_meta": null
+        },
+        "error": null,
+        "durationMs": 0
+      },
+      "threadId": "01a18367-23cb-7b00-b67f-4fb22730cfd6",
+      "turnId": "01a18367-243c-7dd1-b93f-946d185aed8e",
+      "completedAtMs": 1793205937403
+    }
+  },
+  "usageLimitRateLimits": {
+    "method": "account/rateLimits/updated",
+    "params": {
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 100,
+          "windowDurationMins": 300,
+          "resetsAt": 1793207969
+        },
+        "secondary": {
+          "usedPercent": 10,
+          "windowDurationMins": 10080,
+          "resetsAt": 1793290769
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": null
+        },
+        "individualLimit": null,
+        "spendControlReached": null,
+        "planType": null,
+        "rateLimitReachedType": null
+      }
+    }
+  },
+  "usageLimitError": {
+    "method": "error",
+    "params": {
+      "error": {
+        "message": "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 7:49 PM.",
+        "codexErrorInfo": "usageLimitExceeded",
+        "additionalDetails": null,
+        "misalignment": null
+      },
+      "willRetry": false,
+      "threadId": "01a1834f-3675-7842-8f9e-27fc3fbfc203",
+      "turnId": "01a1834f-3699-76f0-9b39-34b5baa78ac1"
+    }
+  }
+}

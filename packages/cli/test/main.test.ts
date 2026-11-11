@@ -21,6 +21,13 @@ describe('main', () => {
     expect(out.join('')).toContain('agflow join');
   });
 
+  test('the help lists the runner forms of mcp and hook', async () => {
+    const { io, out } = capture();
+    expect(await main(['help'], io)).toBe(0);
+    expect(out.join('')).toContain('agflow mcp --vendor claude|codex --runner');
+    expect(out.join('')).toContain('agflow hook brief --runner');
+  });
+
   test('an unknown command is a usage error', async () => {
     const { io, err } = capture();
     expect(await main(['fly'], io)).toBe(2);

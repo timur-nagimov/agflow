@@ -1,5 +1,6 @@
 import type { HubEvent } from '@agflow/core';
 import { type DependencyList, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { ApiError } from './api';
 import { subscribe } from './live';
 import { type Route, parseRoute } from './route';
 
@@ -126,6 +127,8 @@ export type Outcome<T> = { ok: true; value: T } | { ok: false };
 export interface Action {
   busy: boolean;
   error: string | null;
+  /** The hub's error code ('runner_offline', 'conflict', ...) when the hub refused; null for other failures. */
+  errorCode: string | null;
   /** Runs a hub call and keeps its error for display. */
   run<T>(fn: () => Promise<T>): Promise<Outcome<T>>;
   clearError(): void;
@@ -134,18 +137,24 @@ export interface Action {
 export function useAction(): Action {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const run = useCallback(async <T>(fn: () => Promise<T>): Promise<Outcome<T>> => {
     setBusy(true);
     setError(null);
+    setErrorCode(null);
     try {
       return { ok: true, value: await fn() };
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+      setErrorCode(caught instanceof ApiError ? caught.code : null);
       return { ok: false };
     } finally {
       setBusy(false);
     }
   }, []);
-  const clearError = useCallback(() => setError(null), []);
-  return useMemo(() => ({ busy, error, run, clearError }), [busy, error, run, clearError]);
+  const clearError = useCallback(() => {
+    setError(null);
+    setErrorCode(null);
+  }, []);
+  return useMemo(() => ({ busy, error, errorCode, run, clearError }), [busy, error, errorCode, run, clearError]);
 }

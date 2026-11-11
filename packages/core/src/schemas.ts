@@ -88,6 +88,11 @@ const OwnedPathSchema = z
 /** Shown to the lead in its task tools; the web board sorts the same way. */
 export const PRIORITY_HELP = '0 is the most urgent, 9 the least';
 
+/** TaskContract.vendorHint: the scheduler prefers it after the ladder's vendor requirement (design 6.6). */
+export const VendorHintSchema = VendorSchema.nullable().describe(
+  'the vendor the scheduler should prefer for this task: claude or codex; null for no preference',
+);
+
 const contractFields = {
   title: z.string().min(1).max(200).refine(isSingleLine, SINGLE_LINE),
   kind: TaskKindSchema,
@@ -99,6 +104,8 @@ const contractFields = {
   ownedPaths: z.array(OwnedPathSchema).max(50),
   dependsOn: z.array(TaskIdSchema).max(50),
   priority: z.number().int().min(0).max(9).describe(PRIORITY_HELP),
+  // Optional with no default, so a task created without one stores none.
+  vendorHint: VendorHintSchema.optional(),
 };
 
 export const NewTaskSchema = z.strictObject({

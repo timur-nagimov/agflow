@@ -18,20 +18,48 @@ const shots = mkdtempSync(join(tmpdir(), 'agflow-ui-'));
 
 const hub = Bun.spawn(['bun', join(import.meta.dir, 'demo-hub.ts')], {
   env: { ...process.env, AGFLOW_DEMO_PORT: String(port) },
-  stdout: 'inherit',
+  stdout: 'pipe',
   stderr: 'inherit',
 });
 
+/** The line the demo prints once its story has settled and checked itself. */
+const READY_LINE = 'agflow demo hub on';
+
+/** Forwards the demo's output, all along, and resolves at its ready line; rejects if the demo exits before it. */
+function readyLine(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const forward = async () => {
+      const decoder = new TextDecoder();
+      let buffered = '';
+      for await (const chunk of hub.stdout) {
+        buffered += decoder.decode(chunk, { stream: true });
+        const lines = buffered.split('\n');
+        buffered = lines.pop() ?? '';
+        for (const line of lines) {
+          console.log(line);
+          if (line.startsWith(READY_LINE)) resolve();
+        }
+      }
+      throw new Error(`the demo hub exited with code ${await hub.exited} before it was ready`);
+    };
+    forward().catch(reject);
+  });
+}
+
+/**
+ * The demo prints its ready line once its story has settled and checked itself; it exits with an error naming what
+ * did not settle instead. Either that, or 20 seconds without the line, fails the check.
+ */
 async function waitForHub(): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt++) {
-    try {
-      if ((await fetch(`${base}/api/auth-config`)).ok) return;
-    } catch {
-      // not listening yet
-    }
-    await Bun.sleep(100);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('the demo hub was not ready within 20 seconds')), 20_000);
+  });
+  try {
+    await Promise.race([readyLine(), timeout]);
+  } finally {
+    clearTimeout(timer);
   }
-  throw new Error('the demo hub did not start within 5 seconds');
 }
 
 const failures: string[] = [];
@@ -77,8 +105,13 @@ async function main(): Promise<void> {
   current = page;
   const consoleErrors: string[] = [];
   page.on('console', (message) => {
-    // 400 and 401 answers are expected: a bad commit SHA, and /api/me before sign-in.
-    if (message.type() === 'error' && !/status of 40[01]/.test(message.text())) consoleErrors.push(message.text());
+    // 400 and 401 answers are expected: a bad commit SHA and /api/me before sign-in. The only 409 allowed is the faked
+    // take-over refusal; any other one is a page error.
+    const fakedRefusal =
+      /status of 409/.test(message.text()) && new URL(message.location().url, base).pathname === '/api/tasks/T-8/takeover';
+    if (message.type() === 'error' && !/status of 40[01]/.test(message.text()) && !fakedRefusal) {
+      consoleErrors.push(message.text());
+    }
   });
 
   try {
@@ -140,20 +173,28 @@ async function main(): Promise<void> {
       const ids = await page.locator('.task-card .task-id').allTextContents();
       for (const id of ['T-3', 'T-4', 'T-6', 'T-7', 'T-8']) if (!ids.includes(id)) throw new Error(`${id} missing`);
     });
+    /** A task's card on the board. */
+    const taskCard = (id: string) => page.locator('.task-card', { has: page.locator(`.task-id:text-is("${id}")`) });
+    await check('the board marks T-11 live chat only, and T-10, on its second attempt, with its attempt number', async () => {
+      await taskCard('T-11').locator('.live-only', { hasText: 'Live chat only' }).waitFor();
+      if ((await page.locator('.task-card .live-only').count()) !== 1) throw new Error('another card is marked live chat only');
+      await taskCard('T-10').locator('.attempt-count', { hasText: /^attempt 2$/ }).waitFor();
+      if ((await taskCard('T-8').locator('.attempt-count').count()) !== 0) throw new Error('T-8, on its first attempt, shows a number');
+    });
     await check('a person can create a task', async () => {
       await page.click('button:has-text("New task")');
       await page.fill('.new-task input >> nth=0', 'Export invoices as CSV');
       await page.fill('.new-task textarea >> nth=0', 'Finance can export a month of invoices as CSV.');
       await page.fill('.new-task textarea >> nth=2', '- One row per invoice\n- Totals match the PDF');
       await page.click('.new-task button.primary');
-      await page.waitForURL(/#\/task\/T-11$/);
+      await page.waitForURL(/#\/task\/T-13$/);
       await waitForCount(page.locator('.criteria li'), 2);
     });
     await shot(page, 'new-task');
 
     await open(page, '#/goal', '.charter-text');
     await check('opening the goal clears the badge for messages to people', () =>
-      page.locator('.nav .badge').waitFor({ state: 'detached' }),
+      page.locator('.nav a[href="#/goal"] .badge').waitFor({ state: 'detached' }),
     );
     await check('editing the goal previews the change and saves a new version', async () => {
       await page.click('button:has-text("Edit goal")');
@@ -200,17 +241,641 @@ async function main(): Promise<void> {
     await shot(page, 'knowledge');
 
     await open(page, '#/agents', 'table');
-    await check('agents are listed with what they work on', async () => {
+    await check('agents are listed with what they work on, and the lead is the runner lead on R-1', async () => {
+      // The live lead chat, A-1, has been away for hours, so it is listed only with the disconnected agents.
       const text = (await page.locator('table').textContent()) ?? '';
-      if (!text.includes('A-1') || !text.includes('Lead') || !text.includes('T-4')) throw new Error(text.slice(0, 200));
+      if (!text.includes('T-4')) throw new Error(text.slice(0, 200));
+      // The page signed in, so its fetch carries the session.
+      const seat = await page.evaluate<{ kind: string; agentId: string | null; runnerId: string | null }>(
+        "fetch('/api/status').then((response) => response.json()).then((status) => status.leadSeat)",
+      );
+      if (seat.kind !== 'runner' || seat.runnerId !== 'R-1') throw new Error(`the seat: ${JSON.stringify(seat)}`);
+      const leadRow = page.locator('tr', { has: page.locator('.chip', { hasText: 'Lead' }) });
+      await waitForCount(leadRow, 1);
+      const row = (await leadRow.textContent()) ?? '';
+      if (!seat.agentId || !row.includes(seat.agentId)) throw new Error(`the Lead row: ${row}`);
     });
     await shot(page, 'agents');
+
+    /** The text of the attempt page's fact with this label. */
+    const fact = async (label: string) =>
+      (await page.locator('.fact', { has: page.locator(`dt:text-is("${label}")`) }).locator('dd').first().textContent()) ?? '';
+    await open(page, '#/attempt/T-10-a1', '.attempt-head');
+    await check("the page of T-10's first attempt shows Replaced, its class, who asked and why, its WIP ref and the log", async () => {
+      const chip = (await page.locator('.attempt-head .chip').textContent()) ?? '';
+      if (chip !== 'Replaced') throw new Error(`the chip reads ${chip}`);
+      if ((await fact('Class')) !== 'None') throw new Error(`the class reads ${await fact('Class')}`);
+      const stop = page.locator('.stop-request');
+      if ((await fact('Cause')) !== 'Replace') throw new Error(`the cause reads ${await fact('Cause')}`);
+      if (!(await fact('Asked by')).startsWith('alice')) throw new Error(`asked by ${await fact('Asked by')}`);
+      await stop.locator('.stop-reason', { hasText: 'It keeps re-reading the plan catalogue' }).waitFor();
+      if (!(await fact('Work in progress')).startsWith('refs/agflow/T-10/a1 at ')) {
+        throw new Error(`the WIP reads ${await fact('Work in progress')}`);
+      }
+      await page.locator('.attempt-log .log-text', { hasText: 'the agent exited' }).waitFor();
+      await page.locator('a.back[href="#/task/T-10"]').waitFor();
+    });
+    await shot(page, 'attempt');
+    await open(page, '#/attempt/T-12-a1', '.attempt-head');
+    await check("the page of T-12's running attempt shows its facts: phase, last event, turns", async () => {
+      await page.locator('.attempt-facts').waitFor();
+      const facts = { Phase: 'Working', 'Last agent event': /^\d+ s ago$/, Turns: '3', Fence: /^e1\.\d+$/ };
+      for (const [label, expected] of Object.entries(facts)) {
+        const value = await fact(label);
+        if (typeof expected === 'string' ? value !== expected : !expected.test(value)) throw new Error(`${label} reads ${value}`);
+      }
+    });
+    await check("the lead's attempt page has no task and links to Agents", async () => {
+      const seat = await page.evaluate<{ attemptId: string | null }>(
+        "fetch('/api/status').then((response) => response.json()).then((status) => status.leadSeat)",
+      );
+      if (!seat.attemptId?.startsWith('lead-')) throw new Error(`the seat's attempt: ${seat.attemptId}`);
+      await open(page, `#/attempt/${seat.attemptId}`, '.attempt-head');
+      await page.locator('a.back[href="#/agents"]').waitFor();
+      await page.locator('.nav a[href="#/agents"][aria-current="page"]').waitFor();
+      if ((await page.locator('.attempt-head .task-link').count()) !== 0) throw new Error('the page names a task');
+      if (!(await page.locator('h1.page-title').textContent())?.startsWith('Lead attempt')) throw new Error('no lead title');
+    });
+
+    await open(page, '#/agents', 'table');
+    /** The Agents row of the agent working on a task. */
+    const agentRow = (taskId: string) => page.locator('tr', { has: page.locator(`.task-link:text-is("${taskId}")`) });
+    const cell = async (row: Locator, name: string) => ((await row.locator(`.agent-${name}`).textContent()) ?? '').trim();
+    await check("runner agents show their runner, attempt and phase (T-12's agent: R-1, a1, Working)", async () => {
+      const row = agentRow('T-12');
+      // The phase comes from the open attempts, which load apart from the agents, so the check waits for it.
+      await row.locator('.agent-phase', { hasText: /^Working$/ }).waitFor();
+      const cells = { runner: await cell(row, 'runner'), attempt: await cell(row, 'attempt'), phase: await cell(row, 'phase') };
+      if (cells.runner !== 'R-1' || cells.attempt !== 'a1' || cells.phase !== 'Working') {
+        throw new Error(`the row shows ${JSON.stringify(cells)}`);
+      }
+      await row.locator('.agent-attempt a[href="#/attempt/T-12-a1"]').waitFor();
+    });
+    await check("the lead's row says it runs on R-1 and how many wake-ups it has had", async () => {
+      const lead = page.locator('tr', { has: page.locator('.chip', { hasText: 'Lead' }) });
+      const seat = (await lead.locator('.lead-seat').textContent()) ?? '';
+      if (!/^On R-1 · \d+ wake-ups? since rotation$/.test(seat)) throw new Error(`the lead's row says ${seat}`);
+    });
+    await check('live chats have no runner actions, only Message', async () => {
+      const row = agentRow('T-4');
+      await waitForCount(row, 1);
+      if ((await cell(row, 'runner')) !== 'Live chat') throw new Error(`T-4's agent runs in ${await cell(row, 'runner')}`);
+      if ((await row.locator('button').count()) !== 0) throw new Error('a live chat offers runner actions');
+      if ((await row.locator('.cell-action').textContent())?.trim() !== 'Message') throw new Error('no Message link');
+    });
+    /** Opens the actions of the agent on a task. */
+    const actionsOf = async (taskId: string) => {
+      const row = agentRow(taskId);
+      if ((await row.locator('button[aria-expanded="true"]').count()) === 0) await row.locator('button:text-is("Actions")').click();
+      return page.locator('.agent-actions-row .runner-actions-panel');
+    };
+    await check("interrupting T-12's agent succeeds, and its attempt log records the interrupt", async () => {
+      const actions = await actionsOf('T-12');
+      const offered = await actions.locator('.actions button').allTextContents();
+      if (offered.join(',') !== 'Interrupt,Stop,Stop and hold,Replace,Take over') throw new Error(`it offers ${offered.join(', ')}`);
+      await actions.locator('.actions button:text-is("Interrupt")').click();
+      // The second click.
+      await actions.locator('.action-form .confirm-action:text-is("Interrupt")').click();
+      await actions.locator('.runner-actions-done', { hasText: 'Interrupt' }).waitFor();
+      // The runner logs the interrupt in its own time, and logging sends no event, so the hub is asked until it has
+      // the entry; the attempt page, opened then, must show it.
+      for (let tries = 0; ; tries++) {
+        const logged = await page.evaluate<boolean>(
+          "fetch('/api/attempts/T-12-a1').then((response) => response.json())" +
+            ".then(({ log }) => log.some((entry) => entry.summary === 'the turn was interrupted'))",
+        );
+        if (logged) break;
+        if (tries === 20) throw new Error('the hub has no log entry for the interrupt');
+        await Bun.sleep(250);
+      }
+      await open(page, '#/attempt/T-12-a1', '.attempt-head');
+      await page.locator('.attempt-log .log-text', { hasText: 'the turn was interrupted' }).waitFor();
+    });
+    await open(page, '#/agents', 'table');
+    await check('stop and hold on T-12\'s agent asks for a reason, then T-12 is Paused', async () => {
+      const actions = await actionsOf('T-12');
+      await actions.locator('.actions button:text-is("Stop and hold")').click();
+      const confirm = actions.locator('.action-form .confirm-action:text-is("Stop and hold")');
+      if (!(await confirm.isDisabled())) throw new Error('it stops without a reason');
+      await actions.locator('.action-form textarea').fill('Hold this until the pricing review is done.');
+      await shot(page, 'agent-actions');
+      await confirm.click();
+      // The form closes once the hub took the request; the agent then leaves, and its row with it.
+      await confirm.waitFor({ state: 'detached' });
+      await open(page, '#/task/T-12', '.task-head');
+      await statusIs(page, 'Paused');
+    });
+    await check("T-12, paused by the Agents check, shows the 'Stopped and held by a person' heading and offers Unblock", async () => {
+      await page.locator('.attention h2', { hasText: /^Stopped and held by a person$/ }).waitFor();
+      await page.locator('.attention', { hasText: 'Hold this until the pricing review is done.' }).waitFor();
+      await page.locator('.actions button:text-is("Unblock")').waitFor();
+    });
+
+    /** A task as the hub has it, through the page's signed-in session. */
+    const taskDetail = (id: string) =>
+      page.evaluate<{
+        task: { status: string; blockedKind: string | null; workRef: string | null; workSha: string | null };
+        attempts: { id: string; wipSha: string | null; takeover: { ref: string } | null }[];
+        submissions: { id: string; headSha: string | null }[];
+      }>(`fetch('/api/tasks/${id}').then((response) => response.json())`);
+    /** The Attempts table's row of an attempt, by its short name. */
+    const attemptRow = (name: string) =>
+      page.locator('.attempts-table tbody tr', { has: page.locator(`.attempt-link:text-is("${name}")`) });
+    const rowCell = async (row: Locator, name: string) => ((await row.locator(`.attempt-${name}`).textContent()) ?? '').trim();
+    await open(page, '#/task/T-8', '.task-head');
+    await check('T-8 shows its current attempt, its work position and its newest log entries', async () => {
+      await page.locator('.task-head .fact a.attempt-link[href="#/attempt/T-8-a1"]').waitFor();
+      const current = await fact('Current attempt');
+      if (current !== 'a1 · Waiting for approval') throw new Error(`the current attempt reads ${current}`);
+      const { task } = await taskDetail('T-8');
+      const position = await fact('Work position');
+      if (!task.workRef || !task.workSha || position !== `${task.workRef} at ${task.workSha.slice(0, 7)}`) {
+        throw new Error(`the work position reads ${position}`);
+      }
+      const log = page.locator('.task-attempt-log .log-text');
+      await log.filter({ hasText: 'Read src/webhooks/stripe.ts' }).waitFor();
+      await log.filter({ hasText: 'The signature check needs the Stripe SDK' }).waitFor();
+      // The log lists newest first, so its first row is the hub's last entry (after the row's kind label).
+      const { log: entries } = await page.evaluate<{ log: { summary: string }[] }>(
+        "fetch('/api/attempts/T-8-a1').then((response) => response.json())",
+      );
+      const newest = entries.at(-1)?.summary;
+      const first = ((await log.first().textContent()) ?? '').trim();
+      if (!newest || !first.endsWith(newest)) throw new Error(`the newest entry reads ${first}, not ${newest}`);
+      await page.locator('.task-attempt-log a[href="#/attempt/T-8-a1"]').waitFor();
+      if ((await fact('Attempts')) !== '1') throw new Error(`the attempt count reads ${await fact('Attempts')}`);
+    });
+    await check('T-8, held by a runner, offers Stop, Stop and hold, Replace and Take over, but not Release claim', async () => {
+      const offered = await page.locator('.actions-card .runner-actions-panel .actions button').allTextContents();
+      if (offered.join(',') !== 'Stop,Stop and hold,Replace,Take over') throw new Error(`it offers ${offered.join(', ')}`);
+      const all = await page.locator('.actions-card button').allTextContents();
+      if (all.includes('Release claim')) throw new Error(`the page offers ${all.join(', ')}`);
+      const hint = (await page.locator('.actions-card .action-hint').textContent()) ?? '';
+      if (!hint.includes('on a runner')) throw new Error(`the hint reads ${hint}`);
+    });
+    await open(page, '#/task/T-10', '.task-head');
+    await check('T-10 lists attempts a1 (Replaced, its runner, WIP ref and sha) and a2 (Holding), each linking its attempt page', async () => {
+      await waitForCount(page.locator('.attempts-table tbody tr'), 2);
+      const { attempts } = await taskDetail('T-10');
+      const first = attempts.find((attempt) => attempt.id === 'T-10-a1');
+      const cells = {
+        end: await rowCell(attemptRow('a1'), 'end'),
+        runner: await rowCell(attemptRow('a1'), 'runner'),
+        wip: await rowCell(attemptRow('a1'), 'wip'),
+        second: await rowCell(attemptRow('a2'), 'status'),
+      };
+      const wip = `refs/agflow/T-10/a1 at ${first?.wipSha?.slice(0, 7)}`;
+      if (cells.end !== 'Replaced' || cells.runner !== 'R-1' || cells.wip !== wip || cells.second !== 'Holding') {
+        throw new Error(`the rows show ${JSON.stringify(cells)}`);
+      }
+      await attemptRow('a1').locator('a.attempt-link[href="#/attempt/T-10-a1"]').waitFor();
+      await attemptRow('a2').locator('a.attempt-link[href="#/attempt/T-10-a2"]').waitFor();
+      if ((await fact('Attempts')) !== '2') throw new Error(`the attempt count reads ${await fact('Attempts')}`);
+    });
+    await check("T-10's handoff note, its successor's restatement and the late-work note sit side by side", async () => {
+      const step = page.locator('.note-step', { has: page.locator('.note-step-head', { hasText: 'a1 → a2' }) });
+      await waitForCount(step, 1);
+      const left = step.locator('.note-left');
+      const right = step.locator('.note-right');
+      await left.locator('.note', { hasText: 'It keeps re-reading the plan catalogue' }).waitFor();
+      await left.locator('.note', { hasText: 'Late work of attempt T-10-a1' }).waitFor();
+      await right.locator('.note', { hasText: 'Restating T-10' }).waitFor();
+      const [a, b] = [await left.boundingBox(), await right.boundingBox()];
+      if (!a || !b || a.x + a.width > b.x || a.y >= b.y + b.height || b.y >= a.y + a.height) {
+        throw new Error(`the columns are not side by side: ${JSON.stringify([a, b])}`);
+      }
+      // The progress note stays in the notes list, outside the handoffs.
+      await page.locator('.card:not(.handoffs) .note', { hasText: 'it has no per-day prices yet' }).waitFor();
+      if ((await page.locator('.handoffs .note', { hasText: 'no per-day prices' }).count()) !== 0) {
+        throw new Error('the progress note is among the handoffs');
+      }
+    });
+    await check("T-10's submissions show S-1 refused because the branch needs a merge, and S-2 submitted at its sha; accepting T-10 still works", async () => {
+      const { submissions } = await taskDetail('T-10');
+      const s2 = submissions.find((submission) => submission.id === 'S-2');
+      const record = (id: string) => page.locator('.submission-record', { has: page.locator(`.submission-id:text-is("${id}")`) });
+      const refused = (await record('S-1').locator('.submission-outcome').textContent()) ?? '';
+      if (!refused.startsWith('Refused: someone added commits to the task branch, so it must merge them first')) {
+        throw new Error(`S-1 reads ${refused}`);
+      }
+      await record('S-1').locator('.submission-detail', { hasText: 'someone pushed to agflow/T-10' }).waitFor();
+      const submitted = (await record('S-2').locator('.submission-outcome').textContent()) ?? '';
+      if (!s2?.headSha || submitted !== `Submitted at ${s2.headSha.slice(0, 7)}`) throw new Error(`S-2 reads ${submitted}`);
+      // Its attempt still holds, but a submitted task has no runner actions: only people's review.
+      const runnerPanels = await page.locator('.actions-card .runner-actions-panel').count();
+      if (runnerPanels !== 0) throw new Error('T-10 offers runner actions');
+      await page.click('.actions button:has-text("Accept")');
+      await page.click('.action-form .confirm-action');
+      await statusIs(page, 'Accepted');
+    });
+    await shot(page, 'task-attempts');
+    await open(page, '#/task/T-11', '.task-head');
+    await check('T-11 is marked live chat only', async () => {
+      await page.locator('.task-head .chip.live-only', { hasText: 'Live chat only' }).waitFor();
+    });
+    await open(page, '#/task/T-12', '.task-head');
+    await check('a task runners may take has no live-chat-only mark', async () => {
+      await statusIs(page, 'Paused');
+      if ((await page.locator('.live-only').count()) !== 0) throw new Error('T-12 is marked live chat only');
+    });
+
+    await check('the strip shows how many runners are online', () =>
+      page.locator('.strip .readout', { hasText: /^Runners\s*1\/3\s*online$/ }).waitFor(),
+    );
+    await open(page, '#/runners', '.runner-card');
+    /** The text of one runner's card. */
+    const card = (id: string) => page.locator('.runner-card', { has: page.locator(`.runner-id:text-is("${id}")`) });
+    const cardText = async (id: string) => (await card(id).textContent()) ?? '';
+    await check('the Runners page lists R-1, R-2 and R-3 with owner, state, slots, power, disk, keep-awake, git and each vendor', async () => {
+      await waitForCount(page.locator('.runner-card'), 3);
+      const expected: Record<string, { owner: string; parts: (string | RegExp)[] }> = {
+        'R-1': {
+          owner: 'demo',
+          parts: ["demo's MacBook Pro", 'Online', /\d of 3 slots free/, 'On AC power', '182 GB free, 6.4 GB used by agflow'],
+        },
+        'R-2': {
+          owner: 'bob',
+          parts: ["bob's Mac mini", 'Offline', /\d of \d slots? free/, 'On battery, 57%', '41.0 GB free, 2.1 GB used by agflow'],
+        },
+        'R-3': {
+          owner: 'demo',
+          parts: ["demo's MacBook Air", 'Offline', /\d of \d slots? free/, 'On AC power', '120 GB free, 2.0 GB used by agflow'],
+        },
+      };
+      for (const [id, { owner, parts }] of Object.entries(expected)) {
+        const ownerFact = card(id).locator('.fact', { has: page.locator('dt:text-is("Owner")') }).locator('dd');
+        if ((await ownerFact.textContent()) !== owner) throw new Error(`${id}'s owner is not ${owner}`);
+        const text = await cardText(id);
+        // Every demo runner keeps the hello's default keep-awake setting.
+        const all = [...parts, 'Kept awake on AC power', 'Git ready', 'Claude Code'];
+        const missing = all.filter((part) => (typeof part === 'string' ? !text.includes(part) : !part.test(text)));
+        if (missing.length > 0) throw new Error(`${id} lacks ${missing.join(', ')}: ${text.slice(0, 300)}`);
+      }
+      for (const id of ['R-1', 'R-2']) {
+        if (!(await cardText(id)).includes('Codex')) throw new Error(`${id} does not list Codex`);
+      }
+    });
+    await check("R-2 says why it is offline, shows its weakened boundary and Codex 'not logged in'", async () => {
+      const why = (await card('R-2').locator('.runner-why').textContent()) ?? '';
+      // R-2 went away without a word, so the line is the offline default.
+      if (!why.startsWith('Last seen')) throw new Error(`the why line: ${why}`);
+      const text = await cardText('R-2');
+      if (!text.includes('Not enforced on this laptop: network allowlist')) throw new Error('no weakened boundary');
+      const codex = card('R-2').locator('.vendor', { has: page.locator('.vendor-name:text-is("Codex")') });
+      if (!((await codex.textContent()) ?? '').includes('not logged in')) throw new Error('Codex is not "not logged in"');
+    });
+    await check("R-1's Claude meters show the utilization against the 85% ceiling and the account's reset time", async () => {
+      const claude = card('R-1').locator('.vendor', { has: page.locator('.vendor-name:text-is("Claude Code")') });
+      const meters = claude.locator('.meter');
+      await waitForCount(meters, 2);
+      const used = [
+        ['42% used, ceiling 85%', '42%'],
+        ['31% used, ceiling 85%', '31%'],
+      ];
+      for (const [index, [text, width]] of used.entries()) {
+        const meter = meters.nth(index);
+        if (!((await meter.textContent()) ?? '').includes(text)) throw new Error(`meter ${index} lacks ${text}`);
+        const fill = (await meter.locator('.meter-fill').getAttribute('style')) ?? '';
+        if (!fill.includes(width)) throw new Error(`meter ${index}'s fill: ${fill}`);
+        const mark = (await meter.locator('.meter-mark').getAttribute('style')) ?? '';
+        if (!mark.includes('85%')) throw new Error(`meter ${index}'s ceiling mark: ${mark}`);
+      }
+      // The reset time as the browser shows it, in its own time zone.
+      const reset = await page.evaluate<string>(`fetch('/api/runners').then((response) => response.json()).then(({ accounts }) => {
+        const at = new Date(accounts.find((a) => a.owner === 'demo' && a.vendor === 'claude').quota.resetsAt);
+        return String(at.getHours()).padStart(2, '0') + ':' + String(at.getMinutes()).padStart(2, '0');
+      })`);
+      const line = (await claude.locator('.quota-line').textContent()) ?? '';
+      if (!line.startsWith('Resets at') || !line.includes(reset)) throw new Error(`the quota line: ${line}`);
+    });
+    await check('only the owner sees Settings, Drain and Retire: R-1 and R-3 show them, R-2 does not', async () => {
+      for (const [id, expected] of [
+        ['R-1', ['Settings', 'Drain', 'Retire']],
+        ['R-2', []],
+        ['R-3', ['Settings', 'Drain', 'Retire']],
+      ] as const) {
+        const buttons = await card(id).locator('.runner-actions .actions button').allTextContents();
+        if (buttons.join(',') !== expected.join(',')) throw new Error(`${id} shows ${buttons.join(', ') || 'no controls'}`);
+      }
+    });
+    await check("the owner raises R-1's capacity from 3 to 4, and the card shows 4", async () => {
+      await card('R-1').locator('button:text-is("Settings")').click();
+      const capacity = card('R-1').locator('.runner-settings input[type=number] >> nth=0');
+      if ((await capacity.inputValue()) !== '3') throw new Error(`the form says ${await capacity.inputValue()}`);
+      await capacity.fill('4');
+      await card('R-1').locator('button:text-is("Save settings")').click();
+      await card('R-1').locator('.runner-settings').waitFor({ state: 'detached' });
+      await card('R-1').locator('.fact', { hasText: /\d of 4 slots free/ }).waitFor();
+    });
+    await check('Drain marks R-1 draining, and Undrain clears it', async () => {
+      await card('R-1').locator('button:text-is("Drain")').click();
+      await card('R-1').locator('.runner-why', { hasText: 'Draining' }).waitFor();
+      await card('R-1').locator('button:text-is("Undrain")').click();
+      await card('R-1').locator('button:text-is("Drain")').waitFor();
+      await card('R-1').locator('.runner-why', { hasText: 'Draining' }).waitFor({ state: 'detached' });
+    });
+    await shot(page, 'runners');
+    await check('retiring the offline R-3 asks first, then its card goes', async () => {
+      await card('R-3').locator('button:text-is("Retire")').click();
+      const confirm = card('R-3').locator('.retire-confirm');
+      const text = (await confirm.textContent()) ?? '';
+      for (const part of ['end lost', 'back to ready', 'submitted tasks keep their status']) {
+        if (!text.includes(part)) throw new Error(`the question lacks "${part}": ${text}`);
+      }
+      await confirm.locator('button:text-is("Retire R-3")').click();
+      await waitForCount(page.locator('.runner-card'), 2);
+      await page.locator('.strip .readout', { hasText: /^Runners\s*1\/2\s*online$/ }).waitFor();
+    });
+
+    /** The Approvals item's badge. */
+    const approvalsBadge = page.locator('.nav a[href="#/approvals"] .badge');
+    await check('the Approvals item shows a badge with 2', async () => {
+      await approvalsBadge.filter({ hasText: /^2$/ }).waitFor();
+    });
+    await open(page, '#/approvals', '.approval-card');
+    const request = (summary: string) => page.locator('.approval-card', { hasText: summary });
+    const install = request('Install the Stripe SDK');
+    const fixtures = request('Add signed sample payloads');
+    await check('the npm install request shows the command, cwd, reason, warning, package.json diff and time left', async () => {
+      await waitForCount(page.locator('.approval-card'), 2);
+      const command = (await install.locator('.approval-command').textContent()) ?? '';
+      if (command !== 'npm install stripe@^18.2.0') throw new Error(`the command reads ${command}`);
+      const text = (await install.textContent()) ?? '';
+      const parts = [
+        /\/Users\/demo\/\.agflow\/work\/T-8-a\d+/,
+        'The signature check uses stripe.webhooks.constructEvent',
+        'Approving runs this command outside the sandbox, with network access and write access to all your files',
+        'T-8',
+        'R-1',
+      ];
+      const missing = parts.filter((part) => (typeof part === 'string' ? !text.includes(part) : !part.test(text)));
+      if (missing.length > 0) throw new Error(`it lacks ${missing.join(', ')}`);
+      await install.locator('.diff-add', { hasText: '"stripe": "^18.2.0"' }).first().waitFor();
+      await install.locator('.diff-same', { hasText: 'package.json' }).first().waitFor();
+      const left = (await install.locator('.approval-left').textContent()) ?? '';
+      if (!/^\d+ (min|h)/.test(left) || !left.endsWith('left')) throw new Error(`the time left reads ${left}`);
+    });
+    // Both approvals are decided below, so the phone check gets them back from this answer.
+    const pendingApprovals = await page.evaluate<unknown>(
+      "fetch('/api/approvals?status=pending').then((response) => response.json())",
+    );
+    /** The signed-in person's approvals in one status, as the hub recorded them. */
+    const recorded = (status: string) =>
+      page.evaluate<{ summary: string; decidedBy: string | null }[]>(
+        `fetch('/api/approvals?status=${status}').then((response) => response.json()).then(({ approvals }) => approvals)`,
+      );
+    const holds = (list: { summary: string }[], summary: string) => list.some((entry) => entry.summary.includes(summary));
+    await check('the file change shows its grant-root warning; declining it records a decline, and the badge shows 1', async () => {
+      const warnings = (await fixtures.locator('.approval-warnings').textContent()) ?? '';
+      if (!warnings.includes('write anywhere under this root') || !warnings.includes('/Users/demo/code/acme-fixtures')) {
+        throw new Error(`the warnings: ${warnings}`);
+      }
+      // Decline is the default action.
+      await fixtures.locator('button.primary:text-is("Decline")').click();
+      await waitForCount(page.locator('.approval-card'), 1);
+      await approvalsBadge.filter({ hasText: /^1$/ }).waitFor();
+      const declined = await recorded('declined');
+      const entry = declined.find((approval) => approval.summary.includes('Add signed sample payloads'));
+      if (entry?.decidedBy !== 'user:demo') throw new Error(`the hub records ${JSON.stringify(declined)}`);
+    });
+    // Every decision the page sends, to prove that a click sent none.
+    const decisions: string[] = [];
+    page.on('request', (sent) => {
+      if (sent.method() === 'POST' && sent.url().includes('/api/approvals/')) decisions.push(sent.url());
+    });
+    await check('a double-click on Approve… does not approve the command', async () => {
+      await install.locator('button:text-is("Approve…")').dblclick();
+      await install.locator('button:text-is("Approve and let it run")').waitFor();
+      if (decisions.length > 0) throw new Error(`the page sent ${decisions.join(', ')}`);
+      if (!holds(await recorded('pending'), 'Install the Stripe SDK')) throw new Error('the hub no longer has it pending');
+      await install.locator('button:text-is("Keep")').click();
+    });
+    await check('approving the command needs a second click; then the hub records it, and the badge is gone', async () => {
+      await install.locator('button:text-is("Approve…")').click();
+      await install.locator('button:text-is("Approve and let it run")').waitFor();
+      if (decisions.length > 0) throw new Error(`one click sent ${decisions.join(', ')}`);
+      if (!holds(await recorded('pending'), 'Install the Stripe SDK')) throw new Error('one click approved it');
+      await install.locator('button:text-is("Approve and let it run")').click();
+      await page.locator('.empty-title', { hasText: 'No approvals waiting' }).waitFor();
+      await approvalsBadge.waitFor({ state: 'detached' });
+      if (!holds(await recorded('approved'), 'Install the Stripe SDK')) throw new Error('the hub has not recorded the approval');
+      if (holds(await recorded('declined'), 'Install the Stripe SDK')) throw new Error('the hub recorded a decline');
+    });
+    await shot(page, 'approvals');
+
+    // The take-over runs after the approvals checks: its stop voids the approvals still pending.
+    await open(page, '#/task/T-8', '.task-head');
+    const runnerPanel = page.locator('.actions-card .runner-actions-panel');
+    const takeoverCard = page.locator('.takeover-card');
+    // The demo's runner never refuses a take-over, so the page gets the hub's 409 from a fake answer instead.
+    const takeoverRoute = (url: URL) => url.pathname === '/api/tasks/T-8/takeover';
+    await check("view test (fake api): a refused take-over shows the hub's reason and offers Stop and hold", async () => {
+      const message = 'a submission of T-8 is being pushed; wait for it, or stop and hold';
+      await page.route(takeoverRoute, (route) =>
+        route.fulfill({ status: 409, json: { error: 'submission_pending', message } }),
+      );
+      try {
+        await runnerPanel.locator('.actions button:text-is("Take over")').click();
+        await runnerPanel.locator('.action-form .confirm-action:text-is("Take over")').click();
+        const refused = runnerPanel.locator('.takeover-refused');
+        await refused.locator('p', { hasText: 'A submission is being pushed' }).waitFor();
+        await refused.locator('p', { hasText: message }).waitFor();
+        await refused.locator('button:text-is("Stop and hold")').click();
+        await runnerPanel.locator('.action-form .confirm-action:text-is("Stop and hold")').waitFor();
+        await runnerPanel.locator('.action-form button:text-is("Never mind")').click();
+      } finally {
+        await page.unroute(takeoverRoute);
+      }
+      const { task } = await taskDetail('T-8');
+      if (task.status === 'blocked') throw new Error(`the hub has T-8 ${task.blockedKind}`);
+    });
+    await check("taking over T-8 asks first; then T-8 reads 'Taken over' and shows both commands with Copy buttons", async () => {
+      await runnerPanel.locator('.actions button:text-is("Take over")').click();
+      const confirm = runnerPanel.locator('.action-form .confirm-action:text-is("Take over")');
+      await confirm.waitFor();
+      if ((await taskDetail('T-8')).task.status === 'blocked') throw new Error('one click took it over');
+      await confirm.click();
+      await statusIs(page, 'Taken over');
+      const local = takeoverCard.locator('pre[aria-label="The command on the runner\'s laptop"]');
+      const anywhere = takeoverCard.locator('pre[aria-label="The command for anywhere"]');
+      await local.waitFor();
+      if (!((await local.textContent()) ?? '').includes('--resume session-T-8-a1')) throw new Error(`local: ${await local.textContent()}`);
+      if (!((await anywhere.textContent()) ?? '').startsWith('git fetch origin refs/agflow/T-8/a1')) {
+        throw new Error(`anywhere: ${await anywhere.textContent()}`);
+      }
+      await waitForCount(takeoverCard.locator('.command-block button:text-is("Copy")'), 2);
+    });
+    await shot(page, 'task-takeover');
+    await check('a taken-over task offers Hand back, not Unblock', async () => {
+      const buttons = await page.locator('.actions-card button, .takeover-card button').allTextContents();
+      if (!buttons.includes('Hand back from the clone') || !buttons.includes('Hand back from a ref')) {
+        throw new Error(`the page offers ${buttons.join(', ')}`);
+      }
+      if (buttons.includes('Unblock')) throw new Error('the page offers Unblock');
+      if ((await runnerPanel.count()) !== 0) throw new Error('the page still offers runner actions');
+    });
+    // A hand-back from the demo's clone ends at once, so a pending one and a refused one come from fake answers.
+    const taskRoute = (url: URL) => url.pathname === '/api/tasks/T-8';
+    await check("view test (fake api): a pending clone hand-back shows 'Handing back…' and no Hand back; a refused one shows why and offers it again; a failed take-over shows the runner's error; one in progress shows 'Taking over…'", async () => {
+      let takeover: Record<string, unknown> = { handingBack: { by: 'user:demo', at: Date.now() }, error: null };
+      let preparing = false;
+      await page.route(taskRoute, async (route) => {
+        const response = await route.fetch();
+        const detail = (await response.json()) as {
+          task: { currentAttempt: string };
+          attempts: { id: string; status: string; takeover: object | null }[];
+        };
+        const current = detail.attempts.find((attempt) => attempt.id === detail.task.currentAttempt);
+        if (current?.takeover) Object.assign(current.takeover, takeover);
+        // While the runner prepares, the attempt still runs and has no take-over record yet.
+        if (current && preparing) Object.assign(current, { status: 'running', takeover: null });
+        await route.fulfill({ response, json: detail });
+      });
+      try {
+        await page.reload();
+        await takeoverCard.locator('.handing-back', { hasText: 'Handing back…' }).waitFor();
+        if ((await takeoverCard.locator('button', { hasText: 'Hand back' }).count()) !== 0) throw new Error('it offers Hand back');
+        takeover = { handingBack: null, error: 'process_running: pids 4121, 4188 still run in the clone' };
+        // The refusal is a command result and sends no event, so the panel's own reload has to bring it in.
+        await takeoverCard.locator('.handback-refused', { hasText: 'pids 4121, 4188 still run in the clone' }).waitFor({ timeout: 15_000 });
+        await takeoverCard.locator('button:text-is("Hand back from the clone")').waitFor();
+        takeover = { handingBack: null, local: null, error: 'clone_failed: git clone --shared exited 128' };
+        await page.reload();
+        await takeoverCard.locator('p.error', { hasText: 'could not ready its clone: clone_failed' }).waitFor();
+        await waitForCount(takeoverCard.locator('pre[aria-label]'), 1);
+        await takeoverCard.locator('pre[aria-label="The command for anywhere"]').waitFor();
+        preparing = true;
+        await page.reload();
+        await takeoverCard.locator('.taking-over', { hasText: 'Taking over…' }).waitFor();
+        const offered = await takeoverCard.locator('button, pre').count();
+        if (offered !== 0) throw new Error(`while taking over it offers ${offered} commands or buttons`);
+      } finally {
+        await page.unroute(taskRoute);
+      }
+      await page.reload();
+      await takeoverCard.locator('pre[aria-label="The command for anywhere"]').waitFor();
+    });
+    await check('handing T-8 back from the prefilled take-over ref with a 40-hex sha makes it Ready (or Claimed by the next agent), and its first attempt reads Taken over', async () => {
+      await takeoverCard.locator('button:text-is("Hand back from a ref")').click();
+      const form = takeoverCard.locator('.handback-form');
+      const ref = await form.locator('input[name=ref]').inputValue();
+      const { attempts } = await taskDetail('T-8');
+      const expected = attempts.find((attempt) => attempt.id === 'T-8-a1')?.takeover?.ref;
+      if (!expected || ref !== expected) throw new Error(`the ref reads ${ref}, not ${expected}`);
+      const confirm = form.locator('.confirm-action');
+      await form.locator('input[name=sha]').fill('3f2a9c1');
+      if (!(await confirm.isDisabled())) throw new Error('a short sha can be sent');
+      const sha = '3f2a9c1d'.repeat(5);
+      await form.locator('input[name=sha]').fill(sha);
+      await confirm.click();
+      await page.locator('.task-head .chip', { hasText: /^(Ready|Claimed|Working)$/ }).waitFor();
+      const { task } = await taskDetail('T-8');
+      if (task.workRef !== ref || task.workSha !== sha) throw new Error(`the work position is ${task.workRef} at ${task.workSha}`);
+      await attemptRow('a1').locator('.attempt-end', { hasText: /^Taken over$/ }).waitFor();
+    });
+    await open(page, '#/task/T-9', '.task-head');
+    await check('T-9, whose runner is offline, offers no Take over; Stop and hold makes T-9 Paused', async () => {
+      await runnerPanel.locator('.actions button').first().waitFor();
+      const offered = await runnerPanel.locator('.actions button').allTextContents();
+      if (offered.join(',') !== 'Stop,Stop and hold,Replace') throw new Error(`it offers ${offered.join(', ')}`);
+      await runnerPanel.locator('.actions button:text-is("Stop and hold")').click();
+      await runnerPanel.locator('.action-form textarea').fill('R-2 is away; hold this until bob is back.');
+      await runnerPanel.locator('.action-form .confirm-action:text-is("Stop and hold")').click();
+      await statusIs(page, 'Paused');
+    });
 
     await open(page, '#/timeline', '.log');
     await check('live events arrive without reloading', () => page.locator('.log-row.fresh').first().waitFor({ timeout: 12_000 }));
     await shot(page, 'timeline');
+    /** The type and subject of every event the timeline shows. */
+    const rows = () =>
+      page
+        .locator('.log-row')
+        .evaluateAll((items) => items.map((item) => ({ type: item.getAttribute('data-type') ?? '', subject: item.getAttribute('data-subject') })));
+    const filtered = async (label: string, prefixes: string[]) => {
+      await page.click(`.filters .filter:text-is("${label}")`);
+      await page.locator(`.filters .filter[aria-pressed="true"]:text-is("${label}")`).waitFor();
+      const shown = await rows();
+      if (shown.length === 0) throw new Error(`the ${label} filter shows nothing`);
+      const other = shown.filter((row) => !prefixes.some((prefix) => row.type.startsWith(prefix)));
+      if (other.length > 0) throw new Error(`the ${label} filter shows ${other.map((row) => row.type).join(', ')}`);
+      return shown;
+    };
+    await check('the Runners filter shows runner events, and the Attempts filter shows attempt events', async () => {
+      const runners = await filtered('Runners', ['runner.', 'account.']);
+      if (!runners.some((row) => row.type === 'runner.retired')) throw new Error("R-3's retirement is missing");
+      const attempts = await filtered('Attempts', ['attempt.', 'submission.', 'approval.']);
+      if (!attempts.some((row) => row.type === 'attempt.started')) throw new Error('no attempt started');
+      await page.click('.filters .filter:text-is("All")');
+    });
+    await check("a runner card's Events link shows only that runner's events, and an attempt page's Events link only that attempt's events", async () => {
+      await open(page, '#/runners', '.runner-card');
+      await card('R-1').locator('a.events-link').click();
+      await page.waitForURL(/#\/timeline\?subject=R-1$/);
+      await page.locator('.timeline-subject', { hasText: 'R-1' }).waitFor();
+      await page.locator('.log-row').first().waitFor();
+      const runnerRows = await rows();
+      if (runnerRows.some((row) => row.subject !== 'R-1')) throw new Error(`R-1's events include ${JSON.stringify(runnerRows)}`);
+      // T-10's first attempt: its task's events, kept to those of the attempt.
+      await open(page, '#/attempt/T-10-a1', '.attempt-head');
+      await page.locator('.attempt-head a.events-link').click();
+      await page.waitForURL(/#\/timeline\?subject=T-10-a1$/);
+      await page.locator('.log-row').first().waitFor();
+      const expected = await page.evaluate<number>(
+        "fetch('/api/events?subject=T-10&latest=1&limit=200').then((response) => response.json())" +
+          ".then(({ events }) => events.filter((event) => event.data.attemptId === 'T-10-a1').length)",
+      );
+      const all = await page.evaluate<number>(
+        "fetch('/api/events?subject=T-10&latest=1&limit=200').then((response) => response.json()).then(({ events }) => events.length)",
+      );
+      const attemptRows = await rows();
+      if (attemptRows.some((row) => row.subject !== 'T-10')) throw new Error(`T-10-a1's events include ${JSON.stringify(attemptRows)}`);
+      if (attemptRows.length !== expected || expected === all) {
+        throw new Error(`it shows ${attemptRows.length} events; the hub has ${expected} of T-10-a1 among T-10's ${all}`);
+      }
+      await page.click('.page-meta a:text-is("Show everything")');
+      await page.waitForURL(/#\/timeline$/);
+    });
 
     await open(page, '#/goal', '.charter-text');
+    const leadCard = page.locator('.lead-card');
+    const noLead = page.locator('.banner.no-lead');
+    type Seat = { kind: string; agentId: string | null; attemptId: string | null; runnerId: string | null; runnerLeads: boolean };
+    const seatNow = () =>
+      page.evaluate<Seat>("fetch('/api/status').then((response) => response.json()).then((status) => status.leadSeat)");
+    const firstSeat = await seatNow();
+    await check('the Goal page shows the lead on R-1 with its wake-ups', async () => {
+      if (firstSeat.kind !== 'runner' || firstSeat.runnerId !== 'R-1') throw new Error(`the seat: ${JSON.stringify(firstSeat)}`);
+      const summary = ((await leadCard.locator('.lead-summary').textContent()) ?? '').trim();
+      const expected = new RegExp(`^${firstSeat.agentId} on R-1, (no|\\d+) wake-ups? since its last rotation$`);
+      if (!expected.test(summary)) throw new Error(`the Lead section says ${summary}`);
+      const wakeups = (await leadCard.locator('.fact', { has: page.locator('dt:text-is("Wake-ups")') }).locator('dd').textContent()) ?? '';
+      if (!/^\d+$/.test(wakeups)) throw new Error(`the wake-ups read ${wakeups}`);
+      await leadCard.locator(`a.attempt-link[href="#/attempt/${firstSeat.attemptId}"]`).waitFor();
+      if ((await noLead.count()) !== 0) throw new Error('the no-lead banner shows while a lead holds the seat');
+    });
+    await check('turning runner leads off asks first; then the seat empties and the no-lead banner appears', async () => {
+      await leadCard.locator('button:text-is("Turn runner leads off")').click();
+      const confirm = leadCard.locator('button:text-is("Turn off and rotate the lead out")');
+      await confirm.waitFor();
+      if (!(await seatNow()).runnerLeads) throw new Error('one click turned them off');
+      await confirm.click();
+      // The runner lead writes its handoff and exits; then the seat is empty.
+      await noLead.filter({ hasText: 'agflow join --role lead' }).waitFor({ timeout: 20_000 });
+      await leadCard.locator('.lead-summary', { hasText: 'Nobody holds the lead seat' }).waitFor();
+      const seat = await seatNow();
+      if (seat.kind !== 'none' || seat.runnerLeads) throw new Error(`the seat: ${JSON.stringify(seat)}`);
+    });
+    await check('turning them back on starts a new runner lead, and the banner goes', async () => {
+      await leadCard.locator('button:text-is("Turn runner leads on")').click();
+      await noLead.waitFor({ state: 'detached', timeout: 20_000 });
+      const seat = await seatNow();
+      if (seat.kind !== 'runner' || !seat.attemptId?.startsWith('lead-') || seat.attemptId === firstSeat.attemptId) {
+        throw new Error(`the seat: ${JSON.stringify(seat)}`);
+      }
+      await leadCard.locator('.lead-summary', { hasText: `${seat.agentId} on ${seat.runnerId}` }).waitFor();
+    });
+    await shot(page, 'goal-lead');
     await check('pausing shows a banner, and resuming from it removes the banner', async () => {
       await page.click('button:has-text("Pause everything")');
       await page.click('button:has-text("Pause all work")');
@@ -220,12 +885,41 @@ async function main(): Promise<void> {
     });
 
     await page.setViewportSize({ width: 390, height: 844 });
-    await open(page, '#/board', '.board');
-    await check('the layout fits a phone screen', async () => {
+    /** Fails when the page is wider than the phone's screen. */
+    const fitsPhone = async () => {
       const width = await page.evaluate<number>('document.documentElement.scrollWidth');
       if (width > 390) throw new Error(`the page is ${width}px wide`);
-    });
+    };
+    await open(page, '#/board', '.board');
+    await check('the layout fits a phone screen', fitsPhone);
     await shot(page, 'phone-board');
+    // An approval card, with its full command, cwd, warnings and diff, is the widest M2 content. Both T-8 approvals are
+    // decided by now, so the Approvals page gets them as they were while pending, from a fake answer.
+    const approvalsRoute = (url: URL) => url.pathname === '/api/approvals';
+    await page.route(approvalsRoute, (route) =>
+      route.request().method() === 'GET' ? route.fulfill({ json: pendingApprovals }) : route.fallback(),
+    );
+    await check('the Runners page, the Approvals page with its approval cards and a task page with attempts fit a phone screen', async () => {
+      try {
+        for (const [hash, selector, name] of [
+          ['#/runners', '.runner-card', 'phone-runners'],
+          ['#/approvals', '.approval-card', 'phone-approvals'],
+          ['#/task/T-10', '.attempts-table', 'phone-task-attempts'],
+        ] as const) {
+          // A new hash keeps the page and its loaded data, so a reload fetches the approvals from the fake answer.
+          await page.goto(`${base}/${hash}`);
+          await page.reload();
+          await page.waitForSelector(selector);
+          if (hash === '#/approvals') await waitForCount(page.locator('.approval-card'), 2);
+          await fitsPhone().catch((error: Error) => {
+            throw new Error(`${hash}: ${error.message}`);
+          });
+          await shot(page, name);
+        }
+      } finally {
+        await page.unroute(approvalsRoute);
+      }
+    });
     await page.setViewportSize({ width: 1440, height: 900 });
 
     await check('signing out shows the sign-in page', async () => {
@@ -233,7 +927,7 @@ async function main(): Promise<void> {
       await page.locator('input[autocomplete=username]').waitFor();
     });
 
-    await check('no errors in the page', async () => {
+    await check('the final check finds no page errors after every M2 page', async () => {
       const errors = [...(await page.evaluate<string[]>('window.__agflowErrors')), ...consoleErrors];
       if (errors.length > 0) throw new Error(errors.join(' | '));
     });

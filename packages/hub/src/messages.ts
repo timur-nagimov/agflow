@@ -2,6 +2,7 @@ import { type Agent, type Message, type MessageView, parseTarget } from '@agflow
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
 import { badRequest, notFound } from './errors';
+import { holdsSeat } from './hub-state';
 
 export interface MessageRow {
   id: number;
@@ -78,9 +79,15 @@ export function sendMessage(ctx: HubContext, message: NewMessage): Message {
   return tx(ctx, (emit) => insertMessage(ctx, emit, message));
 }
 
+// A message in flight to one of the agent's runner attempts (pending_deliveries, design 6.7) is not unread for it.
 const UNREAD_SQL = `
 SELECT m.* FROM messages m
-WHERE m.sender != $self AND (
+WHERE m.sender != $self
+AND NOT EXISTS (
+  SELECT 1 FROM pending_deliveries p JOIN attempts a ON a.id = p.attempt_id
+  WHERE p.message_id = m.id AND a.agent_id = $id
+)
+AND (
   (m.target = $self AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.agent_id = $id))
   OR ($isLead = 1 AND m.target = 'lead' AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id))
   OR ($taskTarget IS NOT NULL AND m.target = $taskTarget
@@ -94,7 +101,8 @@ export function unreadFor(ctx: HubContext, agent: Agent): Message[] {
   const rows = ctx.db.query(UNREAD_SQL).all({
     self: `agent:${agent.id}`,
     id: agent.id,
-    isLead: agent.role === 'lead' ? 1 : 0,
+    // Lead messages are for the seat holder alone, whatever an agent's role column says.
+    isLead: holdsSeat(ctx, agent.id) ? 1 : 0,
     taskTarget: agent.currentTask ? `task:${agent.currentTask}` : null,
     createdAt: agent.createdAt,
   }) as MessageRow[];

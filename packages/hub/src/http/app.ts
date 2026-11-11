@@ -2,16 +2,21 @@ import { type Agent, TransitionError } from '@agflow/core';
 import { type Context, Hono } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { findAgent, touchAgent } from '../agents';
-import { verifySession } from '../auth';
+import { isAgentToken, resolveAgentToken, verifySession } from '../auth';
 import type { HubContext } from '../context';
-import { HubError, forbidden } from '../errors';
+import { HubError, agentNotAllowed, forbidden } from '../errors';
 import { mountAgentRoutes } from './agent-routes';
+import { isAgentRouteAllowed } from './agent-routes-allowed';
+import { mountApprovalRoutes } from './approval-routes';
+import { mountAttemptRoutes } from './attempt-routes';
 import { mountAuthRoutes } from './auth-routes';
 import { mountCliLoginPage } from './cli-login-page';
 import { mountEventRoutes } from './event-routes';
 import { mountGithubRoutes } from './github-routes';
+import { mountLeadRoutes } from './lead-routes';
 import { mountMessageRoutes } from './message-routes';
 import { mountProjectRoutes } from './project-routes';
+import { type RunnerLinkUpgrade, mountRunnerRoutes } from './runner-routes';
 import { mountStatic } from './static';
 import { mountTaskRoutes } from './task-routes';
 
@@ -19,7 +24,8 @@ export const SESSION_COOKIE = 'agflow_session';
 
 export interface Principal {
   user: string;
-  via: 'web' | 'cli';
+  /** agent: a runner agent's token, which always names its agent. */
+  via: 'web' | 'cli' | 'agent';
   agent: Agent | null;
   token: string;
 }
@@ -60,7 +66,14 @@ export function resolvePrincipal(
   cookie: string | undefined,
   agentId: string | undefined,
 ): Principal | null {
-  const token = bearerToken(authorization) || cookie;
+  const bearer = bearerToken(authorization);
+  // An agent token is never looked up as a session, and it names its own agent.
+  if (bearer && isAgentToken(bearer)) {
+    if (agentId) throw agentNotAllowed('an agent token names its agent; X-Agflow-Agent is refused with it');
+    const grant = resolveAgentToken(ctx, bearer);
+    return { user: grant.user, via: 'agent', agent: grant.agent, token: bearer };
+  }
+  const token = bearer || cookie;
   if (!token) return null;
   const session = verifySession(ctx, token);
   if (!session) return null;
@@ -69,17 +82,26 @@ export function resolvePrincipal(
     const found = findAgent(ctx, agentId);
     if (!found) throw new HubError(401, 'unknown_agent', `unknown agent ${agentId}; call hello again`);
     if (found.user !== session.user) throw forbidden('this agent belongs to another user');
+    // The owner's CLI token must not stand in for a runner agent, whose authority is its own scoped token.
+    if (found.origin === 'runner') throw forbidden('a runner agent acts only with its own agent token');
     touchAgent(ctx, found.id);
     agent = findAgent(ctx, found.id);
   }
   return { user: session.user, via: session.kind, agent, token };
 }
 
-export function createApp(ctx: HubContext): App {
+export interface AppOptions {
+  /** Opens runner links; startHub passes its server's. Without it, GET /api/runner/ws upgrades nothing. */
+  upgradeRunnerLink?: RunnerLinkUpgrade | undefined;
+}
+
+export function createApp(ctx: HubContext, options: AppOptions = {}): App {
   const app = new Hono<AppEnv>();
   const hubOrigin = originOf(ctx.config.publicUrl);
   app.onError((error, c) => {
-    if (error instanceof HubError) return c.json({ error: error.code, message: error.message }, error.status);
+    if (error instanceof HubError) {
+      return c.json({ error: error.code, message: error.message, ...error.extra }, error.status);
+    }
     if (error instanceof TransitionError) return c.json({ error: 'invalid_transition', message: error.message }, 409);
     console.error(error);
     return c.json({ error: 'internal', message: 'internal error' }, 500);
@@ -106,7 +128,12 @@ export function createApp(ctx: HubContext): App {
     if (cookie && !bearerToken(authorization) && !SAFE_METHODS.has(c.req.method) && crossOrigin(c, hubOrigin)) {
       throw forbidden('cross-site request refused');
     }
-    c.set('principal', resolvePrincipal(ctx, authorization, cookie, c.req.header('x-agflow-agent')));
+    const principal = resolvePrincipal(ctx, authorization, cookie, c.req.header('x-agflow-agent'));
+    // Agent tokens reach only their bridge's routes, checked here so that no route can forget it.
+    if (principal?.via === 'agent' && !isAgentRouteAllowed(c.req.method, c.req.path)) {
+      throw agentNotAllowed(`an agent token cannot use ${c.req.method} ${c.req.path}`);
+    }
+    c.set('principal', principal);
     await next();
   });
   mountAuthRoutes(app, ctx);
@@ -114,8 +141,12 @@ export function createApp(ctx: HubContext): App {
   mountProjectRoutes(app, ctx);
   mountTaskRoutes(app, ctx);
   mountAgentRoutes(app, ctx);
+  mountAttemptRoutes(app, ctx);
+  mountApprovalRoutes(app, ctx);
+  mountLeadRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
   mountEventRoutes(app, ctx);
+  mountRunnerRoutes(app, ctx, options.upgradeRunnerLink);
   mountCliLoginPage(app, ctx);
   if (ctx.config.webDist) mountStatic(app, ctx.config.webDist);
   return app;

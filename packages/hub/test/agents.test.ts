@@ -1,16 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import {
-  ACTIVE_MS,
-  IDLE_MS,
-  LEAD_STALE_MS,
-  currentLead,
-  getAgent,
-  helloAgent,
-  listAgents,
-  startLiveSession,
-} from '../src/agents';
+import { ACTIVE_MS, IDLE_MS, getAgent, helloAgent, listAgents, startLiveSession } from '../src/agents';
 import { HubError } from '../src/errors';
-import { listEvents } from '../src/events';
 import { createTestContext } from './helpers';
 
 describe('live sessions', () => {
@@ -46,32 +36,7 @@ describe('live sessions', () => {
   });
 });
 
-describe('lead seat', () => {
-  test('the first lead request takes the seat', () => {
-    const { ctx } = createTestContext();
-    const result = startLiveSession(ctx, 'alice', { vendor: 'claude', sessionId: 'lead', role: 'lead' });
-    expect(result.agent.role).toBe('lead');
-    expect(currentLead(ctx)?.id).toBe(result.agent.id);
-    expect(listEvents(ctx.db).map((event) => event.type)).toContain('agent.lead_changed');
-  });
-
-  test('a second lead request becomes a worker while the lead is fresh', () => {
-    const { ctx } = createTestContext();
-    const lead = startLiveSession(ctx, 'alice', { vendor: 'claude', sessionId: 'lead', role: 'lead' });
-    const other = startLiveSession(ctx, 'bob', { vendor: 'codex', sessionId: 'x', role: 'lead' });
-    expect(other.agent.role).toBe('worker');
-    expect(other.leadSeatTakenBy?.id).toBe(lead.agent.id);
-  });
-
-  test('a stale lead loses the seat to the next request', () => {
-    const { ctx, clock } = createTestContext();
-    const old = startLiveSession(ctx, 'alice', { vendor: 'claude', sessionId: 'lead', role: 'lead' });
-    clock.advance(LEAD_STALE_MS + 1);
-    const next = startLiveSession(ctx, 'bob', { vendor: 'codex', sessionId: 'x', role: 'lead' });
-    expect(next.agent.role).toBe('lead');
-    expect(getAgent(ctx, old.agent.id).role).toBe('worker');
-  });
-});
+// The lead seat has its own suite: lead-seat.test.ts.
 
 describe('hello and liveness', () => {
   test('hello resolves a code for the same user only', () => {

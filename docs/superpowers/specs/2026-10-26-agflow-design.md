@@ -147,13 +147,15 @@ retry ladder exhausted → failed (people are notified)
 - `ready`: plan checks passed, dependencies merged, and no running task owns an overlapping path.
 - Only the hub moves a task between states.
 
+M2 adds `rejected → blocked`, `ready → failed` and `blocked → failed` for re-planning and exhausted retries. The [M2 retry ladder](2026-10-28-m2-runners-design.md#69-retry-ladder-the-m2-part-of-spec-95) defines when these transitions apply; runner-attempt endings follow the [M2 trigger table](2026-10-28-m2-runners-design.md#64-attempts-fencing-and-leases).
+
 ### 5.4 Where state lives
 
 | Store | Contents |
 |---|---|
 | Hub database (SQLite) | Tasks, attempts, leases, agents, runners, messages, budgets and the append-only event log. Backed up daily; exportable. |
 | Repository | Durable shared knowledge: `AGENTS.md`, `CLAUDE.md` (a single line, `@AGENTS.md`), `docs/goal.md` (mirror of the current goal), `docs/decisions/`, `docs/research/`, `docs/architecture.md`, skills. |
-| Each worktree (untracked) | `.agflow/task.md` (the task pack) and `.agflow/brief.md`. Rewritten by the runner; never committed. |
+| Each attempt clone (untracked) | Runner files live in `.agflow/run/`, including `task.md` and `brief.md`; never committed. See the [M2 runner layout](2026-10-28-m2-runners-design.md#72-layout). |
 
 From M3, the merge queue (§9.6) commits `docs/goal.md` whenever the goal version changes. Until then the goal lives only in the hub.
 
@@ -161,37 +163,21 @@ From M3, the merge queue (§9.6) commits `docs/goal.md` whenever the goal versio
 
 ### 6.1 Runner
 
-`agflow runner start` runs in the foreground or as a launchd service. It:
+The runner supervises agents in standalone per-attempt clones, backed by a runner-owned vault. WIP goes to per-attempt refs; only the runner pushes. See [M2 git isolation and WIP](2026-10-28-m2-runners-design.md#73-git) and [sandboxed dependency preparation](2026-10-28-m2-runners-design.md#77-dependency-preparation).
 
-- connects to the hub over an outbound WebSocket (works behind NAT; the hub never connects to laptops) and registers its owner (from `agflow login`), logged-in vendors and CLI versions, capacity (default 2 agents), permission profile and keep-awake setting;
-- keeps one mirror clone per project and creates a worktree per task on branch `agflow/T-042-<slug>`;
-- pushes work-in-progress commits to the task branch every 10 minutes and before any handoff;
-- runs checks in a separate, clean verification worktree that no agent writes to;
-- performs pushes, PR creation and merges with the owner's existing git login (`gh`, `glab` or a git credential helper);
-- holds a macOS `caffeinate` assertion while its agents work, if the owner enabled keep-awake;
-- keeps agents working through hub outages, buffering events and replaying them after reconnecting.
+Foreground operation and the macOS service follow the [M2 runner lifecycle](2026-10-28-m2-runners-design.md#71-setup-service-and-lifecycle). Verification checks, PRs and merging move to M3; see [M2 scope](2026-10-28-m2-runners-design.md#2-scope).
 
 ### 6.2 Claude Code adapter
 
-- **Drive:** the Claude Agent SDK (TypeScript, on Bun) in streaming-input mode: one long-lived `claude` process per agent; `streamInput()` sends messages at any time and `interrupt()` stops a turn. Fallback: `claude -p --input-format stream-json --output-format stream-json --verbose`.
-- **Login:** the person's subscription. Never `--bare`. The runner removes `ANTHROPIC_API_KEY` from the agent's environment because it would silently replace the subscription login in print mode.
-- **Session:** the session ID is set up front with `--session-id` and stored on the attempt. Crash recovery uses `--resume`. A person takes over with `claude --resume <id>` in the task's worktree.
-- **Context:** `AGENTS.md` through `CLAUDE.md`; the task pack; the brief through an SDK `SessionStart` hook callback, which runs again after resume and compaction. Nothing dynamic goes into `--append-system-prompt`, because the system prompt is frozen at the first request.
-- **Tools and permissions:** the agflow MCP bridge via `--mcp-config … --strict-mcp-config`; `--permission-mode auto` with the runner profile's allow rules; `--permission-prompts none`, so anything that would prompt is denied instead of waiting.
+The Claude Agent SDK drives a long-lived session with a persistent message inbox, the runner's subscription home and a command hook for the brief. Drive, session, context, permissions and recovery follow the [M2 Claude Code adapter](2026-10-28-m2-runners-design.md#8-claude-code-adapter).
 
 ### 6.3 Codex adapter
 
-- **Drive:** one private `codex app-server` process per agent over stdio JSON-RPC. `thread/start` takes `cwd`, `model`, `sandbox: workspace-write`, `approvalPolicy`, `developerInstructions` and config overrides. `turn/start` starts a turn, `turn/steer` adds input to a running turn, and `turn/interrupt` stops it. The runner answers approval requests according to the permission profile. Fallback: `codex exec --json` plus `codex exec resume` (no steering mid-turn).
-- **Protocol types:** generated with `codex app-server generate-ts` for the pinned CLI version, and regenerated whenever the pin changes.
-- **Login:** the ChatGPT login stored in `CODEX_HOME`. No API key.
-- **Session:** the thread ID is stored on the attempt and used for resume and take-over (`codex resume <id>`).
-- **Context:** `AGENTS.md` loads only in trusted projects, so the runner marks each worktree as trusted through a config override. The task pack and brief are also passed as `developerInstructions`. After compaction or resume, the runner sends the brief again.
-- **Tools:** the agflow MCP bridge configured through `mcp_servers` config overrides.
-- **Quota:** read from `account/rateLimits/*` notifications.
+Each attempt uses a private `codex app-server` process. There is no exec fallback. Thread setup, project trust, context, messages, quota, approvals and recovery follow the [M2 Codex adapter](2026-10-28-m2-runners-design.md#9-codex-adapter).
 
 ### 6.4 Continuation without hooks
 
-Agents started by runners do not depend on hooks. When a turn ends and the agent has called none of `submit`, `declare_blocked` or `declare_impossible`, the runner sends a continuation prompt containing the task's remaining acceptance IDs. It does this up to `max_turns`, then marks the attempt stalled.
+The runner continues workers after eligible completed turns; leads receive no continuation. The hub decides stalls from the runner's facts. Eligibility, outage handling and budgets follow [M2 continuation and stall detection](2026-10-28-m2-runners-design.md#68-stall-detection-continuation-replacement-and-handoff).
 
 ### 6.5 Live chats (`agflow join`)
 
@@ -219,7 +205,7 @@ When a live chat claims a task, the bridge creates the task branch `agflow/T-<id
 
 | Target | Path |
 |---|---|
-| Agent started by a runner | Injected immediately: Claude `streamInput()`; Codex `turn/steer` if a turn is running, otherwise `turn/start`. |
+| Agent started by a runner | Pushed through the runner with delivery and acknowledgement tracking; see [M2 message delivery](2026-10-28-m2-runners-design.md#67-message-delivery-to-runner-agents) for batching, backlog and authority rules. |
 | Live Claude chat | `Stop` and `UserPromptSubmit` hooks. Best-effort immediate delivery to an idle chat through its session inbox socket (works, but the message format is undocumented). |
 | Live Codex chat | Hooks. Best-effort immediate delivery through the shared Codex daemon (not yet verified live). |
 
@@ -228,59 +214,27 @@ When a live chat claims a task, the bridge creates the task branch `agflow/T-<id
 
 ### 6.7 Leases, liveness and replacement
 
-- **Lease.** A claim is a lease `{task, attempt, agent, fencing_token, expires_at}`. Leases are renewed by activity the runner observes — agent events, file changes, commits — never by the agent's own report. Hub time is authoritative.
-- **Stall.** An attempt is stalled when any of these hold: no events for `stall_timeout` (default 10 minutes, longer while a known long command runs); several turns without tool calls or diff changes; repeated identical actions; budget exhausted; the process exited; the runner went offline.
-- **Who kills.** Only hub code stops or replaces agents, never an agent, and every kill is logged with its reason.
-- **Handoff.** The hub first asks the agent to write a handoff note and then stops it. If that fails, the hub assembles the note itself from:
-  - the task pack;
-  - the progress reports;
-  - `git log --stat base..HEAD` of the pushed branch;
-  - decisions;
-  - the last messages;
-  - the last turns of the transcript, uploaded by the runner.
-- **Handoff note fields:** done; remaining; commands run with their results; files touched; decisions and reasons; failed approaches with exact errors; blockers; next step; verification command and its last result.
-- **Successor.** The successor, from either vendor, continues on the same branch. Its first output must restate the current state and next step; the hub records it next to the handoff note so the manager can spot a mismatch.
-- **Fencing.** Submissions and pushes carrying an outdated fencing token are rejected.
-- **Fresh context per attempt.** Each attempt is a fresh agent, so context does not rot across tasks.
-- **Manager rotation.** Managers are long-lived but rotated with a handoff when their context grows large or after a fixed number of wake-ups.
+A runner lease measures laptop presence and is renewed by heartbeats. Stall decisions belong to the hub and use fresh attempt facts. Attempt endings, fencing and task moves follow the [M2 trigger table and lease rules](2026-10-28-m2-runners-design.md#64-attempts-fencing-and-leases); replacement, crashes, handoffs and successor context follow [M2 stall detection and handoff](2026-10-28-m2-runners-design.md#68-stall-detection-continuation-replacement-and-handoff).
+
+Live chats retain their M1 task leases, as distinguished in the same lease rules.
 
 ### 6.8 Scheduling and requesting agents
 
-- **Tick.** Every 15 seconds and on relevant events, the scheduler:
-  1. reconciles hub state with what runners actually report;
-  2. computes the ready set;
-  3. orders it by priority, then age;
-  4. claims tasks atomically;
-  5. dispatches each to a runner that has a free slot, the right vendor login and remaining quota.
-- **Caps:** concurrent code-writing agents per project (default 4); per-runner capacity; per-area share, set by the lead (M4); per vendor.
-- **`request_agents(role, count, vendor?, model?, reason)`** starts whatever the caps allow and replies with what actually started.
-- **Auto-fill.** If ready tasks are waiting and slots are free, the scheduler starts workers without asking a manager.
-- **Vendor choice, in order:**
-  1. a reviewer always differs from the author's vendor;
-  2. then the task's `vendor_hint`;
-  3. then the vendor with more remaining quota.
+The hub reconciles attempts and auto-fills ready work within the worker target and runner capacity. Placement uses quota per account, shared across that owner's runners. Ordering, eligibility, vendor preferences and `request_agents` follow the [M2 scheduler](2026-10-28-m2-runners-design.md#66-scheduler).
 
 ### 6.9 Permission profiles
 
-- **Default laptop profile:**
-  - Codex runs with `sandbox = workspace-write`. Command approvals are answered by an allowlist; everything else is declined.
-  - Claude Code runs with `--permission-mode auto`, the same allowlist as allow rules, and `--permission-prompts none`.
-- **Write access** is limited to the task's worktree.
-- **Network access** follows the profile, which defaults to package registries plus the git host.
-- **The owner** can tighten or loosen the profile per project.
+Claude defaults to `acceptEdits` with the sandbox; `auto` mode is opt-in. Codex uses `workspace-write`. The runner never decides an approval itself. Profiles, filesystem and network limits, and the agent environment follow [M2 profiles](2026-10-28-m2-runners-design.md#76-agent-environment-and-profile); requests that need an owner follow the [M2 approvals relay](2026-10-28-m2-runners-design.md#610-quota-and-approvals).
 
 ### 6.10 Accounts and usage limits
 
-- A runner uses only its owner's own logins. Credentials never leave the laptop and are never shared.
-- All of one person's parallel sessions share that account's 5-hour and weekly allowances, for both vendors.
-- When a runner sees a limit signal (Codex rate-limit notifications; Claude limit errors or results), it marks that vendor exhausted until the reset time, and the scheduler routes work elsewhere.
-- Plans' fair-use terms assume individual use. Heavy autonomous use may call for team or business plans. The UI shows usage per person so the team can judge.
+Runners use their owner's subscription logins in runner-specific vendor homes; credentials stay on the laptop. Quota is shared per owner, vendor and account, with per-runner ceilings and paid usage disabled by default. Quota waits, reset handling and owner-only approval decisions follow [M2 quota and approvals](2026-10-28-m2-runners-design.md#610-quota-and-approvals).
 
 ## 7. Managers, steering and the goal
 
 ### 7.1 Roles
 
-| | Lead manager (exactly one, held by a lease) | Area manager (zero or more, one per area; M4) |
+| | Lead manager (exactly one, holding the lead seat) | Area manager (zero or more, one per area; M4) |
 |---|---|---|
 | Plans | How the goal is read, milestones, which areas exist and their scopes | Tasks inside its area |
 | Staffing | Splits agent slots between areas and rebalances them | Requests agents within its share; asks the lead for more |
@@ -290,6 +244,8 @@ When a live chat claims a task, the bridge creates the task branch `agflow/T-<id
 - At most two levels.
 - Until areas exist, the lead plans tasks directly.
 - Work that crosses areas is a task created by the lead.
+
+The **lead seat** is an explicit hub record (`lead_agent_id`, `lead_kind`, `lead_since`); holding it grants lead authority, never the agent's role column. Both live and runner leads use it. Runner leads idle between wake-ups, rotate with a handoff and fail over on another runner; see [M2 §6.11](2026-10-28-m2-runners-design.md#611-the-lead-on-runners) for seat ownership and lifecycle.
 
 ### 7.2 Wake-ups
 
@@ -348,9 +304,9 @@ Enforced by hub code, not by prompts:
 
 ### 7.6 Guards
 
-- At most one lead at a time, held by a lease. If the lead's laptop goes offline, a new lead starts on another runner from the handoff.
-- Default limits: 4 re-plans per hour, 20 tasks per re-plan, 3 attempts per task, 200 open tasks. Hitting any limit pauses new dispatches and notifies people.
-- **Pause everything** and **pause area** controls in the UI.
+At most one lead holds the [lead seat](2026-10-28-m2-runners-design.md#611-the-lead-on-runners). The M1 creation limits remain; M2 adds a churn budget for mutating planning calls. Exhausting one task's attempt limit triggers that task's re-plan, rather than a project-wide pause. The counted calls, limits and dispatch pause are defined in [M2 §6.15](2026-10-28-m2-runners-design.md#615-guards).
+
+People can pause the project; area controls arrive with area managers in M4.
 
 ## 8. Context system
 
@@ -515,16 +471,11 @@ Human authority is never inferred from a CLI login, because agents on the same l
 | Reviewer | `get_review_packet`, `submit_review(verdict, findings[], criteria[])` |
 | Manager | Worker tools plus the tools in §7.3 |
 
-Calls are authorized by role, task and fencing token. For example, a worker can submit only its own current attempt.
+Runner-agent credentials are accepted only on the explicit [agent-token route allowlist in M2 §6.5](2026-10-28-m2-runners-design.md#65-agent-tokens-and-principals); every other route returns 403 `agent_not_allowed`. Holder, fence and lead-seat checks apply in addition to the allowlist. A runner agent cannot use the owner's CLI token to impersonate its identity. The table above spans milestones; it does not grant access to unimplemented tools or routes.
 
 ### 11.2 Hub–runner link
 
-A WebSocket opened by the runner, carrying JSON messages.
-
-- **Runner → hub:** `hello` (identity, vendors, versions, capacity, profile), `heartbeat`, `events` (batched, with sequence numbers, replayed after reconnecting), `command_result`.
-- **Hub → runner:** `start_agent`, `send_message`, `interrupt`, `stop`, `prepare_takeover`, `run_checks`, `run_review_packet`, `merge`, `update_profile`.
-
-Commands carry IDs and are idempotent. Delivery is at-least-once.
+The runner opens the authenticated protocol-1 WebSocket at `/api/runner/ws`. Durable sequenced events, cumulative acknowledgements, journalled commands, reconnect replay and settings sync follow [M2 §6.3](2026-10-28-m2-runners-design.md#63-runner-link), the source of truth for message shapes and reconciliation. Settings sync retains the M2 runner-side rule and its documented Known limits after a restore; the exact-echo protocol change is deferred.
 
 ### 11.3 Event types
 
@@ -532,44 +483,25 @@ Commands carry IDs and are idempotent. Delivery is at-least-once.
 
 ## 12. Security
 
-- **Login.** People sign in to the hub with GitHub or GitLab OAuth. Access is an allowlist of usernames configured on the hub.
-- **Human authority** comes only from browser sessions. CLI tokens can act only as agents, call hook endpoints, or read (§11.1).
-- **Runner identity.** A runner acts as its owner, using the login from `agflow login` (stored in the OS keychain).
-- **Agent identity.** Each agent gets a short-lived credential scoped to its agent ID, attempt, role and fencing token.
-- **What the hub stores.** Only the OAuth application settings and its own data. No AI credentials and no git credentials.
-- **Injection hygiene.**
-  - Task text, messages and repository content are presented to agents as quoted data.
-  - Messages from agents never authorize anything.
-  - Agents cannot approve permission requests.
-  - agflow never answers a live chat's approval prompts.
-- **Agent environment.** The runner starts agents with a minimal environment: no unrelated secrets, no `ANTHROPIC_API_KEY`, no `OPENAI_API_KEY`.
-- **Protected paths.** See §9.7.
+People sign in through GitHub or GitLab OAuth; the hub checks an allowlist of usernames. Browser sessions authorize people's controls. The hub stores its own state and OAuth application settings, never AI or git credentials.
+
+Runner agents are contained by network, write, authority and git boundaries. Only the runner pushes, from its agent-inaccessible vault. Every approval goes to the owner; agflow never grants one itself or bypasses device policy. Agent-authored text stays quoted. The boundaries, owner-approved escalation and residual risks (including same-user reads and shell profiles) are defined in [M2 §5](2026-10-28-m2-runners-design.md#5-security-model-for-runner-agents).
+
+The runner authenticates using `agflow login`'s CLI credential; keychain storage for that token is deferred to M3. Each runner agent uses an attempt- and fence-scoped token. Its route allowlist, revocation, epoch checks and lead-seat authority are defined in [M2 §6.5](2026-10-28-m2-runners-design.md#65-agent-tokens-and-principals). Live chats keep their M1 identity path and approvals remain with the person.
 
 ## 13. Failure handling
 
-| Failure | Behaviour |
-|---|---|
-| Hub down | Agents keep working. Runners buffer events and reconnect with backoff. MCP calls answer "hub unavailable, keep working". Nothing new is dispatched until the hub returns, then a reconcile pass runs. |
-| Laptop asleep or offline | Leases expire. Tasks go back to `ready` with a handoff note. Work in progress is already pushed. |
-| Agent process crashes | The runner reports the exit; the attempt ends; the retry ladder continues. |
-| Usage limit reached | That vendor on that runner is marked exhausted until reset; work moves to other runners or the other vendor. |
-| Superseded agent returns | Its fencing token is outdated, so its submissions and pushes are rejected. |
-| State drift | The reconcile pass compares hub state with runner reports and git, then fixes orphaned claims, zombie sessions and merged-but-unmarked tasks. |
-| Lead lost | The lead lease expires and a new lead starts from the handoff on another runner. |
-| Hub database loss | Restore from the daily backup. The repository still holds goal, decisions and research. |
+The hub remains the authority for attempts and work positions. Runner outages and crashes follow the [attempt trigger table](2026-10-28-m2-runners-design.md#64-attempts-fencing-and-leases) and [replacement and handoff rules](2026-10-28-m2-runners-design.md#68-stall-detection-continuation-replacement-and-handoff); quota waits follow [M2 §6.10](2026-10-28-m2-runners-design.md#610-quota-and-approvals). Lead loss follows the [lead-seat failover rules](2026-10-28-m2-runners-design.md#611-the-lead-on-runners).
+
+After hub downtime or a forward clock jump, a recovery window lets runners reconnect and replay before lease expiry, stall decisions or dispatch resume. Backward clock steps never shorten leases. Backup restores advance the epoch, replay retained work, then re-fence surviving attempts; unknown attempts stop. Hourly, daily and start backups and the offline restore procedure are defined in [M2 §6.14](2026-10-28-m2-runners-design.md#614-restarts-clock-jumps-restores-and-backups).
+
+During an outage runners buffer events, and failed bridge calls receive a retry nudge after reconnection. Reconciliation uses the [runner link protocol](2026-10-28-m2-runners-design.md#63-runner-link). WIP pushes have a bounded grace period; fenced or otherwise ineligible work is preserved as late work on separate refs, with durable retries, rather than overwriting a successor. See [M2 §7.3](2026-10-28-m2-runners-design.md#73-git) and [§7.4](2026-10-28-m2-runners-design.md#74-processes).
 
 ## 14. Testing
 
-- **Unit tests** for the deterministic core: task state machine, scheduler, admission by owned paths, leases and fencing, retry ladder, caps and guards.
-- **Fake CLIs** that replay recorded Claude stream-json and Codex app-server sessions, so runners are tested without using anyone's subscription.
-- **Smoke suite against the real CLIs** for every pinned-version change: start, message, interrupt, resume, submit. Both CLIs change weekly, and the Codex app-server is experimental.
-- **End-to-end runs on a toy repository** ("small CLI with tests plus one research note") with 2–3 real agents and injected faults:
-  - kill an agent mid-task;
-  - disconnect a runner;
-  - plant an agent that weakens tests.
+M2 combines deterministic core and hub tests, runner tests with a fake adapter and local bare origins, security contract tests, and real pinned CLIs driven by scripted model servers with scratch homes and zero subscription use. The local suites cover sandbox boundaries and multi-runner recovery (killed agent, closed laptop, lost lead, restarts, restore, delivery and take-over with hand-back). Gates, fixtures and the separately invoked manual live run are defined in [M2 §15](2026-10-28-m2-runners-design.md#15-testing).
 
-  Expected: tasks recover from handoff notes, the tampering is caught, and main stays green.
-- **Dogfooding.** From M2 on, agflow develops agflow.
+Validation and tamper-detection scenarios belong to M3, alongside checks, reviewers and the merge queue. From M2 on, agflow can dogfood on its own repository.
 
 ## 15. Stack and layout
 
@@ -582,18 +514,20 @@ Commands carry IDs and are idempotent. Delivery is at-least-once.
 ```
 packages/core      domain model, state machine, scheduler, policies (pure; unit-tested)
 packages/hub       HTTP API, SSE, runner gateway, auth, storage
-packages/runner    runner daemon, worktrees, git operations, checks, adapters/claude, adapters/codex
+packages/runner    daemon and service, per-attempt clones and vault, dependency preparation, vendor adapters
 packages/cli       agflow login | runner | join | mcp | brief | hook entry points
 packages/web       React UI
-packages/testkit   fake CLIs, recorded sessions, end-to-end harness
+packages/testkit   git fixtures, refusing proxy, scripted model servers, recorded-stream fake CLI, end-to-end harness
 ```
+
+Package dependencies and the shared runner/adapter interfaces are defined in [M2 §13](2026-10-28-m2-runners-design.md#13-packages-and-interfaces). Checks and verification clones arrive in M3.
 
 ## 16. Milestones
 
 | Milestone | Scope | Exit criteria |
 |---|---|---|
 | **M1: Project brain** | Hub (login, state, events, API, SSE); the task contract with structural checks (unknown or batch-local dependencies, cycles, owned-path overlap at claim time); guards (open-task and hourly creation limits); pause and resume; standing rules; daily backups with an integrity check; MCP bridge with worker and lead tools; web UI (goal editor, board with people's task actions, agents, timeline, steering chat, knowledge); `agflow join` for both CLIs, with a task branch per claim; the lead runs as a live chat started by a person, so it wakes when its turn ends or its person prompts it (immediate wake-ups arrive with runners in M2); tasks are accepted by the lead and marked merged by people. | On a toy repo, a person starts a Claude lead and two workers (one Claude, one Codex) with `agflow join`. The lead plans from the goal, workers claim and submit, a goal edit produces a visible re-plan, and a steering message reaches a worker through its `Stop` hook. |
-| **M2: Runners** | Runner daemon; Claude and Codex adapters; worktrees and WIP pushes; leases, stall detection, replacement and handoff; `request_agents` and auto-fill; quota-aware routing; permission profiles; keep-awake; take-over; lead failover. | Killing an agent and closing a laptop mid-task both end with the task finished on another runner from the handoff note; the lead survives losing its laptop. |
+| **M2: Runners** | Runner execution, isolation, recovery and operations as defined in [M2 design §2](2026-10-28-m2-runners-design.md#2-scope), including sandboxed dependency preparation, lead failover and the runner/attempt/approval UI. The lead accepts or rejects submissions; people mark tasks merged. | Killing an agent and closing a laptop mid-task both end with the task finished on another runner from the handoff note; the lead survives losing its laptop. |
 | **M3: Validation and merge** | Task contracts and plan checks; checks in verification worktrees; tamper and scope checks; cross-vendor review; research review; evidence log; retry ladder; PR per task; merge queue; protected paths. | A planted test-weakening agent is caught. A 10-task toy project goes from goal to merged main with no human action, and main stays green throughout. |
 | **M4: Scale and knowledge** | Area managers; learnings curation and curator tasks; context linter; hidden checks; plan critic; usage dashboards. | A two-area project runs with a lead and two area managers. A proposed learning reaches `AGENTS.md` through a curation task. |
 
@@ -613,32 +547,32 @@ Open questions to settle during implementation:
 
 1. Will Anthropic document the session inbox socket's message format (anthropics/claude-code issue #103048)?
 2. Can an external client steer threads in the shared Codex daemon in practice (not verified live)?
-3. What is the exact config override that marks a Codex worktree as trusted?
+3. What is the exact config override that marks a Codex clone as trusted? **Answered in M2:** `projects.<path>.trust_level` is a nested object in the thread config, never a dotted key: `config: { projects: { [realpath(clone)]: { trust_level: projectConfigVerified ? 'trusted' : 'untrusted' } } }`. The runner verifies `.codex/` against the restore base before start and resume; see [M2 §9.2](2026-10-28-m2-runners-design.md#92-threads-and-turns).
 4. How much quota does a typical task consume per vendor and plan? Measure during M2 and adjust the default caps.
 
 ## 18. Review findings to resolve before the M2 and M3 plans
 
-A four-reviewer adversarial review of this spec (2026-10-26) found the issues below. M1 already absorbs the ones that affect it. The ones listed here must be designed into the M2 and M3 plans; until then the matching sections above are incomplete.
+A four-reviewer adversarial review of this spec (2026-10-26) found the issues below. M1 absorbed the ones that affect it. The status column follows [M2 §17](2026-10-28-m2-runners-design.md#17-spec-changes). Resolved rows link to the current contract; open rows retain their required direction for M3 or M4. Resolution here covers M2 scope: reviewers and validation remain M3, and area managers remain M4.
 
-| # | Area | Problem | Required direction |
-|---|---|---|---|
-| 1 | Git credentials | Agents run as the laptop owner and can reach the owner's git login, so they could push to `main` and bypass the merge queue, fencing and the tamper scan. | Start agents with a credential-free git setup (own `GIT_CONFIG_GLOBAL` without credential helpers, empty `GH_CONFIG_DIR`, `GIT_TERMINAL_PROMPT=0`). Keep the git host off the agents' network allowlist. Deny `git push`, `gh` and `glab` in both CLIs. Only the runner pushes. |
-| 2 | Sandboxing | Allow rules decide which commands start, not what they do. Checks run agent-written code outside any sandbox. | One OS-level sandbox profile for every agent tool call and every runner-run check. Claude: the Bash sandbox via `--settings` with the unsandboxed fallback off. Codex: `network_access = false`, with the runner installing dependencies first. Checks: a macOS sandbox profile with no keychain or credential access. |
-| 3 | Repo-controlled config | Both CLIs load hooks, MCP servers and settings from the task branch at every start, so a tampered branch runs code on the next laptop before any scan. | Before every agent start, the runner restores people-only paths from the base. It strips them from work-in-progress commits and runs git with its own git directory and hooks disabled. |
-| 4 | Fencing on pushes | The git host knows nothing about fencing tokens, so a cut-off runner can keep pushing to a branch its successor uses. | Push work in progress to per-attempt refs (`agflow/T-42/a3`). The PR branch moves only after a fenced `submit`, via `--force-with-lease` against the commit the hub recorded. |
-| 5 | Leases after submit | An author waiting for checks and review looks stalled. | Only `claimed` and `working` hold leases. At `submit`, the hub keeps a hold instead. The process stops but its session id is kept, and it is resumed for step-1 fixes. Add `rebut_review`. |
-| 6 | Hub restarts | After an outage longer than the lease, every lease looks expired. | On start, a recovery window extends leases by the downtime and waits for runners to reconnect and replay before reconciling. A claim, its attempt and the start command are written in one transaction. |
-| 7 | Quota and long builds | Usage limits and long builds look like stalls and burn attempts. | A `quota_wait` attempt state freezes the lease, the stall timer and the budget. Stall windows are set per command. |
-| 8 | Merge queue | Merge jobs have no lease or fencing, and the git host cannot enforce the hub's verdict. | A short-lived merge permit bound to (task, head SHA, main SHA). Merges are conditional on the expected head SHA. A hub-signed acceptance attestation is checked by a required CI status. |
-| 9 | Validation inputs | Diffs use the frozen `base_commit` although branches are rebased. | Compute every diff as `merge-base(origin/main, HEAD)..HEAD`, and restore protected paths from the rebase target. |
-| 10 | Review blind spots | Some defects (data exfiltration, new dependencies, leaked secrets) cannot be shown by a failing test, so they would merge automatically. | Security-class findings block without a reproduction and go to a person. Add deterministic tamper rules for new outbound hosts and new dependencies. |
-| 11 | Per-role lifecycles | Continuation and stall rules assume workers, so managers would loop. | Managers are idle between wake-ups and hold a role lease. Reviewers end with `submit_review`. |
-| 12 | Guards | "Re-plan" is undefined, create-and-cancel loops evade the limits, and one hard task should not pause everything. | Count every mutating planning call and add a churn budget. Reaching the attempt limit triggers only a re-plan (§9.5 step 4). |
-| 13 | Vendor rules | §6.8 and §9.3 disagree about same-vendor review. | A reviewer uses the other vendor when it is available, otherwise the §9.3 fallback after a stated wait. |
-| 14 | Claude adapter | The SDK bundles a different Claude version than the installed CLI, auto mode may be unavailable, and API-key variables silently override the subscription. | Pin the binary and check its version at start. Fall back to `acceptEdits` plus the sandbox when auto mode is off. Build the agent environment from an allowlist and verify subscription auth before dispatch. |
-| 15 | Codex adapter | Codex forwards only allowlisted environment variables to stdio MCP servers, and `turn/steer` carries user authority. | Declare `mcp_servers.agflow.env_vars`. Send agent messages as tool-output items, and keep `turn/steer` for human steering. |
-| 16 | Restore | Restoring a daily backup rolls back counters and fencing tokens. | Continuous WAL replication or hourly snapshots, plus a hub epoch embedded in tokens and bumped on restore. |
-| 17 | Repo-derived context | The hub cannot read the repository, so it cannot build repo maps, pitfalls or the research index. | Runners and bridges build that context from the worktree and upload a derived index keyed by commit. |
+| # | Area | Problem | Required direction | Status |
+|---|---|---|---|---|
+| 1 | Git credentials | Agents run as the laptop owner and can reach the owner's git login, so they could push to `main` and bypass the merge queue, fencing and the tamper scan. | Network and credential isolation; only the runner pushes from its vault. [M2 contract](2026-10-28-m2-runners-design.md#5-security-model-for-runner-agents). | Resolved in M2 |
+| 2 | Sandboxing | Allow rules decide which commands start, not what they do. Checks run agent-written code outside any sandbox. | Sandboxed agent tools and dependency preparation are in M2; verification checks arrive in M3. [M2 contract](2026-10-28-m2-runners-design.md#77-dependency-preparation). | Resolved in M2 with sandboxed dependency preparation; checks in M3 |
+| 3 | Repo-controlled config | Both CLIs load hooks, MCP servers and settings from the task branch at every start, so a tampered branch runs code on the next laptop before any scan. | Restore and strip protected paths, and isolate runner git from agent-writable config. [M2 contract](2026-10-28-m2-runners-design.md#73-git). | Resolved in M2 |
+| 4 | Fencing on pushes | The git host knows nothing about fencing tokens, so a cut-off runner can keep pushing to a branch its successor uses. | Per-attempt WIP refs; fenced submission moves the task branch conditionally. [M2 contract](2026-10-28-m2-runners-design.md#613-submissions-from-runner-agents). | Resolved in M2 |
+| 5 | Leases after submit | An author waiting for checks and review looks stalled. | Submitted workers enter a hold, retaining the session for fixes; `rebut_review` waits for M3 reviewers. [M2 contract](2026-10-28-m2-runners-design.md#64-attempts-fencing-and-leases). | Resolved in M2 except `rebut_review` (M3) |
+| 6 | Hub restarts | After an outage longer than the lease, every lease looks expired. | Recovery windows extend leases and allow replay before reconciliation. [M2 contract](2026-10-28-m2-runners-design.md#614-restarts-clock-jumps-restores-and-backups). | Resolved in M2 |
+| 7 | Quota and long builds | Usage limits and long builds look like stalls and burn attempts. | Quota waits suspend stall and budget decisions; long tools have command-specific caps, while the runner lease still detects a lost laptop. [M2 contract](2026-10-28-m2-runners-design.md#68-stall-detection-continuation-replacement-and-handoff). | Resolved in M2 |
+| 8 | Merge queue | Merge jobs have no lease or fencing, and the git host cannot enforce the hub's verdict. | A short-lived merge permit bound to (task, head SHA, main SHA). Merges are conditional on the expected head SHA. A hub-signed acceptance attestation is checked by a required CI status. | Open for M3 |
+| 9 | Validation inputs | Diffs use the frozen `base_commit` although branches are rebased. | Compute every diff as `merge-base(origin/main, HEAD)..HEAD`, and restore protected paths from the rebase target. | Open for M3 |
+| 10 | Review blind spots | Some defects (data exfiltration, new dependencies, leaked secrets) cannot be shown by a failing test, so they would merge automatically. | Security-class findings block without a reproduction and go to a person. Add deterministic tamper rules for new outbound hosts and new dependencies. | Open for M3 |
+| 11 | Per-role lifecycles | Continuation and stall rules assume workers, so managers would loop. | Runner leads idle between wake-ups and hold the lead seat. Reviewers and area managers remain deferred. [M2 contract](2026-10-28-m2-runners-design.md#611-the-lead-on-runners). | Resolved in M2 |
+| 12 | Guards | "Re-plan" is undefined, create-and-cancel loops evade the limits, and one hard task should not pause everything. | Count mutating planning calls with a churn budget; one task reaching its attempt limit triggers its own re-plan. [M2 contract](2026-10-28-m2-runners-design.md#615-guards). | Resolved in M2 |
+| 13 | Vendor rules | §6.8 and §9.3 disagree about same-vendor review. | A reviewer uses the other vendor when it is available, otherwise the §9.3 fallback after a stated wait. | Open for M3 |
+| 14 | Claude adapter | The SDK bundles a different Claude version than the installed CLI, auto mode may be unavailable, and API-key variables silently override the subscription. | Pin and verify the binary, use a minimal environment and subscription preflight; standard is acceptEdits plus sandbox, auto is opt-in. [M2 contract](2026-10-28-m2-runners-design.md#8-claude-code-adapter). | Resolved in M2 |
+| 15 | Codex adapter | Codex forwards only allowlisted environment variables to stdio MCP servers, and `turn/steer` carries user authority. | Explicit bridge environment forwarding and tool-authority agent messages. [M2 contract](2026-10-28-m2-runners-design.md#9-codex-adapter). | Resolved in M2 |
+| 16 | Restore | Restoring a daily backup rolls back counters and fencing tokens. | Hourly snapshots, a restore epoch and replay before re-fencing. [M2 contract](2026-10-28-m2-runners-design.md#614-restarts-clock-jumps-restores-and-backups). | Resolved in M2 |
+| 17 | Repo-derived context | The hub cannot read the repository, so it cannot build repo maps, pitfalls or the research index. | Runners and bridges build that context from the worktree and upload a derived index keyed by commit. | Open for M4 |
 
 ## 19. References
 

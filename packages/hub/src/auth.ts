@@ -1,5 +1,9 @@
+import { type Agent, type Attempt, fenceEquals } from '@agflow/core';
+import { findAgent } from './agents';
+import { findAttempt } from './attempt-store';
 import { type HubContext, tx } from './context';
-import { conflict, forbidden } from './errors';
+import { attemptEnded, attemptRefenced, conflict, forbidden } from './errors';
+import { getHubState, hubEpoch } from './hub-state';
 
 export type SessionKind = 'web' | 'cli';
 
@@ -28,7 +32,9 @@ export function isAllowed(ctx: HubContext, user: string): boolean {
 
 export function createSession(ctx: HubContext, user: string, kind: SessionKind, label?: string): string {
   if (!isAllowed(ctx, user)) throw forbidden(`${user} is not on this hub's allowlist`);
-  const token = randomToken();
+  // resolvePrincipal reads every bearer with the agent prefix as an agent token, so no session token may have it.
+  let token = randomToken();
+  while (isAgentToken(token)) token = randomToken();
   const now = ctx.now();
   ctx.db
     .query(
@@ -46,7 +52,11 @@ export function createSession(ctx: HubContext, user: string, kind: SessionKind, 
 }
 
 export function verifySession(ctx: HubContext, token: string): SessionInfo | null {
-  const hash = hashToken(token);
+  return verifySessionHash(ctx, hashToken(token));
+}
+
+/** verifySession for a session known by its hash, such as the one a runner's link recorded in runners.session_hash. */
+export function verifySessionHash(ctx: HubContext, hash: string): SessionInfo | null {
   const row = ctx.db.query('SELECT login, kind, expires_at FROM sessions WHERE token_hash = $hash').get({ hash }) as {
     login: string;
     kind: SessionKind;
@@ -63,6 +73,106 @@ export function verifySession(ctx: HubContext, token: string): SessionInfo | nul
 
 export function deleteSession(ctx: HubContext, token: string): void {
   ctx.db.query('DELETE FROM sessions WHERE token_hash = $hash').run({ hash: hashToken(token) });
+}
+
+/** The key a session is stored under, which runners.session_hash records for a runner's link. */
+export function sessionHashOf(token: string): string {
+  return hashToken(token);
+}
+
+/**
+ * Moves a CLI session's expiry to a full TTL from now, so a runner in use never loses its login to the 90-day limit
+ * (design 6.3). False when no unexpired CLI session has this hash.
+ */
+export function slideSession(ctx: HubContext, sessionHash: string): boolean {
+  const now = ctx.now();
+  const result = ctx.db
+    .query("UPDATE sessions SET expires_at = $expires WHERE token_hash = $hash AND kind = 'cli' AND expires_at > $now")
+    .run({ hash: sessionHash, now, expires: now + SESSION_TTL.cli });
+  return result.changes > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Agent tokens (design 6.5)
+// ---------------------------------------------------------------------------
+
+export const AGENT_TOKEN_PREFIX = 'agt_';
+
+export function isAgentToken(token: string): boolean {
+  return token.startsWith(AGENT_TOKEN_PREFIX);
+}
+
+/**
+ * A new token for the attempt at the given fence: 'agt_' and 32 random bytes in base64url. Only its hash is stored;
+ * the raw token goes into a wire command and nowhere else.
+ */
+export function mintAgentToken(ctx: HubContext, attempt: Pick<Attempt, 'id' | 'agentId' | 'fence'>): string {
+  const token = `${AGENT_TOKEN_PREFIX}${randomToken(32)}`;
+  ctx.db
+    .query(
+      `INSERT INTO agent_tokens (token_hash, agent_id, attempt_id, fence_epoch, fence_counter, created_at)
+       VALUES ($hash, $agentId, $attemptId, $fenceEpoch, $fenceCounter, $now)`,
+    )
+    .run({
+      hash: hashToken(token),
+      agentId: attempt.agentId,
+      attemptId: attempt.id,
+      fenceEpoch: attempt.fence.epoch,
+      fenceCounter: attempt.fence.counter,
+      now: ctx.now(),
+    });
+  return token;
+}
+
+/** Every token of the attempt stops working: it ended, got a new fence, or the epoch changed. */
+export function revokeAgentTokens(ctx: HubContext, attemptId: string): void {
+  ctx.db
+    .query('UPDATE agent_tokens SET revoked_at = $now WHERE attempt_id = $attemptId AND revoked_at IS NULL')
+    .run({ attemptId, now: ctx.now() });
+}
+
+export interface AgentGrant {
+  /** The runner's owner, whose user the runner agent belongs to. */
+  user: string;
+  agent: Agent;
+  attempt: Attempt;
+}
+
+interface AgentTokenRow {
+  agent_id: string;
+  attempt_id: string;
+  fence_epoch: number;
+  fence_counter: number;
+  revoked_at: number | null;
+}
+
+/**
+ * The agent a token acts for. Valid means not revoked, the attempt not ended, and the token's fence the attempt's
+ * current one, at the current hub epoch. Otherwise it throws 401 attempt_refenced when a restore is about to give the
+ * attempt a new fence, and 401 attempt_ended for every other fault.
+ */
+export function resolveAgentToken(ctx: HubContext, token: string): AgentGrant {
+  const row = ctx.db
+    .query('SELECT agent_id, attempt_id, fence_epoch, fence_counter, revoked_at FROM agent_tokens WHERE token_hash = $hash')
+    .get({ hash: hashToken(token) }) as AgentTokenRow | null;
+  if (!row) {
+    // Tokens minted after the backup are unknown to a restored hub, and their attempts are about to be re-fenced.
+    const { restoredAt } = getHubState(ctx);
+    if (restoredAt !== null && ctx.now() - restoredAt < ctx.config.runnerLeaseMs) throw attemptRefenced();
+    throw attemptEnded(null);
+  }
+  const attempt = findAttempt(ctx, row.attempt_id);
+  if (!attempt || attempt.status === 'ended') throw attemptEnded(attempt?.endReason ?? null);
+  const fence = { epoch: row.fence_epoch, counter: row.fence_counter };
+  if (row.revoked_at !== null || !fenceEquals(fence, attempt.fence)) throw attemptEnded(null);
+  // The token's only fault is the epoch, so the attempt is waiting for its re-fence after a restore.
+  if (fence.epoch !== hubEpoch(ctx)) throw attemptRefenced();
+  const agent = findAgent(ctx, row.agent_id);
+  if (!agent) throw attemptEnded(null);
+  // Like a session, the token stops working once its owner leaves the allowlist. The answer stays in the closed set
+  // the bridge knows (design 6.5), so the agent is told to stop.
+  if (!isAllowed(ctx, agent.user)) throw attemptEnded(null);
+  return { user: agent.user, agent, attempt };
 }
 
 /** Stores only the approval; pollCliLogin starts the session when the CLI collects it, so no raw token is stored. */
