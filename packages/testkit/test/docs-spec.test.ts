@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { canTransition } from '../../core/src/task-state';
 
@@ -9,9 +9,14 @@ const spec = readFileSync(resolve(SPEC_DIR, '2026-10-26-agflow-design.md'), 'utf
 const m2 = readFileSync(resolve(SPEC_DIR, M2_FILE), 'utf8');
 
 function section(number: string): string {
-  const heading = `### ${number} `;
+  const heading = number.includes('.') ? `### ${number} ` : `## ${number}. `;
   expect(spec, `spec needs §${number}`).toContain(heading);
   return spec.split(heading)[1]!.split(/\n#{1,3} /)[0]!;
+}
+
+function tableRows(markdown: string): string[][] {
+  return markdown.split('\n').filter((line) => line.startsWith('|'))
+    .map((line) => line.slice(1, -1).split('|').map((cell) => cell.trim()));
 }
 
 function withoutFences(markdown: string): string {
@@ -122,5 +127,157 @@ describe('spec M2 domain and runner contracts', () => {
       expect(fragment, `${target} needs a heading fragment`).toBeTruthy();
       expect(anchors.has(decodeURIComponent(fragment!)), `${target} has no matching heading`).toBe(true);
     }
+  });
+});
+
+describe('spec M2 managers, security and milestones', () => {
+  test('M2 carries the implemented shell mitigation through verification, environment and snapshot rules', () => {
+    for (const number of ['3', '7.6', '8.2', '15', '18']) {
+      const heading = number.includes('.') ? `### ${number} ` : `## ${number}. `;
+      const text = m2.split(heading)[1]!.split(/\n#{1,3} /)[0]!;
+      expect(text, `M2 §${number}`).toContain('~/.zshrc');
+      if (number !== '15') {
+        expect(text, `M2 §${number}`).toContain('ZDOTDIR');
+        expect(text, `M2 §${number}`).toContain('CLAUDE_CODE_SHELL');
+      }
+    }
+    const checks = m2.split('## 15. ')[1]!.split('## 16. ')[0]!;
+    expect(checks).toContain("With either zsh or bash as the owner's `SHELL`");
+    expect(checks).toContain('their functions and PATH changes do not reach agent commands');
+    expect(m2).not.toContain('shell-profile proposal in the review notes remains undecided');
+    expect(m2).not.toContain('(or `.bashrc`)');
+  });
+
+  test('M2 §18 records the full X-49 contract', () => {
+    const changes = m2.split('## 18. ')[1]!;
+    for (const term of ['X-49', 'Runner.stateDetail', 'refused a start: <code>', 'next heartbeat',
+      'Attempt.stopRequested.by', 'user:<login>', 'agent:<id>', 'system', 'handingBack',
+      'epoch milliseconds', '409 handback_pending', 'Completion, refusal or timeout clears',
+      'task.ready', '{ from, attemptId, reason }', 'task.handed_back', 'reportHolds', 'utilization']) {
+      expect(changes).toContain(term);
+    }
+  });
+
+  test('§18 assigns every finding its M2 resolution or deferred milestone', () => {
+    const [header, , ...rows] = tableRows(section('18'));
+    expect(header, '§18 needs a Status column').toContain('Status');
+    const statusColumn = header!.indexOf('Status');
+    expect(rows.map((row) => Number(row[0]))).toEqual(Array.from({ length: 17 }, (_, i) => i + 1));
+    for (const row of rows) {
+      const id = Number(row[0]);
+      const expected = id === 5 ? 'Resolved in M2 except `rebut_review` (M3)'
+        : id === 2 ? 'Resolved in M2 with sandboxed dependency preparation; checks in M3'
+        : id === 17 ? 'Open for M4'
+        : [8, 9, 10, 13].includes(id) ? 'Open for M3' : 'Resolved in M2';
+      expect(row[statusColumn], `finding #${id}`).toBe(expected);
+    }
+  });
+
+  test('§17 question 3 answers trust with the nested projects.<path>.trust_level override', () => {
+    const question = section('17').split(/\n3\. /)[1]!.split(/\n4\. /)[0]!;
+    expect(question).toMatch(/answered/i);
+    expect(question).toContain('projects.<path>.trust_level');
+    expect(question).toMatch(/projects:\s*\{\s*\[realpath\(clone\)\]:\s*\{\s*trust_level:/);
+    expect(question).toContain("'trusted'");
+    expect(question).toContain("'untrusted'");
+    expect(linkTargets(question)).toContain(`${M2_FILE}#92-threads-and-turns`);
+  });
+
+  test('§15 layout lists exactly the package directories, once each', () => {
+    const layout = section('15').match(/```[^\n]*\n([\s\S]*?)```/)![1]!;
+    const listed = [...layout.matchAll(/^packages\/([^\s/]+)/gm)].map((match) => match[1]!).sort();
+    const actual = readdirSync(resolve(SPEC_DIR, '../../../packages'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    expect(listed).toEqual(actual);
+    expect(layout).toMatch(/packages\/runner[^\n]*clones[^\n]*vault/);
+    expect(layout).toMatch(/packages\/testkit[^\n]*scripted model servers/);
+  });
+
+  test('§16 M2 scope delegates to the M2 scope section', () => {
+    const row = tableRows(section('16')).find((cells) => cells[0]?.includes('M2:'))!;
+    expect(linkTargets(row[1]!)).toContain(`${M2_FILE}#2-scope`);
+    expect(row[1]).not.toContain('worktrees');
+  });
+
+  test('the M2 status names all seven implementing plans', () => {
+    const status = m2.match(/^- \*\*Status:\*\* (.+)$/m)![1]!;
+    expect(status).toMatch(/implemented/i);
+    expect(status.match(/\bM2[a-g]\b/g)).toEqual(['M2a', 'M2b', 'M2c', 'M2d', 'M2e', 'M2f', 'M2g']);
+    expect(m2).not.toMatch(/^#{1,6} .*implementation notes/im);
+  });
+
+  test.each([
+    ['7.1', '611-the-lead-on-runners'],
+    ['7.6', '611-the-lead-on-runners'],
+    ['7.6', '615-guards'],
+    ['11.1', '65-agent-tokens-and-principals'],
+    ['11.2', '63-runner-link'],
+    ['12', '5-security-model-for-runner-agents'],
+    ['12', '65-agent-tokens-and-principals'],
+    ['13', '614-restarts-clock-jumps-restores-and-backups'],
+    ['13', '63-runner-link'],
+    ['14', '15-testing'],
+    ['15', '13-packages-and-interfaces'],
+  ])('§%s delegates its contract to M2 #%s', (number, anchor) => {
+    expect(linkTargets(section(number))).toContain(`${M2_FILE}#${anchor}`);
+  });
+
+  test('superseded manager, link, security and failure rules are removed', () => {
+    expect(section('7.1')).toContain('lead seat');
+    expect(section('7.6')).not.toMatch(/4 re-plans|Hitting any limit/);
+    expect(section('11.1')).toMatch(/403[^\n]*agent_not_allowed/);
+    expect(section('11.2')).not.toMatch(/command_result|start_agent|run_checks|update_profile/);
+    expect(section('12')).not.toMatch(/stored in the OS keychain/);
+    expect(section('13')).not.toMatch(/hub unavailable, keep working|Restore from the daily backup/);
+    for (const term of [/recovery window/i, /clock jump/i, /epoch/i, /late work/i]) {
+      expect(section('13')).toMatch(term);
+    }
+    expect(section('14')).toMatch(/scripted model servers/i);
+    expect(section('14')).toMatch(/tamper[^\n]*M3/i);
+  });
+
+  test('settings-sync keeps the runner-only rule and records its limits and later protocol fix', () => {
+    const sync = m2.split('**Settings sync.**')[1]!.split('**Link behaviour:**')[0]!;
+    expect(sync).toContain('oldest unanswered edit');
+    expect(sync).toContain('Known limits');
+    expect(sync).toMatch(/After a restore[^\n]*equal echo[^\n]*lost/);
+    expect(sync).toContain('same versions');
+    const changes = m2.split('## 18. ')[1]!;
+    expect(changes).toMatch(/settings sync/i);
+    expect(changes).toMatch(/later milestone/i);
+    expect(changes).toContain('answers {seq, refused?}');
+  });
+
+  test('the M2 design records accepted late-work and backup clarifications', () => {
+    expect(m2).toContain('AttemptRecord.lateWorkSha');
+    expect(m2).toMatch(/cleanup pushes pending late work first, even with the clone gone/);
+    expect(m2).toMatch(/daily[^\n]*once per UTC day/);
+    expect(m2.split('## 18. ')[1]).toMatch(/submitted.head[^\n]*Known limit/i);
+  });
+
+  test('the M2 design records bridge startup isolation and persistent Codex tool discovery', () => {
+    const bridge = m2.split('## 10. Bridge and hooks')[1]!.split('## 11.')[0]!;
+    for (const flag of ['--no-compile-autoload-bunfig', '--no-compile-autoload-dotenv', '--no-env-file', '--config=/dev/null']) {
+      expect(bridge).toContain(flag);
+    }
+    expect(m2).toMatch(/bridge: \{[^\n]*tools: readonly string\[\]/);
+    expect(m2).toMatch(/developerInstructions[^\n]*launch.bridge.tools/);
+    expect(m2).toMatch(/cwd: codexUserHome/);
+  });
+
+  test('the M2 design distinguishes untrusted project config from skills and MCP startup', () => {
+    const threads = m2.split('### 9.2 Threads and turns')[1]!.split('### 9.3')[0]!;
+    expect(threads).toMatch(/untrusted[^\n]*still loads[^\n]*\.codex\/skills/);
+    expect(threads).toContain('mcpServer/startupStatus/updated');
+    expect(threads).toMatch(/trusted[^\n]*MCP servers[^\n]*outside the sandbox[^\n]*before/i);
+  });
+
+  test('the M2 design records Claude screening and resume clarifications', () => {
+    expect(m2).toContain("preset: 'claude_code'");
+    expect(m2).toContain('CLAUDE_BASH_NOTE');
+    expect(m2).toMatch(/resumed[^\n]*mismatch[^\n]*attempt.exited/);
+    expect(m2).toMatch(/computed Git subcommands/);
+    expect(m2).toContain('~/.agflow/work/*/*');
+    expect(m2).not.toMatch(/`~\/\.agflow\/work` (?:goes only|, with `allowRead`)/);
   });
 });

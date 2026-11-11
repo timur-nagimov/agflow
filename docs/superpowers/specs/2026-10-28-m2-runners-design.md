@@ -1,7 +1,7 @@
 # agflow M2 design — runners
 
 - **Date:** 2026-10-28, revision 4 (after the design review, a re-check of revision 2, and the cross-plan questions of the seven plan outlines)
-- **Status:** design for the M2 implementation plans
+- **Status:** implemented by plans M2a (hub), M2b (runner core and bridge), M2c (runner service and operations), M2d (Claude adapter), M2e (Codex adapter), M2f (web UI) and M2g (end-to-end and documentation); manual live-run results are recorded separately in [the runbook](../../m2-live-run.md).
 - **Extends:** [the agflow design spec](2026-10-26-agflow-design.md), sections 6, 9.5, 9.7 and 11–14, and the open items of section 18
 - **Evidence:**
   - A live verification of both CLIs, git isolation and process supervision on 2026-10-28 (Claude Code 2.1.285 with Agent SDK 0.3.285, Codex 0.159.2 under this Mac's MDM policy, git 2.50, Bun 1.3.11, macOS 26.6).
@@ -62,7 +62,7 @@ As in M1, the lead accepts or rejects submissions and people mark tasks merged.
 | A per-agent `CLAUDE_CONFIG_DIR` loses the login (earlier research) | The 2.1.285 binary names the keychain item `Claude Code-credentials-<first 8 hex of sha256(configDir)>` whenever `CLAUDE_CONFIG_DIR` is set. `.claude.json`, transcripts and memory stay inside the directory. | Each runner has its own Claude config directory and its own Codex home, each logged in once by the owner. Agents never load the owner's hooks, skills, MCP servers or global instructions, and the runner's login cannot disturb the owner's. |
 | Codex's managed policy shows as a mismatch on `thread/start` (revision 1) | On this Mac, `thread/start` returns the policy that was requested. `configRequirements/read` and `config/read {includeLayers: true}` show the requirements and the MDM layer. | Detection uses those two calls and fails closed. The runner never answers approvals itself anyway (section 6.10). |
 | Codex agents are isolated by their own `CODEX_HOME` | The built-in `codex_apps` MCP server exposes the account's ChatGPT apps. Their read-only tools (web search) run without approval. Personal skills load from `$HOME/.agents/skills`. | `--disable apps --disable plugins`. App-server runs with a runner-owned empty `HOME`. Every start checks that the agflow bridge is the only MCP server and that no user skills load. |
-| `ZDOTDIR` keeps the owner's shell profile away from Claude agents | Before its first Bash call, Claude Code runs `$SHELL -c -l` outside the sandbox and sources `$HOME/.zshrc` (or `.bashrc`) to build a shell snapshot. `ZDOTDIR` does not change that. | Accepted as a residual risk (section 5). The snapshot file lives in the runner's Claude home, which sandboxed commands cannot read. |
+| `ZDOTDIR` keeps the owner's shell profile away from Claude agents | The implemented mitigation sets `ZDOTDIR=<claudeHome>/agflow-empty`, drops incoming `CLAUDE_CODE_SHELL`, and sets `CLAUDE_CODE_SHELL=/bin/zsh` unless `SHELL` already names zsh. Only the snapshot sources `~/.zshrc` outside the sandbox, once per Claude process; `~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc` do not run around agent commands. | The snapshot remains an accepted residual risk (section 5). Its file lives in the runner's Claude home, which sandboxed commands cannot read. |
 | A per-attempt `TMPDIR` | Claude's sandbox always lets commands write `/tmp/claude`, and gives them `TMPDIR=/tmp/claude-<uid>`, which every Claude session of the user shares. With `CLAUDE_CODE_TMPDIR=<dir>` they get `<dir>/claude-<uid>`, but only while that path is at most 44 bytes; beyond that the CLI silently falls back to the shared directory. | Each Claude attempt gets a short private directory `/tmp/agf/<id>` as `CLAUDE_CODE_TMPDIR`, and `/tmp/claude` goes into `denyWrite`. |
 | Leases renewed by runner-observed activity (§6.7) | Claude is silent for a whole foreground tool call. A polling, hung tool looks busy to CPU and process signals. | **Runner lease** = the laptop is there. **Stall** = a hub decision from fresh facts, with a hard cap on tool time (section 6.8). |
 | Kill the agent's process group | Both CLIs put tool processes in their own sessions and groups. Claude ignores stdin EOF in the middle of a turn. SIGINT ends Codex but leaves its command running. | A stop ladder: interrupt, then close, then SIGTERM, then SIGKILL of every recorded group, with identity checks against PID reuse (section 7.4). |
@@ -644,16 +644,32 @@ export type HubMessage =
 
   `draining` is a separate flag. `RunnerVendor.degraded` and the hub's not-ready marks come from `runners.vendor_holds` and are never taken from runner messages. A vendor report whose `preflightAt` is later than the mark's `notReadySince` clears it.
 
-**Settings sync.** `runner.json` holds the settings and a snapshot of the last ones the hub confirmed, with their version.
-- `hello.settings` carries that snapshot and never a local edit.
+**Settings sync.** `runner.json` holds the settings, plus a snapshot of the last settings the hub confirmed, with their version.
+- `hello.settings` carries that snapshot, never a local edit.
 - On `hello`, the hub compares versions:
-  - a new runner: the hub stores the reported values at version 1 and echoes them with `update_settings`;
+  - a runner it does not know (a new runner, or a hub restored from a backup older than the runner): the hub stores the reported values at version 1 and echoes them with `update_settings`;
   - an equal version: nothing;
-  - an older version (the owner changed settings in the browser meanwhile): the hub sends its settings with `update_settings`;
-  - a newer version (a restored hub): the hub adopts the reported values and version.
-- Local edits (`drain`, `undrain`, a hand edit, the crash-loop self-drain) travel only as `runner.settings`, after `welcome`. After each `welcome` the runner sends every field where `runner.json` differs from the snapshot.
-- An `update_settings` echo replaces the snapshot. It also updates `runner.json`, except pending local edits (fields that differed from the old snapshot and differ from the echo): they keep their value and are sent again.
+  - an older version (the owner changed settings in the browser meanwhile): the hub sends all of its settings with `update_settings`;
+  - a newer version (a restored hub): the hub adopts the reported values and version, and cancels its pending `update_settings`.
+- Local edits (`drain`, `undrain`, a hand edit, the crash-loop self-drain) travel only as `runner.settings`, after `welcome`. The hub applies them in seq order, whatever their base, each at a new version. It echoes each one verbatim with `update_settings`, as it echoes the owner's edits. A local edit that cannot be written to `runner.json`, or whose `runner.settings` cannot be stored, changes nothing, and the error is thrown.
+- An edit is in flight until an echo answers it and the snapshot reaches that echo's version. `runner.json` holds the view: the snapshot with the edits in flight laid over it. A local edit counts as a change when it differs from `runner.json`, so an edit back to an earlier value is sent. After each `welcome`, the runner sends every field where `runner.json` differs from the view: a hand edit made while it was down.
+- An echo answers the oldest unanswered edit with the same settings among the edits the outbox held when the echo arrived. The runner keeps that answer in `runner.db` with the echo's version, and writes it before `runner.json`.
+- The snapshot moves one version at a time. An echo at the snapshot's version + 1 becomes the snapshot. `runner.json` takes the new view, except a field that differed from the view before the echo (an edit made by other means): that field keeps its value and is sent again. An echo at or below the snapshot's version only marks the edit it answers. The hub's whole settings (every field, with each per-vendor record naming every vendor the snapshot's record holds) become the snapshot at any version not below the snapshot's.
+- Each `hello` starts a new lineage of commands. An `update_settings` the runner took before its latest `hello` gets no result and does not run. The hub keeps a command with no result pending and sends it again after the next `welcome`, if it still has it.
+- These `update_settings` wait: one that would skip a version, one that fails (a `runner.db` error), and one whose journal row cannot be written. A failure is retried after 1 s, then after a wait that doubles up to 60 s. The waiting echoes run in version order, once the ones before them have run or the hub's whole settings cover them. Each gets its result on the same link. The next `hello` leaves the ones still waiting without a result. Any other command whose journal row cannot be written is answered with the failure.
+- When `runner.json` cannot be written, the runner logs it and keeps the new settings in memory; the next successful write catches the file up. If the runner restarts before then, it reads the older version, and its `hello` brings the hub's whole settings.
+- Refusals: the hub acknowledges an edit it refuses and never echoes it. After an acknowledgement, once the commands received before it have run, an acknowledged edit with no echo gets a probe. A probe is a `runner.settings` with no fields: the hub applies it at a new version and echoes it as `update_settings {}`, which nothing else sends. At the probe's echo, every older unanswered edit was refused. The runner logs a warning, `runner.json` takes the hub's value, and the edit is never sent again.
+- A restored hub: a `welcome` whose hub epoch differs from the last one's. The runner records the events it holds, then the new epoch (a death between the two records the events again). Then it says `hello` again at once, before it runs a command or sends an event. The hub reconciled the first `hello` against what its backup knew of the runner, perhaps nothing. The second `hello` finds the runner's snapshot there, at its version or adopted, and what the first one made the hub send is cancelled or gets no result. A write that fails while the runner handles a `welcome` or an `ack` is logged and handling continues. Failed restore bookkeeping is the exception: recording the held events and then the epoch share one guarded block; if either fails, the runner drops the link with normal backoff and returns before commands or replay. The epoch remains unrecorded and the next `welcome` retries the bookkeeping. Successful restore bookkeeping still reconnects immediately.
+- Replays: the replays to a restored hub leave out the edits held at its first `welcome` whose answer the snapshot holds, because the restored hub would apply them twice. Every other replay sends every event above `welcome.ackedSeq`, since the hub acknowledges an event in the transaction that applies it. The hub permits omissions within replay up to `hello.lastSeq`, and its cumulative acknowledgement covers them; gaps after `hello.lastSeq` close the link. Restored-hub omissions are bounded by `restoredThrough` and covered by the replacement `hello`. When the newest event held is one the replay leaves out, a probe follows it, so the acknowledgement reaches `hello.lastSeq`.
+- An events message the hub cannot apply as a whole receives no acknowledgement and closes the link with 1011. The runner reconnects through normal backoff and replays from the acknowledged position.
+- Retention never prunes an edit still in flight for the snapshot `runner.json` was last written with, and keeps no probe.
 - So a drain made while offline and a capacity change made in the browser meanwhile both survive.
+- Known limits. An echo does not name the edit it answers, and a version does not name the hub that gave it. The exact fix is a protocol change for a later milestone. `update_settings` would name the `runner.settings` it answers, refusals would be answered explicitly, and `hello` would name the edits its snapshot holds. Until then:
+  - After a restore, an edit that an equal echo answered before the edit reached the hub can be lost.
+  - After a restore, when the owner's edits took the hub past the runner's version before the runner's `hello`, the hub does not adopt the runner's snapshot. The edits the old hub echoed after the backup are then not delivered.
+  - When the owner's edits bring a restored hub exactly to the runner's version before its `hello`, the hub finds the versions equal. The two sides then keep different settings at the same versions.
+  - A restored hub ahead of the runner with another history (a backup older than an earlier restore) has its pending echoes applied on the runner's snapshot until its whole settings come.
+  - A probe's echo settles the oldest open probe. After a probe the hub refused, later refusals are settled one probe late, and new probes wait for the next `welcome`. When retention drops an acknowledged probe before its echo runs, that echo settles a newer probe and marks the edits before it as refused. `runner.json` reverts them until their own echoes come.
 
 **Link behaviour:**
 - The runner sends a heartbeat every 15 s. The hub answers each one with `heartbeat_ack`.
@@ -902,7 +918,7 @@ The runner applies `welcome.stop` before any command, and answers later commands
 - **(e) Holder fields.** A move at request time keeps `tasks.assignee`, `tasks.current_attempt` and the agent's `current_task`. The transaction that ends the attempt clears `current_task`. It also clears `assignee`, unless the task is `submitted` or `accepted`.
 
 **Cleanup.** The transaction that ends any attempt queues `cleanup_attempt` for it, except for `taken_over` attempts, whose cleanup follows hand-back.
-- The runner runs it once the attempt's final WIP is confirmed; for `lost` attempts, that is after the late-work push that `welcome.stop` triggers.
+- The runner runs it once the attempt's final WIP is confirmed; for `lost` attempts, that is after the late-work push that `welcome.stop` triggers. Before deleting anything, it pushes pending late work (the exit's harvest), then any newer clone work, each to a new late-work ref. A failed push keeps the clone and records the work for the durable retries in section 7.4; the hub does not resend a failed cleanup.
 - If the agent's process is still alive (an accept or reject during `hold_attempt`), `cleanup_attempt` first runs the stop ladder.
 - It uploads the transcript tail, then removes the clone, the pins, the private temporary directory and the transcript.
 
@@ -1353,7 +1369,7 @@ Runner agents cannot push, so `submit` has two phases.
   - The hub detects a restore from `hello.lastHubEpoch` being lower than its epoch. It first applies the events the runner replays (so WIP pushed after the backup still updates work positions). Then every attempt that the runner reports, and that the restored hub knows and has not ended, gets a new fence through `resume_attempt` (class `infra`; section 6.3). If its task no longer names it, it ends `superseded`.
   - Attempts the hub does not know go to `welcome.stop`. Their late work becomes a note on the task if the task exists, and goes to people otherwise.
   - Recorded branch heads are treated as unknown; the first `push_submission` of each task adopts the remote head under section 6.13's rule.
-- **Backups.** An `hourly` kind (kept 24 hours) joins `daily` (7) and `start` (3). The first hourly snapshot comes an hour after start, so a start still writes only `start` (and a missing `daily`). `VACUUM INTO` runs outside the tick, and its duration is logged.
+- **Backups.** An `hourly` kind (kept 24 hours) joins `daily` (7) and `start` (3). The first hourly snapshot comes an hour after start, so a start still writes only `start` (and a missing `daily`). The daily backup is written once per UTC day by hourly housekeeping. `VACUUM INTO` runs outside the tick, and its duration is logged.
 
 ### 6.15 Guards
 
@@ -1627,6 +1643,7 @@ Lead attempts have no WIP refs.
 - **Unrequested exits.** When an agent exits without a request (a worker or a lead), the runner first runs ladder steps 3 and 4: SIGKILL every recorded group that passes the identity check, then the clone sweep. Only then does the final work start, so an orphaned tool cannot write during or after the harvest.
 - **Final work before `attempt.exited`.** For every exit, requested or not, the runner first finishes the final harvest, strip and push, with retries for up to `finalPush` (60 s). Only then does it emit `attempt.exited`, with `finalSha` and `finalWip`, or `pushError`. After `prepare_takeover`, `attempt.taken_over` takes its place (section 6.12). After reporting a `pushError`, the runner keeps retrying that push with backoff to a late-work ref, and reports `attempt.late_work` when it lands.
 - **CLI version.** The runner records the CLI version each attempt started with. Every resume of the attempt runs that version's binary (`AgentLaunch.cliVersion`), and so do its take-over commands; new attempts use the current pin.
+- **Durable late work.** When a final push fails or `canPushWip` refuses it, the runner records `AttemptRecord.lateWorkSha` before reporting `attempt.exited`, even when a known-ended attempt reports `pushError: null`. It retries to a late-work ref with backoff until the push lands and `attempt.late_work` is reported. After a restart, retries resume at the first `welcome`. A cleanup pushes pending late work first, even with the clone gone. If either that push or the push of newer clone work fails, the clone is kept, the work stays pending and retries continue. A hand-back's push settles pending late work because the person's work includes the agent's.
 - **Resume failures.**
   - A session or thread that never ran a turn cannot be resumed ("No conversation found", "no rollout found"). The adapter then starts a fresh session in the same clone with the attempt's brief and first prompt, and reports the new `sessionRef`.
   - Any other resume failure is harvested and pushed, then reported as `attempt.failed_to_start` (infra).
@@ -1670,7 +1687,7 @@ export interface PermissionProfile {
 - **Claude's sandbox `filesystem.denyRead`** (Bash commands):
   - `~/.ssh`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/glab-cli`, `~/.config/agflow`;
   - `~/.agflow/runner`, all of it, with `allowRead` for `<CLAUDE_CONFIG_DIR>/projects/<slug of the clone>/`, because Claude Code saves oversized tool output there and tells the model to read it;
-  - `~/.agflow/work`, with `allowRead` for the attempt's own clone;
+  - `~/.agflow/work/*/*`, with `allowRead` for the attempt's own clone; the work root and project parents stay readable for package-script resolution;
   - `~/.claude`, `~/.claude.json`, `~/.codex`;
   - `~/Library/Keychains`;
   - `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker/config.json`.
@@ -1687,15 +1704,18 @@ export interface PermissionProfile {
 - **Sandbox `denyWrite`:** `/tmp/claude`, `/private/tmp/claude` and `~/.npm/_logs`. The sandbox runtime otherwise always lets commands write them.
 
 **Other attempts' clones and transcripts.** No permission rule ever names `~/.agflow/work`. Deny rules cannot be re-allowed, and `Edit` deny rules also become sandbox `denyWrite` paths, so such a rule would deny every Read, Edit and Write, and every sandboxed write, in the attempt's own clone. Instead:
-- `~/.agflow/work` goes only into the sandbox's `denyRead`, with `allowRead: [clone]`;
+- `~/.agflow/work/*/*` goes only into the sandbox's `denyRead`, with `allowRead: [clone]`; the work root and project parents stay readable for package-script resolution;
 - sandboxed writes are already limited to the clone and the temporary directory;
 - the guard (section 8.2) refuses:
   - any `Read`, `Glob`, `Grep`, `Edit`, `Write` or `NotebookEdit` whose real path, or search root, is under `~/.agflow/work` but outside the clone;
   - any `Read`, `Glob` or `Grep` under `<CLAUDE_CONFIG_DIR>/projects/` outside the attempt's own project directory;
   - any `Edit`, `Write` or `NotebookEdit` outside the clone and its temporary directory.
 
+**Bash screening.** Claude's command screening can refuse shell shapes before the sandbox runs them. Keep the production permission rules; for a complex legitimate operation, write a script inside the clone with Edit or Write and run it. The script still runs under the sandbox, including sibling-clone read denials. `CLAUDE_BASH_NOTE` explains this fallback and the refused computed Git subcommands.
+
 **Agent environment.** It is built from an allowlist, never by removing variables from the runner's own environment.
 - **User and system:** `USER`, `LOGNAME`, `LANG`, `LC_*`, `TERM=dumb`, `SHELL`, and `NODE_USE_SYSTEM_CA=1`.
+- **Claude shell:** the adapter sets `ZDOTDIR=<claudeHome>/agflow-empty` (an empty runner-owned directory), drops any incoming `CLAUDE_CODE_SHELL`, and sets `CLAUDE_CODE_SHELL=/bin/zsh` unless the basename of `SHELL` is already `zsh`. Only the snapshot sources `~/.zshrc` outside the sandbox, once per Claude process; `~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc` do not run around agent commands. The snapshot remains an accepted residual risk (section 5).
 - **Connectivity:** the variables captured at setup.
 - **Home and temporary directories:**
   - Claude: the owner's `HOME`, because the CLI process needs it for its login. `CLAUDE_CODE_TMPDIR=/tmp/agf/<id>`, a short private directory (mode 0700, removed at cleanup), also in the sandbox's `allowWrite`. The CLI creates `claude-<uid>/` (the commands' `TMPDIR`) and `cc-socks/` inside it. The runner refuses a temporary path whose `<dir>/claude-<uid>` exceeds 44 bytes, because beyond that the CLI silently falls back to the shared `/tmp/claude-<uid>`.
@@ -1775,7 +1795,7 @@ Agents need dependencies, but Codex agents have no network, and Claude's sandbox
 - **Quota and extra usage.** On the same query, preflight calls the SDK's experimental `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()`, which the pin fixes. Its `rate_limits` give the 5-hour and weekly utilization (percent / 100) and reset times; `extra_usage.is_enabled` gives `paidUsage` `enabled` or `disabled`. If the call fails or its shape differs, `paidUsage` is `unknown` and the quota stays unknown until the first `rate_limit_event`.
 - **The account** gives `accountId` (a hash of the account email) and `plan`. `managedPolicy` is always false for Claude.
 - **Weakened items.** Preflight's `weakened` list names what cannot be enforced: the `auto` profile, and the shared `/tmp/claude` if the local sandbox checks (section 15) find its `denyWrite` unenforced on the pin. The list is fixed per pin from those checks; nothing is probed at run time.
-- **First turn.** The first turn of every session checks `system/init` again, expecting the attempt's CLI version. A mismatch fails the start (`attempt.failed_to_start`, infra); the hub's two-failed-starts rule then marks the vendor not ready.
+- **First turn.** The first turn of every session checks `system/init` again, expecting the attempt's CLI version. A new session's mismatch fails the start (`attempt.failed_to_start`, infra); the hub's two-failed-starts rule then marks the vendor not ready. A resumed session's first-turn mismatch is reported as `attempt.exited`, rather than as a new failed start.
 
 ### 8.2 Session options
 
@@ -1788,6 +1808,7 @@ query({
     sessionId: newUuid /* new sessions */, resume: sessionRef /* resumed ones */,
     model,                                                    // AgentLaunch.model: a full id, never an alias
     settingSources: ['project'], projectConfigRoot: baseCheckout,
+    systemPrompt: { type: 'preset', preset: 'claude_code', append: CLAUDE_BASH_NOTE },
     strictMcpConfig: true,
     mcpServers: { agflow: { type: 'stdio', command, args: ['mcp', '--vendor', 'claude', '--runner'], env: bridgeEnv } },
     tools: ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'Task',
@@ -1811,17 +1832,18 @@ query({
 });
 ```
 
+- **System prompt.** The `claude_code` preset is explicit; otherwise the SDK sends an empty system prompt. The appended `CLAUDE_BASH_NOTE` explains the runner's Bash restrictions.
 - **Sandbox placement.** The sandbox is a top-level option, never also inside `settings`, so the SDK passes `failIfUnavailable` and Bash never runs unsandboxed.
 - **Bridge tools.** `permissions.allow` lists `mcp__agflow`; without it, every bridge call would be denied under `permissionPrompts: 'none'`. The flag-settings layer honours allow rules.
-- **Brief.** The brief arrives through the `SessionStart` command hook. That hook runs with `pwd` set to the base checkout, so `agflow hook brief --runner` identifies the attempt from `AGFLOW_AGENT_TOKEN`.
+- **Brief.** The brief arrives through the `SessionStart` command hook. The hook command changes to `<claudeHome>/agflow-empty` before starting agflow (section 10); `agflow hook brief --runner` identifies the attempt from `AGFLOW_AGENT_TOKEN`.
 - **The guard,** a `PreToolUse` callback in both profiles, refuses:
   - Bash commands that run `git push` (including `git -C … push`), `git credential`, `git config --global`, `gh`, `glab` or `security`, or that write into `.git/hooks` or `.git/config`;
   - `Edit`, `Write` and `NotebookEdit` whose real path is outside the clone and its temporary directory, or is `<clone>/.git/config` or under `<clone>/.git/hooks/`;
   - `Read`, `Glob` and `Grep` whose real path is in another attempt's clone, or under `<CLAUDE_CONFIG_DIR>/projects/` outside the attempt's own project directory (section 7.6).
 
-  A command the guard cannot parse is refused.
+  A command the guard cannot parse is refused. This includes computed Git subcommands through substitutions, backticks or variables, and eval/sh wrappers that could hide a push. Production Bash permissions stay restrictive; the script fallback in section 7.6 supports legitimate commands.
 - **Tools.** The explicit built-in tools list removes `SendMessage`, `ListAgents`, cron and wake-up tools, `RemoteTrigger`, `Workflow`, `EnterWorktree` and `ToolSearch`.
-- **Shell snapshot.** Claude Code sources the owner's shell profile outside the sandbox once per process (section 5). The snapshot is written to the runner's Claude home, which sandboxed commands cannot read. The owner's functions therefore do not reach agent commands, and the agent's `PATH` comes from its environment.
+- **Shell snapshot.** The mitigation is implemented: the adapter sets `ZDOTDIR=<claudeHome>/agflow-empty`, drops any incoming `CLAUDE_CODE_SHELL`, and sets `CLAUDE_CODE_SHELL=/bin/zsh` unless the basename of `SHELL` is already `zsh`. Only the snapshot sources the owner's `~/.zshrc` outside the sandbox, once per Claude process; `~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc` do not run around agent commands. The snapshot remains an accepted residual risk (section 5). It is written to the runner's Claude home, which sandboxed commands cannot read. The owner's functions therefore do not reach agent commands, and the agent's `PATH` comes from its environment.
 
 ### 8.3 Messages, turns and events
 
@@ -1893,6 +1915,7 @@ query({
     shell_environment_policy: { inherit: 'all', exclude: ['AGFLOW_*'],
                                 set: { HOME: `${clone}/.agflow/run/home`, TMPDIR: `${clone}/.agflow/run/tmp` } },
     mcp_servers: { agflow: { command, args: ['mcp', '--vendor', 'codex', '--runner'],
+                             cwd: codexUserHome,                 // never the clone; bridge runs outside the sandbox
                              env_vars: Object.keys(launch.bridge.env),   // every bridge variable of section 7.6:
                                        // the AGFLOW_* ones, the poll settings, NODE_USE_SYSTEM_CA, connectivity
                              default_tools_approval_mode: 'approve', required: true } },
@@ -1901,11 +1924,12 @@ query({
 }
 ```
 
-- **Trust.** Before `thread/start` and `thread/resume`, the runner checks that the clone's `.codex/` equals the restore base's, through the vault, after restoring the agent-config paths. It passes the answer as `AgentLaunch.projectConfigVerified`. The trust entry is always explicit: without one, Codex would trust the clone automatically and write a trust entry, which now lands in the runner's own Codex home. When the check fails, the thread runs `untrusted`, without the project's `.codex/` layer, and the runner logs a note.
+- **Trust.** Before `thread/start` and `thread/resume`, the runner checks that the clone's `.codex/` equals the restore base's, through the vault, after restoring the agent-config paths. It passes the answer as `AgentLaunch.projectConfigVerified`. The trust entry is always explicit: without one, Codex would trust the clone automatically and write a trust entry, which now lands in the runner's own Codex home. When the check fails, the thread runs `untrusted`: project config, hooks and exec policies are skipped, but it still loads `<clone>/.codex/skills`. The runner's warning says so.
 - **Checks after every `thread/start`.**
-  - `mcpServerStatus/list` must list only `agflow`.
+  - `mcpServerStatus/list` must list only `agflow`. The list omits servers still starting or failed, so any `mcpServer/startupStatus/updated` naming another server also refuses the start. A trusted project's MCP servers can run outside the sandbox before these checks refuse the thread: trusting a verified `.codex/` means trusting its commands.
   - `skills/list` must list no user or plugin skills.
   - A `configWarning` naming an unrecognised or disallowed setting fails the start (`failed_to_start`, infra).
+- **Tool discovery.** Code Mode defers MCP tools. `developerInstructions` also name `launch.bridge.tools` and the `tools.mcp__agflow__<name>` calling form, so tool discovery survives compaction; a first-prompt note alone would not.
 - **Naming.** The thread is named `agflow T-42-a3` (`thread/name/set`).
 - **Turns.** `turn/start` returns the active turn id; use it, because `turn/started` arrives later. `turn/completed` reports `completed`, `interrupted` or `failed`.
 - **Child threads.** All threads on the attempt's app-server belong to the attempt, including collaboration sub-agents. Turn tracking, continuation and acknowledgements follow only the main thread id. Approvals from child threads are relayed under the same attempt.
@@ -1946,6 +1970,8 @@ query({
 - **Take-over:** the app-server must exit, because `thread/unsubscribe` keeps the single-writer lock. The person then runs `codex resume --no-daemon <thread>` in the clone with the runner's `CODEX_HOME`. Hand-back stops any daemon in that home first; the runner core does that and builds the commands, so the adapter needs no take-over hooks.
 
 ## 10. Bridge and hooks
+
+**Startup isolation.** The bridge and Claude's brief hook run outside the vendor sandbox. They load no `bunfig.toml` or `.env` from their working directory: the compiled binary uses `--no-compile-autoload-bunfig` and `--no-compile-autoload-dotenv`; the source form runs `bun --no-env-file --config=/dev/null <repo>/packages/cli/src/main.ts`. Claude's bridge and brief hook start in `<claudeHome>/agflow-empty`. Codex's bridge MCP config sets its cwd to the runner's Codex user home, because stdio MCP servers otherwise start in the thread's cwd.
 
 **Runner mode** of `agflow mcp`. An explicit flag selects it, `agflow mcp --vendor <v> --runner`; it is never inferred.
 - At startup the bridge exits non-zero if `AGFLOW_AGENT_TOKEN`, `AGFLOW_HUB_URL`, `AGFLOW_ATTEMPT_ID`, `AGFLOW_ROLE` or `AGFLOW_CONFIG_DIR` is missing. With Codex's `required: true`, `thread/start` then fails.
@@ -2140,12 +2166,14 @@ export interface AgentLaunch {
   role: AgentRole;
   model: string;                 // resolved by the runner
   cliVersion: string;            // the pin at start; the attempt's recorded version on every resume (section 7.4)
-  clone: string;                 // real path; the agent's cwd
+  clone: string;                 // real path; tool commands run here; Codex app-server starts in codexUserHome
   baseCheckout: string | null;   // Claude's project config root; null for Codex
   projectConfigVerified: boolean;  // the clone's .codex/ equals the restore base's (section 9.2)
   tmpDir: string;                // CLAUDE_CODE_TMPDIR or the Codex TMPDIR
   env: Record<string, string>;   // the agent environment (section 7.6)
-  bridge: { command: string; args: string[]; env: Record<string, string> };
+  bridge: { command: string; args: string[]; env: Record<string, string>; tools: readonly string[] };
+                                 // unprefixed agflow tools for AGFLOW_ROLE; BRIDGE_TOOL_NAMES in packages/runner,
+                                 // checked against the CLI tool lists
   profile: PermissionProfile;
   brief: string;                 // spec.brief plus "Your working directory: <clone>" (section 10)
   firstPrompt: string;
@@ -2242,9 +2270,11 @@ Parallel plans avoid editing the same files: the runner core pre-declares the sh
   - `Edit` and `Write` to the base checkout and to `~/.zshrc` are refused in both profiles;
   - a bridge call succeeds without a permission denial;
   - a Codex attempt lists no `codex_apps` tools;
+  - the keychain lookup inside the sandbox uses the real HOME, so the check exercises the sandbox rather than HOME isolation;
+  - Bun package scripts succeed, script-based sibling-clone reads are refused, and expansion-based Git pushes remain refused;
   - a fixture `bun install` and `pip install` succeed from an empty cache through dependency preparation;
   - in both profiles, these succeed: Read, Edit and Write of a clone file; a Bash write and a git commit in the clone; a Read of a persisted oversized Bash output. If the last fails under the `~/.agflow/runner` read deny, the runner's files are denied one by one instead, and the runner's Claude home is left to the sandbox's `denyRead`;
-  - a marker `~/.zshrc` (and `~/.bashrc` with `SHELL=/bin/bash`) runs once per Claude process outside the sandbox, and its functions do not reach agent commands.
+  - With either zsh or bash as the owner's `SHELL`, the snapshot sources `~/.zshrc` once per Claude process outside the sandbox; the other startup files (`~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc`) do not run, and their functions and PATH changes do not reach agent commands.
 - **End-to-end (local).** M2g's harness: one hub, three runners with separate `AGFLOW_HOME`s, a local bare origin, scripted model servers, and short timings in test mode. It runs the three exit scenarios plus a runner restart, a hub restart, a hub restore, a delivery to a mid-turn agent, and a take-over with hand-back. It runs with `AGFLOW_E2E=1`, and then fails, instead of skipping, when a prerequisite is missing.
 - **Pinned binaries in tests.** `findClaudeBinary` (testkit) and `findCodexBinary` (`packages/runner`) look at `AGFLOW_CLAUDE_BIN` and `AGFLOW_CODEX_BIN`, then at the runner's vendor directory under `~/.agflow`; `bun run vendor:install` puts the pins there without a full setup. A test runner home links the located version directory into its own `vendor/`. A test runner without one vendor just lacks its binary, and preflight reports "binary missing".
 - **Live run (manual).** The exit scenarios with real subscriptions on a toy repository, like M1's, plus a TTY check of both take-over commands on the runner's laptop.
@@ -2366,5 +2396,14 @@ Revision 2 applies the review's upheld findings. The main changes:
 - **Hub.** Unknown agent tokens after a restore get `attempt_refenced`, and the 401 body names the end reason. M1 operations keep their M1 preconditions. A rule for a second stop request, and a row for stopping a runner lead. `startHub` options. Hub test mode (`AGFLOW_TEST_CONFIG`) and minimums. Retention runs outside the tick, and the first hourly backup an hour after start.
 - **Plans.** A staged, parallel execution order (section 14).
 - **Test mode and the web bundle.** Codex tests pass `test.codexConfig` as `-c` flags and write no `config.toml` (15.1). `packages/web` imports values only from zod-free core modules and checks the zod modules' values in its tests, so zod stays out of the browser bundle.
+
+**Accepted plan-review clarification (2026-11-11): settings sync.** Section 6.3 records the runner-only rule retained for M2: content-matched echoes, versioned answers, refusal probes, command lineages and restore replay filtering. Its Known limits include settings lost or diverging after a restore; a person may need to redo a local setting. The exact fix belongs to a later milestone: `update_settings` carries `answers {seq, refused?}`, refusals are explicit, `hello` names the highest answered `runner.settings` seq, and a restored hub adopting the snapshot skips those edits. That requires coordinated core and hub changes; it is not an M2 protocol promise.
+
+**Other accepted plan-review clarifications (2026-11-11).**
+- **X-49 (§6.1, §6.12).** A refused start sets `Runner.stateDetail` to `refused a start: <code>` until the next heartbeat. `Attempt.stopRequested.by` is `user:<login>`, `agent:<id>`, or `system`. A pending clone hand-back records `handingBack` with `by=user:<login>` and `at` in epoch milliseconds; another otherwise-authorized hand-back receives `409 handback_pending`. Completion, refusal or timeout clears it. A fallback without returned clone work emits `task.ready` with `{ from, attemptId, reason }`, not `task.handed_back`. Core exports `reportHolds` and `utilization` for the runner card.
+- **Recovery and late work (§6.4, §6.14, §7.4).** Daily backups run once per UTC day. Pending late work is durable before the exit event, retried after restart and pushed before cleanup, even without a clone. A failed cleanup retains its work for retries. A push of the submitted head after the attempt ended creates no late-work note or merge message; on a non-WIP ref it still emits `attempt.late_work` for retention. **Known limit:** the timeline labels this submitted-head event as late work even though there is nothing new; a distinguishing event flag is deferred.
+- **Bridge and Codex (§9.2, §10, §13).** The bridge and brief hook cannot autoload Bun config or dotenv from a clone. MCP cwd is explicit. `AgentLaunch.bridge.tools` supplies persistent Code Mode tool discovery. Untrusted Codex skips project config, hooks and exec policies but still loads project skills. MCP startup notifications cover servers omitted from the status list; verified project config remains trusted code running outside the sandbox.
+- **Claude (§3, §5, §7.6, §8.1–§8.2, §15).** The system-prompt preset is explicit, with `CLAUDE_BASH_NOTE`. A resumed first-turn mismatch is an exit. Read denials target individual clones so package scripts can resolve their parents; computed Git subcommands fail closed, and legitimate complex shell operations use the sandboxed script fallback. The shell-profile mitigation is implemented: the adapter sets `ZDOTDIR=<claudeHome>/agflow-empty`, drops any incoming `CLAUDE_CODE_SHELL`, and sets `CLAUDE_CODE_SHELL=/bin/zsh` unless the basename of `SHELL` is already `zsh`. Only the snapshot sources `~/.zshrc` outside the sandbox, once per Claude process; `~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc` do not run around agent commands. The snapshot remains an accepted residual risk. Carrying a resume's first message in `AgentLaunch` is future work.
+- **Deferred cleanup.** The web's fixable-submit flags keep their parity test; moving the core re-export to avoid bundling zod is a later-milestone change, with no M2 contract change.
 
 Later contract changes are recorded here the same way.
