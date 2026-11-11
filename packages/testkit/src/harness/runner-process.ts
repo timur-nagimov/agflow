@@ -17,7 +17,12 @@ import {
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { CREDENTIALS_FILE, type Credentials, CredentialsSchema, type Vendor } from '@agflow/core';
-import { type RunnerConfig, type RunnerTimings, saveRunnerConfig } from '@agflow/runner/src/config';
+import {
+  CONNECTIVITY_VARS,
+  type RunnerConfig,
+  type RunnerTimings,
+  saveRunnerConfig,
+} from '@agflow/runner/src/config';
 import { projectKey, type RunnerPaths, runnerPaths } from '@agflow/runner/src/paths';
 import { type ProcessIdentity, processIdentity, sameProcess } from '@agflow/runner/src/processes';
 import { removeAgentTools } from '@agflow/runner/src/run-dir';
@@ -78,6 +83,24 @@ function runnerPath(path = process.env.PATH ?? ''): string {
 /** What prepareRunnerHome needs of the scripted models: Models, or stand-ins in a test. */
 export type RunnerModels = Pick<Models, 'claudeEnv' | 'codexConfig' | 'proxyUrl'>;
 
+/**
+ * A live run's models (design 1, 15, X-43): the vendors' own services, reached through the person's runner vendor homes
+ * that one `agflow runner setup` logged in. Every runner of the run shares them, and none goes through the refusing
+ * proxy: they reach the network as the person's runner does.
+ */
+export interface RealModels {
+  readonly kind: 'real';
+  /** CLAUDE_CONFIG_DIR and CODEX_HOME exactly as setup created them: Claude's keychain item depends on the string. */
+  readonly homes: Readonly<Record<Vendor, string>>;
+  /** The person's HOME, which the runners get as in production: their remote git uses the person's credentials. */
+  readonly home: string;
+  /**
+   * The proxy and certificate variables setup recorded in the person's runner.json (design 7.1); empty without one.
+   * Each runner records them too, and its process gets them, as the LaunchAgent sets them.
+   */
+  readonly connectivity: RunnerConfig['connectivity'];
+}
+
 export interface RunnerHomeOptions {
   /** The runner's directory; created, and used at its real path. Keep it short: runner.sock must fit in 104 bytes. */
   dir: string;
@@ -87,9 +110,9 @@ export interface RunnerHomeOptions {
   credentials: Credentials;
   /** The vendors the runner offers; any other lacks its binary, and preflight reports 'binary missing' (X-10). */
   vendors: readonly Vendor[];
-  /** The located pinned binaries, from requireE2e. */
+  /** The located pinned binaries, from requireE2e; with real models, the person's from setup. */
   binaries: Partial<Record<Vendor, string>>;
-  models: RunnerModels;
+  models: RunnerModels | RealModels;
   /** The hub's project name, which names the runner's vault and clone directories; 'e2e' by default. */
   projectName?: string;
 }
@@ -103,7 +126,10 @@ export interface RunnerHome {
   readonly binaries: Partial<Record<Vendor, string>>;
   /** The runner's directory, at its real path; everything below lives in it. */
   readonly dir: string;
-  /** HOME: a scratch home, so no CLI ever reads or writes the developer's own. */
+  /**
+   * HOME: a scratch home, so no CLI ever reads or writes the developer's own; with real models, the person's HOME, as
+   * in production.
+   */
   readonly home: string;
   /** AGFLOW_HOME. */
   readonly agflowHome: string;
@@ -123,13 +149,27 @@ export interface RunnerHome {
   remove(): void;
 }
 
-/** The runner process's environment: only what the runner and its agents read, never a developer's own settings. */
-function runnerEnv(home: { home: string; agflowHome: string; configDir: string }): Record<string, string> {
+/**
+ * The runner process's environment: only what the runner and its agents read, never a developer's own settings. With
+ * real models the runner also gets the person's SSH agent, which its remote git uses for a remote origin, and the
+ * recorded connectivity variables, as the LaunchAgent gives them (design 7.1).
+ */
+function runnerEnv(
+  home: { home: string; agflowHome: string; configDir: string },
+  real: RealModels | null,
+): Record<string, string> {
   const env: Record<string, string> = { PATH: runnerPath() };
+  if (real !== null) {
+    for (const name of CONNECTIVITY_VARS) {
+      const value = real.connectivity[name];
+      if (value !== undefined) env[name] = value;
+    }
+  }
+  const passed = ['TMPDIR', 'USER', 'LOGNAME', 'LANG', 'SHELL', ...(real !== null ? ['SSH_AUTH_SOCK'] : [])];
   // The user variables agents inherit (buildAgentEnv), and the temporary directory Bun and the sandbox use.
   for (const [name, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
-    if (['TMPDIR', 'USER', 'LOGNAME', 'LANG', 'SHELL'].includes(name) || name.startsWith('LC_')) env[name] = value;
+    if (passed.includes(name) || name.startsWith('LC_')) env[name] = value;
   }
   return {
     ...env,
@@ -168,6 +208,8 @@ function linkBinaries(
 /**
  * Creates a runner home: runner.json from createRunnerConfig with readMachineId's id and the e2e overrides (X-42), the
  * vendor homes inside it, the offered vendors' binaries linked into its vendor/, and the owner's credentials.json.
+ * With real models, runner.json's test block holds only allowShortTimings (X-30), so preflight checks the logins; it
+ * points at the person's vendor homes and records the person's connectivity variables, never the refusing proxy.
  */
 export async function prepareRunnerHome(options: RunnerHomeOptions): Promise<RunnerHome> {
   mkdirSync(options.dir, { recursive: true });
@@ -175,28 +217,46 @@ export async function prepareRunnerHome(options: RunnerHomeOptions): Promise<Run
   const dir = realpathSync(options.dir);
   const owner = options.credentials.user;
   const projectName = options.projectName ?? 'e2e';
-  const home = join(dir, 'home');
+  const models = options.models;
+  const real = 'kind' in models ? models : null;
+  const home = real === null ? join(dir, 'home') : real.home;
   const agflowHome = join(dir, 'agflow');
   const configDir = join(dir, 'config');
-  for (const path of [home, agflowHome, configDir]) mkdirSync(path, { recursive: true, mode: 0o700 });
+  for (const path of [agflowHome, configDir, ...(real === null ? [home] : [])]) {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+  }
   const paths = runnerPaths(agflowHome);
   linkBinaries(paths, options.vendors, options.binaries);
-  const { claudeEnv, codexConfig, proxyUrl } = options.models;
+  const scripted = 'kind' in models ? null : models;
   const config = createRunnerConfig(
     {
       machineId: await readMachineId(),
       name: options.name,
       capturedPath: runnerPath(),
-      connectivity: { HTTPS_PROXY: proxyUrl, HTTP_PROXY: proxyUrl, ALL_PROXY: proxyUrl, NO_PROXY },
+      connectivity:
+        scripted === null
+          ? { ...real?.connectivity }
+          : { HTTPS_PROXY: scripted.proxyUrl, HTTP_PROXY: scripted.proxyUrl, ALL_PROXY: scripted.proxyUrl, NO_PROXY },
       commitIdentity: { name: owner, email: `${owner}@agflow.invalid` },
-      homes: { claude: canonicalHome(paths.homes.claude), codex: canonicalHome(paths.homes.codex) },
+      homes:
+        real === null
+          ? { claude: canonicalHome(paths.homes.claude), codex: canonicalHome(paths.homes.codex) }
+          : { ...real.homes },
     },
     {
       capacity: 2,
       keepAwake: 'off',
       minFreeGb: E2E_MIN_FREE_GB,
       timings: { ...E2E_RUNNER_TIMINGS },
-      test: { claudeEnv, codexConfig, skipAuthChecks: true, allowShortTimings: true },
+      test:
+        scripted === null
+          ? { allowShortTimings: true }
+          : {
+              claudeEnv: scripted.claudeEnv,
+              codexConfig: scripted.codexConfig,
+              skipAuthChecks: true,
+              allowShortTimings: true,
+            },
     },
   );
   saveRunnerConfig(paths.config, config);
@@ -216,7 +276,7 @@ export async function prepareRunnerHome(options: RunnerHomeOptions): Promise<Run
     config,
     hubUrl: credentials.hubUrl,
     projectName,
-    env: runnerEnv({ home, agflowHome, configDir }),
+    env: runnerEnv({ home, agflowHome, configDir }, real),
     logPath: join(dir, 'runner-process.log'),
     clonePath: (attemptId) => paths.clone(project, attemptId),
     remove() {

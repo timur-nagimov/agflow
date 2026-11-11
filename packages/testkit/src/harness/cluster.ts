@@ -1,18 +1,25 @@
 // A cluster for the e2e scenarios (design 1, 15): one hub process, a local bare origin, the scripted models and three
 // runners owned by alice, bob and carol. Every runner offers the cluster's vendor only (X-10), so placement and lead
 // seating are deterministic. Scenarios wait on what the hub shows; a wait that times out fails with a dump of
-// everything a reader needs to see why.
+// everything a reader needs to see why. A live run's cluster uses real models instead, and may use a throwaway remote
+// as its origin (X-43).
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Attempt, HubEvent, Vendor } from '@agflow/core';
-import { type OriginRepo, originRepo } from '../git-fixtures';
+import { gitIn, type OriginRepo, originRepo } from '../git-fixtures';
 import { requireE2e } from './env';
 import { E2E_USERS, type HubProcess, type HubTimings, startHubProcess } from './hub-process';
 import { type Models, startModels } from './models';
 import { cliToken, type Person, signIn } from './person';
 import { GATE_DIR, type Programs } from './playbook';
 import { processesInDir } from './proc';
-import { prepareRunnerHome, type RunnerHome, type RunnerProcess, startRunnerProcess } from './runner-process';
+import {
+  prepareRunnerHome,
+  type RealModels,
+  type RunnerHome,
+  type RunnerProcess,
+  startRunnerProcess,
+} from './runner-process';
 
 export interface ClusterOptions {
   /** Every runner offers this vendor only. */
@@ -27,10 +34,28 @@ export interface ClusterOptions {
   programs?: Programs;
   /** The hub's timings; E2E_HUB_TIMINGS by default. */
   hubTimings?: HubTimings;
+  /**
+   * The scripted servers behind the refusing proxy (the default), or a live run's real models through the person's
+   * logged-in vendor homes. With real models no scripted server starts, and Cluster.models records nothing.
+   */
+  models?: 'scripted' | RealModels;
+  /**
+   * The pinned binaries the runners link; by default requireE2e's located ones, or none with real models, which bring
+   * the person's.
+   */
+  binaries?: Partial<Record<Vendor, string>>;
+  /**
+   * A throwaway remote to use as the project's repository instead of a new local bare origin (a live run's --repo).
+   * The cluster resets it to main holding the files (remoteOrigin), and Cluster.origin is a local mirror of it that
+   * every wait fetches again before it returns, so the reads after a wait see what the hub saw.
+   */
+  repo?: string;
+  /** How long waitFor and waitForEvent wait by default; 120 s. A live run waits longer for real models. */
+  waitMs?: number;
 }
 
 export interface ClusterWaitOptions {
-  /** 120 s by default. */
+  /** ClusterOptions.waitMs by default. */
   timeoutMs?: number;
   /** 250 ms by default. */
   intervalMs?: number;
@@ -54,7 +79,9 @@ export interface Cluster {
   readonly dir: string;
   readonly vendor: Vendor;
   readonly hub: HubProcess;
+  /** The project's repository: a local bare origin, or the local mirror of a throwaway remote. */
   readonly origin: OriginRepo;
+  /** The scripted models; with real models, noScriptedModels(). */
   readonly models: Models;
   /** alice, signed in: she set the goal and the runner-leads switch, and accepts work. */
   readonly person: Person;
@@ -101,6 +128,119 @@ const DEFAULT_INTERVAL_MS = 250;
 const DEFAULT_GOAL = 'Keep the e2e repository tidy, one small task at a time.';
 const DEFAULT_FILES = { 'README.md': '# e2e\n\nA repository for agflow end-to-end tests.\n' };
 
+/** The subject of main's commit after remoteOrigin's reset: only a remote whose main has it may be reset again. */
+export const REMOTE_MAIN_SUBJECT = 'agflow: the toy repository of a live run';
+
+/** The refs a live run's cluster leaves on its remote, which a later reset may delete. */
+const RUN_REFS = [/^HEAD$/, /^refs\/heads\/main$/, /^refs\/heads\/agflow\//, /^refs\/agflow\//];
+
+/** A throwaway remote's local mirror, and how to fetch it again. */
+export interface RemoteOrigin {
+  origin: OriginRepo;
+  refresh(): Promise<void>;
+}
+
+/**
+ * git with the person's own environment and configuration, so their credentials reach the remote; no hooks run and
+ * nothing prompts.
+ */
+async function personGit(dir: string, args: string[]): Promise<string> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !name.startsWith('GIT_')) env[name] = value;
+  }
+  const proc = Bun.spawn(['git', '-c', 'core.hooksPath=/dev/null', ...args], {
+    cwd: dir,
+    env: { ...env, GIT_TERMINAL_PROMPT: '0' },
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) throw new Error(`git ${args.join(' ')} failed (exit ${code}): ${stderr.trim()}`);
+  return stdout.trim();
+}
+
+/**
+ * Resets a throwaway remote for a live cluster and mirrors it into dir: main becomes one new commit holding the files,
+ * and every other ref is deleted, so task ids starting again at T-1 meet no ref of an earlier run. It refuses a
+ * remote with a ref outside main and agflow's own refs, or whose main is not one a reset made: that is no throwaway.
+ */
+export async function remoteOrigin(url: string, files: Record<string, string>, dir: string): Promise<RemoteOrigin> {
+  mkdirSync(dirname(dir), { recursive: true });
+  await personGit(dirname(dir), ['clone', '--quiet', '--mirror', url, dir]);
+  const refs = (await personGit(dir, ['for-each-ref', '--format=%(refname)'])).split('\n').filter(Boolean);
+  const foreign = refs.filter((ref) => !RUN_REFS.some((pattern) => pattern.test(ref)));
+  const subject = refs.includes('refs/heads/main') ? await personGit(dir, ['log', '-1', '--format=%s', 'main']) : null;
+  if (foreign.length > 0 || (subject !== null && subject !== REMOTE_MAIN_SUBJECT)) {
+    const why = foreign.length > 0 ? `it has ${foreign.join(', ')}` : `its main is ${JSON.stringify(subject)}`;
+    throw new Error(`${url} is not a throwaway repository of the live run (${why}); give an empty repository`);
+  }
+  for (const ref of refs) await gitIn(dir, ['update-ref', '-d', ref]);
+  // The new main, committed in a scratch repository with the fixture identity and fetched into the mirror.
+  const scratch = mkdtempSync(join(dirname(dir), 'toy-'));
+  try {
+    await gitIn(scratch, ['init', '--quiet']);
+    for (const [path, content] of Object.entries(files)) {
+      mkdirSync(dirname(join(scratch, path)), { recursive: true });
+      writeFileSync(join(scratch, path), content);
+    }
+    await gitIn(scratch, ['add', '--all']);
+    await gitIn(scratch, ['commit', '--quiet', '-m', REMOTE_MAIN_SUBJECT]);
+    await gitIn(dir, ['fetch', '--quiet', scratch, '+HEAD:refs/heads/main']);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+  await gitIn(dir, ['symbolic-ref', 'HEAD', 'refs/heads/main']);
+  // The remote becomes the mirror: main is replaced, and every ref the mirror no longer has is deleted.
+  await personGit(dir, ['push', '--quiet', '--mirror', url]);
+  const mainSha = await gitIn(dir, ['rev-parse', 'refs/heads/main']);
+  return {
+    origin: { root: dir, path: dir, mainSha, remove: () => rmSync(dir, { recursive: true, force: true }) },
+    refresh: async () => {
+      await personGit(dir, ['fetch', '--quiet', '--prune', url, '+refs/*:refs/*']);
+    },
+  };
+}
+
+/** Cluster.models with real models: nothing is recorded, and nothing can be programmed or reached. */
+export function noScriptedModels(): Models {
+  const refuse = (what: string): never => {
+    throw new Error(`the cluster runs real models: it has no ${what}`);
+  };
+  return {
+    get anthropic() {
+      return refuse('scripted Anthropic server');
+    },
+    get responses() {
+      return refuse('scripted Responses provider');
+    },
+    get proxy() {
+      return refuse('refusing proxy');
+    },
+    get proxyUrl() {
+      return refuse('refusing proxy');
+    },
+    get claudeEnv() {
+      return refuse('scripted Anthropic server');
+    },
+    get codexConfig() {
+      return refuse('scripted Responses provider');
+    },
+    addPrograms: () => refuse('scripted programs'),
+    requests: () => [],
+    requestsFor: () => [],
+    sawText: () => false,
+    unmatched: () => [],
+    externalAttempts: () => [],
+    close: async () => {},
+  };
+}
+
 /** How much of the cluster the dump shows. */
 const DUMP = { attemptLog: 20, events: 40, logLines: 30, requests: 6, requestChars: 1_500 };
 
@@ -123,13 +263,17 @@ function matches(event: HubEvent, match: EventMatch): boolean {
 
 /** Starts a cluster; a start that fails stops every process it started and keeps its files for a look. */
 export async function startCluster(options: ClusterOptions): Promise<Cluster> {
-  const { binaries } = await requireE2e();
+  const real = options.models === undefined || options.models === 'scripted' ? null : options.models;
+  // A scripted cluster is e2e-gated whatever binaries it is given; a live run needs no gate, as it brings the person's.
+  const located = real === null ? (await requireE2e()).binaries : {};
+  const binaries = options.binaries ?? located;
   // Short and real: runner.sock must fit in 104 bytes, and lsof reports real paths.
   const dir = realpathSync(mkdtempSync('/tmp/agf-e2e-'));
   const started: {
     origin?: OriginRepo;
     models?: Models;
     hub?: HubProcess;
+    refreshOrigin?: () => Promise<void>;
     homes: RunnerHome[];
     runners: RunnerProcess[];
   } = { homes: [], runners: [] };
@@ -147,9 +291,16 @@ export async function startCluster(options: ClusterOptions): Promise<Cluster> {
     }
   };
   try {
-    started.origin = await originRepo(options.files ?? DEFAULT_FILES);
-    started.models = await startModels({ programs: options.programs });
-    const repo = started.origin.path;
+    const files = options.files ?? DEFAULT_FILES;
+    if (options.repo === undefined) {
+      started.origin = await originRepo(files);
+    } else {
+      const remote = await remoteOrigin(options.repo, files, join(dir, 'origin.git'));
+      started.origin = remote.origin;
+      started.refreshOrigin = remote.refresh;
+    }
+    started.models = real === null ? await startModels({ programs: options.programs }) : noScriptedModels();
+    const repo = options.repo ?? started.origin.path;
     const hub = await startHubProcess({ dir: join(dir, 'hub'), repo, timings: options.hubTimings });
     started.hub = hub;
     const people = await Promise.all(E2E_USERS.map((login) => signIn(hub.url, login)));
@@ -167,7 +318,7 @@ export async function startCluster(options: ClusterOptions): Promise<Cluster> {
           credentials: { hubUrl: hub.url, token: await cliToken(owner), user: owner.login },
           vendors: [options.vendor],
           binaries,
-          models,
+          models: real ?? models,
         }),
       );
     }
@@ -181,6 +332,8 @@ export async function startCluster(options: ClusterOptions): Promise<Cluster> {
       person,
       homes: started.homes,
       runners: started.runners,
+      waitMs: options.waitMs ?? DEFAULT_WAIT_MS,
+      refreshOrigin: started.refreshOrigin ?? null,
     });
   } catch (error) {
     await stopAll();
@@ -197,10 +350,13 @@ interface ClusterParts {
   person: Person;
   homes: RunnerHome[];
   runners: RunnerProcess[];
+  waitMs: number;
+  /** Fetches a remote origin's mirror again; null for a local origin. */
+  refreshOrigin: (() => Promise<void>) | null;
 }
 
 function createCluster(parts: ClusterParts): Cluster {
-  const { dir, vendor, hub, origin, models, person, homes, runners } = parts;
+  const { dir, vendor, hub, origin, models, person, homes, runners, waitMs, refreshOrigin } = parts;
   let failed = false;
   let inFlight = 0;
   let closing: Promise<void> | null = null;
@@ -293,14 +449,18 @@ function createCluster(parts: ClusterParts): Cluster {
     check: () => Promise<T | null | undefined | false>,
     options: ClusterWaitOptions = {},
   ): Promise<T> {
-    const timeoutMs = options.timeoutMs ?? DEFAULT_WAIT_MS;
+    const timeoutMs = options.timeoutMs ?? waitMs;
     const deadline = Date.now() + timeoutMs;
     let lastError: unknown = null;
     for (;;) {
       requireOpen(`wait for ${what}`);
       try {
         const value = await check();
-        if (value !== null && value !== undefined && value !== false) return value;
+        if (value !== null && value !== undefined && value !== false) {
+          // A remote's pushes come before the hub records them, so the mirror is fetched once the wait is over.
+          if (refreshOrigin !== null) await refreshOrigin();
+          return value;
+        }
         lastError = null;
       } catch (error) {
         lastError = error;
