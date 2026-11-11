@@ -147,13 +147,15 @@ retry ladder exhausted → failed (people are notified)
 - `ready`: plan checks passed, dependencies merged, and no running task owns an overlapping path.
 - Only the hub moves a task between states.
 
+M2 adds `rejected → blocked`, `ready → failed` and `blocked → failed` for re-planning and exhausted retries. The [M2 retry ladder](2026-10-28-m2-runners-design.md#69-retry-ladder-the-m2-part-of-spec-95) defines when these transitions apply; runner-attempt endings follow the [M2 trigger table](2026-10-28-m2-runners-design.md#64-attempts-fencing-and-leases).
+
 ### 5.4 Where state lives
 
 | Store | Contents |
 |---|---|
 | Hub database (SQLite) | Tasks, attempts, leases, agents, runners, messages, budgets and the append-only event log. Backed up daily; exportable. |
 | Repository | Durable shared knowledge: `AGENTS.md`, `CLAUDE.md` (a single line, `@AGENTS.md`), `docs/goal.md` (mirror of the current goal), `docs/decisions/`, `docs/research/`, `docs/architecture.md`, skills. |
-| Each worktree (untracked) | `.agflow/task.md` (the task pack) and `.agflow/brief.md`. Rewritten by the runner; never committed. |
+| Each attempt clone (untracked) | Runner files live in `.agflow/run/`, including `task.md` and `brief.md`; never committed. See the [M2 runner layout](2026-10-28-m2-runners-design.md#72-layout). |
 
 From M3, the merge queue (§9.6) commits `docs/goal.md` whenever the goal version changes. Until then the goal lives only in the hub.
 
@@ -161,37 +163,21 @@ From M3, the merge queue (§9.6) commits `docs/goal.md` whenever the goal versio
 
 ### 6.1 Runner
 
-`agflow runner start` runs in the foreground or as a launchd service. It:
+The runner supervises agents in standalone per-attempt clones, backed by a runner-owned vault. WIP goes to per-attempt refs; only the runner pushes. See [M2 git isolation and WIP](2026-10-28-m2-runners-design.md#73-git) and [sandboxed dependency preparation](2026-10-28-m2-runners-design.md#77-dependency-preparation).
 
-- connects to the hub over an outbound WebSocket (works behind NAT; the hub never connects to laptops) and registers its owner (from `agflow login`), logged-in vendors and CLI versions, capacity (default 2 agents), permission profile and keep-awake setting;
-- keeps one mirror clone per project and creates a worktree per task on branch `agflow/T-042-<slug>`;
-- pushes work-in-progress commits to the task branch every 10 minutes and before any handoff;
-- runs checks in a separate, clean verification worktree that no agent writes to;
-- performs pushes, PR creation and merges with the owner's existing git login (`gh`, `glab` or a git credential helper);
-- holds a macOS `caffeinate` assertion while its agents work, if the owner enabled keep-awake;
-- keeps agents working through hub outages, buffering events and replaying them after reconnecting.
+Foreground operation and the macOS service follow the [M2 runner lifecycle](2026-10-28-m2-runners-design.md#71-setup-service-and-lifecycle). Verification checks, PRs and merging move to M3; see [M2 scope](2026-10-28-m2-runners-design.md#2-scope).
 
 ### 6.2 Claude Code adapter
 
-- **Drive:** the Claude Agent SDK (TypeScript, on Bun) in streaming-input mode: one long-lived `claude` process per agent; `streamInput()` sends messages at any time and `interrupt()` stops a turn. Fallback: `claude -p --input-format stream-json --output-format stream-json --verbose`.
-- **Login:** the person's subscription. Never `--bare`. The runner removes `ANTHROPIC_API_KEY` from the agent's environment because it would silently replace the subscription login in print mode.
-- **Session:** the session ID is set up front with `--session-id` and stored on the attempt. Crash recovery uses `--resume`. A person takes over with `claude --resume <id>` in the task's worktree.
-- **Context:** `AGENTS.md` through `CLAUDE.md`; the task pack; the brief through an SDK `SessionStart` hook callback, which runs again after resume and compaction. Nothing dynamic goes into `--append-system-prompt`, because the system prompt is frozen at the first request.
-- **Tools and permissions:** the agflow MCP bridge via `--mcp-config … --strict-mcp-config`; `--permission-mode auto` with the runner profile's allow rules; `--permission-prompts none`, so anything that would prompt is denied instead of waiting.
+The Claude Agent SDK drives a long-lived session with a persistent message inbox, the runner's subscription home and a command hook for the brief. Drive, session, context, permissions and recovery follow the [M2 Claude Code adapter](2026-10-28-m2-runners-design.md#8-claude-code-adapter).
 
 ### 6.3 Codex adapter
 
-- **Drive:** one private `codex app-server` process per agent over stdio JSON-RPC. `thread/start` takes `cwd`, `model`, `sandbox: workspace-write`, `approvalPolicy`, `developerInstructions` and config overrides. `turn/start` starts a turn, `turn/steer` adds input to a running turn, and `turn/interrupt` stops it. The runner answers approval requests according to the permission profile. Fallback: `codex exec --json` plus `codex exec resume` (no steering mid-turn).
-- **Protocol types:** generated with `codex app-server generate-ts` for the pinned CLI version, and regenerated whenever the pin changes.
-- **Login:** the ChatGPT login stored in `CODEX_HOME`. No API key.
-- **Session:** the thread ID is stored on the attempt and used for resume and take-over (`codex resume <id>`).
-- **Context:** `AGENTS.md` loads only in trusted projects, so the runner marks each worktree as trusted through a config override. The task pack and brief are also passed as `developerInstructions`. After compaction or resume, the runner sends the brief again.
-- **Tools:** the agflow MCP bridge configured through `mcp_servers` config overrides.
-- **Quota:** read from `account/rateLimits/*` notifications.
+Each attempt uses a private `codex app-server` process. There is no exec fallback. Thread setup, project trust, context, messages, quota, approvals and recovery follow the [M2 Codex adapter](2026-10-28-m2-runners-design.md#9-codex-adapter).
 
 ### 6.4 Continuation without hooks
 
-Agents started by runners do not depend on hooks. When a turn ends and the agent has called none of `submit`, `declare_blocked` or `declare_impossible`, the runner sends a continuation prompt containing the task's remaining acceptance IDs. It does this up to `max_turns`, then marks the attempt stalled.
+The runner continues workers after eligible completed turns; leads receive no continuation. The hub decides stalls from the runner's facts. Eligibility, outage handling and budgets follow [M2 continuation and stall detection](2026-10-28-m2-runners-design.md#68-stall-detection-continuation-replacement-and-handoff).
 
 ### 6.5 Live chats (`agflow join`)
 
@@ -219,7 +205,7 @@ When a live chat claims a task, the bridge creates the task branch `agflow/T-<id
 
 | Target | Path |
 |---|---|
-| Agent started by a runner | Injected immediately: Claude `streamInput()`; Codex `turn/steer` if a turn is running, otherwise `turn/start`. |
+| Agent started by a runner | Pushed through the runner with delivery and acknowledgement tracking; see [M2 message delivery](2026-10-28-m2-runners-design.md#67-message-delivery-to-runner-agents) for batching, backlog and authority rules. |
 | Live Claude chat | `Stop` and `UserPromptSubmit` hooks. Best-effort immediate delivery to an idle chat through its session inbox socket (works, but the message format is undocumented). |
 | Live Codex chat | Hooks. Best-effort immediate delivery through the shared Codex daemon (not yet verified live). |
 
@@ -228,53 +214,21 @@ When a live chat claims a task, the bridge creates the task branch `agflow/T-<id
 
 ### 6.7 Leases, liveness and replacement
 
-- **Lease.** A claim is a lease `{task, attempt, agent, fencing_token, expires_at}`. Leases are renewed by activity the runner observes — agent events, file changes, commits — never by the agent's own report. Hub time is authoritative.
-- **Stall.** An attempt is stalled when any of these hold: no events for `stall_timeout` (default 10 minutes, longer while a known long command runs); several turns without tool calls or diff changes; repeated identical actions; budget exhausted; the process exited; the runner went offline.
-- **Who kills.** Only hub code stops or replaces agents, never an agent, and every kill is logged with its reason.
-- **Handoff.** The hub first asks the agent to write a handoff note and then stops it. If that fails, the hub assembles the note itself from:
-  - the task pack;
-  - the progress reports;
-  - `git log --stat base..HEAD` of the pushed branch;
-  - decisions;
-  - the last messages;
-  - the last turns of the transcript, uploaded by the runner.
-- **Handoff note fields:** done; remaining; commands run with their results; files touched; decisions and reasons; failed approaches with exact errors; blockers; next step; verification command and its last result.
-- **Successor.** The successor, from either vendor, continues on the same branch. Its first output must restate the current state and next step; the hub records it next to the handoff note so the manager can spot a mismatch.
-- **Fencing.** Submissions and pushes carrying an outdated fencing token are rejected.
-- **Fresh context per attempt.** Each attempt is a fresh agent, so context does not rot across tasks.
-- **Manager rotation.** Managers are long-lived but rotated with a handoff when their context grows large or after a fixed number of wake-ups.
+A runner lease measures laptop presence and is renewed by heartbeats. Stall decisions belong to the hub and use fresh attempt facts. Attempt endings, fencing and task moves follow the [M2 trigger table and lease rules](2026-10-28-m2-runners-design.md#64-attempts-fencing-and-leases); replacement, crashes, handoffs and successor context follow [M2 stall detection and handoff](2026-10-28-m2-runners-design.md#68-stall-detection-continuation-replacement-and-handoff).
+
+Live chats retain their M1 task leases, as distinguished in the same lease rules.
 
 ### 6.8 Scheduling and requesting agents
 
-- **Tick.** Every 15 seconds and on relevant events, the scheduler:
-  1. reconciles hub state with what runners actually report;
-  2. computes the ready set;
-  3. orders it by priority, then age;
-  4. claims tasks atomically;
-  5. dispatches each to a runner that has a free slot, the right vendor login and remaining quota.
-- **Caps:** concurrent code-writing agents per project (default 4); per-runner capacity; per-area share, set by the lead (M4); per vendor.
-- **`request_agents(role, count, vendor?, model?, reason)`** starts whatever the caps allow and replies with what actually started.
-- **Auto-fill.** If ready tasks are waiting and slots are free, the scheduler starts workers without asking a manager.
-- **Vendor choice, in order:**
-  1. a reviewer always differs from the author's vendor;
-  2. then the task's `vendor_hint`;
-  3. then the vendor with more remaining quota.
+The hub reconciles attempts and auto-fills ready work within the worker target and runner capacity. Placement uses quota per account, shared across that owner's runners. Ordering, eligibility, vendor preferences and `request_agents` follow the [M2 scheduler](2026-10-28-m2-runners-design.md#66-scheduler).
 
 ### 6.9 Permission profiles
 
-- **Default laptop profile:**
-  - Codex runs with `sandbox = workspace-write`. Command approvals are answered by an allowlist; everything else is declined.
-  - Claude Code runs with `--permission-mode auto`, the same allowlist as allow rules, and `--permission-prompts none`.
-- **Write access** is limited to the task's worktree.
-- **Network access** follows the profile, which defaults to package registries plus the git host.
-- **The owner** can tighten or loosen the profile per project.
+Claude defaults to `acceptEdits` with the sandbox; `auto` mode is opt-in. Codex uses `workspace-write`. The runner never decides an approval itself. Profiles, filesystem and network limits, and the agent environment follow [M2 profiles](2026-10-28-m2-runners-design.md#76-agent-environment-and-profile); requests that need an owner follow the [M2 approvals relay](2026-10-28-m2-runners-design.md#610-quota-and-approvals).
 
 ### 6.10 Accounts and usage limits
 
-- A runner uses only its owner's own logins. Credentials never leave the laptop and are never shared.
-- All of one person's parallel sessions share that account's 5-hour and weekly allowances, for both vendors.
-- When a runner sees a limit signal (Codex rate-limit notifications; Claude limit errors or results), it marks that vendor exhausted until the reset time, and the scheduler routes work elsewhere.
-- Plans' fair-use terms assume individual use. Heavy autonomous use may call for team or business plans. The UI shows usage per person so the team can judge.
+Runners use their owner's subscription logins in runner-specific vendor homes; credentials stay on the laptop. Quota is shared per owner, vendor and account, with per-runner ceilings and paid usage disabled by default. Quota waits, reset handling and owner-only approval decisions follow [M2 quota and approvals](2026-10-28-m2-runners-design.md#610-quota-and-approvals).
 
 ## 7. Managers, steering and the goal
 

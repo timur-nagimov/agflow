@@ -127,7 +127,7 @@ Both sandboxes also let agent commands read the argv and environment of every pr
 **Device policy.** agflow never works around an organisation's policy. On a device whose Codex policy is managed, nothing changes, because the runner already answers no approval.
 
 **Residual risks:**
-- **Shell profile.** Claude Code sources the owner's shell profile (`~/.zshrc` or `~/.bashrc`) outside the sandbox once per Claude process, with the agent's environment, to build its shell snapshot.
+- **Shell profile.** The mitigation is implemented: the adapter sets `ZDOTDIR=<claudeHome>/agflow-empty`, drops any incoming `CLAUDE_CODE_SHELL`, and sets `CLAUDE_CODE_SHELL=/bin/zsh` unless the basename of `SHELL` is already `zsh`. Only the snapshot sources the owner's `~/.zshrc` outside the sandbox, once per Claude process, with the agent's environment. `~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc` do not run around agent commands. The snapshot remains an accepted residual risk.
 - **Package registries.** They are allowed hosts for Claude, so a determined agent could encode data in registry requests.
 - **Base checkout.** Hooks and settings from the base checkout of `main` run outside the sandbox. Agent-config paths on `main` change only through people (section 7.3).
 - **The `auto` profile.** Claude's classifier decides Bash commands that would otherwise prompt, within the sandbox. The guard still confines `Edit` and `Write`.
@@ -184,7 +184,7 @@ export interface Attempt {
   phase: AttemptPhase | null;
   facts: AttemptFacts | null;
   stopRequested: { cause: StopCause; reason: string; by: string; handoff: boolean; deferred: boolean; at: number } | null;
-  takeover: { local: string | null; anywhere: string; ref: string; error: string | null } | null;
+  takeover: { local: string | null; anywhere: string; ref: string; error: string | null; handingBack: { by: string; at: number } | null } | null;
                               // commands shown to the person; ref: the take-over ref they push to (section 6.12)
   leaseExpiresAt: number | null;
   quotaResetsAt: number | null;
@@ -1275,15 +1275,16 @@ Messages that the ended lead received but never acknowledged become unread again
   - anywhere: `git fetch origin <work ref> && git switch -c agflow/T-42-<slug> FETCH_HEAD`, and when done, `git push origin HEAD:<wipRefPrefix>T-42/takeover-<login>`. The hub keeps that take-over ref in `Attempt.takeover.ref`, so the page can offer it for a hand-back.
 
 **Hand back** (the same person, or anyone if the runner is gone, which means not `online`; `POST /api/tasks/:id/handback { source }`).
+- **Pending clone hand-back.** `Attempt.takeover.handingBack` records `{ by, at }`, with `by=user:<login>` and `at` in epoch milliseconds, while the hub waits for clone work. Another otherwise-authorized hand-back receives `409 handback_pending`, including one from a ref. Completion, refusal or timeout clears it.
 - **Clone source** (`'clone'`, the runner's clone). The hub sends `hand_back` to the attempt's runner, which:
   - stops the runner-home Codex daemon (`CODEX_HOME=<runner codex home> <runner codex> app-server daemon stop`, errors ignored);
   - refuses if a process still runs in the clone: the command answers `{ ok: false, error: 'process_running' }`, naming the pids, and the runner logs an `attempt.activity` note. The hub keeps the task `blocked` (`takeover`), shows the error in `Attempt.takeover.error`, and stops the hand-back timer; the person may hand back again;
   - harvests the clone (the person's commits and uncommitted changes), and strips and checks it like a WIP;
   - pushes the result to a new late-work ref, reports `attempt.handed_back`, and then cleans the attempt up.
 
-  The task stays `blocked` until `attempt.handed_back` arrives. Then the hub records the sha as the work position (not late work) and moves the task to `ready`. If the runner is offline, or nothing arrives within `handbackTimeoutMs` (10 minutes), the task becomes `ready` from the last recorded position, and a later push is late work.
+  The task stays `blocked` until `attempt.handed_back` arrives. Then the hub records the sha as the work position (not late work), moves the task to `ready`, and emits `task.handed_back`. If the runner has no link, or nothing arrives within `handbackTimeoutMs` (10 minutes), the task becomes `ready` from the last recorded position, and a later push is late work. A connected runner reporting `disk_low` or `crash_loop` still gets time to return the clone. This fallback without returned clone work emits `task.ready` with `{ from, attemptId, reason }`, not `task.handed_back`.
 - **Ref source** (`{ ref, sha }`, for example the take-over ref; `sha` is a full 40-hex sha, because the next runner may fetch it by SHA). It needs no runner.
-  - In the request transaction, the hub records `{ ref, sha }` as the work position (not late work), moves the task to `ready`, queues `cleanup_attempt` for the taken-over attempt, and sends nothing else.
+  - In the request transaction, the hub records `{ ref, sha }` as the work position (not late work), moves the task to `ready`, emits `task.handed_back`, queues `cleanup_attempt` for the taken-over attempt, and sends nothing else.
   - The next attempt's runner fetches the ref with its `<wipRefPrefix><task>/*` refspec, or by SHA. Before starting, it restores and strips it like a WIP, and reports `attempt.violation` for stripped paths.
 - **Unblock.** Unblock on a `takeover` task answers 409, "hand it back instead".
 
