@@ -2,8 +2,9 @@
 // runners, each with its own AGFLOW_HOME, whose runner.json points at the person's runner vendor homes that one
 // `agflow runner setup` logged in, and at the pinned binaries it installed. The scenario drivers run unchanged, with
 // task texts that tell a real model what the scripted programs do; their checks become a results table and
-// results.json. Nothing here sends a prompt: checkVendorHome asks the vendor CLIs only for their login status.
-import { existsSync } from 'node:fs';
+// results.json. The take-over check (design 6.12) adds a person at a browser and a terminal, or a stand-in for one.
+// Nothing here sends a prompt: checkVendorHome asks the vendor CLIs only for their login status.
+import { existsSync, lstatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { type Vendor, VendorSchema } from '@agflow/core';
@@ -17,10 +18,21 @@ import {
   type VendorLoginStatus,
 } from '@agflow/runner/src/vendor/login';
 import { VENDOR_PINS, vendorBinary } from '@agflow/runner/src/vendor/pins';
-import type { ClusterOptions } from './harness/cluster';
+import { gitIn, isAncestor } from './git-fixtures';
+import type { Cluster, ClusterOptions } from './harness/cluster';
 import { E2E_PLATFORM } from './harness/env';
-import { LOST_LEAD } from './scenarios/lost-lead';
-import type { ScenarioResult } from './scenarios/result';
+import { closedLaptop } from './scenarios/closed-laptop';
+import { killedAgent } from './scenarios/killed-agent';
+import { LOST_LEAD, lostLead } from './scenarios/lost-lead';
+import {
+  checks,
+  cloneFile,
+  type ScenarioOptions,
+  type ScenarioResult,
+  SNAPSHOT_SUBJECT,
+  shown,
+} from './scenarios/result';
+import { handbackChecks, readyForTakeover, type TakeoverOptions, takeoverChecks } from './scenarios/takeover';
 
 const VENDORS: readonly Vendor[] = VendorSchema.options;
 
@@ -382,4 +394,187 @@ export function formatResults(results: readonly ScenarioResult[]): { markdown: s
   }
   const passed = results.length > 0 && results.every((result) => result.passed);
   return { markdown: `${lines.join('\n')}\n`, json: { passed, rows } };
+}
+
+/** Runs one exit scenario's driver in a live cluster: real models have no programs and no gates. */
+export function runLiveScenario(cluster: Cluster, scenario: LiveScenario): Promise<ScenarioResult> {
+  const options: ScenarioOptions = { scripted: false };
+  switch (scenario) {
+    case 'killed-agent':
+      return killedAgent(cluster, options);
+    case 'closed-laptop':
+      return closedLaptop(cluster, options);
+    case 'lost-lead':
+      return lostLead(cluster, options);
+  }
+}
+
+/** The check a live cluster whose close failed fails. */
+export const CLUSTER_CLOSED = 'the cluster closed cleanly';
+
+/** Where a live run tells the person how it goes: a line at a time, an empty one by default. */
+export type LiveLog = (line?: string) => void;
+
+/**
+ * Runs body in the cluster start gives, then closes it, keeping its files when asked or when a check failed. It never
+ * throws, so one cluster's trouble never ends a run that spends real quota: a cluster that does not start, a body that
+ * throws and a close that fails each add a failed result, and the run goes on with the next cluster.
+ */
+export async function inLiveCluster(
+  what: string,
+  vendor: Vendor,
+  start: () => Promise<Cluster>,
+  keep: boolean,
+  body: (cluster: Cluster) => Promise<ScenarioResult[]>,
+  log: LiveLog = () => {},
+): Promise<ScenarioResult[]> {
+  log();
+  log(`== ${what} (${vendor})`);
+  const holder: { cluster?: Cluster } = {};
+  const started = await checks(`${what}: the cluster`, vendor, async () => {
+    holder.cluster = await start();
+  });
+  const cluster = holder.cluster;
+  if (cluster === undefined) return [started];
+  log(`The hub is at ${cluster.hub.url}; the cluster's files are in ${cluster.dir}.`);
+  let results: ScenarioResult[];
+  try {
+    results = await body(cluster);
+  } catch (error) {
+    // The drivers record their own failures; whatever else stops the body still becomes a row of the table.
+    results = [await checks(what, vendor, () => Promise.reject(error))];
+  }
+  for (const result of results) log(`${result.passed ? 'passed' : 'FAILED'}: ${result.scenario} (${vendor})`);
+  const kept = keep || !results.every((result) => result.passed);
+  try {
+    await cluster.close({ keep: kept });
+  } catch (error) {
+    // close() keeps its first outcome, so a second call would only fail again.
+    const why = error instanceof Error ? error.message : String(error);
+    const detail = `${why}\n${kept ? `its files are in ${cluster.dir}` : 'its files were removed'}`;
+    log(`FAILED: closing the cluster: ${why}`);
+    const checked = [{ name: CLUSTER_CLOSED, passed: false, detail }];
+    results.push({ scenario: `${what}: the cluster`, vendor, checks: checked, passed: false, dump: null });
+  }
+  return results;
+}
+
+/** What a person's step of the take-over check is about. */
+export interface TakeoverStep {
+  cluster: Cluster;
+  taskId: string;
+  /** The attempt the person takes over. */
+  attemptId: string;
+}
+
+export interface HandbackStep extends TakeoverStep {
+  /** The taken-over clone, where the person works: the runner has replaced its .git with its own. */
+  clone: string;
+  /** The command that resumes the session on the runner's laptop. */
+  local: string;
+}
+
+/**
+ * The person of the take-over check: in a live run someone at a browser and a terminal (scripts/live-run.ts), in a
+ * test a stand-in that uses the API and plain git.
+ */
+export interface TakeoverPerson {
+  /** Takes the task over, as the task page's Take over does; resolves once the hub was asked. */
+  takeOver(step: TakeoverStep): Promise<void>;
+  /**
+   * Resumes the session with the local command if they can, commits in the clone, and hands back from the clone;
+   * resolves once the hand-back was done. resumed: whether the person saw the local command resume the session and
+   * committed from it, or null when they did not run it.
+   */
+  handBack(step: HandbackStep): Promise<{ resumed: boolean | null }>;
+}
+
+/** The take-over check's own result: the person's part, and the run as a whole. */
+export const TAKEOVER_CHECK = {
+  scenario: 'take-over check',
+  checks: {
+    committed: "the person's commit in the clone is on top of the head the runner harvested",
+    resumed: "the person resumed the agent's session with the local command in a terminal and committed from it",
+  },
+} as const;
+
+/**
+ * The taken-over clone and its local command, once the runner handed it over (design 6.12): a1 ended taken over with no
+ * take-over error, and the clone's .git is a directory sharing the runner's vault. Otherwise the agent's own .git may
+ * still be in the clone, and git there would run what the agent planted in it (hooks, core.fsmonitor, filters) with the
+ * owner's rights, so this throws before anyone runs git in it.
+ */
+async function handedOver(
+  cluster: Cluster,
+  taskId: string,
+  attemptId: string,
+): Promise<{ clone: string; local: string }> {
+  await cluster.waitForEvent({ type: 'attempt.ended', subject: taskId, attemptId });
+  const { attempt } = await cluster.person.attempt(attemptId);
+  const runner = await cluster.runnerOf(attemptId);
+  const clone = runner.clonePath(attemptId);
+  const takeover = attempt.takeover;
+  const local = takeover?.local ?? null;
+  const refuse = (why: string): never => {
+    throw new Error(`the take-over did not hand the clone over (${why}): nothing runs git in ${clone}`);
+  };
+  if (takeover === null || takeover.error !== null || local === null) {
+    return refuse(takeover === null ? 'no take-over record' : (takeover.error ?? 'no local command'));
+  }
+  if (lstatSync(join(clone, '.git'), { throwIfNoEntry: false })?.isDirectory() !== true) {
+    return refuse("the clone's .git is not a directory");
+  }
+  // Read as a file, never through git: the runner's .git is a shared clone of its vault.
+  const alternates = cloneFile(clone, '.git/objects/info/alternates') ?? '';
+  const { vaults } = runner.home.paths;
+  if (!alternates.includes(vaults)) {
+    return refuse(`the clone's .git does not share ${vaults}: alternates ${shown(alternates.trim())}`);
+  }
+  return { clone, local };
+}
+
+/**
+ * The TTY check of a take-over (design 6.12, 15): the person takes over the take-over scenario's task, works in the
+ * clone and hands back from it; the take-over scenario's takeoverChecks and handbackChecks then give their verdicts.
+ * Its own result comes first: the person's commit, whether the session resumed (when the person could tell), and
+ * whether the check ran to its end.
+ */
+export async function runTakeoverCheck(
+  cluster: Cluster,
+  person: TakeoverPerson,
+  options: TakeoverOptions = {},
+): Promise<ScenarioResult[]> {
+  const verdicts: ScenarioResult[] = [];
+  const own = await checks(
+    TAKEOVER_CHECK.scenario,
+    cluster.vendor,
+    async (record) => {
+      const { origin, waitForEvent } = cluster;
+      const { taskId, attemptId } = await readyForTakeover(cluster, options);
+      const login = cluster.person.login;
+      await person.takeOver({ cluster, taskId, attemptId });
+      // takeoverChecks runs git in the clone only once the runner replaced its .git; it records why otherwise.
+      verdicts.push(await takeoverChecks(cluster, { taskId, attemptId, login }, options));
+      // Neither the check nor the person goes on in a clone the runner did not hand over.
+      const { clone, local } = await handedOver(cluster, taskId, attemptId);
+      const harvested = await gitIn(clone, ['rev-parse', 'HEAD'], { allowFailure: true });
+      const { resumed } = await person.handBack({ cluster, taskId, attemptId, clone, local });
+      if (resumed !== null) record.check(TAKEOVER_CHECK.checks.resumed, resumed, `${shown(local)}: ${resumed}`);
+      // The person's commit: the hand-back's head, under the snapshot of anything they left uncommitted.
+      const handed = await waitForEvent({ type: 'task.handed_back', subject: taskId, data: { attemptId } });
+      const sha = String(handed.data.sha);
+      const subject = await gitIn(origin.path, ['log', '-1', '--format=%s', sha]);
+      const commit = subject.startsWith(SNAPSHOT_SUBJECT) ? await gitIn(origin.path, ['rev-parse', `${sha}^`]) : sha;
+      const onTop = harvested !== '' && commit !== harvested && (await isAncestor(origin.path, harvested, commit));
+      record.check(
+        TAKEOVER_CHECK.checks.committed,
+        onTop,
+        `handed back ${sha} (${shown(subject)}); the person's commit ${commit}; ` +
+          `harvested head ${harvested || 'unknown'}`,
+      );
+      verdicts.push(await handbackChecks(cluster, { taskId, attemptId, source: 'clone', commit }));
+    },
+    cluster.dump,
+  );
+  return [own, ...verdicts];
 }

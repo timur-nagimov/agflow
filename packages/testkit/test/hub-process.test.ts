@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { type HubStatus, WhoamiResponseSchema } from '@agflow/core';
 import { loadConfig } from '../../hub/src/config';
@@ -99,6 +99,24 @@ describe('startHubProcess', () => {
     expect(hub.dir).toBe(dir);
     expect(existsSync(hub.logPath)).toBe(true);
     expect((await (await signIn(hub.url, 'alice')).status()).epoch).toBe(1);
+  }, 30_000);
+
+  test('with webDist, the hub serves the built web UI; without it, none', async () => {
+    const web = mkdtempSync('/tmp/agf-web-');
+    dirs.push(web);
+    writeFileSync(join(web, 'index.html'), '<!doctype html><title>agflow</title>\n');
+    const origin = await originRepo({ 'README.md': 'hub process test\n' });
+    dirs.push(origin.root);
+    const dir = mkdtempSync('/tmp/agf-hub-');
+    dirs.push(dir);
+    const hub = await startHubProcess({ dir, repo: origin.path, webDist: web });
+    hubs.push(hub);
+    expect(hub.env.AGFLOW_WEB_DIST).toBe(web);
+    const page = await fetch(`${hub.url}/`);
+    expect(await page.text()).toContain('<title>agflow</title>');
+    const { hub: plain } = await startHubWithOrigin();
+    expect(plain.env.AGFLOW_WEB_DIST).toBeUndefined();
+    expect((await fetch(`${plain.url}/`)).status).toBe(404);
   }, 30_000);
 
   test('GET /api/status shows no lead seat, epoch 1 and the project', async () => {

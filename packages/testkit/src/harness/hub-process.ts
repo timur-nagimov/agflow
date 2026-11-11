@@ -57,6 +57,8 @@ export interface HubProcessOptions {
   timings?: HubTimings;
   /** How long a start may take to answer /api/auth-config; 30 s by default. */
   startTimeoutMs?: number;
+  /** AGFLOW_WEB_DIST: the built web UI, which the hub then serves (a live run's take-over check uses it). */
+  webDist?: string;
 }
 
 export interface HubProcess {
@@ -150,6 +152,7 @@ function createHubProcess(options: HubProcessOptions, port: number): HubProcess 
     AGFLOW_BACKUP_DIR: backupDir,
     AGFLOW_TEST: '1',
     AGFLOW_TEST_CONFIG: JSON.stringify(options.timings ?? E2E_HUB_TIMINGS),
+    ...(options.webDist === undefined ? {} : { AGFLOW_WEB_DIST: options.webDist }),
   };
   let proc: Bun.Subprocess | null = null;
 

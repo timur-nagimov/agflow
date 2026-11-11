@@ -52,6 +52,8 @@ export interface ClusterOptions {
   repo?: string;
   /** How long waitFor and waitForEvent wait by default; 120 s. A live run waits longer for real models. */
   waitMs?: number;
+  /** The built web UI for the hub to serve (HubProcessOptions.webDist); none by default. */
+  webDist?: string;
 }
 
 export interface ClusterWaitOptions {
@@ -301,7 +303,12 @@ export async function startCluster(options: ClusterOptions): Promise<Cluster> {
     }
     started.models = real === null ? await startModels({ programs: options.programs }) : noScriptedModels();
     const repo = options.repo ?? started.origin.path;
-    const hub = await startHubProcess({ dir: join(dir, 'hub'), repo, timings: options.hubTimings });
+    const hub = await startHubProcess({
+      dir: join(dir, 'hub'),
+      repo,
+      timings: options.hubTimings,
+      webDist: options.webDist,
+    });
     started.hub = hub;
     const people = await Promise.all(E2E_USERS.map((login) => signIn(hub.url, login)));
     const [person] = people;
