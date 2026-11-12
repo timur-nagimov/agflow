@@ -100,6 +100,34 @@ function factsOf(attemptId: string): AttemptFacts {
 const leadMessages = (ctx: HubContext) => listMessages(ctx, {}).filter((message) => message.to === 'lead');
 
 describe('dispatch', () => {
+  test('a coherent crashed exit reuses the final WIP on another eligible runner', () => {
+    const { ctx, clock } = schedulerContext({ infraBackoffMs: [1_000, 2_000, 3_000] });
+    const { attempt, runner, task } = addRunnerAttempt(ctx);
+    const other = addRunner(ctx);
+    expect([runner.id, other]).toEqual(['R-1', 'R-2']);
+    const finalWip = { ref: 'refs/agflow/T-1/a1', sha: 'b'.repeat(40) };
+    const stamp = { at: ctx.now(), attemptId: attempt.id, fence: attempt.fence };
+    applyRunnerEvents(ctx, runner.id, {
+      outboxEpoch: 'outbox-1',
+      events: [
+        { ...stamp, seq: 1, type: 'attempt.wip', data: {
+          ...finalWip, stripped: [], skipped: [], embedded: [], logStat: 'Add a.txt',
+        } },
+        { ...stamp, seq: 2, type: 'attempt.exited', data: {
+          code: null, signal: 'SIGKILL', stoppedBy: 'none', cause: null, handoffWritten: false,
+          finalSha: finalWip.sha, finalWip, pushError: null,
+        } },
+      ],
+    }, { restoreReplay: false });
+    expect(getAttempt(ctx, attempt.id)).toMatchObject({ endReason: 'crashed', failureClass: 'infra' });
+    clock.advance(1_000);
+    expect(tick(ctx)).toEqual([[task.id, other, 'claude']]);
+    const start = pendingCommands(ctx, other, 1).find((row) => row.command.kind === 'start_attempt');
+    expect(start?.command).toMatchObject({
+      kind: 'start_attempt', attempt: { attemptId: 'T-1-a2', start: finalWip },
+    });
+  });
+
   test('a ready task with a free slot and a usable runner gets an attempt, by priority then age', () => {
     const { ctx, clock } = schedulerContext();
     const runnerId = addRunner(ctx);
