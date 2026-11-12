@@ -53,6 +53,57 @@ async function crashWhen(f: RunnerFixture, controller: ReturnType<RunnerFixture[
 }
 
 describe('AttemptController: exits', () => {
+  test('unchanged dirty work already pushed exits with that exact WIP commit', async () => {
+    const f = await createRunnerFixture({
+      script: { turns: [[
+        { do: 'write', path: 'a.txt', content: 'a\n' },
+        { do: 'commit', message: 'Add a.txt' },
+        { do: 'write', path: 'b.txt', content: 'b\n' },
+        { do: 'sleep', ms: 20_000 },
+      ]] },
+    });
+    const controller = f.controller();
+    await controller.start(f.spec());
+    const clone = f.paths.clone(FIXTURE_PROJECT, controller.attemptId);
+    await waitFor(() => existsSync(join(clone, 'b.txt')));
+    expect((await controller.pushWip()).status).toBe('pushed');
+    const pushed = await originRef(f, WIP);
+    expect(pushed).not.toBeNull();
+    expect(await originFile(f, pushed as string, 'a.txt')).toBe('a');
+    expect(await originFile(f, pushed as string, 'b.txt')).toBe('b');
+    const wips = f.events('attempt.wip').length;
+    await crashWhen(f, controller, 'b.txt');
+    const [exited] = await waitFor(() => f.events('attempt.exited').length > 0 && f.events('attempt.exited'));
+    expect(exited?.data).toMatchObject({
+      signal: 'SIGKILL', finalSha: pushed, finalWip: { ref: WIP, sha: pushed }, pushError: null,
+    });
+    await controller.settled();
+    expect(await originRef(f, WIP)).toBe(pushed);
+    expect(f.events('attempt.wip')).toHaveLength(wips);
+    expect(f.events('attempt.late_work')).toEqual([]);
+    expect(f.store.get(controller.attemptId)).toMatchObject({ pushedSha: pushed, pushError: null, lateWorkSha: null });
+  });
+
+  test('unchanged work without a previous push exits at its starting commit', async () => {
+    const f = await createRunnerFixture({
+      // Stripping a protected edit produces a new commit with the original tree, but no work to push.
+      script: { turns: [[
+        { do: 'write', path: '.envrc', content: 'echo changed\n' },
+        { do: 'sleep', ms: 20_000 },
+      ]] },
+    });
+    const controller = f.controller();
+    await controller.start(f.spec());
+    await crashWhen(f, controller, '.envrc');
+    const [exited] = await waitFor(() => f.events('attempt.exited').length > 0 && f.events('attempt.exited'));
+    expect(exited?.data).toMatchObject({ finalSha: f.origin.mainSha, finalWip: null, pushError: null });
+    await controller.settled();
+    expect(await originRef(f, WIP)).toBeNull();
+    expect(f.events('attempt.wip')).toEqual([]);
+    expect(f.events('attempt.late_work')).toEqual([]);
+    expect(f.store.get(controller.attemptId)).toMatchObject({ pushedSha: null, pushError: null, lateWorkSha: null });
+  });
+
   test('an unrequested exit kills recorded tools first, then pushes the final work, reports it as a WIP push and reports one exit', async () => {
     // The outliving tool writes until killed: a harvest before cleanup would leave the clone ahead of final work.
     const writer = (file: string) => `i=0; while :; do i=$((i+1)); echo $i > ${file}; sleep 0.01; done`;
