@@ -8,45 +8,51 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 14
     strategy:
       fail-fast: false
       matrix:
-        prep: [full, none]
-        rep: [1, 2, 3]
-    name: test (${{ matrix.prep }} ${{ matrix.rep }})
+        include:
+          - variant: all
+            pattern: ''
+          - variant: no-deleted-clone
+            pattern: '^(?!.*a deleted clone is reported)'
+          - variant: no-new-start-tests
+            pattern: '^(?!.*(turns spent polling|new review tools end|a vendor-failed tool turn|pending fingerprints cannot))'
+          - variant: deleted-clone-then-git
+            pattern: '(a deleted clone is reported|diffFingerprint)'
+    name: facts x12 (${{ matrix.variant }})
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.11
       - run: bun install --frozen-lockfile
-      - if: matrix.prep == 'full'
-        run: bun run typecheck
-      - if: matrix.prep == 'full'
-        run: bun run build:web
-      - name: bun test with a process watchdog
+      - name: facts.test.ts twelve times
+        env:
+          PATTERN: ${{ matrix.pattern }}
         run: |
-          tree() { for c in $(ps -o pid= --ppid "$1"); do echo "$c"; tree "$c"; done; }
-          watchdog() {
-            for i in $(seq 1 16); do
-              sleep 15
-              bunpid=$(pgrep -fx 'bun test' | head -1)
-              echo "=== watchdog t=$((i*15))s bun=$bunpid"
-              [ -n "$bunpid" ] || continue
-              echo "bun: $(ps -o stat=,wchan:32= -p $bunpid) threads=$(ls /proc/$bunpid/task | wc -l) fds=$(ls /proc/$bunpid/fd | wc -l)"
-              for p in $(tree "$bunpid"); do
-                [ -d /proc/$p ] || continue
-                line=$(ps -o pid=,ppid=,pgid=,stat=,etimes=,wchan:32=,args= -p "$p" | cut -c1-230)
-                echo "  $line"
-                et=$(ps -o etimes= -p "$p" | tr -d ' ')
-                if [ -n "$et" ] && [ "$et" -gt 8 ]; then
-                  echo "  --- old $p cwd=$(readlink /proc/$p/cwd)"
-                  sudo cat /proc/$p/stack 2>/dev/null | head -8 | sed 's/^/      /'
-                  ls -l /proc/$p/fd 2>/dev/null | tail -n +2 | head -10 | sed 's/^/      /'
-                fi
+          hangs=0
+          for rep in $(seq 1 12); do
+            if [ -n "$PATTERN" ]; then
+              bun test packages/runner/test/facts.test.ts -t "$PATTERN" > out.txt 2>&1 &
+            else
+              bun test packages/runner/test/facts.test.ts > out.txt 2>&1 &
+            fi
+            pid=$!
+            for s in $(seq 1 80); do sleep 0.5; kill -0 $pid 2>/dev/null || break; done
+            if kill -0 $pid 2>/dev/null; then
+              hangs=$((hangs+1))
+              echo "=== rep $rep: HANG (40 s); fds by type:"
+              ls -l /proc/$pid/fd | tail -n +2 | awk '{print $NF}' | sed -E 's/[0-9]+/N/g' | sort | uniq -c | sort -rn | head -12
+              for t in /proc/$pid/task/*; do
+                echo "--- task $(basename $t) $(cat $t/comm) wchan=$(cat $t/wchan)"
+                sudo cat $t/stack 2>/dev/null | head -6 | sed 's/^/    /'
               done
-            done
-          }
-          watchdog &
-          timeout 240 bun test || true
+              grep -E '\((pass|fail)\)' out.txt | tail -4
+              kill -9 $pid
+            fi
+            wait $pid && code=0 || code=$?
+            echo "rep $rep: exit=$code pass=$(grep -c '(pass)' out.txt) fail=$(grep -c '(fail)' out.txt)"
+          done
+          echo "TOTAL hangs=$hangs/12"
