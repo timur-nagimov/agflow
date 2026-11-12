@@ -66,8 +66,12 @@ async function until(check: () => boolean, timeoutMs = 15_000): Promise<void> {
   }
 }
 
-/** A tracker on a plain directory, with a fingerprint the test sets. */
-function tracker(options: { clone?: string; fingerprint?: () => Promise<string> } = {}) {
+/**
+ * A tracker on a plain directory, with a fingerprint the test sets. It watches no files unless the test asks: on Linux
+ * (CI), a recursive watch closed a millisecond after it starts, as most of these tests would do, can stop Bun's worker
+ * pool, and every later fs.promises call in the process then hangs.
+ */
+function tracker(options: { clone?: string; fingerprint?: () => Promise<string>; watch?: boolean } = {}) {
   const source = new ManualSource();
   const clock = new AwakeClock({ source, tickMs: 1_000, gapMs: 5_000 });
   const clone = options.clone ?? tempDir('agflow-facts-');
@@ -78,6 +82,7 @@ function tracker(options: { clone?: string; fingerprint?: () => Promise<string> 
     toolCaps: CAPS,
     clock,
     fingerprint: options.fingerprint ?? (async () => 'same'),
+    watch: options.watch ?? false,
   });
   cleanups.push(() => facts.close());
   return { source, clock, facts, clone };
@@ -451,7 +456,7 @@ describe('FactsTracker', () => {
     cleanups.push(() => repo.remove());
     const clone = join(tempDir('agflow-facts-clone-'), 'T-4-a1');
     await gitIn(tmpdir(), ['clone', '--quiet', repo.path, clone]);
-    const { source, clock, facts } = tracker({ clone });
+    const { source, clock, facts } = tracker({ clone, watch: true });
     await facts.start();
     // Events from before the start may still arrive; only what follows counts.
     await Bun.sleep(300);

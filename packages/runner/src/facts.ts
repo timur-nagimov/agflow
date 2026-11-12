@@ -44,6 +44,12 @@ export interface FactsTrackerOptions {
   existenceCheckMs?: number;
   /** Called once, when the clone is found gone. */
   onCloneGone?(): void;
+  /**
+   * Whether to watch the clone's files and commits, which fsAgeMs and commitAgeMs come from; true by default. Tests of
+   * the other facts turn it off: on Linux (CI), a recursive watch closed right after it starts can stop Bun's worker
+   * pool for the rest of the process.
+   */
+  watch?: boolean;
 }
 
 interface ToolInFlight {
@@ -101,8 +107,10 @@ export class FactsTracker {
 
   /** Starts the watches and the existence check, and takes the first fingerprint. */
   async start(): Promise<void> {
-    this.watchTree();
-    this.watchCommits();
+    if (this.options.watch !== false) {
+      this.watchTree();
+      this.watchCommits();
+    }
     this.timer = setInterval(() => this.checkClone(), this.options.existenceCheckMs ?? CLONE_CHECK_MS);
     this.timer.unref?.();
     this.fingerprint = await this.options.fingerprint().catch(() => null);
@@ -288,7 +296,7 @@ export class FactsTracker {
   /** .git/logs/HEAD may not exist yet, or be replaced by git; the existence check attaches the watch again. */
   private watchCommits(): void {
     const log = join(this.options.clone, '.git', 'logs', 'HEAD');
-    if (this.closed || this.commitWatcher !== null || !existsSync(log)) return;
+    if (this.options.watch === false || this.closed || this.commitWatcher !== null || !existsSync(log)) return;
     try {
       const watcher = watch(log, (type) => {
         this.lastCommitAt = this.now();
