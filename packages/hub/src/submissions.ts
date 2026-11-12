@@ -243,7 +243,7 @@ function recordSuccess(
     body:
       `${named(task)} was submitted by ${attempt.agentId} for review on branch ${branch ?? '(none)'} at ` +
       `${head ?? 'an unknown head'}.\n${attempt.agentId} wrote:\n${quoteLines(clip(submission.summary, 1500))}\n` +
-      submissionReviewInstruction(branch),
+      submissionReviewInstruction(task.id, branch),
   });
   const recorded = findSubmission(ctx, submission.id) as SubmissionRecord;
   emit({

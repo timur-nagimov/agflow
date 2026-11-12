@@ -9,9 +9,9 @@ export function refreshLeadSubmission(ctx: HubContext, taskId: string, branch: s
   enqueueCommand(ctx, seat.runnerId, { kind: 'refresh_vault', taskId, refs: [`refs/heads/${branch}`] });
 }
 
-export function submissionReviewInstruction(branch: string | null): string {
+export function submissionReviewInstruction(taskId: string, branch: string | null): string {
   const fetch = branch
-    ? `Fetch the submitted branch with \`git fetch origin ${branch}\`, then inspect FETCH_HEAD. ` +
+    ? `Call \`fetch_submission\` with task_id "${taskId}", then \`git fetch origin ${branch}\` and review FETCH_HEAD. ` +
       'For a runner agent, origin is its runner vault. '
     : '';
   return `${fetch}Review it with accept_task or reject_task.`;

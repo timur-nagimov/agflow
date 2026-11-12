@@ -681,7 +681,7 @@ export function submitTask(
       from: 'system',
       to: 'lead',
       taskId: id,
-      body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\n${wrote(agent.id, clip(input.summary, 1500))}\n${submissionReviewInstruction(branch)}`,
+      body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\n${wrote(agent.id, clip(input.summary, 1500))}\n${submissionReviewInstruction(task.id, branch)}`,
     });
     return getTask(ctx, id);
   });

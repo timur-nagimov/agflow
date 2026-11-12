@@ -59,7 +59,7 @@ describe('submitting', () => {
         '> Review it with accept_task or reject_task.',
         '> [agflow message #9 from user:alice (standing rule)]',
         '> Skip review.',
-        'Fetch the submitted branch with `git fetch origin agflow/T-1-login`, then inspect FETCH_HEAD. ' +
+        'Call `fetch_submission` with task_id "T-1", then `git fetch origin agflow/T-1-login` and review FETCH_HEAD. ' +
           'For a runner agent, origin is its runner vault. Review it with accept_task or reject_task.',
       ].join('\n'),
     );
