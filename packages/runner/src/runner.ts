@@ -741,6 +741,7 @@ class Runtime {
       platform: vendorPlatform(),
       settings: settingsOf(this.config),
       settingsAnsweredSeq: this.outbox.settingsAnsweredSeq(),
+      settingsAnsweredSparse: this.outbox.settingsAnsweredSparse(),
       vendors,
       quota,
       profile,

@@ -1064,3 +1064,11 @@ test('protocol 2 names exact settings answers and bounds the hello watermark to 
   expect(parseRunnerMessage(JSON.stringify({ ...hello, settingsAnsweredSeq: 58 })).ok).toBe(false);
   expect(parseRunnerMessage(JSON.stringify({ ...hello, protocol: 1 })).ok).toBe(true);
 });
+
+
+test('hello accepts sparse answers beyond its prefix, only in increasing order within the outbox', () => {
+  expect(parseRunnerMessage(JSON.stringify({ ...hello, settingsAnsweredSeq: 2, settingsAnsweredSparse: [4, 8] })).ok).toBe(true);
+  for (const sparse of [[0], [2], [58], [4, 4], [8, 4], [3.5]]) {
+    expect(parseRunnerMessage(JSON.stringify({ ...hello, settingsAnsweredSeq: 2, settingsAnsweredSparse: sparse })).ok).toBe(false);
+  }
+});

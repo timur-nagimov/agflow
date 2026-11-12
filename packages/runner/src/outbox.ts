@@ -165,8 +165,20 @@ export class Outbox {
     this.db.setMeta('settingsSavedVersion', version);
   }
 
-  /** Highest contiguous settings answer included in this snapshot; retained after events are pruned. */
+  /** Prefix advertised in hello: pruning after a clock jump can leave lastSeq below the durable prefix. */
   settingsAnsweredSeq(version = this.confirmedVersion()): number {
+    return Math.min(this.settingsAnsweredPrefix(version), this.lastSeq());
+  }
+
+  /** Answers beyond a gap must also protect retained edits from replay after snapshot adoption. */
+  settingsAnsweredSparse(version = this.confirmedVersion()): number[] {
+    const prefix = this.settingsAnsweredPrefix(version);
+    const answered = new Set(this.marks().filter(mark => mark.version <= version).map(mark => mark.seq));
+    return this.settingsEvents().filter(event => event.seq > prefix && answered.has(event.seq)).map(event => event.seq);
+  }
+
+  /** Full contiguous prefix, kept internally even when pruning lowers lastSeq. */
+  private settingsAnsweredPrefix(version: number): number {
     const saved = this.db.meta('settingsAnswered');
     let seq = saved && saved.version <= version ? saved.seq : 0;
     const marks = new Map(this.marks().map(mark => [mark.seq, mark]));
@@ -227,7 +239,7 @@ export class Outbox {
   private prune(condition: string, params: Record<string, number>): number {
     const confirmed = Math.min(this.confirmedVersion(), this.savedVersion());
     const edits = this.settingsInFlight(confirmed);
-    this.db.setMeta('settingsAnswered', { seq: this.settingsAnsweredSeq(confirmed), version: confirmed });
+    this.db.setMeta('settingsAnswered', { seq: this.settingsAnsweredPrefix(confirmed), version: confirmed });
     const keep = JSON.stringify(edits.map((event) => event.seq));
     const { changes } = this.db.sqlite
       .query(`DELETE FROM outbox WHERE ${condition} AND seq NOT IN (SELECT value FROM json_each($keep))`)

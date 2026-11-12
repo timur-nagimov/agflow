@@ -14,7 +14,7 @@ import {
   type Vendor,
 } from '@agflow/core';
 import { verifySessionHash } from './auth';
-import { type CommandRow, type StoredCommand, cancelPendingSettings, enqueueCommand } from './commands';
+import { type CommandRow, type StoredCommand, cancelPendingSettings, enqueueCommand, pendingCommands } from './commands';
 import { type HubContext, afterCommit, tx } from './context';
 import { nextId } from './db';
 import { forbidden, notFound } from './errors';
@@ -53,7 +53,7 @@ export interface RunnerInfo {
    */
   restorePending?: boolean;
   /** Settings replay covered by a snapshot this hub adopted; scoped to runner.db. */
-  settingsAdopted?: { outboxEpoch: string; seq: number };
+  settingsAdopted?: { outboxEpoch: string; seq: number; sparse?: number[] };
 }
 
 /** A refused start: the runner's code for it, and when the hub heard of it. */
@@ -617,13 +617,13 @@ function existingRow(ctx: HubContext, runnerId: string): RunnerRow {
  * - sent: the runner's version is older, as when its owner changed settings in the browser meanwhile, so the hub
  *   sends all of its settings;
  * - adopted: the runner's version is newer, which only a restored hub sees, so the hub takes its values and version
- *   and cancels the older update_settings it still had queued.
+ *   and replaces queued settings payloads with answer-only commands at the adopted version.
  */
 export function reconcileHelloSettings(
   ctx: HubContext,
   runnerId: string,
   reported: RunnerSettings,
-  snapshot?: { outboxEpoch: string; settingsAnsweredSeq?: number },
+  snapshot?: Pick<HelloMessage, 'outboxEpoch' | 'settingsAnsweredSeq' | 'settingsAnsweredSparse'>,
 ): 'stored' | 'unchanged' | 'sent' | 'adopted' {
   const row = existingRow(ctx, runnerId);
   const { version, ...values } = reported;
@@ -638,7 +638,12 @@ export function reconcileHelloSettings(
   if (version > row.settings_version) {
     writeSettings(ctx, row, values, version);
     if (snapshot) recordSettingsAdoption(ctx, runnerId, snapshot);
+    // The backup may have acknowledged an edit whose exact answer never reached runner.db. Keep its identity,
+    // including refusals, but discard obsolete values. Fresh command ids also avoid stale runner journal entries.
+    const answers = pendingCommands(ctx, runnerId, row.protocol).flatMap(({ command }) =>
+      command.kind === 'update_settings' && command.answers ? [command.answers] : []);
     cancelPendingSettings(ctx, runnerId);
+    for (const answer of answers) enqueueCommand(ctx, runnerId, settingsCommand({}, version, answer));
     return 'adopted';
   }
   const { version: hubVersion, ...hubValues } = runnerSettings(row);
@@ -650,17 +655,21 @@ export function reconcileHelloSettings(
 function recordSettingsAdoption(
   ctx: HubContext,
   runnerId: string,
-  snapshot: { outboxEpoch: string; settingsAnsweredSeq?: number },
+  snapshot: Pick<HelloMessage, 'outboxEpoch' | 'settingsAnsweredSeq' | 'settingsAnsweredSparse'>,
 ): void {
   const row = existingRow(ctx, runnerId);
   const info = runnerInfo(row);
-  info.settingsAdopted = { outboxEpoch: snapshot.outboxEpoch, seq: snapshot.settingsAnsweredSeq ?? 0 };
+  info.settingsAdopted = {
+    outboxEpoch: snapshot.outboxEpoch, seq: snapshot.settingsAnsweredSeq ?? 0,
+    sparse: snapshot.settingsAnsweredSparse ?? [],
+  };
   ctx.db.query('UPDATE runners SET info = ? WHERE id = ?').run(JSON.stringify(info), runnerId);
 }
 
 export function settingsReplayCovered(ctx: HubContext, runnerId: string, outboxEpoch: string, seq: number): boolean {
   const info = runnerInfo(existingRow(ctx, runnerId));
-  return info.settingsAdopted?.outboxEpoch === outboxEpoch && seq <= info.settingsAdopted.seq;
+  const adopted = info.settingsAdopted;
+  return adopted?.outboxEpoch === outboxEpoch && (seq <= adopted.seq || (adopted.sparse ?? []).includes(seq));
 }
 
 /** A refusal still answers exactly one edit, at the current snapshot version; it changes no settings. */

@@ -53,6 +53,24 @@ async function runnerJson(s: { paths: { config: string } }) {
 }
 
 describe('createRunner', () => {
+  test.each([false, true])('hello reports retained sparse answers and bounds the pruned prefix (pruned=%s)', async (pruned) => {
+    const s = await setup();
+    let now = 1000;
+    const outbox = new Outbox(s.db, { now: () => now, confirmedVersion: () => 4 });
+    if (pruned) outbox.append({ type: 'runner.state', data: { state: 'ok', detail: null } });
+    else outbox.append({ type: 'runner.settings', data: { settings: { capacity: 3 }, baseVersion: 4 } });
+    now = 500;
+    const answered = outbox.append({ type: 'runner.settings', data: { settings: { draining: true }, baseVersion: 3 } });
+    outbox.markSettingsEcho({ seq: answered.seq, outboxEpoch: outbox.epoch }, 4);
+    outbox.settingsSaved(4);
+    if (pruned) expect(outbox.pruneBefore(750)).toBe(1);
+    await s.start({ config: { confirmedSettings: SNAPSHOT } });
+    const hello = await s.hub.waitFor(() => hellos(s.hub)[0]);
+    expect(RunnerMessageSchema.safeParse(hello).success).toBe(true);
+    expect(hello).toMatchObject({ settingsAnsweredSeq: pruned ? 1 : 0,
+      settingsAnsweredSparse: pruned ? [] : [answered.seq], lastSeq: pruned ? 1 : answered.seq });
+  });
+
   test('hello carries the identity, the confirmed settings, the vendors, git, the outbox and the recovered attempts', async () => {
     const s = await setup();
     const store = new AttemptStore(s.db);

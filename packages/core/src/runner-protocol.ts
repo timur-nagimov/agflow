@@ -134,8 +134,10 @@ export type RunnerMessage =
       platform: string;
       /** The last hub-confirmed snapshot, never local edits. */
       settings: RunnerSettings;
-      /** Highest answered settings edit included in the snapshot, within outboxEpoch (protocol 2). */
+      /** Contiguous answered settings prefix, bounded to lastSeq, within outboxEpoch (protocol 2). */
       settingsAnsweredSeq?: number;
+      /** Retained answered settings edits beyond the prefix, in increasing order (protocol 2). */
+      settingsAnsweredSparse?: number[];
       vendors: RunnerVendor[];
       quota: AccountQuotaReport[];
       profile: ProfileSummary;
@@ -704,6 +706,7 @@ const HelloSchema = z
     platform: Name,
     settings: RunnerSettingsSchema,
     settingsAnsweredSeq: NonNegativeInt.optional(),
+    settingsAnsweredSparse: z.array(PositiveInt).optional(),
     vendors: z.array(RunnerVendorSchema),
     quota: z.array(AccountQuotaReportSchema),
     profile: ProfileSummarySchema,
@@ -718,6 +721,11 @@ const HelloSchema = z
   })
   .refine((hello) => (hello.settingsAnsweredSeq ?? 0) <= hello.lastSeq, {
     error: 'settingsAnsweredSeq cannot exceed lastSeq', path: ['settingsAnsweredSeq'],
+  })
+  .refine((hello) => (hello.settingsAnsweredSparse ?? []).every((seq, index, sparse) =>
+    seq > (index === 0 ? hello.settingsAnsweredSeq ?? 0 : sparse[index - 1]!) && seq <= hello.lastSeq), {
+    error: 'sparse settings answers must increase beyond the prefix and cannot exceed lastSeq',
+    path: ['settingsAnsweredSparse'],
   })
   .refine((hello) => hello.lastSeq >= hello.firstSeq - 1, {
     error: 'lastSeq must be at least firstSeq − 1, which an empty outbox reports',

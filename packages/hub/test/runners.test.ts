@@ -471,15 +471,15 @@ describe('settings sync', () => {
     const id = registered(ctx);
     ctx.db.query('UPDATE runners SET settings_version = ? WHERE id = ?').run(version, id);
     const snapshot = settings({ capacity: 4, draining: false, version: 5 });
-    tx(ctx, () => reconcileHelloSettings(ctx, id, snapshot, { outboxEpoch: 'box', settingsAnsweredSeq: 2 }));
+    tx(ctx, () => reconcileHelloSettings(ctx, id, snapshot, { outboxEpoch: 'box', settingsAnsweredSeq: 1, settingsAnsweredSparse: [3] }));
     // The replacement hello, or reconnect after a crash, must retain the adoption cutoff.
-    tx(ctx, () => reconcileHelloSettings(ctx, id, runnerSettings(findRunnerRow(ctx, id)!), { outboxEpoch: 'box', settingsAnsweredSeq: 2 }));
+    tx(ctx, () => reconcileHelloSettings(ctx, id, runnerSettings(findRunnerRow(ctx, id)!), { outboxEpoch: 'box', settingsAnsweredSeq: 1, settingsAnsweredSparse: [3] }));
     const event = { seq: 1, at: 1, type: 'runner.settings', data: { settings: { draining: true }, baseVersion: 1 } };
-    const replay = { outboxEpoch: 'box', events: [event, { ...event, seq: 2, data: { settings: { capacity: 6 }, baseVersion: 2 } }] };
-    expect(applyRunnerEvents(ctx, id, replay, { restoreReplay: true })).toBe(2);
+    const replay = { outboxEpoch: 'box', events: [event, { ...event, seq: 2, data: { settings: { capacity: 6 }, baseVersion: 2 } }, { ...event, seq: 3 }] };
+    expect(applyRunnerEvents(ctx, id, replay, { restoreReplay: true })).toBe(3);
     expect(getRunner(ctx, id)).toMatchObject(version < 5
-      ? { capacity: 4, draining: false, settingsVersion: 5 }
-      : { capacity: 6, draining: true, settingsVersion: 10 });
+      ? { capacity: 6, draining: false, settingsVersion: 6 }
+      : { capacity: 6, draining: true, settingsVersion: 11 });
     // A fresh runner.db reuses seq 1; the previous epoch's cutoff cannot suppress it.
     applyRunnerEvents(ctx, id, { outboxEpoch: 'new-box', events: [event] }, { restoreReplay: false });
     expect(getRunner(ctx, id).draining).toBe(true);

@@ -239,6 +239,9 @@ describe('spec M2 managers, security and milestones', () => {
   test('settings-sync documents exact answers, hub replay filtering and the remaining lineage limits', () => {
     const sync = m2.split('**Settings sync.**')[1]!.split('**Link behaviour:**')[0]!;
     expect(sync).toContain('settingsAnsweredSeq');
+    expect(sync).toContain('settingsAnsweredSparse');
+    expect(sync).toContain('answer-only');
+    expect(sync).toContain('backward clock jump');
     expect(sync).toContain('answers');
     expect(sync).toContain('outboxEpoch');
     expect(sync).toContain('refused: true');

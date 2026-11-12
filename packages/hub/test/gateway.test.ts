@@ -797,11 +797,11 @@ test.each([1, 2])('hub-first upgrade: protocol %i receives only settings fields 
   else expect(echo).toHaveProperty('answers', { seq: 1, outboxEpoch: 'outbox-1' });
 });
 
-test('gateway persists hello adoption before replay and acknowledges the skipped settings tail', async () => {
+test.each([false, true])('gateway persists hello adoption before replay and acknowledges the skipped settings tail (sparse=%s)', async (sparse) => {
   const { ctx, gateway, token } = setup();
   const session = { user: 'alice', sessionHash: sessionHashOf(token) };
   const fake = new FakeRunner<FakeConnection>(endpoint => new FakeConnection(gateway, session, endpoint));
-  const hello = { ...fake.hello(), settingsAnsweredSeq: 1, firstSeq: 1, lastSeq: 1,
+  const hello = { ...fake.hello(), settingsAnsweredSeq: sparse ? 0 : 1, settingsAnsweredSparse: sparse ? [1] : [], firstSeq: 1, lastSeq: 1,
     settings: { ...fake.settings, draining: false, version: 5 } };
   const first = recordingSocket();
   const connection = gateway.open(first.socket, session);
