@@ -298,18 +298,31 @@ describe('take-over readiness', () => {
     }
   });
 
-  test('non-TTY input and EOF never start the cluster', async () => {
-    for (const isTTY of [false, true]) {
+  test('non-TTY input and a typed q never start the cluster', async () => {
+    for (const [isTTY, answer] of [[false, null], [true, 'q'], [true, ' Skip ']] as const) {
       let starts = 0;
       const result = await inLiveCluster('take-over check', 'codex', async () => {
         starts++;
         throw new Error('must not start');
       }, false, async () => [], () => {}, () => confirmTakeoverReady('codex', {
-        isTTY, log: () => {}, ask: () => null,
+        isTTY, log: () => {}, ask: () => answer,
       }));
       expect(starts).toBe(0);
       expect(result[0]?.passed).toBe(false);
-      expect(result[0]?.checks[0]?.detail).toMatch(/TTY|cancelled/);
+      expect(result[0]?.checks[0]?.detail).toMatch(/TTY|skipped/);
     }
+  });
+
+  test('a bare Enter starts the cluster: Bun prompt() gives null for an empty line', async () => {
+    const { cluster } = closingCluster(async () => {});
+    let starts = 0;
+    const result = await inLiveCluster('take-over check', 'claude', async () => {
+      starts++;
+      return cluster;
+    }, false, async () => [PASSED], () => {}, () => confirmTakeoverReady('claude', {
+      isTTY: true, log: () => {}, ask: () => null,
+    }));
+    expect(starts).toBe(1);
+    expect(result.every((entry) => entry.passed)).toBe(true);
   });
 });

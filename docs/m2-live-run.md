@@ -90,7 +90,8 @@ bun run live-run --repo git@github.com:you/agflow-live-toy.git --takeover claude
 
 ## The take-over check
 
-With `--takeover <vendors>`, the script explains the check and waits for Enter in a TTY **before each cluster starts**.
+With `--takeover <vendors>`, the script explains the check and waits for Enter in a TTY **before each cluster starts**
+(type `q` and Enter to skip that vendor's cluster; Ctrl-C ends the run).
 Be ready with a browser and another terminal. The scripted e2e path stays non-interactive.
 The script starts one more cluster per vendor, waits until the take-over task's agent
 runs its long command (`sleep 600`), and then walks you through the check:

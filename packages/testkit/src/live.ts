@@ -426,8 +426,11 @@ export function confirmTakeoverReady(
       'You will have 10 minutes from the start of sleep 600 to press Take over in the browser, ' +
       'then resume, commit and hand back.',
   );
-  if (terminal.ask('Press Enter when ready to start this cluster:') === null) {
-    throw new Error('Take-over check cancelled before starting the cluster.');
+  // Bun's prompt() returns null for an empty line, so a bare Enter arrives as null, like EOF: only a typed q skips.
+  // Ctrl-C still ends the whole run.
+  const answer = terminal.ask('Press Enter when ready to start this cluster (or type q and Enter to skip it):');
+  if (answer !== null && /^\s*(q|quit|skip)\s*$/i.test(answer)) {
+    throw new Error('Take-over check skipped before starting the cluster.');
   }
 }
 
