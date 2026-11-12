@@ -504,10 +504,12 @@ export interface TakeoverPerson {
   takeOver(step: TakeoverStep): Promise<void>;
   /**
    * Resumes the session with the local command if they can, commits in the clone, and hands back from the clone;
-   * resolves once the hand-back was done. resumed: whether the person saw the local command resume the session and
-   * committed from it, or null when they did not run it.
+   * resolves once the hand-back was done. resumed: whether the person saw the local command resume the session (its
+   * earlier conversation showed), or null when they did not run it; committedInSession: whether the commit was made from
+   * inside that session (a vendor whose sandbox forbids writes under .git, such as Codex under a managed policy, cannot),
+   * or null when unknown.
    */
-  handBack(step: HandbackStep): Promise<{ resumed: boolean | null }>;
+  handBack(step: HandbackStep): Promise<{ resumed: boolean | null; committedInSession?: boolean | null }>;
 }
 
 /** The take-over check's own result: the person's part, and the run as a whole. */
@@ -515,7 +517,7 @@ export const TAKEOVER_CHECK = {
   scenario: 'take-over check',
   checks: {
     committed: "the person's commit in the clone is on top of the head the runner harvested",
-    resumed: "the person resumed the agent's session with the local command in a terminal and committed from it",
+    resumed: "the person resumed the agent's session with the local command in a terminal, and its earlier conversation showed",
   },
 } as const;
 
@@ -579,8 +581,9 @@ export async function runTakeoverCheck(
       // Neither the check nor the person goes on in a clone the runner did not hand over.
       const { clone, local } = await handedOver(cluster, taskId, attemptId);
       const harvested = await gitIn(clone, ['rev-parse', 'HEAD'], { allowFailure: true });
-      const { resumed } = await person.handBack({ cluster, taskId, attemptId, clone, local });
-      if (resumed !== null) record.check(TAKEOVER_CHECK.checks.resumed, resumed, `${shown(local)}: ${resumed}`);
+      const { resumed, committedInSession = null } = await person.handBack({ cluster, taskId, attemptId, clone, local });
+      const where = committedInSession === null ? '' : committedInSession ? '; committed from the session' : '; committed outside the session';
+      if (resumed !== null) record.check(TAKEOVER_CHECK.checks.resumed, resumed, `${shown(local)}: ${resumed}${where}`);
       // The person's commit: the hand-back's head, under the snapshot of anything they left uncommitted.
       const handed = await waitForEvent({ type: 'task.handed_back', subject: taskId, data: { attemptId } });
       const sha = String(handed.data.sha);

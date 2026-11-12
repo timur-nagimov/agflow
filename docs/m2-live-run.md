@@ -100,17 +100,28 @@ runs its long command (`sleep 600`), and then walks you through the check:
    Take over. The window lasts 10 minutes from the command's start; the script prints its approximate closing time
    and seconds remaining.
 2. Once the runner has handed the clone over, the script prints the local command, of the form
-   `( cd <clone> && CLAUDE_CONFIG_DIR=<home> <pinned claude> --resume <session> )`, or the `codex resume --no-daemon`
+   `( cd <clone> && CLAUDE_CONFIG_DIR=<home> <pinned claude> --resume <session> )`, or the `codex resume --no-daemon -s workspace-write -c 'sandbox_workspace_write.writable_roots=["<clone>/.git"]'`
    one. The parentheses run it in a subshell, so your terminal does not stay in the clone. Run it in another
    terminal and check that it shows the agent's earlier conversation.
 3. From inside the resumed session, commit the agent's uncommitted b.txt: type
    `!git add b.txt && git commit -m 'Add b.txt'` (a line that starts with `!` runs as a shell command in Claude Code
-   and in Codex), or ask the agent to commit it. Then exit the session and answer the script's question. If the
-   session did not resume, commit outside it with `git -C <clone> add b.txt && git -C <clone> commit -m 'Add b.txt'`
-   and answer no.
+   and in Codex), or ask the agent to commit it. The Codex command gives the session the clone's `.git` as a writable
+   root (Codex protects `.git` in its workspace-write sandbox otherwise), so the commit works from inside it too. Then
+   exit the session and answer the script's two questions: whether the session resumed with its earlier conversation,
+   and whether you committed from inside it. If the session did not resume, commit outside it with
+   `git -C <clone> add b.txt && git -C <clone> commit -m 'Add b.txt'`.
 4. Leave the clone in every terminal and close any editor open in it: the runner refuses a hand-back while a process
    runs in the clone. Then, in the browser, press Hand back and choose the clone. If the runner refuses, the script
    prints its reason (`process_running` with the process ids); end those processes and press Hand back again.
+
+**Unattended.** `AGFLOW_LIVE_AUTO_PERSON=1 bun run live-run --scenarios none --takeover claude,codex` runs the check
+with no one at the computer: Take over and Hand back go through the API as the cluster's person, and the local command
+runs in a pseudo-terminal driven by `expect(1)` (`/usr/bin/expect` on macOS). It answers the CLI's first-run screens
+(theme, folder trust), checks that the resumed session shows the agent's earlier conversation, and commits b.txt from
+inside it (Claude: a `!` shell line; Codex: it asks the agent, because Codex's `!` shell mode does not submit from a
+pseudo-terminal). When that commit does not land, it commits outside the session and reports so in the check's detail.
+Start it from a plain terminal: inside an agent session, inherited `CLAUDE_CODE_*` variables make Claude Code treat the
+resume as a child session.
 
 The script hands you the clone only when the runner handed it over: the attempt ended taken over with no take-over
 error, and the clone's `.git` is the runner's new one. Otherwise the agent's own `.git` may still be in the clone, and
