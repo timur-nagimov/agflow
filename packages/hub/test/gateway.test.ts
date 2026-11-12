@@ -785,3 +785,37 @@ test.each([true, false])('a pending vault refresh never delays delivery or unrel
   gateway.message(reconnected, JSON.stringify({ t: 'result', commandId: refresh!.id, ok }));
   expect(ids(second.sent)).toContain(deliver!.id);
 });
+
+test.each([1, 2])('hub-first upgrade: protocol %i receives only settings fields it understands', async (protocol) => {
+  const { ctx, gateway, token } = setup();
+  const runner = await connectFakeRunner(ctx, gateway, { token, protocol });
+  runner.emit('runner.settings', { settings: { draining: true }, baseVersion: 1 });
+  await settle();
+  const echo = runner.commands.at(-1)?.command;
+  expect(echo).toMatchObject({ kind: 'update_settings', settings: { draining: true }, version: 2 });
+  if (protocol === 1) expect(echo).not.toHaveProperty('answers');
+  else expect(echo).toHaveProperty('answers', { seq: 1, outboxEpoch: 'outbox-1' });
+});
+
+test('gateway persists hello adoption before replay and acknowledges the skipped settings tail', async () => {
+  const { ctx, gateway, token } = setup();
+  const session = { user: 'alice', sessionHash: sessionHashOf(token) };
+  const fake = new FakeRunner<FakeConnection>(endpoint => new FakeConnection(gateway, session, endpoint));
+  const hello = { ...fake.hello(), settingsAnsweredSeq: 1, firstSeq: 1, lastSeq: 1,
+    settings: { ...fake.settings, draining: false, version: 5 } };
+  const first = recordingSocket();
+  const connection = gateway.open(first.socket, session);
+  gateway.message(connection, JSON.stringify(hello));
+  await settle();
+  expect(getRunner(ctx, 'R-1')).toMatchObject({ settingsVersion: 5, draining: false });
+  gateway.close(connection, 1012, 'reconnect before replay');
+  const second = recordingSocket();
+  const reconnected = gateway.open(second.socket, session);
+  gateway.message(reconnected, JSON.stringify(hello));
+  await settle();
+  gateway.message(reconnected, JSON.stringify({ t: 'events', outboxEpoch: hello.outboxEpoch,
+    events: [{ seq: 1, at: 1, type: 'runner.settings', data: { settings: { draining: true }, baseVersion: 1 } }] }));
+  await settle();
+  expect(second.sent).toContainEqual({ t: 'ack', outboxEpoch: hello.outboxEpoch, seq: 1 });
+  expect(getRunner(ctx, 'R-1')).toMatchObject({ settingsVersion: 5, draining: false });
+});

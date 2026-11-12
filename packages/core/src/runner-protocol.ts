@@ -21,7 +21,7 @@ import type {
   VendorQuota,
 } from './types';
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** The WebSocket close codes the hub ends a runner's link with. */
 export const CLOSE_CODES = {
@@ -134,6 +134,8 @@ export type RunnerMessage =
       platform: string;
       /** The last hub-confirmed snapshot, never local edits. */
       settings: RunnerSettings;
+      /** Highest answered settings edit included in the snapshot, within outboxEpoch (protocol 2). */
+      settingsAnsweredSeq?: number;
       vendors: RunnerVendor[];
       quota: AccountQuotaReport[];
       profile: ProfileSummary;
@@ -257,7 +259,14 @@ export type RunnerCommand =
   | { kind: 'refresh_vault'; taskId: string; refs: string[] } // with a late-work message to the current holder
   | { kind: 'preflight'; vendor: Vendor } // after the hub sets a not-ready mark
   | { kind: 'delete_refs'; refs: { ref: string; expectedSha: string }[] }
-  | { kind: 'update_settings'; settings: Partial<Omit<RunnerSettings, 'version'>>; version: number };
+  | { kind: 'update_settings'; settings: Partial<Omit<RunnerSettings, 'version'>>; version: number; answers?: SettingsAnswer };
+
+/** An exact answer, scoped to the runner.db that emitted the edit. */
+export interface SettingsAnswer {
+  seq: number;
+  outboxEpoch: string;
+  refused?: true;
+}
 
 export type RunnerCommandKind = RunnerCommand['kind'];
 
@@ -634,6 +643,7 @@ export const RunnerCommandSchema = schemaFor<RunnerCommand>()(
       kind: z.literal('update_settings'),
       settings: RunnerSettingsChangesSchema,
       version: PositiveInt,
+      answers: z.strictObject({ seq: PositiveInt, outboxEpoch: Name, refused: z.literal(true).optional() }).optional(),
     }),
   ]),
 );
@@ -693,6 +703,7 @@ const HelloSchema = z
     agflowVersion: Name,
     platform: Name,
     settings: RunnerSettingsSchema,
+    settingsAnsweredSeq: NonNegativeInt.optional(),
     vendors: z.array(RunnerVendorSchema),
     quota: z.array(AccountQuotaReportSchema),
     profile: ProfileSummarySchema,
@@ -704,6 +715,9 @@ const HelloSchema = z
     lastSeq: NonNegativeInt,
     lastHubEpoch: PositiveInt.nullable(),
     attempts: z.array(LiveAttemptSchema),
+  })
+  .refine((hello) => (hello.settingsAnsweredSeq ?? 0) <= hello.lastSeq, {
+    error: 'settingsAnsweredSeq cannot exceed lastSeq', path: ['settingsAnsweredSeq'],
   })
   .refine((hello) => hello.lastSeq >= hello.firstSeq - 1, {
     error: 'lastSeq must be at least firstSeq − 1, which an empty outbox reports',

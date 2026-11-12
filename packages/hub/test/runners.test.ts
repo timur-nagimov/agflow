@@ -12,6 +12,7 @@ import {
 import { createSession, sessionHashOf } from '../src/auth';
 import { pendingCommands } from '../src/commands';
 import { tx } from '../src/context';
+import { applyRunnerEvents, EVENT_HANDLERS } from '../src/events-in';
 import { listEvents } from '../src/events';
 import {
   type RunnerRow,
@@ -449,6 +450,41 @@ describe('settings sync', () => {
     expect(pendingCommands(ctx, id, PROTOCOL_VERSION).map((row) => row.kind)).toEqual(['preflight']);
   });
 
+  test('exact answers name the edit and epoch; refusals explicitly answer without changing the settings', () => {
+    const { ctx } = createTestContext();
+    const id = registered(ctx);
+    tx(ctx, () => reconcileHelloSettings(ctx, id, settings()));
+    const event = { seq: 1, at: 1, type: 'runner.settings', data: { settings: { draining: true }, baseVersion: 1 } };
+    applyRunnerEvents(ctx, id, { outboxEpoch: 'box', events: [event] }, { restoreReplay: false });
+    expect(settingsCommands(ctx).at(-1)).toMatchObject({ answers: { seq: 1, outboxEpoch: 'box' } });
+    const handler = EVENT_HANDLERS['runner.settings'];
+    EVENT_HANDLERS['runner.settings'] = () => { throw new Error('refused'); };
+    try {
+      applyRunnerEvents(ctx, id, { outboxEpoch: 'box', events: [{ ...event, seq: 2 }] }, { restoreReplay: false });
+    } finally { EVENT_HANDLERS['runner.settings'] = handler; }
+    expect(settingsCommands(ctx).at(-1)).toMatchObject({ version: 2, settings: {}, answers: { seq: 2, outboxEpoch: 'box', refused: true } });
+    expect(getRunner(ctx, id)).toMatchObject({ draining: true, settingsVersion: 2 });
+  });
+
+  test.each([0, 1, 8])('restore at version %i skips answered edits only when it adopts the snapshot, durably and within the epoch', (version) => {
+    const { ctx } = createTestContext();
+    const id = registered(ctx);
+    ctx.db.query('UPDATE runners SET settings_version = ? WHERE id = ?').run(version, id);
+    const snapshot = settings({ capacity: 4, draining: false, version: 5 });
+    tx(ctx, () => reconcileHelloSettings(ctx, id, snapshot, { outboxEpoch: 'box', settingsAnsweredSeq: 2 }));
+    // The replacement hello, or reconnect after a crash, must retain the adoption cutoff.
+    tx(ctx, () => reconcileHelloSettings(ctx, id, runnerSettings(findRunnerRow(ctx, id)!), { outboxEpoch: 'box', settingsAnsweredSeq: 2 }));
+    const event = { seq: 1, at: 1, type: 'runner.settings', data: { settings: { draining: true }, baseVersion: 1 } };
+    const replay = { outboxEpoch: 'box', events: [event, { ...event, seq: 2, data: { settings: { capacity: 6 }, baseVersion: 2 } }] };
+    expect(applyRunnerEvents(ctx, id, replay, { restoreReplay: true })).toBe(2);
+    expect(getRunner(ctx, id)).toMatchObject(version < 5
+      ? { capacity: 4, draining: false, settingsVersion: 5 }
+      : { capacity: 6, draining: true, settingsVersion: 10 });
+    // A fresh runner.db reuses seq 1; the previous epoch's cutoff cannot suppress it.
+    applyRunnerEvents(ctx, id, { outboxEpoch: 'new-box', events: [event] }, { restoreReplay: false });
+    expect(getRunner(ctx, id).draining).toBe(true);
+  });
+
   test('runner.settings applies the changed fields at the hub version + 1 and echoes them', () => {
     const { ctx } = createTestContext();
     const id = registered(ctx, settings({ ceilings: { claude: { fiveHour: 0.85, weekly: 0.85 } } }));
@@ -562,5 +598,25 @@ describe('vendor holds', () => {
     // The not-ready mark starts the count again.
     tx(ctx, () => markVendorNotReady(ctx, 'R-1', 'codex'));
     expect(holdsOf(ctx).codex?.failedStarts).toBe(0);
+  });
+});
+
+test('a settings refusal and its cumulative acknowledgement commit together, including invalid edits', () => {
+  const { ctx } = createTestContext();
+  const identity = identifyRunner(ctx, 'alice', hello());
+  if (!identity.ok) throw new Error('registration failed');
+  const id = identity.runner.id;
+  tx(ctx, () => reconcileHelloSettings(ctx, id, hello().settings));
+  ctx.db.run(`CREATE TRIGGER fail_answer BEFORE INSERT ON runner_commands
+    BEGIN SELECT RAISE(ABORT, 'cannot persist answer'); END`);
+  const message = { outboxEpoch: 'box', events: [{ seq: 1, at: 1, type: 'runner.settings',
+    data: { settings: { capacity: 0 }, baseVersion: 1 } }] };
+  expect(() => applyRunnerEvents(ctx, id, message, { restoreReplay: false })).toThrow('cannot persist answer');
+  expect(ctx.db.query('SELECT acked_seq FROM runner_inbox WHERE runner_id = ?').get(id)).toBeNull();
+  expect(ctx.db.query('SELECT seq FROM runner_event_rejects').all()).toEqual([]);
+  ctx.db.run('DROP TRIGGER fail_answer');
+  expect(applyRunnerEvents(ctx, id, message, { restoreReplay: false })).toBe(1);
+  expect(pendingCommands(ctx, id, PROTOCOL_VERSION).at(-1)?.command).toMatchObject({
+    answers: { seq: 1, outboxEpoch: 'box', refused: true }, settings: {}, version: 1,
   });
 });

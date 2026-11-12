@@ -573,8 +573,8 @@ describe('CommandExecutor', () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const settings = () => f.events('runner.settings').map((event) => event.data);
-    const echo = (edit: { capacity?: number; draining?: boolean; keepAwake?: 'off' | 'always' }, version: number) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, version));
+    const echo = (edit: { capacity?: number; draining?: boolean; keepAwake?: 'off' | 'always' }, version: number, seq?: number) =>
+      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version, ...(seq ? { answers: { seq, outboxEpoch: f.outbox.epoch } } : {}) }, version));
     const base = f.config.confirmedSettings.version;
     const keepAwake = f.config.keepAwake === 'always' ? 'off' : 'always';
     // A drain sent and not acknowledged yet, and a keepAwake edit that never went out.
@@ -590,8 +590,8 @@ describe('CommandExecutor', () => {
     ]);
     // Both applied and acknowledged. The drain's echo comes first; keepAwake's, based on base + 1, is still to come.
     f.outbox.ack(f.outbox.epoch, f.outbox.lastSeq());
-    expect((await echo({ draining: true }, base + 2))?.ok).toBe(true);
-    expect((await echo({ keepAwake }, base + 3))?.ok).toBe(true);
+    expect((await echo({ draining: true }, base + 2, 1))?.ok).toBe(true);
+    expect((await echo({ keepAwake }, base + 3, 2))?.ok).toBe(true);
     expect(settings()).toHaveLength(2);
     expect(f.config).toMatchObject({
       capacity: 7,
@@ -605,8 +605,8 @@ describe('CommandExecutor', () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const settings = () => f.events('runner.settings').map((event) => event.data);
-    const echo = (edit: { capacity?: number; draining?: boolean }, version: number) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, version));
+    const echo = (edit: { capacity?: number; draining?: boolean }, version: number, seq?: number) =>
+      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version, ...(seq ? { answers: { seq, outboxEpoch: f.outbox.epoch } } : {}) }, version));
     const base = f.config.confirmedSettings.version;
     // A drain, sent and acknowledged; the hub applied two of the owner's edits first, whose echoes come before its own.
     f.config.draining = true;
@@ -621,7 +621,7 @@ describe('CommandExecutor', () => {
       confirmedSettings: { capacity: 6, draining: false },
     });
     // Its own echo: the drain is in the snapshot and in flight no longer.
-    expect((await echo({ draining: true }, base + 3))?.ok).toBe(true);
+    expect((await echo({ draining: true }, base + 3, 1))?.ok).toBe(true);
     expect(f.outbox.settingsInFlight()).toEqual([]);
     // So a later local edit is sent: the owner undrains, then runner.json drains again by hand, with no event.
     expect((await echo({ draining: false }, base + 4))?.ok).toBe(true);
@@ -634,12 +634,12 @@ describe('CommandExecutor', () => {
     ]);
   });
 
-  test("an owner's echo equal to a later edit in flight leaves the earlier edits in flight", async () => {
+  test("an owner's echo equal to a later edit leaves all local edits in flight", async () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const settings = () => f.events('runner.settings').map((event) => event.data);
-    const echo = (edit: { capacity?: number; draining?: boolean }, version: number) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, version));
+    const echo = (edit: { capacity?: number; draining?: boolean }, version: number, seq?: number) =>
+      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version, ...(seq ? { answers: { seq, outboxEpoch: f.outbox.epoch } } : {}) }, version));
     const base = f.config.confirmedSettings.version;
     const capacity = f.config.capacity + 1;
     // Two edits, sent and acknowledged; the owner drained too, and the hub applied that first.
@@ -648,12 +648,12 @@ describe('CommandExecutor', () => {
     f.outbox.append({ type: 'runner.settings', data: { settings: { capacity }, baseVersion: base } });
     f.outbox.append({ type: 'runner.settings', data: { settings: { draining: true }, baseVersion: base } });
     f.outbox.ack(f.outbox.epoch, f.outbox.lastSeq());
-    // The owner's drain answers the runner's in effect; the capacity edit is still to be applied, so it is not sent.
+    // The owner's drain answers neither local edit; both await their exact echoes.
     expect((await echo({ draining: true }, base + 1))?.ok).toBe(true);
     expect(settings()).toHaveLength(2);
-    expect(f.outbox.settingsInFlight().map((event) => event.data.settings)).toEqual([{ capacity }]);
-    expect((await echo({ capacity }, base + 2))?.ok).toBe(true);
-    expect((await echo({ draining: true }, base + 3))?.ok).toBe(true);
+    expect(f.outbox.settingsInFlight().map((event) => event.data.settings)).toEqual([{ capacity }, { draining: true }]);
+    expect((await echo({ capacity }, base + 2, 1))?.ok).toBe(true);
+    expect((await echo({ draining: true }, base + 3, 2))?.ok).toBe(true);
     expect(settings()).toHaveLength(2);
     expect(f.outbox.settingsInFlight()).toEqual([]);
     expect(f.config).toMatchObject({ capacity, draining: true, confirmedSettings: { capacity, draining: true } });
@@ -663,19 +663,19 @@ describe('CommandExecutor', () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const settings = () => f.events('runner.settings').map((event) => event.data);
-    const echo = (edit: { draining?: boolean }, version: number) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, version));
+    const echo = (edit: { draining?: boolean }, version: number, seq?: number) =>
+      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version, ...(seq ? { answers: { seq, outboxEpoch: f.outbox.epoch } } : {}) }, version));
     const base = f.config.confirmedSettings.version;
     // A drain, then an undrain, both sent and acknowledged: runner.json is back where the snapshot is.
     f.outbox.append({ type: 'runner.settings', data: { settings: { draining: true }, baseVersion: base } });
     f.outbox.append({ type: 'runner.settings', data: { settings: { draining: false }, baseVersion: base } });
     f.outbox.ack(f.outbox.epoch, f.outbox.lastSeq());
     // The hub applied both. The drain's echo comes first: the undrain is still in flight, and runner.json holds it.
-    expect((await echo({ draining: true }, base + 1))?.ok).toBe(true);
+    expect((await echo({ draining: true }, base + 1, 1))?.ok).toBe(true);
     expect(f.config).toMatchObject({ draining: false, confirmedSettings: { draining: true, version: base + 1 } });
     expect(x.run.settings.view()).toMatchObject({ draining: false });
     expect(settings()).toHaveLength(2);
-    expect((await echo({ draining: false }, base + 2))?.ok).toBe(true);
+    expect((await echo({ draining: false }, base + 2, 2))?.ok).toBe(true);
     expect(f.config).toMatchObject({ draining: false, confirmedSettings: { draining: false, version: base + 2 } });
     expect(f.outbox.settingsInFlight()).toEqual([]);
     expect(settings()).toHaveLength(2);
@@ -694,9 +694,9 @@ describe('CommandExecutor', () => {
     outbox.ack(outbox.epoch, outbox.lastSeq());
     f.config.draining = true;
     // What a kill between the mark and runner.json's write leaves: the row running, the mark, the old snapshot.
-    const command: RunnerCommand = { kind: 'update_settings', settings: { draining: true }, version: base + 1 };
+    const command: RunnerCommand = { kind: 'update_settings', settings: { draining: true }, version: base + 1, answers: { seq: seqs[0]!, outboxEpoch: outbox.epoch } };
     journal.begin('1-R-1-9', 9, command);
-    expect(outbox.markSettingsEcho({ draining: true }, base + 1).answered?.seq).toBe(seqs[0]);
+    expect(outbox.markSettingsEcho({ seq: seqs[0]!, outboxEpoch: outbox.epoch }, base + 1).answered?.seq).toBe(seqs[0]);
     expect(outbox.settingsInFlight().map((event) => event.seq)).toEqual(seqs);
     // The next start runs the row again when the hub sends it again.
     const run = new CommandExecutor({ ...x.options, outbox, journal });
@@ -708,38 +708,6 @@ describe('CommandExecutor', () => {
     expect(f.db.meta('settingsEchoed')).toEqual([{ seq: seqs[0], version: base + 1 }]);
     expect(outbox.settingsInFlight().map((event) => event.seq)).toEqual(seqs.slice(1));
     expect(f.events('runner.settings')).toHaveLength(3);
-  });
-
-  test("a probe's echo settles the edits the hub refused: runner.json takes the hub's values, with a warning, and nothing is sent", async () => {
-    const f = await createRunnerFixture();
-    const x = executor(f);
-    const settings = () => f.events('runner.settings').map((event) => event.data);
-    const echo = (edit: { capacity?: number; draining?: boolean }, version: number) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, version));
-    const base = f.config.confirmedSettings.version;
-    const capacity = f.config.confirmedSettings.capacity;
-    // A capacity edit the hub refused, a drain it applied, and a probe after them; all acknowledged.
-    f.config.capacity = capacity + 1;
-    f.config.draining = true;
-    f.outbox.append({ type: 'runner.settings', data: { settings: { capacity: capacity + 1 }, baseVersion: base } });
-    f.outbox.append({ type: 'runner.settings', data: { settings: { draining: true }, baseVersion: base } });
-    f.outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: base } });
-    f.outbox.ack(f.outbox.epoch, f.outbox.lastSeq());
-    // The owner's capacity edit came first: runner.json keeps the refused edit's value while it is in flight.
-    expect((await echo({ capacity: capacity + 2 }, base + 1))?.ok).toBe(true);
-    expect(f.config.capacity).toBe(capacity + 1);
-    expect((await echo({ draining: true }, base + 2))?.ok).toBe(true);
-    // The probe's echo: the capacity edit got none before it, so the hub refused it.
-    expect((await echo({}, base + 3))?.ok).toBe(true);
-    expect(f.config).toMatchObject({
-      capacity: capacity + 2,
-      draining: true,
-      confirmedSettings: { capacity: capacity + 2, draining: true, version: base + 3 },
-    });
-    expect(f.outbox.settingsInFlight()).toEqual([]);
-    expect(settings()).toHaveLength(3);
-    const warning = f.logger.entries.find((entry) => /refused a settings edit/.test(entry.message));
-    expect(warning).toMatchObject({ level: 'warn', fields: { seq: 1, settings: { capacity: capacity + 1 } } });
   });
 
   test('an echo answers no edit made after it came, and a rerun after a restart keeps where it came', async () => {
@@ -785,8 +753,8 @@ describe('CommandExecutor', () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const settings = () => f.events('runner.settings').map((event) => event.data.settings);
-    const echo = (edit: { capacity?: number; draining?: boolean }, version: number) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, version));
+    const echo = (edit: { capacity?: number; draining?: boolean }, version: number, seq?: number) =>
+      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version, ...(seq ? { answers: { seq, outboxEpoch: f.outbox.epoch } } : {}) }, version));
     const base = f.config.confirmedSettings.version;
     // A drain, sent and acknowledged; its echo comes while runner.json cannot be written.
     f.config.draining = true;
@@ -796,7 +764,7 @@ describe('CommandExecutor', () => {
       f.config = config;
       throw new Error('ENOSPC: no space left on device');
     });
-    expect(await echo({ draining: true }, base + 1)).toEqual({ ok: true });
+    expect(await echo({ draining: true }, base + 1, 1)).toEqual({ ok: true });
     expect(f.config).toMatchObject({ draining: true, confirmedSettings: { draining: true, version: base + 1 } });
     expect(f.logger.entries).toContainEqual(
       expect.objectContaining({ level: 'error', fields: { error: 'ENOSPC: no space left on device' } }),
@@ -929,8 +897,8 @@ describe('CommandExecutor', () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const settings = () => f.events('runner.settings').map((event) => event.data.settings);
-    const echo = (edit: Record<string, unknown>, version: number, id = version) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, id));
+    const echo = (edit: Record<string, unknown>, version: number, id = version, seq?: number) =>
+      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version, ...(seq ? { answers: { seq, outboxEpoch: f.outbox.epoch } } : {}) }, id));
     // Runs once every runner command taken before it has run.
     const barrier = () => x.run.onCommand(message({ kind: 'preflight', vendor: 'claude' }, 1_000));
     const base = f.config.confirmedSettings.version;
@@ -952,7 +920,7 @@ describe('CommandExecutor', () => {
       ceilings: { codex: low },
       allowPaidUsage: { claude: true },
     };
-    const waiting = [echo({ capacity: 3 }, base + 2), echo({ keepAwake: 'always' }, base + 3), echo(patch, base + 4)];
+    const waiting = [echo({ capacity: 3 }, base + 2), echo({ keepAwake: 'always' }, base + 3, base + 3, edit.seq), echo(patch, base + 4)];
     await barrier();
     expect(x.journal.get(`1-R-1-${base + 2}`)?.state).toBe('running');
     expect(f.config).toMatchObject({ capacity: 2, keepAwake: 'always', confirmedSettings: { version: base } });
@@ -962,7 +930,7 @@ describe('CommandExecutor', () => {
     expect(await Promise.all(waiting)).toEqual([null, null, null]);
     // That hello reported the older version: the hub sends them again, then all of its settings, which apply past the
     // gap; the echoes they cover only mark the edit they answer.
-    const resent = [echo({ capacity: 3 }, base + 2), echo({ keepAwake: 'always' }, base + 3), echo(patch, base + 4)];
+    const resent = [echo({ capacity: 3 }, base + 2), echo({ keepAwake: 'always' }, base + 3, base + 3, edit.seq), echo(patch, base + 4)];
     const whole = {
       capacity: 4,
       keepAwake: 'always',
@@ -1053,47 +1021,6 @@ describe('CommandExecutor', () => {
       draining: true,
       confirmedSettings: { capacity: 3, draining: true, version: base + 2 },
     });
-  });
-
-  test('settingsAcknowledged sends a probe for an acknowledged edit no echo answered, once the commands before it ran', async () => {
-    const f = await createRunnerFixture();
-    const x = executor(f);
-    const settings = () => f.events('runner.settings').map((event) => event.data.settings);
-    const echo = (edit: { capacity?: number; draining?: boolean }, version: number) =>
-      x.run.onCommand(message({ kind: 'update_settings', settings: edit, version }, version));
-    const ack = () => f.outbox.ack(f.outbox.epoch, f.outbox.lastSeq());
-    const base = f.config.confirmedSettings.version;
-    const capacity = f.config.capacity;
-    // A drain whose echo came before its ack, as M2a sends them, and waits behind a pause: no probe.
-    f.config.draining = true;
-    f.outbox.append({ type: 'runner.settings', data: { settings: { draining: true }, baseVersion: base } });
-    x.run.pause();
-    const echoed = echo({ draining: true }, base + 1);
-    ack();
-    const checked = x.run.settingsAcknowledged({ welcome: false });
-    x.run.resume();
-    await Promise.all([echoed, checked]);
-    expect(settings()).toEqual([{ draining: true }]);
-    // A capacity edit the hub acknowledged and never echoed: a probe follows.
-    f.config.capacity = capacity + 1;
-    f.outbox.append({ type: 'runner.settings', data: { settings: { capacity: capacity + 1 }, baseVersion: base + 1 } });
-    ack();
-    await x.run.settingsAcknowledged({ welcome: false });
-    expect(settings()).toEqual([{ draining: true }, { capacity: capacity + 1 }, {}]);
-    // None more while that probe waits for its acknowledgement, or once acknowledged, for its echo; one at a welcome.
-    await x.run.settingsAcknowledged({ welcome: true });
-    ack();
-    await x.run.settingsAcknowledged({ welcome: false });
-    expect(settings()).toHaveLength(3);
-    await x.run.settingsAcknowledged({ welcome: true });
-    await x.run.settingsAcknowledged({ welcome: true });
-    expect(settings()).toEqual([{ draining: true }, { capacity: capacity + 1 }, {}, {}]);
-    // The first probe's echo: the capacity edit was refused. Nothing is left to probe for.
-    ack();
-    expect((await echo({}, base + 2))?.ok).toBe(true);
-    expect(f.config.capacity).toBe(capacity);
-    await x.run.settingsAcknowledged({ welcome: true });
-    expect(settings()).toHaveLength(4);
   });
 
   test('preparation uses the command id and agent environment, reports outcomes, and works without a live controller after restart', async () => {

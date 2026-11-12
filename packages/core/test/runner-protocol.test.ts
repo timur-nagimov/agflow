@@ -406,12 +406,12 @@ describe('hello', () => {
       if (parsed.ok) throw new Error(`expected an error, got ${JSON.stringify(parsed.value)}`);
       return parsed.hello;
     };
-    const newer = { protocol: 2, runnerKey: hello.runnerKey, machineId: hello.machineId };
+    const newer = { protocol: PROTOCOL_VERSION + 1, runnerKey: hello.runnerKey, machineId: hello.machineId };
     // A protocol-2 hello with a field protocol 1 does not know, and one that kept little of protocol 1's shape.
-    expect(helloOf({ ...hello, protocol: 2, resumeTokens: ['rt_1'] })).toEqual(newer);
+    expect(helloOf({ ...hello, protocol: PROTOCOL_VERSION + 1, resumeTokens: ['rt_1'] })).toEqual(newer);
     expect(helloOf({ t: 'hello', ...newer, capabilities: { compaction: true } })).toEqual(newer);
     // An unreadable protocol-1 hello gives them too: the hub supports that version, so it closes the link instead.
-    expect(helloOf({ ...hello, git: null })).toEqual({ ...newer, protocol: 1 });
+    expect(helloOf({ ...hello, protocol: 1, git: null })).toEqual({ ...newer, protocol: 1 });
     // Without a usable version, key and machine there is nothing to refuse.
     for (const bad of [
       without(hello, 'protocol'),
@@ -544,7 +544,7 @@ describe('commands', () => {
   test('COMMAND_MIN_PROTOCOL maps all 17 kinds to 1', () => {
     expect(Object.keys(COMMAND_MIN_PROTOCOL).sort()).toEqual([...RUNNER_COMMAND_KINDS].sort());
     for (const kind of RUNNER_COMMAND_KINDS) expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, 1]);
-    expect(PROTOCOL_VERSION).toBe(1);
+    expect(PROTOCOL_VERSION).toBe(2);
   });
 
   test('start_attempt and resume_attempt carry an agent token', () => {
@@ -1052,4 +1052,15 @@ describe('runner events', () => {
     if (!parsed.ok || parsed.value.t !== 'events') throw new Error('the events message did not parse');
     expect(parsed.value.events.map((event) => parseRunnerEvent(event).ok)).toEqual([...typed.map(() => true), false]);
   });
+});
+
+test('protocol 2 names exact settings answers and bounds the hello watermark to its outbox', () => {
+  expect(PROTOCOL_VERSION).toBe(2);
+  const command = { kind: 'update_settings', settings: {}, version: 4,
+    answers: { seq: 42, outboxEpoch: 'epoch', refused: true } } as const;
+  expect(RunnerCommandSchema.parse(command)).toEqual(command);
+  expect(RunnerCommandSchema.safeParse({ ...command, answers: { seq: 0, outboxEpoch: 'epoch' } }).success).toBe(false);
+  expect(parseRunnerMessage(JSON.stringify({ ...hello, settingsAnsweredSeq: 42 })).ok).toBe(true);
+  expect(parseRunnerMessage(JSON.stringify({ ...hello, settingsAnsweredSeq: 58 })).ok).toBe(false);
+  expect(parseRunnerMessage(JSON.stringify({ ...hello, protocol: 1 })).ok).toBe(true);
 });

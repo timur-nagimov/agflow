@@ -19,12 +19,10 @@
 //   rows a previous run left running are settled, and late work it left pending (AttemptRecord.lateWorkSha) is
 //   retried until it lands. Each controller then gets its outage nudge and held WIP, and every field runner.json
 //   changed since the snapshot goes out as runner.settings (X-12).
-// - Settings sync (settings-sync.ts, X-12): each ack, and each welcome, checks for a settings edit the hub
-//   acknowledged and never echoed, once the commands received before it have run. A welcome of another hub epoch is
-//   a restored hub's: the runner records the events it holds then and says hello again at once, before it runs or
-//   sends anything, so that hub reconciles against the runner's snapshot, not what its backup knew of it. The replays
-//   to it leave out the edits held then whose answer the snapshot holds, which it would apply twice. runner.json's
-//   write may fail; the runner goes on with the settings it holds.
+// - Settings sync (settings-sync.ts, X-12): exact answers settle local edits, including refusals. Hello carries the
+//   contiguous answer cutoff included in its snapshot. Every retained event is replayed; the hub alone skips edits
+//   covered by a snapshot it adopted. A welcome of another hub epoch records that epoch and reconnects before any
+//   command runs. runner.json's write may fail; the runner goes on with the settings it holds.
 // - After a welcome, a runner.state or runner.vendors the outbox replays that differs from the hello goes out again
 //   as it is now, so the hub's last word on each is current.
 // - Heartbeats carry every live attempt's facts, a start still preparing included, which renews its lease, and the
@@ -414,7 +412,6 @@ class Runtime {
   private preflightTimer: ReturnType<typeof setInterval> | null = null;
   private preflighting = false;
   private readonly stopGaps: () => void;
-  private readonly stopAcks: () => void;
 
   constructor(input: RuntimeInput) {
     const { options, logger, db } = input;
@@ -447,7 +444,6 @@ class Runtime {
         return this.hello();
       },
       heartbeat: () => this.heartbeat(),
-      resent: (event) => this.executor.settings.resent(event),
       handlers: {
         onCommand: (message) => this.executor.onCommand(message),
         onWelcome: (welcome) => this.welcomed(welcome),
@@ -485,7 +481,6 @@ class Runtime {
       },
       logger,
     });
-    this.stopAcks = this.outbox.onAck(() => void this.executor.settingsAcknowledged({ welcome: false }));
   }
 
   start(): void {
@@ -501,7 +496,6 @@ class Runtime {
     this.executor.close();
     this.clock.stop();
     this.stopGaps();
-    this.stopAcks();
     if (this.preflightTimer !== null) clearInterval(this.preflightTimer);
     this.preflightTimer = null;
     for (const controller of this.controllers.values()) controller.close();
@@ -746,6 +740,7 @@ class Runtime {
       agflowVersion: AGFLOW_VERSION,
       platform: vendorPlatform(),
       settings: settingsOf(this.config),
+      settingsAnsweredSeq: this.outbox.settingsAnsweredSeq(),
       vendors,
       quota,
       profile,
@@ -783,12 +778,8 @@ class Runtime {
   }
 
   /**
-   * Each welcome, before any message that follows it. A hub epoch other than the last welcome's is a hub restored from
-   * a backup (X-12): the runner records the events it holds then (Outbox.hubRestored), whose settings edits the replays
-   * to that hub leave out when the snapshot holds their answer, and says hello again at once, before it runs or sends
-   * anything. The hub reconciled the first hello against what it knew of the runner, perhaps nothing (a backup older
-   * than the runner): the second finds its snapshot there, at its version or adopted, and whatever the first one made
-   * the hub send cancelled. The epoch is written last, so a death before it records the events again.
+   * A restored hub gets a replacement hello before any command or replay. Record its epoch first; a failed write
+   * backs off and retries at the next welcome. Settings replay cutoffs are persisted by the hub during adoption.
    */
   private welcomed(welcome: WelcomeMessage): void {
     const lastHubEpoch = this.db.meta('lastHubEpoch');
@@ -799,7 +790,6 @@ class Runtime {
     }
     if (lastHubEpoch !== null && lastHubEpoch !== welcome.hubEpoch) {
       try {
-        this.outbox.hubRestored();
         this.db.setMeta('lastHubEpoch', welcome.hubEpoch);
       } catch (error) {
         this.logger.error('cannot record the restored hub', { error: describe(error) });
@@ -842,11 +832,10 @@ class Runtime {
       this.logger.error('cannot report the state after the replay', { error: describe(error) });
     }
     try {
-      this.executor.settings.welcomed({ ackedSeq: welcome.ackedSeq });
+      this.executor.settings.welcomed();
     } catch (error) {
       this.logger.error('cannot send the settings edits after the welcome', { error: describe(error) });
     }
-    void this.executor.settingsAcknowledged({ welcome: true });
   }
 
   /**

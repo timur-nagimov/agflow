@@ -314,24 +314,6 @@ export class CommandExecutor {
     );
   }
 
-  /**
-   * After an acknowledgement, and after each welcome: once every runner command received before it has run (held
-   * ones included, so a pause holds this too), an acknowledged settings edit still unanswered gets a probe
-   * (SettingsSync.probeUnanswered). Resolves once that check ran.
-   */
-  settingsAcknowledged(options: { welcome: boolean }): Promise<void> {
-    const checked = Promise.withResolvers<void>();
-    const check = () => {
-      this.runnerQueue
-        .run('runner', async () => this.settings.probeUnanswered(options))
-        .catch((error) => this.options.logger.error('cannot check the settings edits', { error: describe(error) }))
-        .then(checked.resolve);
-    };
-    if (this.paused) this.held.push(check);
-    else check();
-    return checked.promise;
-  }
-
   /** Whether welcome.stop ended the command's attempt and the command does not outlive it. */
   private refusedAsEnded(command: RunnerCommand): boolean {
     const attemptId = attemptOf(command);

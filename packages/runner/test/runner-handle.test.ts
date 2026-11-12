@@ -66,10 +66,7 @@ const cloneOf = (s: RunnerSetup, attemptId = 'T-4-a1') =>
 const eventsOf = <T extends RunnerEvent['type']>(s: RunnerSetup, type: T) =>
   s.hub.events().filter((event) => event.type === type) as Extract<RunnerEvent, { type: T }>[];
 
-/**
- * The settings edits the hub received, probes aside: this hub acknowledges an edit before its echo, which M2a never
- * does, so a probe follows each one (SettingsSync.probeUnanswered).
- */
+/** The local settings edits the hub received. */
 const editsOf = (s: RunnerSetup) =>
   eventsOf(s, 'runner.settings').filter((event) => Object.keys(event.data.settings).length > 0);
 
@@ -154,7 +151,7 @@ describe('RunnerHandle', () => {
     // Nothing changes: nothing is sent.
     expect(await runner.changeSettings({ draining: true, capacity: 2 })).toBeNull();
     // The hub applies the drain and echoes it at its next version.
-    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5 })).toMatchObject({
+    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5, answers: { seq: editsOf(s)[0]!.seq, outboxEpoch: s.db.outboxEpoch } })).toMatchObject({
       ok: true,
     });
     expect(loadRunnerConfig(s.paths.config)).toMatchObject({
@@ -163,6 +160,7 @@ describe('RunnerHandle', () => {
     });
     expect(runner.status().settings.draining).toBe(true);
     expect(editsOf(s)).toHaveLength(1);
+    expect(new Outbox(s.db).settingsInFlight()).toEqual([]);
   }, 60_000);
 
   test('a drain made while the runner was down and a capacity change made in the browser meanwhile both survive, the drain sent once', async () => {
@@ -188,7 +186,7 @@ describe('RunnerHandle', () => {
       confirmedSettings: { ...SNAPSHOT, capacity: 3, version: 5 },
     });
     // The drain applied, at version 6.
-    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 6 })).toMatchObject({
+    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 6, answers: { seq: editsOf(s)[0]!.seq, outboxEpoch: s.db.outboxEpoch } })).toMatchObject({
       ok: true,
     });
     expect(sent()).toHaveLength(1);
@@ -198,6 +196,7 @@ describe('RunnerHandle', () => {
       confirmedSettings: { ...SNAPSHOT, capacity: 3, draining: true, version: 6 },
     });
     expect(editsOf(s)).toHaveLength(1);
+    expect(new Outbox(s.db).settingsInFlight()).toEqual([]);
   }, 60_000);
 
   test('a local edit back to an earlier value while an older edit is in flight is sent, and the last one wins', async () => {
@@ -209,7 +208,7 @@ describe('RunnerHandle', () => {
     expect(await runner.changeSettings({ draining: false })).toEqual(expect.any(Number));
     await s.hub.waitFor(() => sent().length === 2);
     // The hub applied both. The drain's echo comes first: the undrain is still in flight, and runner.json holds it.
-    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5 })).toMatchObject({
+    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5, answers: { seq: editsOf(s)[0]!.seq, outboxEpoch: s.db.outboxEpoch } })).toMatchObject({
       ok: true,
     });
     expect(runner.status().settings.draining).toBe(false);
@@ -221,7 +220,7 @@ describe('RunnerHandle', () => {
       [false, 6],
       [true, 7],
     ] as const) {
-      expect(await run(s.hub, { kind: 'update_settings', settings: { draining }, version })).toMatchObject({ ok: true });
+      expect(await run(s.hub, { kind: 'update_settings', settings: { draining }, version, answers: { seq: editsOf(s)[version - 5]!.seq, outboxEpoch: s.db.outboxEpoch } })).toMatchObject({ ok: true });
       expect(runner.status().settings.draining).toBe(true);
     }
     expect(loadRunnerConfig(s.paths.config)).toMatchObject({
@@ -229,6 +228,7 @@ describe('RunnerHandle', () => {
       confirmedSettings: { ...SNAPSHOT, draining: true, version: 7 },
     });
     expect(sent()).toHaveLength(3);
+    expect(new Outbox(s.db).settingsInFlight()).toEqual([]);
   }, 60_000);
 
   test('changeSettings changes nothing and rejects when runner.json cannot be written', async () => {
