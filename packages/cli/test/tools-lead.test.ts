@@ -31,7 +31,11 @@ describe('lead tools', () => {
     createTasks(hub.ctx, [NewTaskSchema.parse(spec('One')), NewTaskSchema.parse(spec('Two'))], 'user:alice');
     const bob = getAgent(hub.ctx, worker.agentId);
     claimTask(hub.ctx, 'T-1', bob);
-    submitTask(hub.ctx, 'T-1', bob, { summary: 'done', evidence: [] });
+    submitTask(hub.ctx, 'T-1', bob, { summary: 'done', evidence: [], branch: 'review-one', headSha: 'a'.repeat(40) });
+    expect(JSON.parse(await call('fetch_submission', { task_id: 'T-1' }, lead))).toEqual({
+      branch: 'review-one', head_sha: 'a'.repeat(40), note: expect.stringContaining('own git remote'),
+    });
+    await expect(call('fetch_submission', { task_id: 'T-1' }, as(worker, 'worker'))).rejects.toThrow('only the lead');
     expect(await call('accept_task', { id: 'T-1', note: 'Nice.' }, lead)).toBe('Accepted T-1.');
     expect(await call('mark_merged', { id: 'T-1', sha: 'abc1234' }, lead)).toBe('T-1 is merged (abc1234).');
     claimTask(hub.ctx, 'T-2', getAgent(hub.ctx, worker.agentId));
@@ -71,9 +75,10 @@ describe('lead tools', () => {
     );
   });
 
-  test('all 27 tools are registered with unique names', () => {
+  test('all 28 tools are registered with unique names', () => {
     const names = allTools.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
-    expect(names).toHaveLength(27);
+    expect(names).toHaveLength(28);
+    expect(names).toContain('fetch_submission');
   });
 });

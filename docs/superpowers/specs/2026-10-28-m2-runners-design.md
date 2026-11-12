@@ -982,10 +982,11 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 | `POST /api/tasks/:id/{progress,handoff,submit,block,impossible,release}` | the holder (above) |
 | `GET /api/submissions/:id` | its own submissions |
 | `POST /api/prepare`, `GET /api/prepare/:id` | dependency preparation for its own attempt |
+| `POST /api/fetch-submission`, `GET /api/fetch-submission/:id` | lead only: the caller must hold the seat; polling is restricted to the lead attempt that requested the fetch (section 6.13) |
 | `POST /api/inbox`, `POST /api/inbox/ack`, `POST /api/messages` | |
 | lead routes: `POST /api/tasks`, `PATCH /api/tasks/:id`, `POST /api/tasks/:id/{cancel,accept,reject,unblock,merged}`, `POST /api/goal/notes`, `POST /api/staffing`, `POST /api/agents/:id/{stop,replace}`, `POST /api/lead/handoff`, `GET /api/lead/notes` | only while the agent holds the lead seat (section 6.11). Stop and replace apply only to runner agents. |
 
-`leadOrHuman` changes for every agent principal, live or runner: the agent must hold the seat (`hub_state.lead_agent_id`).
+`leadOrHuman` changes for every agent principal, live or runner: the agent must hold the seat (`hub_state.lead_agent_id`). For `fetch_submission`, a runner lead uses its ordinary agent token; there is no separate lead token. A live lead uses the M1 CLI token plus `X-Agflow-Agent` and gets the branch and head immediately. A person without an agent identity cannot call either fetch route.
 
 ### 6.6 Scheduler
 
@@ -1410,6 +1411,8 @@ All request and response bodies have zod schemas in `packages/core/src/api-schem
 | `POST /api/agents/:id/interrupt` | person (browser) | → `{ ok }`; sends `interrupt` to a runner agent |
 | `GET /api/submissions/:id` | the submitting agent, or people | → `{ submission: SubmissionRecord }` |
 | `POST /api/prepare`, `GET /api/prepare/:id` | agent token | → `202 { request: PrepareRequest }` / `{ request: PrepareRequest }` |
+| `POST /api/fetch-submission` | seated lead (runner agent token or live agent identity) | `{ task_id }` → `202 { request: FetchSubmissionRequest }` for a pending vault fetch; `200 { request }` for a live lead |
+| `GET /api/fetch-submission/:id` | seated runner lead, requesting attempt only | → `{ request: FetchSubmissionRequest }` |
 | `POST /api/lead/handoff` | seat holder | `{ note }` → `{ ok }` |
 | `GET /api/lead/notes` | seat holder or people | → `{ notes: LeadNote[] }` |
 | `PATCH /api/project` (new) | person (browser) | `{ runnerLeads: boolean }` → `Project` |
