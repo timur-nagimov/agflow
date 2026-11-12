@@ -18,7 +18,7 @@ import { gitIn } from '../src/git-fixtures';
 import type { Cluster } from '../src/harness/cluster';
 import type { ProcessInfo } from '../src/harness/proc';
 import { E2E_PLATFORM } from '../src/harness/env';
-import { CLUSTER_CLOSED, inLiveCluster, LIVE_OPTIONS, runTakeoverCheck, type TakeoverPerson } from '../src/live';
+import { CLUSTER_CLOSED, confirmTakeoverReady, inLiveCluster, LIVE_OPTIONS, runTakeoverCheck, type TakeoverPerson } from '../src/live';
 import { RAN_TO_END, type ScenarioResult } from '../src/scenarios/result';
 import { TAKEOVER } from '../src/scenarios/takeover';
 
@@ -275,5 +275,41 @@ describe('package.json', () => {
   test('the root script `bun run live-run` runs scripts/live-run.ts, kept awake', () => {
     const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
     expect(pkg.scripts['live-run']).toBe('caffeinate -i bun scripts/live-run.ts');
+  });
+});
+
+describe('take-over readiness', () => {
+  test('explains the window and waits before starting each vendor cluster', async () => {
+    const order: string[] = [];
+    for (const vendor of ['claude', 'codex'] as const) {
+      const { cluster } = closingCluster(async () => {});
+      await inLiveCluster('take-over check', vendor, async () => {
+        order.push(`start ${vendor}`);
+        return cluster;
+      }, false, async () => [PASSED], () => {}, () => confirmTakeoverReady(vendor, {
+        isTTY: true,
+        log: (line = '') => order.push(line),
+        ask: (question) => { order.push(question); return ''; },
+      }));
+      const start = order.indexOf(`start ${vendor}`);
+      expect(order[start - 1]).toContain('Press Enter');
+      expect(order[start - 2]).toContain('10 minutes');
+      expect(order[start - 2]).toContain(vendor);
+    }
+  });
+
+  test('non-TTY input and EOF never start the cluster', async () => {
+    for (const isTTY of [false, true]) {
+      let starts = 0;
+      const result = await inLiveCluster('take-over check', 'codex', async () => {
+        starts++;
+        throw new Error('must not start');
+      }, false, async () => [], () => {}, () => confirmTakeoverReady('codex', {
+        isTTY, log: () => {}, ask: () => null,
+      }));
+      expect(starts).toBe(0);
+      expect(result[0]?.passed).toBe(false);
+      expect(result[0]?.checks[0]?.detail).toMatch(/TTY|cancelled/);
+    }
   });
 });

@@ -63,7 +63,7 @@ export const LIVE_OPTIONS = [
   {
     flag: '--scenarios',
     value: '<names>',
-    help: `Some of ${LIVE_SCENARIOS.join(',')} (the default: all three).`,
+    help: `Some of ${LIVE_SCENARIOS.join(',')} (the default: all three), or none for only --takeover.`,
   },
   {
     flag: '--repo',
@@ -190,7 +190,7 @@ export function parseLiveArgs(argv: readonly string[], defaults: LiveDefaults = 
         args.runners = listOf(flag, 'vendor', value, vendorOf);
         break;
       case '--scenarios':
-        args.scenarios = listOf(flag, 'scenario', value, scenarioOf);
+        args.scenarios = value === 'none' ? [] : listOf(flag, 'scenario', value, scenarioOf);
         break;
       case '--repo':
         args.repo = value;
@@ -415,6 +415,22 @@ export const CLUSTER_CLOSED = 'the cluster closed cleanly';
 /** Where a live run tells the person how it goes: a line at a time, an empty one by default. */
 export type LiveLog = (line?: string) => void;
 
+/** A live take-over spends no quota until the person is at their terminal. Scripted drivers omit this gate. */
+export function confirmTakeoverReady(
+  vendor: Vendor,
+  terminal: { isTTY: boolean; log: LiveLog; ask(question: string): string | null },
+): void {
+  if (!terminal.isTTY) throw new Error('The live take-over check needs a TTY; run it from an interactive terminal.');
+  terminal.log(
+    `Take-over check (${vendor}): a new cluster will start, commit a.txt and leave b.txt uncommitted. ` +
+      'You will have 10 minutes from the start of sleep 600 to press Take over in the browser, ' +
+      'then resume, commit and hand back.',
+  );
+  if (terminal.ask('Press Enter when ready to start this cluster:') === null) {
+    throw new Error('Take-over check cancelled before starting the cluster.');
+  }
+}
+
 /**
  * Runs body in the cluster start gives, then closes it, keeping its files when asked or when a check failed. It never
  * throws, so one cluster's trouble never ends a run that spends real quota: a cluster that does not start, a body that
@@ -427,11 +443,13 @@ export async function inLiveCluster(
   keep: boolean,
   body: (cluster: Cluster) => Promise<ScenarioResult[]>,
   log: LiveLog = () => {},
+  beforeStart?: () => void | Promise<void>,
 ): Promise<ScenarioResult[]> {
   log();
   log(`== ${what} (${vendor})`);
   const holder: { cluster?: Cluster } = {};
   const started = await checks(`${what}: the cluster`, vendor, async () => {
+    await beforeStart?.();
     holder.cluster = await start();
   });
   const cluster = holder.cluster;

@@ -17,6 +17,7 @@ import { type Cluster, startCluster } from '../packages/testkit/src/harness/clus
 import { E2E_PLATFORM } from '../packages/testkit/src/harness/env';
 import {
   checkVendorHome,
+  confirmTakeoverReady,
   formatResults,
   inLiveCluster,
   type LiveArgs,
@@ -50,6 +51,14 @@ const TERMINAL_PERSON: TakeoverPerson = {
   async takeOver({ cluster, taskId, attemptId }) {
     say();
     say(`The take-over check: ${attemptId} runs \`${TAKEOVER.longCommand}\`, which ends 10 minutes after it started.`);
+    const { attempt } = await cluster.person.attempt(attemptId);
+    // The heartbeat reports awake age of the original command, including every exec-session poll.
+    const ageMs = attempt.facts?.tool?.ageMs ?? 0;
+    const remainingMs = Math.max(0, 600_000 - ageMs);
+    say(
+      `Window closes approximately ${new Date(Date.now() + remainingMs).toLocaleTimeString()} ` +
+        `(${Math.ceil(remainingMs / 1000)} seconds remaining).`,
+    );
     say('In a browser, open');
     say(`  ${signInUrl(cluster, taskId)}`);
     say(`and press Take over on ${taskId} before that command ends. Waiting for it...`);
@@ -113,7 +122,7 @@ async function main(argv: string[]): Promise<number> {
   }
 
   // Every vendor home the run uses must be logged in before anything starts.
-  const vendors = [...new Set<Vendor>([...args.runners, ...args.takeover])];
+  const vendors = [...new Set<Vendor>([...(args.scenarios.length ? args.runners : []), ...args.takeover])];
   say("Checking the runners' vendor homes (a status command each; no prompt is sent)...");
   const homes = await Promise.all(vendors.map((vendor) => checkVendorHome(vendor, args, { platform: E2E_PLATFORM })));
   const missing = homes.filter((home) => !home.ok);
@@ -153,7 +162,11 @@ async function main(argv: string[]): Promise<number> {
   for (const vendor of args.takeover) {
     const options = { ...liveClusterOptions(args, vendor, 'takeover'), webDist: WEB_DIST };
     const run = (cluster: Cluster) => runTakeoverCheck(cluster, TERMINAL_PERSON, { scripted: false });
-    results.push(...(await inLiveCluster('take-over check', vendor, () => startCluster(options), args.keep, run, say)));
+    results.push(
+      ...(await inLiveCluster('take-over check', vendor, () => startCluster(options), args.keep, run, say, () =>
+        confirmTakeoverReady(vendor, { isTTY: process.stdin.isTTY === true, log: say, ask: prompt }),
+      )),
+    );
     save();
   }
   const markdown = save();

@@ -70,6 +70,7 @@ Other runs, to repeat a part:
 ```sh
 bun run live-run                                   # every scenario, both vendors, no take-over check
 bun run live-run --runners claude --scenarios killed-agent
+bun run live-run --scenarios none --takeover codex # only the Codex take-over check
 bun run live-run --takeover codex                  # the scenarios, then the take-over check with Codex only
 bun run live-run --repo git@github.com:you/agflow-live-toy.git --takeover claude,codex --keep
 ```
@@ -79,7 +80,7 @@ bun run live-run --repo git@github.com:you/agflow-live-toy.git --takeover claude
 | `--claude-home <dir>` | runner.json's Claude home, else `~/.agflow/runner/homes/claude` | The runners' `CLAUDE_CONFIG_DIR`, logged in by setup. Pass the exact path setup used: Claude's login keychain item depends on it. |
 | `--codex-home <dir>` | runner.json's Codex home, else `~/.agflow/runner/homes/codex` | The runners' `CODEX_HOME`, logged in by setup. |
 | `--runners <vendors>` | `claude,codex` | The vendor every runner of a cluster offers; each scenario runs once per vendor. |
-| `--scenarios <names>` | `killed-agent,closed-laptop,lost-lead` | The scenarios to run, in that order. |
+| `--scenarios <names>` | `killed-agent,closed-laptop,lost-lead` | The scenarios to run, in that order; `none` skips them for a take-over-only run. |
 | `--repo <url>` | a local bare origin | A throwaway remote, reset by each cluster (see above). |
 | `--takeover <vendors>` | off | After the scenarios, the take-over check once per vendor named: `claude`, `codex` or `claude,codex`, as the exit run needs. |
 | `--keep` | off | Keep every cluster's files; a failed cluster's files are always kept. |
@@ -89,11 +90,14 @@ bun run live-run --repo git@github.com:you/agflow-live-toy.git --takeover claude
 
 ## The take-over check
 
-With `--takeover <vendors>`, the script starts one more cluster per vendor, waits until the take-over task's agent
+With `--takeover <vendors>`, the script explains the check and waits for Enter in a TTY **before each cluster starts**.
+Be ready with a browser and another terminal. The scripted e2e path stays non-interactive.
+The script starts one more cluster per vendor, waits until the take-over task's agent
 runs its long command (`sleep 600`), and then walks you through the check:
 
 1. Open the sign-in link it prints, which signs you in to the dev hub as alice and opens the task page, and press
-   Take over. Do it before the long command ends, within about 10 minutes of the script's prompt.
+   Take over. The window lasts 10 minutes from the command's start; the script prints its approximate closing time
+   and seconds remaining.
 2. Once the runner has handed the clone over, the script prints the local command, of the form
    `( cd <clone> && CLAUDE_CONFIG_DIR=<home> <pinned claude> --resume <session> )`, or the `codex resume --no-daemon`
    one. The parentheses run it in a subshell, so your terminal does not stay in the clone. Run it in another

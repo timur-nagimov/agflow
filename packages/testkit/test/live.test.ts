@@ -59,6 +59,14 @@ const DEFAULTS: LiveDefaults = {
 };
 
 describe('parseLiveArgs', () => {
+  test('--scenarios none runs only the requested take-over vendors', () => {
+    const args = parseLiveArgs(['--scenarios', 'none', '--takeover', 'codex'], DEFAULTS);
+    expect(args.scenarios).toEqual([]);
+    expect(args.takeover).toEqual(['codex']);
+    expect(liveUsage()).toContain('none');
+    expect(() => parseLiveArgs(['--scenarios', 'none,lost-lead'], DEFAULTS)).toThrow();
+  });
+
   test('gives the defaults without options: both vendors, every scenario, a local origin', () => {
     expect(parseLiveArgs([], DEFAULTS)).toEqual({
       help: false,
