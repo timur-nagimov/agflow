@@ -12,9 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        watch: [on, off]
+        out: [direct, tee, file]
         rep: [1, 2, 3, 4, 5]
-    name: suite (watch ${{ matrix.watch }} ${{ matrix.rep }})
+    name: suite (${{ matrix.out }} ${{ matrix.rep }})
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -23,8 +23,15 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: bun test until past the hang point
         env:
-          AGFLOW_DEBUG_NO_WATCH: ${{ matrix.watch == 'off' && '1' || '' }}
+          OUT: ${{ matrix.out }}
         run: |
-          timeout 110 bun test > out.txt 2>&1 || true
-          grep -E 'a deleted clone is reported|fsAgeMs follows|diffFingerprint|readCloneRefs > reads the head' out.txt | cut -c1-160
-          if grep -q '(pass) diffFingerprint > changes with HEAD' out.txt; then echo "RESULT: no-hang"; elif grep -q '(fail) diffFingerprint > changes with HEAD' out.txt; then echo "RESULT: HANG"; else echo "RESULT: unknown"; tail -5 out.txt; fi
+          # direct: bun writes straight into the Actions log pipe, as ci.yml does today.
+          # tee: bun writes into a pipe that tee drains at once. file: bun writes into a regular file.
+          case "$OUT" in
+            direct) timeout 110 bun test || true ;;
+            tee) (timeout 110 bun test || true) 2>&1 | tee out.txt > /dev/null ;;
+            file) timeout 110 bun test > out.txt 2>&1 || true ;;
+          esac
+          if [ -f out.txt ]; then
+            if grep -q '(pass) diffFingerprint > changes with HEAD' out.txt; then echo "RESULT: no-hang"; elif grep -q '(fail) diffFingerprint > changes with HEAD' out.txt; then echo "RESULT: HANG"; else echo "RESULT: unknown"; fi
+          fi

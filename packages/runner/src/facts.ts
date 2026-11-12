@@ -268,7 +268,6 @@ export class FactsTracker {
   }
 
   private watchTree(): void {
-    if (process.env.AGFLOW_DEBUG_NO_WATCH) return;
     try {
       this.treeWatcher = watch(this.options.clone, { recursive: true }, (_type, name) => {
         const path = typeof name === 'string' ? name : null;
@@ -289,7 +288,6 @@ export class FactsTracker {
   /** .git/logs/HEAD may not exist yet, or be replaced by git; the existence check attaches the watch again. */
   private watchCommits(): void {
     const log = join(this.options.clone, '.git', 'logs', 'HEAD');
-    if (process.env.AGFLOW_DEBUG_NO_WATCH) return;
     if (this.closed || this.commitWatcher !== null || !existsSync(log)) return;
     try {
       const watcher = watch(log, (type) => {
