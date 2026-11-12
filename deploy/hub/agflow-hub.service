@@ -1,0 +1,42 @@
+[Unit]
+Description=agflow hub
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=agflow
+Group=agflow
+WorkingDirectory=/opt/agflow/current
+EnvironmentFile=/etc/agflow/hub.env
+ExecStart=/usr/local/bin/bun packages/hub/src/main.ts
+Restart=on-failure
+RestartSec=5
+# main.ts handles SIGTERM: closes runner links, checkpoints SQLite WAL, releases the DB lock.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agflow
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Bun's JavaScriptCore JIT needs executable memory; do not set MemoryDenyWriteExecute.
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

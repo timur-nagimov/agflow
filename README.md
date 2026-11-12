@@ -10,6 +10,8 @@ M1's hub, web UI and live-chat bridge are built. M2 adds runners that start and 
 
 M2 runners support **macOS on Apple silicon (`darwin-arm64`) only**. The hub and ordinary unit tests also run on Linux. The lead still accepts or rejects submissions, and people mark tasks merged. Verification clones, reviewers, PRs and the merge queue belong to M3; usage dashboards and repository-derived context belong to M4.
 
+For a shared Linux hub with HTTPS, GitHub sign-in, backups and two Mac runners, follow the [hub deployment runbook](docs/deploy-hub.md).
+
 ## Run the hub locally
 
 Requires [Bun](https://bun.sh) 1.3.11 or newer.
