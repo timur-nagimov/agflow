@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { mintAgentToken } from '../src/auth';
 import { AGENT_ROUTES, isAgentRouteAllowed } from '../src/http/agent-routes-allowed';
-import { addRunnerAttempt } from './helpers';
+import { addRunnerAttempt, addRunnerLead } from './helpers';
 import { createTestHub } from './http-helpers';
 
 /** Design 6.5's table of the routes an agent token may use, written out so that a wider allowlist fails here. */
@@ -22,6 +22,8 @@ const DESIGN_TABLE = [
   'GET /api/submissions/:id',
   'POST /api/prepare',
   'GET /api/prepare/:id',
+  'POST /api/fetch-submission',
+  'GET /api/fetch-submission/:id',
   'POST /api/inbox',
   'POST /api/inbox/ack',
   'POST /api/messages',
@@ -47,7 +49,7 @@ function concrete(pattern: string): string {
 
 describe('the agent-token route allowlist', () => {
   test("the allowlist is exactly design 6.5's table", () => {
-    expect(DESIGN_TABLE).toHaveLength(32);
+    expect(DESIGN_TABLE).toHaveLength(34);
     expect(AGENT_ROUTES.map((route) => `${route.method} ${route.path}`).sort()).toEqual([...DESIGN_TABLE].sort());
   });
 
@@ -136,6 +138,8 @@ describe('the agent-token route allowlist', () => {
       expect([action, access('POST', `/api/tasks/:id/${action}`)]).toEqual([action, 'holder']);
     }
     const lead: [string, string][] = [
+      ['POST', '/api/fetch-submission'],
+      ['GET', '/api/fetch-submission/:id'],
       ['POST', '/api/tasks'],
       ['PATCH', '/api/tasks/:id'],
       ['POST', '/api/tasks/:id/cancel'],
@@ -155,6 +159,33 @@ describe('the agent-token route allowlist', () => {
     expect(access('GET', '/api/submissions/:id')).toBe('own');
     expect(access('POST', '/api/inbox')).toBe('self');
     expect(new Set(AGENT_ROUTES.map((route) => `${route.method} ${route.path}`)).size).toBe(AGENT_ROUTES.length);
+  });
+
+  test('fetch routes require the seated lead, not merely an allowed agent token or an owner session', async () => {
+    const hub = createTestHub();
+    const worker = addRunnerAttempt(hub.ctx);
+    const lead = addRunnerLead(hub.ctx);
+    const workerAuth = { headers: { authorization: `Bearer ${mintAgentToken(hub.ctx, worker.attempt)}` } };
+    const leadAuth = { headers: { authorization: `Bearer ${mintAgentToken(hub.ctx, lead.attempt)}` } };
+    const routes = [
+      { method: 'POST', path: '/api/fetch-submission', body: { task_id: worker.task.id }, leadStatus: 409 },
+      { method: 'GET', path: '/api/fetch-submission/1-R-1-999', leadStatus: 404 },
+    ];
+    for (const route of routes) {
+      const call = (auth: Parameters<typeof hub.call>[2]) => hub.call(route.method, route.path, { ...auth, body: route.body });
+      // The lead passes authorization and reaches the missing submission/request checks.
+      expect((await call(leadAuth)).status).toBe(route.leadStatus);
+      for (const auth of [workerAuth, { user: 'alice' }, { user: 'alice', via: 'web' as const }]) {
+        const answer = await call(auth);
+        expect([route.method, answer.status, answer.json.error]).toEqual([route.method, 403, 'forbidden']);
+      }
+      // Runner identity comes only from agt_: an owner session cannot name the runner lead, and an agent token
+      // cannot override its identity with X-Agflow-Agent. There is no separate lead-token credential.
+      const impersonated = await call({ user: 'alice', agent: lead.agent.id });
+      expect([route.method, impersonated.status, impersonated.json.error]).toEqual([route.method, 403, 'forbidden']);
+      const overridden = await call({ ...workerAuth, agent: lead.agent.id });
+      expect([route.method, overridden.status, overridden.json.error]).toEqual([route.method, 403, 'agent_not_allowed']);
+    }
   });
 
   test('a path parameter matches one segment only', () => {

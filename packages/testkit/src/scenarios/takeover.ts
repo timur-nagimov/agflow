@@ -165,6 +165,19 @@ export async function readyForTakeover(
   await waitFor(`${LONG_COMMAND} in ${a1}'s clone`, async () =>
     (await processesIn(clone)).some((row) => row.command.includes(LONG_COMMAND)),
   );
+  if (options.scripted !== false && cluster.vendor === 'codex') {
+    // Cross the loop threshold while the same exec session runs. Taking over immediately after spawn used to
+    // miss the live failure: three check_inbox calls with ignored terminalInteraction polls between them.
+    await waitFor(`${a1} to survive four exec-session polls`, async () => {
+      const { attempt, log } = await person.attempt(a1);
+      if (attempt.status === 'ended' || attempt.stopRequested !== null) {
+        throw new Error(`${a1} stopped while polling its long command: ${attempt.stopRequested?.reason ?? attempt.endReason}`);
+      }
+      const polls = log.filter(entry => entry.kind === 'tool' && entry.summary === 'mcp__agflow__check_inbox: {}').length;
+      return polls >= 4 && attempt.facts?.tool?.command === LONG_COMMAND &&
+        attempt.facts.tool.ageMs >= 4000 && attempt.facts.repeatedCalls < 3;
+    });
+  }
   return { taskId: task.id, attemptId: a1 };
 }
 
@@ -240,7 +253,7 @@ async function checkTakeover(
   const resume =
     attempt.vendor === 'claude'
       ? `CLAUDE_CONFIG_DIR=${home} ${binary} --resume ${session}`
-      : `CODEX_HOME=${home} ${binary} resume --no-daemon ${session}`;
+      : `CODEX_HOME=${home} ${binary} resume --no-daemon -s workspace-write -c 'sandbox_workspace_write.writable_roots=["${clone}/.git"]' ${session}`;
   const local = `cd ${clone} && ${resume}`;
   // With scripted models, the session is the one a1's requests carried; real models record none.
   const seen = scripted ? [...new Set(models.requestsFor(a1).map(sessionOf))] : [];

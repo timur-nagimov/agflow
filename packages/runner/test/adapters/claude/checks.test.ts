@@ -167,11 +167,13 @@ describe('checkAccount', () => {
     });
   });
 
-  test("max, pro, team and enterprise read 'Claude Max', 'Claude Pro', 'Claude Team' and 'Claude Enterprise'", () => {
-    const plans = ['max', 'pro', 'team', 'enterprise', 'founders'].map(
+  test('plan codes are mapped and SDK display names keep their Claude prefix', () => {
+    const plans = ['max', 'pro', 'team', 'enterprise', 'founders', 'Claude Ultra', 'Claude Max'].map(
       (subscriptionType) => checkAccount({ ...recorded, subscriptionType }).plan,
     );
-    expect(plans).toEqual(['Claude Max', 'Claude Pro', 'Claude Team', 'Claude Enterprise', 'Claude founders']);
+    expect(plans).toEqual([
+      'Claude Max', 'Claude Pro', 'Claude Team', 'Claude Enterprise', 'Claude founders', 'Claude Ultra', 'Claude Max',
+    ]);
   });
 
   test('skipAuthChecks gives ready, accountId TEST_ACCOUNT_ID, plan "test mode" and the problem "test mode"', () => {

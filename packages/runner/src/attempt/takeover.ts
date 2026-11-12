@@ -64,10 +64,13 @@ export function takeoverLocalCommand(input: LocalCommandInput): string | null {
   if (input.sessionRef === null) return null;
   const binary = shellWord(join(input.runnerDir, vendorBinary(input.vendor, input.cliVersion)));
   const session = shellWord(input.sessionRef);
+  // Codex protects .git inside its workspace-write sandbox by default; the person gets the same writable root the agent
+  // had (adapters/codex/config.ts threadOverrides), so they can commit from the resumed session. Nothing else widens.
+  const gitRoot = `sandbox_workspace_write.writable_roots=${JSON.stringify([join(input.clone, '.git')])}`;
   const resume =
     input.vendor === 'claude'
       ? `CLAUDE_CONFIG_DIR=${shellWord(input.home)} ${binary} --resume ${session}`
-      : `CODEX_HOME=${shellWord(input.home)} ${binary} resume --no-daemon ${session}`;
+      : `CODEX_HOME=${shellWord(input.home)} ${binary} resume --no-daemon -s workspace-write -c ${shellWord(gitRoot)} ${session}`;
   return `cd ${shellWord(input.clone)} && ${resume}`;
 }
 

@@ -108,6 +108,10 @@ export type AgentEvent =
       error: string | null;
       errorKind: 'quota' | 'vendor' | 'auth' | 'context' | 'policy' | 'denials' | 'session_budget' | null;
     }
+  /** An interaction with an existing running tool, never a new call or a reset of its hard cap. */
+  | { type: 'tool_progress'; toolId: string }
+  /** The command outlives its current turn; only tool_ended closes it. */
+  | { type: 'tool_backgrounded'; toolId: string }
   | { type: 'tool_started'; toolId: string; name: string; input: string; command: string | null }
   | {
       type: 'tool_ended';

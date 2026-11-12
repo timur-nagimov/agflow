@@ -85,6 +85,12 @@ describeE2e('take-over and hand-back', () => {
         cluster().step(async () => {
           const { person } = cluster();
           const { taskId, attemptId } = takenOver();
+          if (vendor === 'codex') {
+            const { attempt, log } = await person.attempt(attemptId);
+            expect(log.filter(entry => entry.kind === 'tool' && entry.summary === 'mcp__agflow__check_inbox: {}').length).toBeGreaterThanOrEqual(4);
+            expect(attempt.facts?.tool?.command).toBe(TAKEOVER.longCommand);
+            expect(attempt.facts?.repeatedCalls).toBeLessThan(3);
+          }
           expect(await person.takeover(taskId)).toBe(attemptId);
           const { task } = await person.task(taskId);
           expect([task.status, task.blockedKind]).toEqual(['blocked', 'takeover']);

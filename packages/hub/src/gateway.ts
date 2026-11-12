@@ -177,7 +177,8 @@ export class Gateway implements RunnerLink {
         return;
       case 'result': {
         const { t: _, ...result } = message;
-        recordResult(ctx, runnerId, result);
+        const recorded = recordResult(ctx, runnerId, result);
+        if (recorded?.kind === 'refresh_vault') this.flush(runnerId);
         return;
       }
       case 'events':

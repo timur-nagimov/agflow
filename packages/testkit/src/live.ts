@@ -63,7 +63,7 @@ export const LIVE_OPTIONS = [
   {
     flag: '--scenarios',
     value: '<names>',
-    help: `Some of ${LIVE_SCENARIOS.join(',')} (the default: all three).`,
+    help: `Some of ${LIVE_SCENARIOS.join(',')} (the default: all three), or none for only --takeover.`,
   },
   {
     flag: '--repo',
@@ -190,7 +190,7 @@ export function parseLiveArgs(argv: readonly string[], defaults: LiveDefaults = 
         args.runners = listOf(flag, 'vendor', value, vendorOf);
         break;
       case '--scenarios':
-        args.scenarios = listOf(flag, 'scenario', value, scenarioOf);
+        args.scenarios = value === 'none' ? [] : listOf(flag, 'scenario', value, scenarioOf);
         break;
       case '--repo':
         args.repo = value;
@@ -415,6 +415,25 @@ export const CLUSTER_CLOSED = 'the cluster closed cleanly';
 /** Where a live run tells the person how it goes: a line at a time, an empty one by default. */
 export type LiveLog = (line?: string) => void;
 
+/** A live take-over spends no quota until the person is at their terminal. Scripted drivers omit this gate. */
+export function confirmTakeoverReady(
+  vendor: Vendor,
+  terminal: { isTTY: boolean; log: LiveLog; ask(question: string): string | null },
+): void {
+  if (!terminal.isTTY) throw new Error('The live take-over check needs a TTY; run it from an interactive terminal.');
+  terminal.log(
+    `Take-over check (${vendor}): a new cluster will start, commit a.txt and leave b.txt uncommitted. ` +
+      'You will have 10 minutes from the start of sleep 600 to press Take over in the browser, ' +
+      'then resume, commit and hand back.',
+  );
+  // Bun's prompt() returns null for an empty line, so a bare Enter arrives as null, like EOF: only a typed q skips.
+  // Ctrl-C still ends the whole run.
+  const answer = terminal.ask('Press Enter when ready to start this cluster (or type q and Enter to skip it):');
+  if (answer !== null && /^\s*(q|quit|skip)\s*$/i.test(answer)) {
+    throw new Error('Take-over check skipped before starting the cluster.');
+  }
+}
+
 /**
  * Runs body in the cluster start gives, then closes it, keeping its files when asked or when a check failed. It never
  * throws, so one cluster's trouble never ends a run that spends real quota: a cluster that does not start, a body that
@@ -427,11 +446,13 @@ export async function inLiveCluster(
   keep: boolean,
   body: (cluster: Cluster) => Promise<ScenarioResult[]>,
   log: LiveLog = () => {},
+  beforeStart?: () => void | Promise<void>,
 ): Promise<ScenarioResult[]> {
   log();
   log(`== ${what} (${vendor})`);
   const holder: { cluster?: Cluster } = {};
   const started = await checks(`${what}: the cluster`, vendor, async () => {
+    await beforeStart?.();
     holder.cluster = await start();
   });
   const cluster = holder.cluster;
@@ -483,10 +504,12 @@ export interface TakeoverPerson {
   takeOver(step: TakeoverStep): Promise<void>;
   /**
    * Resumes the session with the local command if they can, commits in the clone, and hands back from the clone;
-   * resolves once the hand-back was done. resumed: whether the person saw the local command resume the session and
-   * committed from it, or null when they did not run it.
+   * resolves once the hand-back was done. resumed: whether the person saw the local command resume the session (its
+   * earlier conversation showed), or null when they did not run it; committedInSession: whether the commit was made from
+   * inside that session (a vendor whose sandbox forbids writes under .git, such as Codex under a managed policy, cannot),
+   * or null when unknown.
    */
-  handBack(step: HandbackStep): Promise<{ resumed: boolean | null }>;
+  handBack(step: HandbackStep): Promise<{ resumed: boolean | null; committedInSession?: boolean | null }>;
 }
 
 /** The take-over check's own result: the person's part, and the run as a whole. */
@@ -494,7 +517,7 @@ export const TAKEOVER_CHECK = {
   scenario: 'take-over check',
   checks: {
     committed: "the person's commit in the clone is on top of the head the runner harvested",
-    resumed: "the person resumed the agent's session with the local command in a terminal and committed from it",
+    resumed: "the person resumed the agent's session with the local command in a terminal, and its earlier conversation showed",
   },
 } as const;
 
@@ -558,8 +581,9 @@ export async function runTakeoverCheck(
       // Neither the check nor the person goes on in a clone the runner did not hand over.
       const { clone, local } = await handedOver(cluster, taskId, attemptId);
       const harvested = await gitIn(clone, ['rev-parse', 'HEAD'], { allowFailure: true });
-      const { resumed } = await person.handBack({ cluster, taskId, attemptId, clone, local });
-      if (resumed !== null) record.check(TAKEOVER_CHECK.checks.resumed, resumed, `${shown(local)}: ${resumed}`);
+      const { resumed, committedInSession = null } = await person.handBack({ cluster, taskId, attemptId, clone, local });
+      const where = committedInSession === null ? '' : committedInSession ? '; committed from the session' : '; committed outside the session';
+      if (resumed !== null) record.check(TAKEOVER_CHECK.checks.resumed, resumed, `${shown(local)}: ${resumed}${where}`);
       // The person's commit: the hand-back's head, under the snapshot of anything they left uncommitted.
       const handed = await waitForEvent({ type: 'task.handed_back', subject: taskId, data: { attemptId } });
       const sha = String(handed.data.sha);

@@ -5,6 +5,7 @@ import { CODEX_VERSION } from '../../src/adapters/codex/binary';
 import { agflowTerminal, codexToolEnded, codexToolStarted } from '../../src/adapters/codex/items';
 import type { ServerNotification } from '../../src/adapters/codex/protocol';
 import type { CodexErrorInfo, RateLimitSnapshot, ThreadItem } from '../../src/adapters/codex/protocol/v2';
+import { FactsTracker } from '../../src/facts';
 import { CodexSession } from '../../src/adapters/codex/session';
 import type { AgentEvent, TerminalTool } from '../../src/adapters/types';
 import { codexMessages as m, FAKE_THREAD_ID as MAIN, fakeTurnId, readCodexRecord, type ScriptedAnswers } from './peer';
@@ -150,6 +151,47 @@ describe('Codex item mapping', () => {
 });
 
 describe('CodexSession events', () => {
+  test('exec-session polls stay on the original command, including inbox checks between polls', async () => {
+    const exec = { ...command(), command: '/bin/zsh -lc \'bun test\'', processId: '32054', source: 'unifiedExecStartup' as const };
+    const notes: ServerNotification[] = [begin(), m.itemStarted(MAIN, TURN, exec)];
+    for (let n = 0; n < 5; n++) {
+      notes.push({ method: 'item/commandExecution/terminalInteraction', params: {
+        threadId: MAIN, turnId: TURN, itemId: exec.id, processId: '32054', stdin: '',
+      } });
+      notes.push(m.itemCompleted(MAIN, TURN, m.mcpToolCallItem({ id: `inbox-${n}`, tool: 'check_inbox', args: {}, status: 'completed' })));
+    }
+    notes.push(m.itemCompleted(MAIN, TURN, { ...exec, status: 'completed', exitCode: 0 }), finish());
+    const events = await run(notes);
+    expect(events.filter(e => e.type === 'tool_progress')).toEqual(
+      Array.from({ length: 5 }, () => ({ type: 'tool_progress', toolId: exec.id })));
+    expect(events.filter(e => e.type === 'tool_started' && e.name === 'exec_command')).toHaveLength(1);
+    expect(events.filter(e => e.type === 'tool_ended' && e.toolId === exec.id)).toEqual([toolEnded(exec.id)]);
+    expect(events).toContainEqual(turnEnded(6));
+    let now = 0;
+    const facts = new FactsTracker({ attemptId: 'T-1-a1', fence: { epoch: 1, counter: 1 }, clone: import.meta.dir,
+      toolCaps: { defaultMs: 30_000, longMs: 90_000, checks: [] }, clock: { awakeNow: () => now }, fingerprint: async () => 'same' });
+    try {
+      for (const event of events) {
+        if (event.type === 'tool_progress') now += 1000;
+        facts.observe(event);
+        if (event.type === 'tool_progress') {
+          expect(facts.facts()).toMatchObject({ repeatedCalls: 0,
+            tool: { command: 'bun test', long: true, capMs: 90_000, ageMs: now } });
+        }
+      }
+      expect(facts.facts().tool).toBeNull();
+    } finally { facts.close(); }
+  });
+
+  test('each newly executed, finished identical command is still a call', async () => {
+    const events = await run([begin(), ...Array.from({ length: 3 }, (_, n) => {
+      const exec = { ...command(`exec-${n}`), command: 'bun test', status: 'completed' as const, exitCode: 0 };
+      return m.itemCompleted(MAIN, TURN, exec);
+    }), finish()]);
+    expect(events.filter(e => e.type === 'tool_started')).toHaveLength(3);
+    expect(events).toContainEqual(turnEnded(3));
+  });
+
   test('keeps the returned active id before turn/started and emits one start for it', async () => {
     const id = 'returned-turn';
     const f = sessionFixture({

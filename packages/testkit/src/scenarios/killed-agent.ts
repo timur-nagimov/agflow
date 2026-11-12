@@ -60,6 +60,9 @@ const CHECKS = {
   swept: 'when the hub records a1 ended, no process has its cwd in its clone',
   otherRunner: 'a2 runs on another runner than a1',
   startSha: "a2 starts from a1's final WIP",
+  startRef: "a2 starts from a1's WIP ref",
+  wipOrdering: 'b.txt has the requested publication state before the kill',
+  sameWip: 'the exit preserves the WIP already published before the kill',
   cloneFiles: "a2's clone holds a.txt and b.txt before a2 changes anything",
   brief: "a2's first model request quotes a1's handoff note",
   restatement: "a2's first text is stored as a restatement note of a2",
@@ -106,12 +109,18 @@ export const KILLED_AGENT = {
   checks: CHECKS,
 } as const;
 
+/** Optional publication ordering for the scripted killed-agent variants. */
+export interface KilledAgentOptions extends ScenarioOptions {
+  /** Scripted variants; omitted for live runs, which kill as soon as the long command is observed. */
+  wipBeforeKill?: 'pushed' | 'unpublished';
+}
+
 /** Runs exit scenario 1 in the cluster and gives every check it made. */
-export function killedAgent(cluster: Cluster, options: ScenarioOptions = {}): Promise<ScenarioResult> {
+export function killedAgent(cluster: Cluster, options: KilledAgentOptions = {}): Promise<ScenarioResult> {
   return checks(KILLED_AGENT.scenario, cluster.vendor, (record) => drive(cluster, options, record), cluster.dump);
 }
 
-async function drive(cluster: Cluster, options: ScenarioOptions, record: Recorder): Promise<void> {
+async function drive(cluster: Cluster, options: KilledAgentOptions, record: Recorder): Promise<void> {
   const { person, origin, models, waitFor, waitForEvent } = cluster;
   const scripted = options.scripted !== false;
   const [task] = await person.createTasks([TASK]);
@@ -131,6 +140,23 @@ async function drive(cluster: Cluster, options: ScenarioOptions, record: Recorde
     (await processesInDir(clone1)).some((row) => row.command.includes(LONG_COMMAND)),
   );
 
+  let beforeKill: { ref: string; sha: string } | null = null;
+  if (options.wipBeforeKill === 'pushed') {
+    beforeKill = await waitFor(`${a1}'s reported WIP containing b.txt on origin while sleeping`, async () => {
+      const { attempt } = await person.attempt(a1);
+      const { wipRef: ref, wipSha: sha } = attempt;
+      if (ref === null || sha === null || (await refSha(origin.path, ref)) !== sha) return null;
+      if ((await fileAt(origin.path, sha, 'b.txt')) !== 'b\n') return null;
+      if (!(await processesInDir(clone1)).some((row) => row.command.includes(LONG_COMMAND))) return null;
+      return { ref, sha };
+    });
+    record.check(CHECKS.wipOrdering, true, `before kill: ${beforeKill.ref} at ${beforeKill.sha} contains b.txt`);
+  } else if (options.wipBeforeKill === 'unpublished') {
+    const { attempt } = await person.attempt(a1);
+    const sha = attempt.wipRef === null ? null : await refSha(origin.path, attempt.wipRef);
+    record.equal(CHECKS.wipOrdering, sha === null ? null : await fileAt(origin.path, sha, 'b.txt'), null);
+  }
+
   const agent = await runner1.killAgent(a1);
   const ended = await waitForEvent({ type: 'attempt.ended', subject: taskId, attemptId: a1 });
   // Read at once: the runner must have killed and swept before the harvest that the exit report follows.
@@ -145,6 +171,9 @@ async function drive(cluster: Cluster, options: ScenarioOptions, record: Recorde
   const attempt1 = (await person.attempt(a1)).attempt;
   record.equal(CHECKS.crashed, [attempt1.endReason, attempt1.failureClass], ['crashed', 'infra']);
   await checkFinalWip(cluster, attempt1, record);
+  if (beforeKill !== null) {
+    record.equal(CHECKS.sameWip, { ref: attempt1.wipRef, sha: attempt1.wipSha }, beforeKill);
+  }
   // Every handoff note is a1's own; an agent may write more than one, but none may be the hub's.
   const ownNotes = (await person.task(taskId)).notes.filter((note) => note.kind === 'handoff');
   record.check(
@@ -164,6 +193,7 @@ async function drive(cluster: Cluster, options: ScenarioOptions, record: Recorde
     `a1 on ${runner1.name} (${attempt1.runnerId}), a2 on ${runner2.name} (${attempt2.runnerId})`,
   );
   record.equal(CHECKS.startSha, attempt2.startSha, attempt1.wipSha);
+  record.equal(CHECKS.startRef, attempt2.startRef, attempt1.wipRef);
   await waitAtGate(cluster, a2, CHECKED, options);
   const clone2 = runner2.clonePath(a2);
   record.equal(

@@ -502,6 +502,20 @@ describe('CommandExecutor', () => {
     expect(seen).toEqual([1, 2, 3]);
   });
 
+  test('refresh_vault reports the exact submitted branch head, and a missing branch fails', async () => {
+    const f = await createRunnerFixture();
+    const x = executor(f);
+    const sha = (await gitIn(f.origin.path, ['rev-parse', 'refs/heads/main'])).trim();
+    const ref = 'refs/heads/person-review';
+    await gitIn(f.origin.path, ['update-ref', ref, sha]);
+    expect(await x.run.onCommand(message({ kind: 'refresh_vault', taskId: 'T-4', refs: [ref] }))).toEqual({
+      ok: true, data: { refs: { [ref]: sha } },
+    });
+    expect((await gitIn(f.vault.path, ['rev-parse', ref])).trim()).toBe(sha);
+    expect(await x.run.onCommand(message({ kind: 'refresh_vault', taskId: 'T-4', refs: ['refs/heads/missing'] }, 2)))
+      .toMatchObject({ ok: false, error: expect.stringContaining('missing') });
+  });
+
   test('refreshes the vault, reports preflight, deletes with exact leases, and persists a settings echo with pending drain', async () => {
     const f = await createRunnerFixture();
     const x = executor(f);

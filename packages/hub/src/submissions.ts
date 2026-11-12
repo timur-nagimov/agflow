@@ -23,6 +23,7 @@ import { cancelPendingOfKind, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import { badRequest, conflict, forbidden, notFound } from './errors';
 import type { Emit } from './events';
+import { refreshLeadSubmission, submissionReviewInstruction } from './lead-review';
 import { insertMessage } from './messages';
 import {
   type SubmissionRow,
@@ -234,6 +235,7 @@ function recordSuccess(
         `${submission.id} was recorded, and ${task.id} is up for review.`,
     });
   }
+  refreshLeadSubmission(ctx, task.id, branch);
   insertMessage(ctx, emit, {
     from: 'system',
     to: 'lead',
@@ -241,7 +243,7 @@ function recordSuccess(
     body:
       `${named(task)} was submitted by ${attempt.agentId} for review on branch ${branch ?? '(none)'} at ` +
       `${head ?? 'an unknown head'}.\n${attempt.agentId} wrote:\n${quoteLines(clip(submission.summary, 1500))}\n` +
-      'Review it with accept_task or reject_task.',
+      submissionReviewInstruction(task.id, branch),
   });
   const recorded = findSubmission(ctx, submission.id) as SubmissionRecord;
   emit({

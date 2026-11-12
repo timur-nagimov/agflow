@@ -450,11 +450,13 @@ describe('Codex replies', () => {
     // The cell waits for the command until the step's own deadline, polling past exec_command's yields.
     expect(source).toContain('Date.now() + 90000');
     const calls: [string, any][] = [];
+    let inboxChecks = 0;
     const texts = await runScript(source, {
       exec_command: async (args) => {
         calls.push(['exec_command', args]);
         return { session_id: 9, output: '', wall_time_seconds: 30 };
       },
+      mcp__agflow__check_inbox: async () => { inboxChecks++; return {}; },
       write_stdin: async (args) => {
         calls.push(['write_stdin', args]);
         return calls.length < 3
@@ -463,9 +465,10 @@ describe('Codex replies', () => {
       },
     });
     // exec_command gets no timeout_ms: the pinned 0.159.2 declares none, and the cell's own deadline bounds the step.
-    expect(calls[0]?.[1]).toEqual({ cmd: step.cmd, yield_time_ms: 30_000 });
+    expect(calls[0]?.[1]).toEqual({ cmd: step.cmd, yield_time_ms: 1000 });
+    expect(inboxChecks).toBe(2);
     expect(calls.map(([name]) => name)).toEqual(['exec_command', 'write_stdin', 'write_stdin']);
-    expect(texts).toEqual([{ exit_code: 0, output: 'gate go is open\n', wall_time_seconds: 1 }]);
+    expect(texts).toEqual([{}, {}, { exit_code: 0, output: 'gate go is open\n', wall_time_seconds: 1 }]);
   });
 
   test('a tool step calls the agflow tool through exec with the step call id', async () => {
@@ -566,4 +569,9 @@ describe('unfinished steps', () => {
       expect(next.kind === 'error' && next.message).toContain('moved to the background');
     }
   });
+});
+
+test('Codex playbook shell steps exercise inbox checks between exec polls', () => {
+  const response = codexReply({ kind: 'step', step: shell('sleep 600', { timeoutMs: 600_000 }), callId: 'e2e-s0' });
+  expect(response.output[0]).toMatchObject({ type: 'custom_tool_call', name: 'exec', input: expect.stringContaining('tools.mcp__agflow__check_inbox({})') });
 });

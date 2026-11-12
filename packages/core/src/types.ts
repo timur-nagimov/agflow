@@ -538,3 +538,14 @@ export interface PrepareRequest {
   requestedAt: number;
   finishedAt: number | null;
 }
+
+/** A lead's explicit vault fetch; POST /api/fetch-submission and GET /api/fetch-submission/:id. */
+export interface FetchSubmissionRequest {
+  /** The refresh_vault command id, or null for a live-chat lead. */
+  id: string | null;
+  branch: string;
+  head_sha: string;
+  status: 'pending' | 'ok' | 'failed';
+  error: string | null;
+  note?: string;
+}

@@ -475,6 +475,12 @@ export class CodexSession implements AgentSession {
         }
         return;
       }
+      case 'item/commandExecution/terminalInteraction': {
+        const { threadId, turnId, itemId } = notification.params;
+        const tool = this.tools.get(JSON.stringify([threadId, turnId, itemId]));
+        if (tool) this.queue.push({ type: 'tool_progress', toolId: tool.toolId });
+        return;
+      }
       case 'item/started':
       case 'item/completed': {
         const { item, threadId, turnId } = notification.params;

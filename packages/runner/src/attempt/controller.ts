@@ -1803,7 +1803,8 @@ export class AttemptController {
     const pushed = store.get(this.attemptId)?.pushedSha ?? null;
     const last = this.lastWork;
     if (last !== null && last.tree === work.tree && (last.head === null || last.head === work.head)) {
-      return { ...none, finalSha: work.sha, finalWip: pushed === null ? null : { ref, sha: pushed } };
+      // A fresh snapshot can have the same work but a different SHA: report the commit already available remotely.
+      return { ...none, finalSha: pushed ?? last.head, finalWip: pushed === null ? null : { ref, sha: pushed } };
     }
     const result = await pushWithRetries({
       budgetMs: config().timings.finalPush,

@@ -6,7 +6,7 @@ See the [project design](docs/superpowers/specs/2026-10-26-agflow-design.md) and
 
 ## Status
 
-M1's hub, web UI and live-chat bridge are built. M2 adds runners that start and supervise Claude Code and Codex agents on teammates' laptops: scheduling, WIP recovery, lead failover, approvals, dependency preparation and take-over. The prototype includes automated tests with scripted model servers; the [live exit run](docs/m2-live-run.md) with real subscriptions is still pending.
+M1's hub, web UI and live-chat bridge are built. M2 adds runners that start and supervise Claude Code and Codex agents on teammates' laptops: scheduling, WIP recovery, lead failover, approvals, dependency preparation and take-over. Automated tests use scripted model servers; the [live exit run](docs/m2-live-run.md) with real Claude and Codex subscriptions passed on 2026-11-12 (116 of 116 checks).
 
 M2 runners support **macOS on Apple silicon (`darwin-arm64`) only**. The hub and ordinary unit tests also run on Linux. The lead still accepts or rejects submissions, and people mark tasks merged. Verification clones, reviewers, PRs and the merge queue belong to M3; usage dashboards and repository-derived context belong to M4.
 

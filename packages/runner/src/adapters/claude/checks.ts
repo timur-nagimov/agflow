@@ -99,7 +99,7 @@ export function checkAccount(
   if (options.skipAuthChecks) return { ready: true, problem: TEST_MODE, accountId: TEST_ACCOUNT_ID, plan: TEST_MODE };
   const accountId = account ? claudeAccountId(account) : null;
   const type = account?.subscriptionType;
-  const plan = type ? (PLANS[type] ?? `Claude ${type}`) : null;
+  const plan = type ? (PLANS[type] ?? (type.startsWith('Claude') ? type : `Claude ${type}`)) : null;
   let problem: string | null = null;
   if (account?.apiKeySource) problem = apiKeyProblem(account.apiKeySource);
   else if (!type) problem = 'not logged in';

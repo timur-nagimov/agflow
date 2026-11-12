@@ -11,6 +11,7 @@ import type {
   Agent,
   AgentRole,
   Attempt,
+  FetchSubmissionRequest,
   GoalNote,
   GoalVersion,
   HubEvent,
@@ -249,6 +250,13 @@ export class HubClient {
   }
   prepareRequest(id: string) {
     return this.request<{ request: PrepareRequest }>('GET', `/api/prepare/${q(id)}`);
+  }
+
+  requestSubmissionFetch(taskId: string) {
+    return this.request<{ request: FetchSubmissionRequest }>('POST', '/api/fetch-submission', { task_id: taskId });
+  }
+  submissionFetch(id: string) {
+    return this.request<{ request: FetchSubmissionRequest }>('GET', `/api/fetch-submission/${q(id)}`);
   }
 
   // Lead

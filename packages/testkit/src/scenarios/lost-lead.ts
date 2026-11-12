@@ -4,13 +4,23 @@
 // starts on another runner from that handoff and also receives the person's message, which the frozen lead never
 // acknowledged. A worker then submits a task created after the failover, and the new lead accepts it. After the thaw
 // the old runner stops the old lead's process and pushes nothing for it: leads have no WIP.
-import { attemptId, type HubEvent, type LeadNote, leadAttemptId, type NewTaskInput, quoteLines } from '@agflow/core';
+import {
+  attemptId,
+  type AttemptLogEntry,
+  type HubEvent,
+  type LeadNote,
+  leadAttemptId,
+  type NewTaskInput,
+  quoteLines,
+  taskBranchName,
+} from '@agflow/core';
 import { processIdentity, sameProcess } from '@agflow/runner/src/processes';
 import { fileAt, gitIn, refSha } from '../git-fixtures';
 import type { Cluster } from '../harness/cluster';
 import { type Programs, react, say, shell, tool } from '../harness/playbook';
 import {
   checks,
+  cloneFile,
   firstRequestText,
   newestEventId,
   type Recorder,
@@ -39,7 +49,10 @@ const GOAL = [
   '1. If your brief has no lead handoff from a previous lead, call write_handoff, without a task id, with the note: ' +
     `${LEAD_HANDOFF}`,
   '2. If it has one, restate the state of the project and your next step, as your first prompt asks.',
-  '3. Create no tasks and staff nothing. When a task is submitted, accept it with accept_task once its file is in.',
+  '3. Create no tasks and staff nothing. When a task is submitted, call fetch_submission with its task_id and wait ' +
+    'for success. Then run git fetch origin <submitted-branch> ' +
+    'in your clone (origin is your runner vault), then read review.txt from FETCH_HEAD. Accept it with accept_task ' +
+    'only after checking that review.txt holds the line review.',
 ].join('\n');
 
 const TASK: NewTaskInput = {
@@ -61,6 +74,7 @@ const CHECKS = {
   messageSeen: "lead-a2's model is shown the person's message",
   submitted: 'a worker submits the task created after the failover',
   woken: "the submission's message to the lead is delivered to lead-a2",
+  reviewed: 'lead-a2 fetches the submitted branch from its vault and verifies review.txt before accepting',
   accepted: "lead-a2 accepts the task with its agent token, as the acceptance event's actor, while it holds the seat",
   oldStopped: "after the thaw, the old runner stops lead-a1's process",
   noRefs: 'the old runner pushes no ref for lead-a1: leads have no WIP',
@@ -85,12 +99,24 @@ function programs(taskId?: string): Programs {
     [lead2]: { steps: [say(LEAD_RESTATEMENT, tool('get_lead_notes'))] },
   };
   if (taskId === undefined) return known;
+  const branch = taskBranchName(taskId, TASK.title, 1);
+  const review = shell(
+    `git fetch origin ${branch} && git show FETCH_HEAD:review.txt > .agflow/run/review-candidate && ` +
+    `printf 'review\\n' | cmp -s - .agflow/run/review-candidate && ` +
+    'cp .agflow/run/review-candidate .agflow/run/review-verified',
+  );
   const accept = tool('accept_task', { id: taskId, note: 'review.txt is in.' });
   return {
     ...known,
     [lead2]: {
       steps: [say(LEAD_RESTATEMENT, tool('get_lead_notes'))],
-      reactions: [react(submittedMarker(taskId), [say(`I accept ${taskId}.`, accept)])],
+      reactions: [
+        react(submittedMarker(taskId), [
+          say(`I fetch the submission for ${taskId}.`, tool('fetch_submission', { task_id: taskId })),
+          say(`I fetch and review ${taskId}.`, review),
+          say(`I accept ${taskId}.`, accept),
+        ]),
+      ],
     },
     [attemptId(taskId, 1, 1)]: {
       steps: [
@@ -213,6 +239,11 @@ async function drive(cluster: Cluster, options: ScenarioOptions, record: Recorde
     { head: submitted.data.headSha, file: 'review\n' },
   );
   const accepted = await waitForEvent({ type: 'task.accepted', subject: taskId });
+  if (scripted) {
+    const leadRunner = await cluster.runnerOf(lead2);
+    // Playbooks advance even after a failed shell command; require the proof written only after the check passed.
+    record.equal(CHECKS.reviewed, cloneFile(leadRunner.clonePath(lead2), '.agflow/run/review-verified'), 'review\n');
+  }
   const wake = (await person.messages({ taskId })).find(
     (entry) => entry.to === 'lead' && entry.body.startsWith(submittedMarker(taskId)),
   );
@@ -230,11 +261,11 @@ async function drive(cluster: Cluster, options: ScenarioOptions, record: Recorde
     `accepted by ${accepted.actor} at #${accepted.id}; seat changes before it: ${seatMoves.length}`,
   );
 
-  // The acceptance ends the worker's attempt, and its runner pushes any last WIP before it reports the exit; after
-  // that report nothing else pushes.
+  // hold_attempt may have reported the worker's exit before acceptance ends its attempt. Wait for the exit
+  // in either order; its runner pushes any last WIP before that report, and nothing pushes afterwards.
   const worker = String(submitted.data.attemptId);
   await waitFor(`the exit report of ${worker}`, async () =>
-    (await person.attempt(worker)).log.some((entry) => entry.summary.includes('after it ended')),
+    workerExitReported((await person.attempt(worker)).log),
   );
 
   // The lid opens: welcome.stop names lead-a1, so the old runner stops its process and pushes nothing for it.
@@ -289,5 +320,13 @@ function checkBrief(cluster: Cluster, lead2: string, handoff: LeadNote, record: 
     CHECKS.brief,
     first.includes(quoted),
     first === '' ? `${lead2} sent no model request` : `looked for ${shown(quoted)}`,
+  );
+}
+
+/** Whether the worker's exit report has reached the hub. */
+export function workerExitReported(log: readonly Pick<AttemptLogEntry, 'kind' | 'summary'>[]): boolean {
+  return log.some(
+    (entry) => entry.kind === 'note' &&
+      /^the agent (?:exited(?: with code -?\d+)?|was killed by \S+), stopped by /.test(entry.summary),
   );
 }

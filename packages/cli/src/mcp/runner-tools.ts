@@ -26,7 +26,7 @@ export interface RunnerBridgeSettings {
   attemptId: string;
   /** AGFLOW_ROLE */
   role: AgentRole;
-  /** AGFLOW_BRIDGE_POLL_MS: how often submit and prepare_dependencies ask the hub how their request went. */
+  /** AGFLOW_BRIDGE_POLL_MS: how often submit, fetch_submission and prepare_dependencies ask the hub how their request went. */
   pollMs: number;
   /** AGFLOW_BRIDGE_POLL_MAX_MS: how long they ask before they answer that it is still pending. */
   pollMaxMs: number;
@@ -42,6 +42,8 @@ export interface RunnerToolContext extends ToolContext {
    * hub hands back only a pending request, and never sends a preparation's outcome as a message.
    */
   pendingPrepareId: string | null;
+  /** Explicit fetches whose polling budget expired, keyed by task. */
+  pendingFetchIds?: Map<string, string>;
 }
 
 /** A tool's context in runner mode; every runner tool is served in runner mode only. */
@@ -177,6 +179,29 @@ const prepareDependencies = defineTool(
   },
 );
 
+const fetchSubmission = defineTool(
+  'fetch_submission',
+  'Lead: fetch a task submission into your runner vault and wait for its submitted head. After success, run git fetch origin <branch> and review FETCH_HEAD before accepting or rejecting.',
+  { task_id: TaskIdSchema },
+  async ({ task_id }, ctx) => {
+    const bridge = runnerContext(ctx);
+    const client = asAgent(ctx);
+    const pending = bridge.pendingFetchIds ??= new Map();
+    const earlier = pending.get(task_id);
+    const { request } = earlier ? await client.submissionFetch(earlier) : await client.requestSubmissionFetch(task_id);
+    const decided = request.status === 'pending'
+      ? (await pollUntilDecided(() => client.submissionFetch(request.id!), (answer) => answer.request.status !== 'pending', bridge.runner))?.request
+      : request;
+    if (!decided) {
+      pending.set(task_id, request.id!);
+      throw new ToolError(`The submission fetch ${request.id} is still running. Call fetch_submission again for ${task_id} before fetching or reviewing the branch.`);
+    }
+    pending.delete(task_id);
+    if (decided.status === 'failed') throw new ToolError(`The submission fetch failed: ${decided.error ?? 'no reason given'}`);
+    return JSON.stringify({ branch: decided.branch, head_sha: decided.head_sha, ...(decided.note ? { note: decided.note } : {}) });
+  },
+);
+
 const requestAgents = defineTool(
   'request_agents',
   "Lead: set how many workers agflow runs on runners, of any vendor, and why; agflow caps it at the project's limit, and 0 stops new starts without pausing the project. vendor names the vendor new workers prefer for the next hour.",
@@ -266,7 +291,7 @@ const WORKER_TOOLS = ['report_progress', 'write_handoff', 'declare_blocked', 'de
 export const runnerWorkerTools: ToolDef[] = [...runnerShared, ...byName(workerTools, WORKER_TOOLS), runnerRelease, submit, prepareDependencies];
 
 /** A runner lead's tools (design 10): M1's lead tools and the staffing ones; no claim, resume or submit. */
-export const runnerLeadTools: ToolDef[] = [...runnerShared, ...leadTools, requestAgents, replaceAgent, stopAgent, leadHandoff, getLeadNotes];
+export const runnerLeadTools: ToolDef[] = [...runnerShared, ...leadTools.filter((tool) => tool.name !== 'fetch_submission'), requestAgents, replaceAgent, stopAgent, leadHandoff, getLeadNotes, fetchSubmission];
 
 /** The tools AGFLOW_ROLE chooses. */
 export function runnerToolsFor(role: AgentRole): ToolDef[] {

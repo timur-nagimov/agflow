@@ -22,6 +22,8 @@ const HOLDER_ACTIONS = ['progress', 'handoff', 'submit', 'block', 'impossible', 
 const LEAD_TASK_ACTIONS = ['cancel', 'accept', 'reject', 'unblock', 'merged'];
 
 export const AGENT_ROUTES: readonly AgentRoute[] = [
+  { method: 'POST', path: '/api/fetch-submission', access: 'lead' },
+  { method: 'GET', path: '/api/fetch-submission/:id', access: 'lead' },
   { method: 'GET', path: '/api/brief', access: 'self' },
   { method: 'GET', path: '/api/goal', access: 'read' },
   { method: 'GET', path: '/api/status', access: 'read' },

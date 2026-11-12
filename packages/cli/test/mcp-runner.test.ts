@@ -82,7 +82,7 @@ async function call(client: Client, name: string, args: Record<string, unknown> 
 }
 
 describe('agflow mcp --runner', () => {
-  test('lists the worker or the lead tools according to AGFLOW_ROLE; without --runner the live bridge still lists its 27 tools, whatever the environment', async () => {
+  test('lists the worker or the lead tools according to AGFLOW_ROLE; without --runner the live bridge lists its 28 tools including fetch_submission, whatever the environment', async () => {
     const { hub, url } = serveHub();
     const names = async (client: Client) => (await client.listTools()).tools.map((tool) => tool.name);
     const worker = await bridge(['--vendor', 'claude', '--runner'], runnerEnv(hub.runnerAgent(), url));
@@ -94,7 +94,8 @@ describe('agflow mcp --runner', () => {
     saveCredentials({ hubUrl: url, token: hub.tokenFor('alice'), user: 'alice' }, liveDir);
     const live = await bridge(['--vendor', 'claude'], { ...runnerEnv(hub.runnerAgent(), url), AGFLOW_CONFIG_DIR: liveDir });
     const liveNames = await names(live);
-    expect(liveNames).toHaveLength(27);
+    expect(liveNames).toHaveLength(28);
+    expect(liveNames).toContain('fetch_submission');
     expect(liveNames).toContain('claim_task');
     expect(liveNames).not.toContain('request_agents');
     // M1's hello, which asks the hub about the code, not the runner's "already connected".

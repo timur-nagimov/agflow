@@ -385,7 +385,7 @@ export function codexReply(next: Next): StreamReply {
   const { step, callId } = next;
   const call =
     step.kind === 'shell'
-      ? codex.shell({ cmd: step.cmd, timeoutMs: step.timeoutMs, callId })
+      ? codex.shell({ cmd: step.cmd, timeoutMs: step.timeoutMs, callId, pollInbox: true })
       : codex.mcp({ tool: step.tool, args: step.args, callId });
   const before: OutputItem[] = step.text === null ? [] : codex.text(step.text).output;
   return { ...call, output: [...before, ...call.output] };

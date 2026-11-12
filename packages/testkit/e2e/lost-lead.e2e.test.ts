@@ -50,7 +50,7 @@ describeE2e('exit scenario 3: a lost lead', () => {
         passed([named.brief, named.messageMoved, named.messageSeen]));
 
       test('a worker submits the task created after the failover, and lead-a2, woken by it, accepts it as itself', () =>
-        passed([named.submitted, named.woken, named.accepted]));
+        passed([named.submitted, named.woken, named.reviewed, named.accepted]));
 
       test("after the thaw, the old runner stops lead-a1's process and pushes no ref for it", () =>
         passed([named.oldStopped, named.noRefs, RAN_TO_END]));

@@ -412,6 +412,27 @@ describe('reply builders', () => {
     expect(texts).toEqual([{ exit_code: 0, output: 'one two three', wall_time_seconds: 1 }]);
   });
 
+  test('live-like shell polls the exec session with inbox checks between waits', async () => {
+    const source = single(reply.shell({ cmd: 'bun test', timeoutMs: 60_000, pollInbox: true })).input as string;
+    const calls: string[] = [];
+    let polls = 0;
+    const output = await runScript(source, {
+      exec_command: async args => {
+        expect(args.yield_time_ms).toBe(1000);
+        calls.push('start');
+        return { session_id: 32054, output: '' };
+      },
+      mcp__agflow__check_inbox: async () => { calls.push('inbox'); return { message: 'owner update' }; },
+      write_stdin: async args => {
+        expect(args).toEqual({ session_id: 32054, chars: '', yield_time_ms: 1000 });
+        calls.push('poll');
+        return ++polls < 5 ? { session_id: 32054, output: '' } : { exit_code: 0, output: 'done' };
+      },
+    });
+    expect(calls).toEqual(['start', ...Array.from({ length: 5 }, () => ['inbox', 'poll']).flat()]);
+    expect(output).toEqual([...Array.from({ length: 5 }, () => ({ message: 'owner update' })), { exit_code: 0, output: 'done' }]);
+  });
+
   test('shell stops polling at timeoutMs and reports the command still running', async () => {
     const source = single(reply.shell({ cmd: 'sleep 100', timeoutMs: 300, callId: 'c' })).input as string;
     let polls = 0;
