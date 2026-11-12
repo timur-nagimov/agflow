@@ -769,7 +769,7 @@ export type RunnerCommand =
       reason: string | null }
   | { kind: 'upload_transcript'; attemptId: string }   // for attempts that ended lost, when their runner says hello
   | { kind: 'prepare_dependencies'; attemptId: string; fence: Fence; requestId: string }
-  | { kind: 'refresh_vault'; taskId: string; refs: string[] }   // with a late-work message to the current holder
+  | { kind: 'refresh_vault'; taskId: string; refs: string[] }   // late work or a lead's submission fetch
   | { kind: 'preflight'; vendor: Vendor }                        // after the hub sets a not-ready mark
   | { kind: 'delete_refs'; refs: { ref: string; expectedSha: string }[] }
   | { kind: 'update_settings'; settings: Partial<Omit<RunnerSettings, 'version'>>; version: number };
@@ -1237,7 +1237,7 @@ M1's `currentLead()` is removed, and nothing reads `agents.role` for authority.
 
 **Lifecycle.**
 - **Idle between wake-ups.** The lead's process stays alive and idle while its runner is online, and idle is not a stall.
-- **Its clone.** A lead attempt gets a clone checked out detached at `main`. It has no task branch, pushes no WIP and is never harvested (section 7.3).
+- **Its clone.** A lead attempt gets a clone checked out detached at `main`. It has no task branch, pushes no WIP and is never harvested (section 7.3). To review a submission, it calls `fetch_submission({ task_id })`, waits for success, then runs `git fetch origin <branch>` and reviews `FETCH_HEAD` at the returned `head_sha`. Its `origin` is its runner's vault, so the explicit fetch first brings the submitted branch to that vault (section 6.13).
 - **Process exits.** An unrequested exit moves the attempt to `holding` and resumes it: on the next delivery if it was idle, at once (with its unacknowledged deliveries) if it was in a turn. It was in a turn if its last reported phase was `turn`, or a message delivered to it is still unacknowledged. The third unrequested exit within `leadExitWindowMs` (an hour) ends it `crashed`, and the seat empties.
 - **Liveness.** A runner lead's agent `last_seen_at` is renewed with its runner lease.
 
@@ -1328,12 +1328,20 @@ Runner agents cannot push, so `submit` has two phases.
 3. **Recording.** On success the hub, in one transaction:
    - records the submission (task `submitted`, `branch_head`, work position);
    - moves the attempt to `holding` and sends `hold_attempt`;
-   - tells the lead, as in M1.
+   - queues `refresh_vault { taskId, refs: ["refs/heads/<branch>"] }` on the seated runner lead as a best-effort speed-up, then tells the lead to call `fetch_submission`, fetch the branch from `origin` and review `FETCH_HEAD`. Seating a runner lead also queues an early refresh for waiting submissions.
+
+   The early refresh holds no command or message: no delivery barrier or inbox reservation waits for its answer.
 
    The hub records the branch head from every outcome, even one that arrives after the attempt ended. A late success, for an attempt that is no longer current or has a newer submission, records only the head; the hub tells the lead and the task's current holder that the branch moved.
 4. **The agent's answer.** The bridge polls `GET /api/submissions/:id` every `AGFLOW_BRIDGE_POLL_MS` (2 s) for up to `AGFLOW_BRIDGE_POLL_MAX_MS` (3 minutes). It returns "submitted at <sha>", or the refusal with what to fix. On timeout it answers: "submission pending; do not submit again; the result will arrive as a message".
    - The hub sends every failed outcome, and every outcome for a submission that already failed, to the agent as a message, because it cannot know whether the poll returned it. A repeat of what the tool answered is harmless.
    - `remote` and `interrupted` outcomes fail the submission the way the timeout does (below).
+
+**Fetching for review.** `fetch_submission({ task_id })` is a lead-only bridge tool. The hub checks the caller holds the seat and the task has a submission with a branch and head (the waiting or latest submission). For a runner lead it enqueues `refresh_vault { taskId, refs: ["refs/heads/<branch>"] }` on that lead's runner. The command's successful result includes `data: { refs: { "refs/heads/<branch>": "<sha>" } }`, read from the vault after fetching. The hub verifies it matches the submitted head before the tool returns `{ branch, head_sha }`.
+
+The bridge posts `{ task_id }` to `/api/fetch-submission` and polls `/api/fetch-submission/:id` with the same interval and budget as `submit` and `prepare_dependencies`. The request belongs to that lead attempt; an ended or re-fenced attempt cancels it, and a successor cannot poll it. An offline runner, a failed fetch (with its message), an unconfirmed head or a missing submission is an error. If the polling budget expires, the tool reports that the fetch is still running and must be called again before reviewing; another call reports that request without enqueuing a duplicate. A live-chat lead gets the branch and head immediately, with a note that its own git remote has the submission.
+
+After success the lead runs `git fetch origin <branch>` and reviews `FETCH_HEAD` at `head_sha`, then calls `accept_task` or `reject_task`. Other commands and messages, including people's messages to the lead, proceed while the fetch is pending.
 
 **Ordering.**
 - **While a submission is pending:**
@@ -1983,7 +1991,8 @@ query({
     - `request_agents(count, vendor?, reason)`;
     - `replace_agent(agent_id, reason)` and `stop_agent(agent_id, reason, hold?)`, for runner agents only;
     - `write_handoff` with an optional task id (none: a lead handoff);
-    - `get_lead_notes()`.
+    - `get_lead_notes()`;
+    - `fetch_submission(task_id)` (section 6.13): wait for the submitted branch in the runner vault, then fetch from `origin` and review `FETCH_HEAD`.
 
     No claim, resume-claim or submit.
 - **Answers:**
@@ -1992,7 +2001,7 @@ query({
   - **Hub unreachable** (in every mode): "The agflow hub is unreachable; keep working on your task and try again in a few minutes."
 - **One source for the texts.** They are `BRIDGE_ANSWERS` in core, next to `BRIDGE_HEADER` (`X-Agflow-Bridge`) and `BRIDGE_VERSION` (2). The bridge and both adapters import them; `<reason>` is the `reason` of the hub's 401 body.
 - **Error results.** Every refusal (the three answers above, and a refused submit) is an MCP error result. Success and "submission pending" are normal results. Adapters count a terminal tool (`tool_ended.terminal`) only on a normal result, and set `tool_ended.hubUnreachable` when the answer is the hub-unreachable text.
-- The new lead tools are for runner mode only; the live bridge keeps M1's tools.
+- The staffing and lead-handoff tools are for runner mode only. The live bridge also serves `fetch_submission`: it returns the branch and head with the own-remote note, without asking a runner to fetch.
 
 **Live-chat claims** (M1 mode) now start from the task's work position. The claim answer's task names it (`workRef`, `workSha`), and the bridge fetches it with the person's own credentials (fetch-by-SHA works on GitHub), creates the task branch there, and says so. The hub refuses a live claim on a task whose work position is a WIP ref when the bridge does not declare support (an `X-Agflow-Bridge: 2` header). From epoch 2 on, the bridge names the branch with the hub's epoch (`HubStatus.epoch`), and reuses the task's recorded branch only when it carries the current epoch.
 
