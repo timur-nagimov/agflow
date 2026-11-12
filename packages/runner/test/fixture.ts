@@ -199,11 +199,26 @@ export async function createRunnerFixture(options: RunnerFixtureOptions = {}): P
   // Every agent still running is killed, and its controller's work waited for, before the files go. Whatever a test
   // left behind, that work stays short: no timer pushes, and a final push makes one try, so a broken origin costs
   // nothing.
+  // A start resolves before its agent's process record is written (the record waits for a ps call), so a test that
+  // ends right after a start can get here first: records are killed as they appear until every controller has settled.
   cleanups.push(async () => {
     for (const controller of controllers) controller.close();
     fixture.config.timings.finalPush = 0;
-    for (const record of store.processes()) await killGroup(record, 'SIGKILL');
-    await Promise.all(controllers.map((controller) => controller.settled()));
+    let settled = false;
+    const all = Promise.all(controllers.map((controller) => controller.settled())).finally(() => {
+      settled = true;
+    });
+    const killed = new Set<string>();
+    while (!settled) {
+      for (const record of store.processes()) {
+        const key = `${record.pgid}:${record.pid}:${record.lstart}`;
+        if (killed.has(key)) continue;
+        killed.add(key);
+        await killGroup(record, 'SIGKILL');
+      }
+      await Promise.race([all.catch(() => undefined), Bun.sleep(20)]);
+    }
+    await all;
     for (const controller of controllers) controller.close();
   });
   const fixture: RunnerFixture = {
