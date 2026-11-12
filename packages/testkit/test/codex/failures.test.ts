@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { cleanupTestProcesses } from '../../src/process-cleanup';
 import type { RunnerTestBlock } from '@agflow/runner/src/config';
 import {
   codexTestConfig,
@@ -279,4 +280,15 @@ describe('codexTestConfig', () => {
     expect(config.model_providers.agflow_test.base_url).toBe(scripted.url);
     expect(config.model_providers.agflow_test.stream_idle_timeout_ms).toBe(300_000);
   });
+});
+
+test('the cleanup backstop ends a held Responses stream', async () => {
+  const scripted = await startResponsesServer();
+  scripted.setHandler(() => reply.hang());
+  const response = await request(scripted, 'cleanup');
+  const reading = response.text().catch(() => 'aborted');
+  await cleanupTestProcesses();
+  await reading;
+  expect(scripted.release('cleanup')).toBe(0);
+  expect(await request(scripted, 'after').catch(() => 'refused')).toBe('refused');
 });
