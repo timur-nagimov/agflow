@@ -8,51 +8,23 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    timeout-minutes: 8
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: all
-            pattern: ''
-          - variant: no-deleted-clone
-            pattern: '^(?!.*a deleted clone is reported)'
-          - variant: no-new-start-tests
-            pattern: '^(?!.*(turns spent polling|new review tools end|a vendor-failed tool turn|pending fingerprints cannot))'
-          - variant: deleted-clone-then-git
-            pattern: '(a deleted clone is reported|diffFingerprint)'
-    name: facts x12 (${{ matrix.variant }})
+        watch: [on, off]
+        rep: [1, 2, 3, 4, 5]
+    name: suite (watch ${{ matrix.watch }} ${{ matrix.rep }})
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.11
       - run: bun install --frozen-lockfile
-      - name: facts.test.ts twelve times
+      - name: bun test until past the hang point
         env:
-          PATTERN: ${{ matrix.pattern }}
+          AGFLOW_DEBUG_NO_WATCH: ${{ matrix.watch == 'off' && '1' || '' }}
         run: |
-          hangs=0
-          for rep in $(seq 1 12); do
-            if [ -n "$PATTERN" ]; then
-              bun test packages/runner/test/facts.test.ts -t "$PATTERN" > out.txt 2>&1 &
-            else
-              bun test packages/runner/test/facts.test.ts > out.txt 2>&1 &
-            fi
-            pid=$!
-            for s in $(seq 1 80); do sleep 0.5; kill -0 $pid 2>/dev/null || break; done
-            if kill -0 $pid 2>/dev/null; then
-              hangs=$((hangs+1))
-              echo "=== rep $rep: HANG (40 s); fds by type:"
-              ls -l /proc/$pid/fd | tail -n +2 | awk '{print $NF}' | sed -E 's/[0-9]+/N/g' | sort | uniq -c | sort -rn | head -12
-              for t in /proc/$pid/task/*; do
-                echo "--- task $(basename $t) $(cat $t/comm) wchan=$(cat $t/wchan)"
-                sudo cat $t/stack 2>/dev/null | head -6 | sed 's/^/    /'
-              done
-              grep -E '\((pass|fail)\)' out.txt | tail -4
-              kill -9 $pid
-            fi
-            wait $pid && code=0 || code=$?
-            echo "rep $rep: exit=$code pass=$(grep -c '(pass)' out.txt) fail=$(grep -c '(fail)' out.txt)"
-          done
-          echo "TOTAL hangs=$hangs/12"
+          timeout 110 bun test > out.txt 2>&1 || true
+          grep -E 'a deleted clone is reported|fsAgeMs follows|diffFingerprint|readCloneRefs > reads the head' out.txt | cut -c1-160
+          if grep -q '(pass) diffFingerprint > changes with HEAD' out.txt; then echo "RESULT: no-hang"; elif grep -q '(fail) diffFingerprint > changes with HEAD' out.txt; then echo "RESULT: HANG"; else echo "RESULT: unknown"; tail -5 out.txt; fi
