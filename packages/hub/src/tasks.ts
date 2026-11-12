@@ -676,13 +676,13 @@ export function submitTask(
     });
     setAgentTask(ctx, agent.id, null);
     holdLiveAttempt(ctx, emit, task, `agent:${agent.id}`);
+    refreshLeadSubmission(ctx, id, branch);
     insertMessage(ctx, emit, {
       from: 'system',
       to: 'lead',
       taskId: id,
       body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\n${wrote(agent.id, clip(input.summary, 1500))}\n${submissionReviewInstruction(branch)}`,
     });
-    refreshLeadSubmission(ctx, id, branch);
     return getTask(ctx, id);
   });
 }

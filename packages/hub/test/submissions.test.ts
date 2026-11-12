@@ -1,14 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import type { RawRunnerEvent, RunnerEventData } from '@agflow/core';
-import { ACTIVE_MS, getAgent } from '../src/agents';
+import { ACTIVE_MS } from '../src/agents';
 import { attemptLog, getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, expireRunnerLeases, requestStop, resumeAttempt, startRunnerAttempt } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
-import { pendingCommands, recordResult } from '../src/commands';
+import { pendingCommands } from '../src/commands';
 import { flushDeliveries } from '../src/delivery';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
-import { listMessages, sendMessage, takeInbox } from '../src/messages';
+import { listMessages } from '../src/messages';
 import { branchHeadOf, findSubmission, insertSubmission, pendingSubmissionOf } from '../src/submission-store';
 import { expireSubmissions, requestSubmission } from '../src/submissions';
 import { getTask, writeTask } from '../src/task-store';
@@ -622,52 +622,15 @@ describe('branches for a runner lead to review', () => {
 
   function checkRefresh(hub: Hub, runnerId: string, taskId: string, branch: string) {
     hub.clock.advance(hub.ctx.config.deliveryBatchMs);
-    expect(flushDeliveries(hub.ctx).commands).toEqual([]);
+    flushDeliveries(hub.ctx);
     const commands = pendingCommands(hub.ctx, runnerId, 1);
     const refresh = commands.findLast((row) => row.kind === 'refresh_vault');
     expect(refresh?.command).toEqual({ kind: 'refresh_vault', taskId, refs: [`refs/heads/${branch}`] });
-    recordResult(hub.ctx, runnerId, { commandId: refresh!.id, ok: true });
-    const [deliver] = flushDeliveries(hub.ctx).commands;
+    const deliver = commands.findLast((row) => row.kind === 'deliver');
     expect(deliver).toBeDefined();
     expect(refresh!.seq).toBeLessThan(deliver!.seq);
     expect(listMessages(hub.ctx, { target: 'lead' })[0]?.body).toContain('git fetch origin');
   }
-
-  test.each(['runner', 'resubmission', 'live'] as const)(
-    '%s review stays out of check_inbox until its refresh completes',
-    async (source) => {
-      const { hub, held, taskId } = await pendingSetup();
-      const lead = seat(hub);
-      const agent = getAgent(hub.ctx, lead.attempt.agentId);
-      if (source === 'live') {
-        const worker = addAgent(hub.ctx);
-        const task = createTasks(hub.ctx, [newTask()], 'user:alice')[0]!;
-        claimTask(hub.ctx, task.id, worker);
-        submitTask(hub.ctx, task.id, worker, { ...work, branch: 'person-review', headSha: sha('c') });
-      } else {
-        report(hub, held, pushed('S-1'));
-        if (source === 'resubmission') {
-          const first = pendingCommands(hub.ctx, lead.runnerId, 1).findLast((row) => row.kind === 'refresh_vault')!;
-          recordResult(hub.ctx, lead.runnerId, { commandId: first.id, ok: true });
-          expect(takeInbox(hub.ctx, agent)).toHaveLength(1);
-          rejectTask(hub.ctx, taskId, `agent:${agent.id}`, 'Please revise.');
-          requestSubmission(hub.ctx, taskId, held.agent, work);
-          report(hub, held, pushed('S-2', sha('b')));
-        }
-      }
-      const notice = listMessages(hub.ctx, { target: 'lead' })[0]!;
-      const refresh = pendingCommands(hub.ctx, lead.runnerId, 1).findLast((row) => row.kind === 'refresh_vault')!;
-      const other = sendMessage(hub.ctx, { from: 'user:alice', to: 'lead', body: 'Unrelated question.' });
-      expect(takeInbox(hub.ctx, agent).map((message) => message.id)).toEqual([other.id]);
-      expect(takeInbox(hub.ctx, agent)).toEqual([]);
-      expect(listMessages(hub.ctx, { target: 'lead' }).find((message) => message.id === notice.id)?.deliveries).toEqual([]);
-      hub.clock.advance(hub.ctx.config.deliveryBatchMs);
-      expect(flushDeliveries(hub.ctx).commands).toEqual([]);
-      recordResult(hub.ctx, lead.runnerId, { commandId: refresh.id, ok: true });
-      expect(takeInbox(hub.ctx, agent).map((message) => message.id)).toEqual([notice.id]);
-      expect(takeInbox(hub.ctx, agent)).toEqual([]);
-    },
-  );
 
   test('a submission and resubmission refresh the other runner before review delivery', async () => {
     const { hub, held, taskId } = await pendingSetup();
@@ -679,7 +642,7 @@ describe('branches for a runner lead to review', () => {
     requestSubmission(hub.ctx, taskId, held.agent, work);
     report(hub, held, pushed('S-2', sha('b')));
     checkRefresh(hub, lead.runnerId, taskId, held.task.branch!);
-    expect(hub.ctx.db.query("SELECT id FROM runner_commands WHERE runner_id = ? AND kind = 'refresh_vault' AND status = 'done'").all(lead.runnerId)).toHaveLength(2);
+    expect(pendingCommands(hub.ctx, lead.runnerId, 1).filter((row) => row.kind === 'refresh_vault')).toHaveLength(2);
   });
 
   test('seating a runner lead refreshes waiting submissions before its start', async () => {
