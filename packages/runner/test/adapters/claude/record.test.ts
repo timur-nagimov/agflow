@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BRIDGE_ANSWERS } from '@agflow/core';
@@ -404,7 +404,17 @@ describe('the recorder', () => {
     saveRunnerConfig(real.config, RunnerConfigSchema.parse({ ...identity, homes: { claude: claudeHome } }));
     const live = () =>
       scratchLaunch({ bin: FAKE_CLAUDE_BIN, model: 'claude-sonnet-5-5', env: {}, live: true, runnerHome });
-    expect(live).toThrow(/is missing; run bun run vendor:install/);
+    const scratchRoot = join(runnerHome, 'scratch');
+    mkdirSync(scratchRoot);
+    const previousTmp = process.env.TMPDIR;
+    try {
+      process.env.TMPDIR = scratchRoot;
+      expect(live).toThrow(/is missing; run bun run vendor:install/);
+      expect(readdirSync(scratchRoot)).toEqual([]);
+    } finally {
+      if (previousTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmp;
+    }
 
     const pinned = join(real.runner, vendorBinary('claude', CLAUDE_CLI_VERSION));
     mkdirSync(join(pinned, '..'), { recursive: true });

@@ -10,17 +10,19 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ScriptResources } from './resources';
 import { type Locator, type Page, chromium } from 'playwright-core';
 
 const port = 8795;
 const base = `http://localhost:${port}`;
 const shots = mkdtempSync(join(tmpdir(), 'agflow-ui-'));
 
-const hub = Bun.spawn(['bun', join(import.meta.dir, 'demo-hub.ts')], {
+await using resources = new ScriptResources();
+const hub = resources.child(Bun.spawn(['bun', join(import.meta.dir, 'demo-hub.ts')], {
   env: { ...process.env, AGFLOW_DEMO_PORT: String(port) },
   stdout: 'pipe',
   stderr: 'inherit',
-});
+}));
 
 /** The line the demo prints once its story has settled and checked itself. */
 const READY_LINE = 'agflow demo hub on';
@@ -100,7 +102,7 @@ const statusIs = (page: Page, label: string) =>
 
 async function main(): Promise<void> {
   await waitForHub();
-  const browser = await chromium.launch();
+  const browser = await resources.acquire(chromium.launch(), (browser) => browser.close());
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   current = page;
   const consoleErrors: string[] = [];
@@ -939,7 +941,7 @@ async function main(): Promise<void> {
 try {
   await main();
 } finally {
-  hub.kill();
+  await resources.close();
 }
 console.log(`\nScreenshots: ${shots}`);
 if (failures.length > 0) {

@@ -7,6 +7,7 @@ import { pendingCommands } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { Gateway } from '../src/gateway';
+import { recordedRefs } from '../src/retention';
 import { listMessages } from '../src/messages';
 import { getRunner, markGitNotReady } from '../src/runners';
 import { getTask, listTaskNotes, move, writeTask } from '../src/task-store';
@@ -420,10 +421,31 @@ describe('the submitted head pushed after the end', () => {
     expect(rejects(ctx)).toEqual([]);
     // attempt.late_work records the pushed ref, so the task's ref cleanup deletes it (design 6.18).
     expect(lateEvents(ctx)).toEqual([[ref, SUBMITTED_SHA]]);
+    expect(listEvents(ctx.db).find((event) => event.type === 'attempt.late_work')?.data.submittedHead).toBe(true);
+    expect(recordedRefs(ctx, task.id)).toContainEqual({ ref, expectedSha: SUBMITTED_SHA });
     expect(lateNotes(ctx, task.id)).toEqual([]);
     expect(getTask(ctx, task.id)).toMatchObject({ status: 'accepted', workRef, workSha: SUBMITTED_SHA });
     // Its WIP ref was not pushed again, so its record stays.
     expect(getAttempt(ctx, attempt.id)).toMatchObject({ wipRef: attempt.wipRef, wipSha: WIP_SHA });
     expect(attemptLog(ctx, attempt.id).at(-1)?.summary).toContain(`${SUBMITTED_SHA} to ${ref}`);
   });
+  test('a hand-back fallback of the submitted head stays out of a successor’s merge notes and messages', async () => {
+    const { ctx, runnerId, task, runner } = await setup();
+    const attempt = await running(ctx, runner, runnerId, task.id);
+    updateAttempt(ctx, attempt.id, { submittedSha: SUBMITTED_SHA });
+    endAttempt(ctx, { attemptId: attempt.id, trigger: 'lost' });
+    await running(ctx, runner, runnerId, task.id);
+    const ref = lateWorkRef('refs/agflow/', attempt.id, 1);
+    const messages = listMessages(ctx);
+    runner.emit('attempt.handed_back', { ref, sha: SUBMITTED_SHA }, { attemptId: attempt.id, fence: attempt.fence });
+    await settle();
+    expect(rejects(ctx)).toEqual([]);
+    expect(listEvents(ctx.db).find((event) => event.type === 'attempt.late_work')?.data).toMatchObject({
+      ref, sha: SUBMITTED_SHA, submittedHead: true,
+    });
+    expect(lateNotes(ctx, task.id)).toEqual([]);
+    expect(listMessages(ctx)).toEqual(messages);
+    expect(recordedRefs(ctx, task.id)).toContainEqual({ ref, expectedSha: SUBMITTED_SHA });
+  });
+
 });

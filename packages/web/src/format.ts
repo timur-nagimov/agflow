@@ -528,7 +528,10 @@ const M2_SENTENCES: Record<HubEventType, Sentence> = {
       Array.isArray(d.stripped) && d.stripped.length > 0 ? `, without ${count(d.stripped, 'protected path')}` : ''
     }`,
   'attempt.violation': (d) => `${text(d.attemptId)} changed protected paths (${text(d.phase)}): ${list(d.paths)}`,
-  'attempt.late_work': (d) => `${text(d.attemptId)} pushed late work at ${sha7(d.sha)}`,
+  'attempt.late_work': (d) =>
+    d.submittedHead === true
+      ? `${text(d.attemptId)} pushed its submitted head to ${text(d.ref)} (nothing new)`
+      : `${text(d.attemptId)} pushed late work at ${sha7(d.sha)}`,
   'attempt.prepared': (d) =>
     d.ok
       ? `Dependencies are ready for ${text(d.attemptId)}`
@@ -673,6 +676,8 @@ export function eventTone(type: string, data: Record<string, unknown> = {}): Ton
     case 'task.merged':
     case 'project.resumed':
       return 'done';
+    case 'attempt.late_work':
+      return data.submittedHead === true ? 'wait' : 'trouble';
     case 'task.submitted':
     case 'goal.updated':
     case 'goal.note_added':
@@ -703,7 +708,6 @@ export function eventTone(type: string, data: Record<string, unknown> = {}): Ton
     case 'runner.event_rejected':
     case 'account.owner_away':
     case 'attempt.violation':
-    case 'attempt.late_work':
     case 'agent.stalled':
     case 'approval.expired':
     case 'submission.failed':
