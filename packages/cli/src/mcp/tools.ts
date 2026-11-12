@@ -430,6 +430,16 @@ export const gitTools: ToolDef[] = [
 
 export const leadTools: ToolDef[] = [
   defineTool(
+    'fetch_submission',
+    'Lead: get the submitted branch and head to review. Then git fetch origin <branch> and review FETCH_HEAD.',
+    { task_id: TaskIdSchema },
+    async ({ task_id }, ctx) => {
+      const { request } = await asAgent(ctx).requestSubmissionFetch(task_id);
+      if (request.status !== 'ok') throw new ToolError(request.error ?? 'The submission fetch is still running.');
+      return JSON.stringify({ branch: request.branch, head_sha: request.head_sha, note: request.note });
+    },
+  ),
+  defineTool(
     'get_status',
     'Project status: goal version, lead, task counts, active agents and recent messages to people.',
     {},

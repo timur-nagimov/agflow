@@ -378,10 +378,7 @@ export class Gateway implements RunnerLink {
     const messages = tx(ctx, () => {
       const built: CommandMessage[] = [];
       for (const row of pendingCommands(ctx, runnerId, connection.protocol)) {
-        if (connection.sent.has(row.id)) {
-          if (row.kind === 'refresh_vault') break;
-          continue;
-        }
+        if (connection.sent.has(row.id)) continue;
         try {
           // A savepoint per command, so a failing one leaves the earlier ones' writes standing.
           built.push(
@@ -394,9 +391,6 @@ export class Gateway implements RunnerLink {
           this.log(`building command ${row.id} for runner ${runnerId} failed`, error);
           break;
         }
-        // Runner commands and attempt deliveries use separate executor queues. Wait for the fetch result
-        // before sending a start, resume or delivery that lets the agent read the refreshed branch.
-        if (row.kind === 'refresh_vault') break;
       }
       return built;
     });

@@ -759,26 +759,29 @@ describe('heartbeats, results and dead links', () => {
 });
 
 
-test.each([true, false])('a vault refresh finishes before later delivery (ok=%s), including after reconnect', (ok) => {
+test.each([true, false])('a pending vault refresh never delays delivery or unrelated commands (ok=%s), including after reconnect', (ok) => {
   const { ctx, gateway, token } = setup();
   const session = { user: 'alice', sessionHash: sessionHashOf(token) };
   const fake = new FakeRunner<FakeConnection>((endpoint) => new FakeConnection(gateway, session, endpoint));
   const first = recordingSocket();
   const connection = gateway.open(first.socket, session);
   gateway.message(connection, JSON.stringify(fake.hello()));
-  const [refresh, deliver] = tx(ctx, () => [
+  const [refresh, deliver, preflight] = tx(ctx, () => [
     enqueueCommand(ctx, 'R-1', { kind: 'refresh_vault', taskId: 'T-1', refs: ['refs/heads/agflow/T-1-review'] }),
     enqueueCommand(ctx, 'R-1', { kind: 'deliver', attemptId: 'lead-a1', fence: { epoch: 1, counter: 1 }, messages: [], more: 0 }),
+    enqueueCommand(ctx, 'R-1', { kind: 'preflight', vendor: 'claude' }),
   ]);
   const ids = (sent: HubMessage[]) => sent.flatMap((message) => message.t === 'command' ? [message.id] : []);
   expect(ids(first.sent)).toContain(refresh!.id);
   gateway.flush('R-1');
-  expect(ids(first.sent)).not.toContain(deliver!.id);
+  expect(ids(first.sent)).toContain(deliver!.id);
+  expect(ids(first.sent)).toContain(preflight!.id);
   const second = recordingSocket();
   const reconnected = gateway.open(second.socket, session);
   gateway.message(reconnected, JSON.stringify(fake.hello()));
   expect(ids(second.sent)).toContain(refresh!.id);
-  expect(ids(second.sent)).not.toContain(deliver!.id);
+  expect(ids(second.sent)).toContain(deliver!.id);
+  expect(ids(second.sent)).toContain(preflight!.id);
   gateway.message(reconnected, JSON.stringify({ t: 'result', commandId: refresh!.id, ok }));
   expect(ids(second.sent)).toContain(deliver!.id);
 });

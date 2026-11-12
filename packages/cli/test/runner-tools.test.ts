@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { NewTaskSchema, type SubmitError } from '@agflow/core';
+import { recordResult } from '@agflow/hub/src/commands';
+import { requestSubmission } from '@agflow/hub/src/submissions';
 import { tx } from '@agflow/hub/src/context';
 import { updateGoal } from '@agflow/hub/src/goal';
 import { onPrepared } from '@agflow/hub/src/prepare';
@@ -14,7 +16,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { BRIDGE_TOOL_NAMES } from '../../runner/src/adapters/bridge-tools';
 import { type FetchFn, HubClient } from '../src/hub-client';
 import { type RunnerToolContext, runnerLeadTools, runnerToolsFor, runnerWorkerTools } from '../src/mcp/runner-tools';
-import { workerTools } from '../src/mcp/tools';
+import { leadTools, workerTools } from '../src/mcp/tools';
 import { createMcpServer } from '../src/mcp/server';
 import { HUB_URL, type HubFixture, type RunnerAgent, hubFixture } from './fixture';
 
@@ -42,7 +44,7 @@ async function bridgeFor(
   const fetchFn: FetchFn = async (input, init) => {
     const path = new URL(String(input)).pathname;
     if ((init?.method ?? 'GET') === 'GET') {
-      for (const prefix of ['/api/submissions/', '/api/prepare/']) {
+      for (const prefix of ['/api/submissions/', '/api/prepare/', '/api/fetch-submission/']) {
         if (!path.startsWith(prefix)) continue;
         const count = (counts.get(prefix) ?? 0) + 1;
         counts.set(prefix, count);
@@ -145,6 +147,7 @@ describe('the runner tool sets', () => {
       'stop_agent',
       'write_handoff',
       'get_lead_notes',
+      'fetch_submission',
     ]);
     for (const tools of [runnerWorkerTools, runnerLeadTools]) {
       const names = tools.map((tool) => tool.name);
@@ -280,6 +283,57 @@ describe('prepare_dependencies', () => {
     prepared(hub, slow, { ok: false, error: 'lockfile mismatch', logTail: null });
     expect(await slowBridge.call('prepare_dependencies')).toEqual({ text: `The dependency preparation ${request?.id} failed: lockfile mismatch.`, isError: true });
     expect(requestsOf()).toEqual([{ id: request?.id as string }]);
+  });
+});
+
+describe('fetch_submission', () => {
+  function setup() {
+    const hub = hubFixture();
+    const lead = runnerAgent(hub, 'lead');
+    const worker = runnerAgent(hub);
+    const taskId = worker.task!.id;
+    requestSubmission(hub.ctx, taskId, worker.agent, { summary: 'Ready', evidence: [] });
+    submitted(hub, worker, { error: null });
+    const finish = (ok: boolean) => {
+      const row = hub.ctx.db.query("SELECT id FROM runner_commands WHERE kind = 'refresh_vault' AND attempt_id = ?").get(lead.attempt.id) as { id: string };
+      recordResult(hub.ctx, lead.attempt.runnerId!, { commandId: row.id, ok,
+        ...(ok ? { data: { refs: { [`refs/heads/${worker.task!.branch}`]: HEAD } } } : { error: 'fetch denied' }) });
+    };
+    return { hub, lead, worker, taskId, finish };
+  }
+
+  test('a live lead gets the branch and head with the own-remote instruction', async () => {
+    const hub = hubFixture();
+    const lead = hub.liveAgent('alice', 'lead');
+    const worker = runnerAgent(hub);
+    requestSubmission(hub.ctx, worker.task!.id, worker.agent, { summary: 'Ready', evidence: [] });
+    submitted(hub, worker, { error: null });
+    const result = await leadTools.find((tool) => tool.name === 'fetch_submission')!.run({ task_id: worker.task!.id }, {
+      client: lead.client, state: { agentId: lead.agentId, role: 'lead' }, cwd: '/tmp',
+    });
+    expect(JSON.parse(result)).toEqual({ branch: worker.task!.branch, head_sha: HEAD, note: expect.stringContaining('own git remote') });
+  });
+
+  test.each([true, false])('polls the refresh and relays its result (ok=%s)', async (ok) => {
+    const { lead, worker, taskId, finish } = setup();
+    const bridge = await bridgeFor(lead, { decide: { prefix: '/api/fetch-submission/', at: 2, run: () => finish(ok) } });
+    const result = await bridge.call('fetch_submission', { task_id: taskId });
+    expect(result.isError).toBe(!ok);
+    if (ok) expect(JSON.parse(result.text)).toEqual({ branch: worker.task!.branch, head_sha: HEAD });
+    else expect(result.text).toContain('fetch denied');
+    expect(bridge.gets('/api/fetch-submission/')).toBe(2);
+  });
+
+  test('an unanswered fetch has the polling budget and a later call reports its result without enqueuing again', async () => {
+    const { hub, lead, taskId, finish } = setup();
+    const bridge = await bridgeFor(lead, { pollMaxMs: 10 });
+    const answer = await bridge.call('fetch_submission', { task_id: taskId });
+    expect(answer.isError).toBe(true);
+    expect(answer.text).toContain('still running');
+    expect(bridge.gets('/api/fetch-submission/')).toBe(2);
+    finish(false);
+    expect((await bridge.call('fetch_submission', { task_id: taskId })).text).toContain('fetch denied');
+    expect(hub.ctx.db.query("SELECT id FROM runner_commands WHERE kind = 'refresh_vault' AND attempt_id = ?").all(lead.attempt.id)).toHaveLength(1);
   });
 });
 

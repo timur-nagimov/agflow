@@ -49,5 +49,6 @@ export const BRIDGE_TOOL_NAMES: Readonly<Record<AgentRole, readonly string[]>> =
     'stop_agent',
     'write_handoff',
     'get_lead_notes',
+    'fetch_submission',
   ]),
 });

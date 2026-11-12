@@ -455,9 +455,8 @@ export class CommandExecutor {
     const { vault, outbox } = this.options;
     switch (command.kind) {
       case 'refresh_vault':
-        // A late-work ref the hub tells the current holder to merge: fetched before the agent asks for it.
-        await vault.refresh(command.taskId, command.refs, this.options.wipRefPrefix());
-        return { ok: true };
+        // Report the fetched heads so fetch_submission can verify the submitted commit before review.
+        return { ok: true, data: { refs: await vault.refresh(command.taskId, command.refs, this.options.wipRefPrefix()) } };
       case 'preflight': {
         const adapter = this.options.adapters.get(command.vendor);
         if (!adapter) return { ok: false, error: `no ${command.vendor} adapter on this runner` };

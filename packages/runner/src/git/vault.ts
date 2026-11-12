@@ -158,13 +158,23 @@ export class Vault {
   }
 
   /** refresh_vault: the task's refspecs and the named refs, so a late-work ref is there before the holder merges it. */
-  async refresh(taskId: string, refs: string[], wipRefPrefix: string): Promise<void> {
+  async refresh(taskId: string, refs: string[], wipRefPrefix: string): Promise<Record<string, string>> {
     const refspecs = this.taskRefspecs(taskId, wipRefPrefix);
     for (const ref of refs) {
       if (ref.startsWith(LOCAL_PINS)) throw new Error(`${ref} is a local pin and is never fetched`);
       if (!this.covered(ref, taskId, wipRefPrefix)) refspecs.push(`+${ref}:${ref}`);
     }
-    await this.fetch(refspecs);
+    const remote = await this.remote();
+    return this.withLock(async () => {
+      await runGit(remote, [`--git-dir=${this.path}`, 'fetch', '--quiet', '--no-tags', 'origin', ...refspecs]);
+      const heads: Record<string, string> = {};
+      for (const ref of refs) {
+        const sha = await this.commitOf(ref);
+        if (sha === null) throw new Error(`the fetched ref ${ref} is missing from the vault`);
+        heads[ref] = sha;
+      }
+      return heads;
+    });
   }
 
   /**
