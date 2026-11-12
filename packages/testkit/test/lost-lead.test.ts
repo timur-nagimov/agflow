@@ -27,9 +27,11 @@ test('acceptance, hold requests and agent text do not stand in for an exit repor
 test('the scripted lead fetches from its origin and checks review.txt before accepting', async () => {
   const program = LOST_LEAD.programs('T-1')['lead-a2']!;
   const steps = program.reactions![0]!.steps;
-  expect(steps[0]?.kind).toBe('shell');
-  expect(steps[1]).toMatchObject({ kind: 'tool', tool: 'accept_task' });
-  const review = steps[0]!;
+  expect(steps[0]).toMatchObject({ kind: 'tool', tool: 'fetch_submission', args: { task_id: 'T-1' } });
+  expect(LOST_LEAD.goal).toContain('fetch_submission');
+  expect(steps[1]?.kind).toBe('shell');
+  expect(steps[2]).toMatchObject({ kind: 'tool', tool: 'accept_task' });
+  const review = steps[1]!;
   if (review.kind !== 'shell') throw new Error('no review shell step');
   expect(LOST_LEAD.goal).toContain('git fetch origin');
   const repo = await originRepo({ 'README.md': 'demo\n' });

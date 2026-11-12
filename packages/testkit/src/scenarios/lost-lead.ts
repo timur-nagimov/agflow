@@ -49,7 +49,8 @@ const GOAL = [
   '1. If your brief has no lead handoff from a previous lead, call write_handoff, without a task id, with the note: ' +
     `${LEAD_HANDOFF}`,
   '2. If it has one, restate the state of the project and your next step, as your first prompt asks.',
-  '3. Create no tasks and staff nothing. When a task is submitted, run git fetch origin <submitted-branch> ' +
+  '3. Create no tasks and staff nothing. When a task is submitted, call fetch_submission with its task_id and wait ' +
+    'for success. Then run git fetch origin <submitted-branch> ' +
     'in your clone (origin is your runner vault), then read review.txt from FETCH_HEAD. Accept it with accept_task ' +
     'only after checking that review.txt holds the line review.',
 ].join('\n');
@@ -110,7 +111,11 @@ function programs(taskId?: string): Programs {
     [lead2]: {
       steps: [say(LEAD_RESTATEMENT, tool('get_lead_notes'))],
       reactions: [
-        react(submittedMarker(taskId), [say(`I fetch and review ${taskId}.`, review), say(`I accept ${taskId}.`, accept)]),
+        react(submittedMarker(taskId), [
+          say(`I fetch the submission for ${taskId}.`, tool('fetch_submission', { task_id: taskId })),
+          say(`I fetch and review ${taskId}.`, review),
+          say(`I accept ${taskId}.`, accept),
+        ]),
       ],
     },
     [attemptId(taskId, 1, 1)]: {
