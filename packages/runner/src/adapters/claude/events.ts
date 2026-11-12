@@ -528,6 +528,7 @@ function outputRead(command: unknown): string | null {
   if (!['cat', 'tail', 'head'].includes(name ?? '')) return null;
   if (args.length === 1) return args[0]!;
   if (args.length === 2 && args[0] === '--') return args[1]!;
+  if (name !== 'cat' && args.length === 2 && /^-(?:[nc])?\d+$/.test(args[0]!)) return args[1]!;
   if (name !== 'cat' && args.length === 3 && ['-n', '-c'].includes(args[0]!) && /^\d+$/.test(args[1]!)) {
     return args[2]!;
   }

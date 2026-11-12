@@ -458,6 +458,49 @@ describe('ClaudeEventMapper.ended', () => {
 });
 
 describe('background Bash polling', () => {
+  for (const command of [
+    'tail -20 /tmp/bg-1.output',
+    'head -10 /tmp/bg-1.output',
+    'tail -n20 /tmp/bg-1.output',
+    'head -n10 /tmp/bg-1.output',
+    'tail -c20 /tmp/bg-1.output',
+    'head -c10 /tmp/bg-1.output',
+  ]) {
+    test(`${command} preserves the running command cap and detects loops after completion`, () => {
+      const mapper = new ClaudeEventMapper();
+      let now = 0;
+      const facts = new FactsTracker({ attemptId: 'T-1-a1', fence: { epoch: 1, counter: 1 }, clone: import.meta.dir,
+        toolCaps: { defaultMs: 30_000, longMs: 90_000, checks: [] }, clock: { awakeNow: () => now },
+        fingerprint: async () => 'same', phase: 'turn' });
+      const observe = (frames: Frame[]) => {
+        for (const event of mapAll(mapper, frames)) facts.observe(event);
+      };
+      const verdict = () => judgeStall('worker', facts.facts(), { stallMs: 100_000, toolCapMs: 30_000,
+        maxContinuations: 25, activeBudgetMs: 1_000_000 })?.cause;
+      const poll = (id: string) => [assistant([toolUse(id, 'Bash', { command })]), toolResult(id, 'unchanged output')];
+      try {
+        observe([init(), assistant([toolUse('bash', 'Bash', { command: 'bun test', run_in_background: true })]),
+          { type: 'system', subtype: 'task_started', task_id: 'bg-1', tool_use_id: 'bash', task_type: 'local_bash' },
+          toolResult('bash', 'Command running in background with ID: bg-1. Output is being written to: /tmp/bg-1.output', false,
+            { tool_use_result: { backgroundTaskId: 'bg-1' } }),
+        ]);
+        for (let n = 0; n < 3; n++) {
+          now = (n + 1) * 10_000;
+          observe(poll(`poll-${n}`));
+        }
+        expect(verdict()).toBeUndefined();
+        expect(facts.facts()).toMatchObject({ tool: { command: 'bun test', ageMs: 30_000, capMs: 90_000 }, repeatedCalls: 0 });
+        now = 90_001;
+        observe(poll('over-cap'));
+        expect(verdict()).toBe('stall_hung_tool');
+        observe([{ type: 'system', subtype: 'task_notification', task_id: 'bg-1', status: 'completed' }]);
+        expect(facts.facts().tool).toBeNull();
+        for (let n = 0; n < 3; n++) observe(poll(`after-${n}`));
+        expect(verdict()).toBe('stall_loop');
+      } finally { facts.close(); }
+    });
+  }
+
   for (const [name, input] of [
     ['TaskOutput', { task_id: 'bg-1', block: true, timeout: 1000 }],
     ['BashOutput', { bash_id: 'bg-1' }],
