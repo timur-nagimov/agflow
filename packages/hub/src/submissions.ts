@@ -235,7 +235,6 @@ function recordSuccess(
         `${submission.id} was recorded, and ${task.id} is up for review.`,
     });
   }
-  refreshLeadSubmission(ctx, task.id, branch);
   insertMessage(ctx, emit, {
     from: 'system',
     to: 'lead',
@@ -245,6 +244,7 @@ function recordSuccess(
       `${head ?? 'an unknown head'}.\n${attempt.agentId} wrote:\n${quoteLines(clip(submission.summary, 1500))}\n` +
       submissionReviewInstruction(branch),
   });
+  refreshLeadSubmission(ctx, task.id, branch);
   const recorded = findSubmission(ctx, submission.id) as SubmissionRecord;
   emit({
     type: 'submission.recorded',
