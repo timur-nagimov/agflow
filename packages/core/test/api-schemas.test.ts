@@ -719,6 +719,7 @@ describe('the event catalogue', () => {
       'logStat',
     ]);
     expect(data('attempt.late_work')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'ref', 'sha']);
+    expect(HUB_EVENT_TYPES['attempt.late_work'].optionalData).toEqual(['submittedHead']);
     expect(data('task.handed_back')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'source', 'ref', 'sha']);
     expect(data('task.refs_deleted')).toEqual(['taskId', 'runnerId', 'refs']);
     expect(data('agent.stalled')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'cause', 'reason']);

@@ -513,8 +513,10 @@ export type HubEventCategory =
 interface HubEventSpec {
   category: HubEventCategory;
   subject: HubEventSubject | null;
-  /** Every key of the event's data; an id that does not apply to one event is null there. */
+  /** Required data keys; an id that does not apply to one event is null there. */
   data: readonly string[];
+  /** Additional keys present only when applicable; absent on older events. */
+  optionalData?: readonly string[];
 }
 
 // Data carries attemptId, runnerId, agentId, taskId, approvalId and submissionId wherever they apply, so a page that
@@ -555,7 +557,13 @@ export const HUB_EVENT_TYPES = {
     data: [...OF_ATTEMPT, 'ref', 'sha', 'stripped', 'skipped', 'embedded', 'logStat'],
   },
   'attempt.violation': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'phase', 'paths'] },
-  'attempt.late_work': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'ref', 'sha'] },
+  // submittedHead: true means this ref holds the already-submitted sha, retained only for ref cleanup.
+  'attempt.late_work': {
+    category: 'attempts',
+    subject: 'task',
+    data: [...OF_ATTEMPT, 'ref', 'sha'],
+    optionalData: ['submittedHead'],
+  },
   // requestId: the prepare_dependencies command the agent asked for.
   'attempt.prepared': { category: 'attempts', subject: 'task', data: [...OF_ATTEMPT, 'requestId', 'ok', 'error'] },
   // cause: the StopCause; reason: the text the agent was given.
