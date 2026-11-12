@@ -1,13 +1,12 @@
 // A seeded model of settings sync (design 6.3, "Settings sync"; X-12). The runner side is real: the Outbox on a
 // temporary runner.db, the command executor's update_settings path, SettingsSync and config.ts, wired as the runtime
-// wires them (runner.ts: the ack check, the welcome and its hub epoch, the replay filter, runner.json's version at
+// wires them (runner.ts: the welcome and its hub epoch, exact answers, runner.json's version at
 // start). The link is a pair of queues, and the hub a small model of M2a's rules (runners.ts, events-in.ts,
 // gateway.ts, commands.ts): runner.settings applied in seq order whatever their base, each at the next version, and
 // echoed verbatim; the owner's edits echoed the same way; an update_settings echo flushed before the ack of the events
 // message that carried its edit; hello's version comparison (a runner it does not know: hello's settings stored at
 // version 1 and echoed; equal: nothing; older: the hub's whole settings; newer: adopted, pending echoes cancelled);
-// commands resent after each welcome until answered, and a failed result never; refusals acknowledged and never
-// echoed; a restore from a backup, or from one taken before the runner was set up, with a new hub epoch, whose first
+// commands resent after each welcome until answered, and a failed result never; refusals explicitly answered; a restore from a backup, or from one taken before the runner was set up, with a new hub epoch, whose first
 // welcome the runner answers with a new hello.
 //
 // Random steps: local edits of one field, several, or per-vendor entries; the owner's edits, some naming every field
@@ -19,7 +18,7 @@
 // timers that run it again as time passes; hand edits while the runner is down; pruning at 48 h and 14 days, by the
 // runtime's Outbox or one built as M2c's retention builds it; backups and restores, while paused or busy too.
 //
-// Invariants: the hub never applies a runner edit again once the runner ran its echo; every runner.settings the runner
+// Invariants: the hub never applies a runner edit already covered by an adopted snapshot; every runner.settings the runner
 // appends carries only fields a user changed since they last went out (so no stale edit reverts a newer owner change);
 // runner.json always holds the snapshot with the edits in flight laid over it; settingsEchoed stays within the outbox;
 // an echo that moves the snapshot moves it to the settings the hub had at that version; on a link that stays up, every
@@ -49,7 +48,7 @@ import type { Vault } from '../src/git/vault';
 import { type CommandResult, Journal } from '../src/journal';
 import type { CommandMessage } from '../src/link';
 import { memoryLogger } from '../src/log';
-import { isSettingsProbe, Outbox, type SettingsEvent, type StoredEvent } from '../src/outbox';
+import { Outbox, type SettingsEvent, type StoredEvent } from '../src/outbox';
 
 // Each run's directory goes when it ends; a run that throws leaves its own to the afterAll.
 const dirs = new Set<string>();
@@ -177,6 +176,7 @@ interface HubCommand {
   status: 'pending' | 'done' | 'cancelled';
   /** The runner.settings seq it echoes; null for the owner's and hello's. */
   source: number | null;
+  refused?: true;
 }
 
 /** M2a's settings rules, for one runner with one outbox epoch. */
@@ -184,6 +184,7 @@ class HubModel {
   settings: SettingsValues;
   version: number;
   acked = 0;
+  adoptedThrough = 0;
   epoch = 1;
   nextSeq = 1;
   commands: HubCommand[] = [];
@@ -226,9 +227,11 @@ class HubModel {
   receive(events: StoredEvent[]): number {
     for (const event of events) {
       if (event.seq <= this.acked) continue;
-      if (event.type === 'runner.settings') {
+      if (event.type === 'runner.settings' && event.seq > this.adoptedThrough) {
         if (this.refuse(event)) {
           this.refused(event);
+          this.enqueue({}, this.version, event.seq);
+          this.commands.at(-1)!.refused = true;
         } else {
           this.applying(event);
           this.change(event.data.settings, event.seq);
@@ -244,19 +247,21 @@ class HubModel {
   }
 
   /** reconcileHelloSettings and acknowledgePosition; lastHubEpoch is the hello's. */
-  hello(reported: RunnerSettings, firstSeq: number, lastHubEpoch: number | null): number {
+  hello(reported: RunnerSettings, firstSeq: number, lastHubEpoch: number | null, answeredSeq: number): number {
     this.acked = Math.max(this.acked, firstSeq - 1);
     // A runner that has had a welcome of an older epoch says hello again at this one's.
     if (lastHubEpoch === null || lastHubEpoch === this.epoch) this.awaitingHello = false;
     if (this.version === 0) {
       // A runner the hub does not know: hello's settings stored at version 1, and echoed.
       this.settings = valuesOf(reported);
-      this.version = 1;
-      this.history.set(1, structuredClone(this.settings));
-      this.enqueue(structuredClone(this.settings), 1, null);
+      this.version = Math.max(1, reported.version);
+      this.adoptedThrough = answeredSeq;
+      this.history.set(this.version, structuredClone(this.settings));
+      this.enqueue(structuredClone(this.settings), this.version, null);
     } else if (reported.version > this.version) {
       this.settings = valuesOf(reported);
       this.version = reported.version;
+      this.adoptedThrough = answeredSeq;
       this.history.set(this.version, structuredClone(this.settings));
       for (const command of this.commands) if (command.status === 'pending') command.status = 'cancelled';
     } else if (reported.version < this.version) {
@@ -279,6 +284,7 @@ class HubModel {
       settings: this.settings,
       version: this.version,
       acked: this.acked,
+      adoptedThrough: this.adoptedThrough,
       commands: this.commands,
       history: [...this.history],
     });
@@ -293,10 +299,10 @@ class HubModel {
    * new hub epoch, so new command ids never meet the backup's.
    */
   restore(early: boolean): void {
-    type State = Pick<HubModel, 'settings' | 'version' | 'acked' | 'commands'> & {
+    type State = Pick<HubModel, 'settings' | 'version' | 'acked' | 'commands' | 'adoptedThrough'> & {
       history: [number, SettingsValues][];
     };
-    const unknown: State = { settings: this.settings, version: 0, acked: 0, commands: [], history: [] };
+    const unknown: State = { settings: this.settings, version: 0, acked: 0, adoptedThrough: 0, commands: [], history: [] };
     const { history, ...state } = early ? unknown : (JSON.parse(this.backupState as string) as State);
     Object.assign(this, structuredClone(state));
     this.history = new Map(history);
@@ -368,10 +374,6 @@ class Model {
   /** Keys a user changed in runner.json since they last went out as runner.settings. */
   private readonly fresh = new Set<Key>();
   private scanned = 0;
-  /** Runner edits whose echo the runner ran. */
-  private readonly echoRan = new Set<number>();
-  /** The runner.settings last sent while the runner held an answer for them (an echo or a refusal). */
-  private readonly sentAnswered = new Set<number>();
   private readonly refuseRate: number;
   private refusing = true;
   /** The value of each key whose last change was the person's, while nothing has excused its loss since. */
@@ -391,14 +393,10 @@ class Model {
     this.hub = new HubModel(
       this.disk.confirmedSettings,
       (event) =>
-        this.refusing && this.r.chance(isSettingsProbe(event) ? this.refuseRate / 2 : this.refuseRate),
+        this.refusing && this.r.chance(this.refuseRate),
       (event) => {
-        // Matching is by content, so an echo may answer an equal edit the hub refused, leaving its own edit in flight
-        // until a probe's echo; a restore meanwhile replays that edit. That one known case aside (the runner sent it
-        // holding no answer for it), no edit whose echo ran is applied again. A probe applied again changes nothing.
-        if (this.echoRan.has(event.seq) && this.sentAnswered.has(event.seq) && !isSettingsProbe(event)) {
-          this.fail(`the hub applied runner.settings #${event.seq} again after its echo ran`);
-        }
+        // An adopted snapshot is the only reason to skip an answered edit after restore.
+        if (event.seq <= this.hub.adoptedThrough) this.fail('applied an edit already included in the adopted snapshot');
       },
       (event) => {
         this.note(`hub refused #${event.seq}`);
@@ -519,7 +517,6 @@ class Model {
       return answered;
     };
     // runner.ts: each ack checks the settings edits in flight.
-    life.outbox.onAck(() => this.track(life.executor.settingsAcknowledged({ welcome: false })));
     this.life = life;
     this.note('start');
   }
@@ -578,7 +575,7 @@ class Model {
   private connect(life: Life): void {
     life.executor.helloSent();
     const reported = life.config.confirmedSettings;
-    const ackedSeq = this.hub.hello(reported, life.outbox.firstSeq(), life.db.meta('lastHubEpoch'));
+    const ackedSeq = this.hub.hello(reported, life.outbox.firstSeq(), life.db.meta('lastHubEpoch'), life.outbox.settingsAnsweredSeq());
     const welcome: ToRunner = { t: 'welcome', ackedSeq, hubEpoch: this.hub.epoch };
     const link: Link = { toRunner: [welcome], toHub: [], online: false, sentSeq: ackedSeq, sent: new Set() };
     this.link = link;
@@ -596,7 +593,6 @@ class Model {
     life.outbox.ack(life.outbox.epoch, ackedSeq);
     const lastHubEpoch = life.db.meta('lastHubEpoch');
     if (lastHubEpoch !== null && lastHubEpoch !== hubEpoch) {
-      life.outbox.hubRestored();
       if (this.crashAt === 'welcome' && this.r.chance(0.5)) this.crash(life, 'at a restored welcome, before its epoch');
       life.db.setMeta('lastHubEpoch', hubEpoch);
       if (this.crashAt === 'welcome') this.crash(life, 'at a restored welcome, after its epoch');
@@ -612,29 +608,23 @@ class Model {
       life.recovered = true;
       this.track(life.executor.recover());
     }
-    life.executor.settings.welcomed({ ackedSeq });
-    this.track(life.executor.settingsAcknowledged({ welcome: true }));
+    life.executor.settings.welcomed();
     life.welcomed = true;
     this.scan();
     this.fresh.clear();
     this.pump();
   }
 
-  /** link.ts's pump, with the runtime's replay filter. */
+  /** link.ts's pump: every retained event goes to the hub. */
   private pump(): void {
     const life = this.alive();
     const link = this.link;
     if (life === null || link === null || !link.online) return;
     const events: StoredEvent[] = [];
     let through = link.sentSeq;
-    const open = new Set(life.outbox.settingsInFlight().map((event) => event.seq));
     for (const event of life.outbox.eventsAfter(link.sentSeq)) {
       through = event.seq;
-      if (life.executor.settings.resent(event)) continue;
       events.push(event);
-      if (event.type !== 'runner.settings') continue;
-      if (open.has(event.seq)) this.sentAnswered.delete(event.seq);
-      else this.sentAnswered.add(event.seq);
     }
     if (events.length > 0) link.toHub.push(events);
     link.sentSeq = through;
@@ -651,7 +641,7 @@ class Model {
         t: 'command',
         id: command.id,
         seq: Number(command.id.split('-').at(-1)),
-        command: { kind: 'update_settings', settings: command.settings, version: command.version },
+        command: { kind: 'update_settings', settings: command.settings, version: command.version, ...(command.source === null ? {} : { answers: { seq: command.source, outboxEpoch: this.alive()!.outbox.epoch, ...(command.refused ? { refused: true as const } : {}) } }) },
       };
       link.toRunner.push(message);
     }
@@ -704,7 +694,6 @@ class Model {
           .then((answer) => {
             // No answer: the hub sends it again after the next welcome.
             if (life.dead || answer === null) return;
-            if (answer.ok && command.source !== null) this.echoRan.add(command.source);
             if (this.link === link) this.hub.answered(message.id);
           }),
       );
@@ -973,10 +962,9 @@ class Model {
         const ids = stalled.map((command) => command.id).join(', ');
         this.fail(`commands left unanswered on a link that stayed up: ${ids}`);
       }
-      // An edit the hub acknowledged that no echo answered gets a probe at a welcome; a command left unanswered is
-      // sent again after one.
+      // A command left unanswered is sent again after welcome.
       const acked = life.outbox.ackedSeq();
-      const waiting = life.outbox.settingsUnanswered().some((event) => !isSettingsProbe(event) && event.seq <= acked);
+      const waiting = life.outbox.settingsInFlight().some((event) => event.seq <= acked);
       if (!waiting && this.hub.pending().length === 0) break;
       this.note('reconnect to settle');
       this.link = null;
@@ -984,11 +972,11 @@ class Model {
     if (this.hub.pending().length > 0) {
       this.fail(`commands never answered: ${this.hub.pending().map((command) => command.id).join(', ')}`);
     }
-    const unanswered = life.outbox.settingsUnanswered().filter((event) => !isSettingsProbe(event));
+    const unanswered = life.outbox.settingsInFlight();
     if (unanswered.length > 0) this.fail(`edits still unanswered: ${unanswered.map((event) => event.seq).join(',')}`);
-    // Every event went out, but those the replay leaves out, whose answer the snapshot holds.
+    // Every retained event went out and was acknowledged.
     const unacked = life.outbox.eventsAfter(life.outbox.ackedSeq());
-    const unsent = unacked.filter((event) => !life.executor.settings.resent(event));
+    const unsent = unacked;
     if (unsent.length > 0) this.fail(`events never acknowledged: ${unsent.map((event) => event.seq).join(',')}`);
     const local = localSettingsOf(life.config);
     const snapshot = life.config.confirmedSettings;
@@ -1002,7 +990,7 @@ class Model {
     const lost = [...this.lastLocal].filter(([key, value]) => !Bun.deepEquals(valueAt(this.hub.settings, key), value));
     if (lost.length > 0) this.fail(`the person's last change of ${lost.map(([key]) => key).join(', ')} was lost`);
     this.checkMarks(life);
-    // With nothing in flight, retention keeps no runner.settings, a probe the hub refused included; but the edits
+    // With nothing in flight, retention keeps no runner.settings except the edits
     // whose echo runner.json, after a failed write, has not taken yet.
     this.clock.t += 3 * DAY;
     new Outbox(life.db, { now: () => this.clock.t }).pruneAcked(2 * DAY);
@@ -1011,7 +999,7 @@ class Model {
     const unsaved = new Set(marks.flatMap((mark) => (mark.version > saved ? [mark.seq] : [])));
     const left = life.outbox
       .eventsAfter(0)
-      .filter((event) => event.type === 'runner.settings' && (isSettingsProbe(event) || !unsaved.has(event.seq)));
+      .filter((event) => event.type === 'runner.settings' && !unsaved.has(event.seq));
     if (left.length > 0) this.fail(`retention kept runner.settings ${left.map((event) => event.seq).join(',')}`);
     this.die(life, 'end');
   }

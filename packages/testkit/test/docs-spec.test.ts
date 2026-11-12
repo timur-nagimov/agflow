@@ -236,16 +236,20 @@ describe('spec M2 managers, security and milestones', () => {
     expect(section('14')).toMatch(/tamper[^\n]*M3/i);
   });
 
-  test('settings-sync keeps the runner-only rule and records its limits and later protocol fix', () => {
+  test('settings-sync documents exact answers, hub replay filtering and the remaining lineage limits', () => {
     const sync = m2.split('**Settings sync.**')[1]!.split('**Link behaviour:**')[0]!;
-    expect(sync).toContain('oldest unanswered edit');
+    expect(sync).toContain('settingsAnsweredSeq');
+    expect(sync).toContain('settingsAnsweredSparse');
+    expect(sync).toContain('answer-only');
+    expect(sync).toContain('backward clock jump');
+    expect(sync).toContain('answers');
+    expect(sync).toContain('outboxEpoch');
+    expect(sync).toContain('refused: true');
     expect(sync).toContain('Known limits');
-    expect(sync).toMatch(/After a restore[^\n]*equal echo[^\n]*lost/);
     expect(sync).toContain('same versions');
-    const changes = m2.split('## 18. ')[1]!;
-    expect(changes).toMatch(/settings sync/i);
-    expect(changes).toMatch(/later milestone/i);
-    expect(changes).toContain('answers {seq, refused?}');
+    expect(sync).not.toContain('oldest unanswered edit');
+    expect(section('11.2')).toContain('protocol-2');
+    expect(section('11.2')).not.toContain('deferred');
   });
 
   test('the M2 design records accepted late-work and backup clarifications', () => {

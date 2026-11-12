@@ -475,7 +475,7 @@ Runner-agent credentials are accepted only on the explicit [agent-token route al
 
 ### 11.2 Hub–runner link
 
-The runner opens the authenticated protocol-1 WebSocket at `/api/runner/ws`. Durable sequenced events, cumulative acknowledgements, journalled commands, reconnect replay and settings sync follow [M2 §6.3](2026-10-28-m2-runners-design.md#63-runner-link), the source of truth for message shapes and reconciliation. Settings sync retains the M2 runner-side rule and its documented Known limits after a restore; the exact-echo protocol change is deferred.
+The runner opens the authenticated protocol-2 WebSocket at `/api/runner/ws`. Durable sequenced events, cumulative acknowledgements, journalled commands, reconnect replay and settings sync follow [M2 §6.3](2026-10-28-m2-runners-design.md#63-runner-link), the source of truth for message shapes and reconciliation. Settings sync uses exact epoch-scoped answers, explicit refusals and adoption-only replay filtering on the hub. Upgrade the hub first; it also accepts protocol-1 runners. M2 §6.3 records the remaining version-lineage and retained-history limits.
 
 ### 11.3 Event types
 

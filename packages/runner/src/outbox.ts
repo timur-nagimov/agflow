@@ -1,7 +1,7 @@
 // The outbox (design 6.3, "Events"): every event the runner reports is stored here with an AUTOINCREMENT seq before
 // it is sent, and replayed after each welcome until the hub acknowledges it. Acknowledgements are cumulative and
 // belong to one outbox epoch. M2c's retention prunes it (X-7); the runtime schedules nothing here.
-import { parseRunnerEvent, type RunnerEvent } from '@agflow/core';
+import { parseRunnerEvent, type RunnerEvent, type SettingsAnswer } from '@agflow/core';
 import type { RunnerDb, SettingsMark } from './db';
 
 /** An event as the outbox stores and sends it. */
@@ -14,20 +14,7 @@ export type NewEvent = WithoutStamp<RunnerEvent>;
 /** A runner.settings event: local settings edits, which the hub applies and echoes with update_settings (X-12). */
 export type SettingsEvent = Extract<StoredEvent, { type: 'runner.settings' }>;
 
-/**
- * A probe: a runner.settings with no settings. The hub applies it like any edit, at a new version that changes
- * nothing, and echoes it with an update_settings with no settings, which no other hub path sends: an owner's PATCH must
- * name a field, and hello's echoes carry them all. So its echo is known for what it is, and shows that the hub has
- * applied or refused every older runner.settings (markSettingsEcho).
- */
-export function isSettingsProbe(event: SettingsEvent): boolean {
-  return Object.keys(event.data.settings).length === 0;
-}
-
-/**
- * What an update_settings echo answers: the runner.settings it echoes, or null for one of the owner's (or the hub's
- * whole settings); and, for a probe's echo, the older edits the hub refused.
- */
+/** The exact edit answered, with explicit refusals for logging. */
 export interface SettingsEcho {
   answered: SettingsEvent | null;
   refused: SettingsEvent[];
@@ -60,7 +47,6 @@ export class Outbox {
   private readonly now: () => number;
   private readonly confirmedVersion: () => number;
   private readonly listeners = new Set<(event: StoredEvent) => void>();
-  private readonly ackListeners = new Set<(seq: number) => void>();
   private readonly waiters = new Set<Waiter>();
   /** The highest seq announced to the listeners. */
   private announcedSeq = 0;
@@ -147,17 +133,7 @@ export class Outbox {
     for (const waiter of [...this.waiters]) {
       if (waiter.seq <= acked) this.settle(waiter, true);
     }
-    for (const listener of [...this.ackListeners]) listener(acked);
     return true;
-  }
-
-  /**
-   * Called after each ack of this epoch, the welcome's included, with the acknowledged position. Returns the
-   * unsubscribe.
-   */
-  onAck(listener: (seq: number) => void): () => void {
-    this.ackListeners.add(listener);
-    return () => this.ackListeners.delete(listener);
   }
 
   /** Resolves true once the hub has acknowledged seq (at once if it has), false after timeoutMs. */
@@ -189,72 +165,51 @@ export class Outbox {
     this.db.setMeta('settingsSavedVersion', version);
   }
 
-  /**
-   * A restored hub welcomed the runner (X-12): the events held now are those the hub it replaced may have had. The
-   * replays to it leave out the settings edits among them whose answer the snapshot holds (SettingsSync.resent).
-   */
-  hubRestored(): void {
-    this.db.setMeta('restoredThrough', this.lastSeq());
+  /** Prefix advertised in hello: pruning after a clock jump can leave lastSeq below the durable prefix. */
+  settingsAnsweredSeq(version = this.confirmedVersion()): number {
+    return Math.min(this.settingsAnsweredPrefix(version), this.lastSeq());
   }
 
-  /** The newest seq held at the last welcome of a restored hub; 0 when none came. */
-  restoredThrough(): number {
-    return this.db.meta('restoredThrough') ?? 0;
+  /** Answers beyond a gap must also protect retained edits from replay after snapshot adoption. */
+  settingsAnsweredSparse(version = this.confirmedVersion()): number[] {
+    const prefix = this.settingsAnsweredPrefix(version);
+    const answered = new Set(this.marks().filter(mark => mark.version <= version).map(mark => mark.seq));
+    return this.settingsEvents().filter(event => event.seq > prefix && answered.has(event.seq)).map(event => event.seq);
   }
 
-  /** The runner.settings events no echo has answered yet, counted or not: what a probe may still settle. */
-  settingsUnanswered(): SettingsEvent[] {
-    const marked = new Set(this.marks().map((mark) => mark.seq));
-    return this.settingsEvents().filter((event) => !marked.has(event.seq));
+  /** Full contiguous prefix, kept internally even when pruning lowers lastSeq. */
+  private settingsAnsweredPrefix(version: number): number {
+    const saved = this.db.meta('settingsAnswered');
+    let seq = saved && saved.version <= version ? saved.seq : 0;
+    const marks = new Map(this.marks().map(mark => [mark.seq, mark]));
+    for (const event of this.settingsEvents()) {
+      if (event.seq <= seq) continue;
+      const mark = marks.get(event.seq);
+      if (!mark || mark.version > version) break;
+      seq = event.seq;
+    }
+    return seq;
   }
 
-  /**
-   * An update_settings echo at its version: the oldest runner.settings no echo has answered whose settings equal the
-   * echo's is marked answered at that version; none is for an echo of the owner's or of the hub's whole settings. Only
-   * the events up to arrivedAfter may match, the outbox's newest seq when the echo arrived: no echo is of an edit made
-   * after it came. The hub applies the runner's edits in seq order, yet the match need not be the oldest unanswered:
-   * an edit the hub refused is never echoed, and an echo of the owner's that equals a later edit answers that one
-   * early. Neither sends an edit twice: the early answer comes with a snapshot that holds the edit's values, and the
-   * edit's own echo, met as the owner's, sets them again. A probe's echo is exact (isSettingsProbe): every older edit
-   * still unanswered got no echo, as its echo would have come first, so the hub refused it, and it is marked refused
-   * at that version.
-   *
-   * The marks are written before runner.json takes the echo, and count only once its snapshot has the version
-   * (settingsInFlight), so an echo whose write never happened leaves its edits in flight. An echo whose version has
-   * marks already (the same command run again after a restart, or the hub's whole settings at the version of an echo
-   * that came) marks nothing more.
-   */
+  /** Exact answers are durable before runner.json changes and count only at their snapshot version. */
   markSettingsEcho(
-    settings: SettingsEvent['data']['settings'],
+    answer: SettingsAnswer | undefined,
     version: number,
     arrivedAfter = Number.MAX_SAFE_INTEGER,
   ): SettingsEcho {
-    const marks = this.marks();
-    const events = this.settingsEvents();
-    const bySeq = new Map(events.map((event) => [event.seq, event]));
-    const existing = marks.filter((mark) => mark.version === version);
-    if (existing.length > 0) {
-      const first = existing.find((mark) => !mark.refused);
-      const answered = first === undefined ? undefined : bySeq.get(first.seq);
-      if (answered === undefined || !Bun.deepEquals(answered.data.settings, settings)) {
-        return { answered: null, refused: [] };
-      }
-      const refused = existing.flatMap((mark) => (mark.refused ? (bySeq.get(mark.seq) ?? []) : []));
-      return { answered, refused };
+    if (!answer || answer.outboxEpoch !== this.epoch || answer.seq > arrivedAfter) {
+      return { answered: null, refused: [] };
     }
-    const marked = new Set(marks.map((mark) => mark.seq));
-    const open = events.filter((event) => !marked.has(event.seq) && event.seq <= arrivedAfter);
-    const answered = open.find((event) => Bun.deepEquals(event.data.settings, settings));
-    if (answered === undefined) return { answered: null, refused: [] };
-    const refused = isSettingsProbe(answered) ? open.filter((event) => event.seq < answered.seq) : [];
-    // The marks of pruned events go.
-    const kept = marks.filter((mark) => bySeq.has(mark.seq));
+    const events = this.settingsEvents();
+    const answered = events.find(event => event.seq === answer.seq);
+    if (!answered) return { answered: null, refused: [] };
+    const kept = new Set(events.map(event => event.seq));
+    const marks = this.marks().filter(mark => kept.has(mark.seq) && mark.seq !== answer.seq);
     this.db.setMeta('settingsEchoed', [
-      ...kept,
-      ...refused.map((event) => ({ seq: event.seq, version, refused: true as const })),
-      { seq: answered.seq, version },
+      ...marks,
+      { seq: answer.seq, version, ...(answer.refused ? { refused: true as const } : {}) },
     ]);
-    return { answered, refused };
+    return { answered, refused: answer.refused ? [answered] : [] };
   }
 
   /**
@@ -279,11 +234,12 @@ export class Outbox {
    * Deletes the events the condition selects, and the marks of those it deleted, but keeps every runner.settings edit
    * in flight (settingsInFlight) for the snapshot runner.json was last written with: with one pruned, the next start
    * could find runner.json ahead of the snapshot and its edits in flight, and send the edit again, though the hub
-   * applied it (X-12). No probe is kept: it changes nothing, and one the hub refused is never echoed.
+   * applied it (X-12). The contiguous answer watermark survives pruning.
    */
   private prune(condition: string, params: Record<string, number>): number {
     const confirmed = Math.min(this.confirmedVersion(), this.savedVersion());
-    const edits = this.settingsInFlight(confirmed).filter((event) => !isSettingsProbe(event));
+    const edits = this.settingsInFlight(confirmed);
+    this.db.setMeta('settingsAnswered', { seq: this.settingsAnsweredPrefix(confirmed), version: confirmed });
     const keep = JSON.stringify(edits.map((event) => event.seq));
     const { changes } = this.db.sqlite
       .query(`DELETE FROM outbox WHERE ${condition} AND seq NOT IN (SELECT value FROM json_each($keep))`)

@@ -8,12 +8,13 @@ import {
   type RunnerMessage,
   type RunnerSettings,
   type RunnerState,
+  type SettingsAnswer,
   type RunnerVendor,
   type StartRefusal,
   type Vendor,
 } from '@agflow/core';
 import { verifySessionHash } from './auth';
-import { type CommandRow, type StoredCommand, cancelPendingSettings, enqueueCommand } from './commands';
+import { type CommandRow, type StoredCommand, cancelPendingSettings, enqueueCommand, pendingCommands } from './commands';
 import { type HubContext, afterCommit, tx } from './context';
 import { nextId } from './db';
 import { forbidden, notFound } from './errors';
@@ -51,6 +52,8 @@ export interface RunnerInfo {
    * written before it existed have none.
    */
   restorePending?: boolean;
+  /** Settings replay covered by a snapshot this hub adopted; scoped to runner.db. */
+  settingsAdopted?: { outboxEpoch: string; seq: number; sparse?: number[] };
 }
 
 /** A refused start: the runner's code for it, and when the hub heard of it. */
@@ -597,8 +600,8 @@ function writeSettings(ctx: HubContext, row: RunnerRow, changes: SettingsChanges
     });
 }
 
-function settingsCommand(settings: SettingsChanges, version: number): StoredCommand {
-  return { kind: 'update_settings', settings, version };
+function settingsCommand(settings: SettingsChanges, version: number, answers?: SettingsAnswer): StoredCommand {
+  return { kind: 'update_settings', settings, version, ...(answers ? { answers } : {}) };
 }
 
 function existingRow(ctx: HubContext, runnerId: string): RunnerRow {
@@ -609,34 +612,71 @@ function existingRow(ctx: HubContext, runnerId: string): RunnerRow {
 
 /**
  * Compares a hello's settings snapshot with the hub's (design 6.3, "Settings sync"), in the hello's transaction:
- * - stored: a new runner (version 0 here) has its reported settings stored at version 1 and echoed;
+ * - stored: a new runner (version 0 here) has its reported settings stored at max(1, reported version) and echoed (version 1 for protocol 1);
  * - unchanged: equal versions;
  * - sent: the runner's version is older, as when its owner changed settings in the browser meanwhile, so the hub
  *   sends all of its settings;
  * - adopted: the runner's version is newer, which only a restored hub sees, so the hub takes its values and version
- *   and cancels the older update_settings it still had queued.
+ *   and replaces queued settings payloads with answer-only commands at the adopted version.
  */
 export function reconcileHelloSettings(
   ctx: HubContext,
   runnerId: string,
   reported: RunnerSettings,
+  snapshot?: Pick<HelloMessage, 'outboxEpoch' | 'settingsAnsweredSeq' | 'settingsAnsweredSparse'>,
 ): 'stored' | 'unchanged' | 'sent' | 'adopted' {
   const row = existingRow(ctx, runnerId);
   const { version, ...values } = reported;
   if (row.settings_version === 0) {
-    writeSettings(ctx, row, values, 1);
-    enqueueCommand(ctx, runnerId, settingsCommand(values, 1));
+    const initialVersion = snapshot ? Math.max(1, version) : 1;
+    writeSettings(ctx, row, values, initialVersion);
+    if (snapshot) recordSettingsAdoption(ctx, runnerId, snapshot);
+    enqueueCommand(ctx, runnerId, settingsCommand(values, initialVersion));
     return 'stored';
   }
   if (version === row.settings_version) return 'unchanged';
   if (version > row.settings_version) {
     writeSettings(ctx, row, values, version);
+    if (snapshot) recordSettingsAdoption(ctx, runnerId, snapshot);
+    // The backup may have acknowledged an edit whose exact answer never reached runner.db. Keep its identity,
+    // including refusals, but discard obsolete values. Fresh command ids also avoid stale runner journal entries.
+    const answers = pendingCommands(ctx, runnerId, row.protocol).flatMap(({ command }) =>
+      command.kind === 'update_settings' && command.answers ? [command.answers] : []);
     cancelPendingSettings(ctx, runnerId);
+    for (const answer of answers) enqueueCommand(ctx, runnerId, settingsCommand({}, version, answer));
     return 'adopted';
   }
   const { version: hubVersion, ...hubValues } = runnerSettings(row);
   enqueueCommand(ctx, runnerId, settingsCommand(hubValues, hubVersion));
   return 'sent';
+}
+
+/** Persist the cutoff with adoption, so a reconnect or hub crash cannot forget which edits it includes. */
+function recordSettingsAdoption(
+  ctx: HubContext,
+  runnerId: string,
+  snapshot: Pick<HelloMessage, 'outboxEpoch' | 'settingsAnsweredSeq' | 'settingsAnsweredSparse'>,
+): void {
+  const row = existingRow(ctx, runnerId);
+  const info = runnerInfo(row);
+  info.settingsAdopted = {
+    outboxEpoch: snapshot.outboxEpoch, seq: snapshot.settingsAnsweredSeq ?? 0,
+    sparse: snapshot.settingsAnsweredSparse ?? [],
+  };
+  ctx.db.query('UPDATE runners SET info = ? WHERE id = ?').run(JSON.stringify(info), runnerId);
+}
+
+export function settingsReplayCovered(ctx: HubContext, runnerId: string, outboxEpoch: string, seq: number): boolean {
+  const info = runnerInfo(existingRow(ctx, runnerId));
+  const adopted = info.settingsAdopted;
+  return adopted?.outboxEpoch === outboxEpoch && (seq <= adopted.seq || (adopted.sparse ?? []).includes(seq));
+}
+
+/** A refusal still answers exactly one edit, at the current snapshot version; it changes no settings. */
+export function refuseRunnerSettings(ctx: HubContext, runnerId: string, outboxEpoch: string, seq: number): void {
+  const row = existingRow(ctx, runnerId);
+  if (row.protocol < 2) return;
+  enqueueCommand(ctx, runnerId, settingsCommand({}, Math.max(1, row.settings_version), { seq, outboxEpoch, refused: true }));
 }
 
 /** Applies changes at the hub's version + 1, queues their update_settings echo, and emits runner.updated. */
@@ -646,6 +686,7 @@ function changeSettings(
   row: RunnerRow,
   changes: SettingsChanges,
   actor: string,
+  answers?: SettingsAnswer,
 ): CommandRow {
   const version = row.settings_version + 1;
   writeSettings(ctx, row, changes, version);
@@ -655,7 +696,7 @@ function changeSettings(
     subject: row.id,
     data: { runnerId: row.id, name: row.name, fields: Object.keys(changes) },
   });
-  return enqueueCommand(ctx, row.id, settingsCommand(changes, version));
+  return enqueueCommand(ctx, row.id, settingsCommand(changes, version, answers));
 }
 
 /**
@@ -663,8 +704,14 @@ function changeSettings(
  * whatever the event's baseVersion, because the runner sends again only edits that still differ from what the hub
  * echoed. Returns the queued update_settings echo.
  */
-export function applyRunnerSettings(ctx: HubContext, emit: Emit, runnerId: string, changes: SettingsChanges): CommandRow {
-  return changeSettings(ctx, emit, existingRow(ctx, runnerId), changes, `runner:${runnerId}`);
+export function applyRunnerSettings(
+  ctx: HubContext,
+  emit: Emit,
+  runnerId: string,
+  changes: SettingsChanges,
+  answers?: SettingsAnswer,
+): CommandRow {
+  return changeSettings(ctx, emit, existingRow(ctx, runnerId), changes, `runner:${runnerId}`, answers);
 }
 
 /** The owner's PATCH /api/runners/:id: a new version, sent to the runner with update_settings. */
