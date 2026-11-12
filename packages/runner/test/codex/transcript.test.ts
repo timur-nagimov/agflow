@@ -1,3 +1,4 @@
+import { withoutTestProcessEnv } from '@agflow/testkit/src/process-cleanup';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { AGFLOW_VERSION } from '@agflow/core';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -200,7 +201,7 @@ describe('deleteCodexTranscript', () => {
       },
       { method: 'thread/delete', params: { threadId: sessionRef } },
     ]);
-    expect(run.env).toEqual({
+    expect(withoutTestProcessEnv(run.env)).toEqual({
       PATH: '/usr/bin:/bin',
       CODEX_HOME: vendorHomes(input.config, input.paths).codex,
       HOME: input.paths.homes.codexUser,
@@ -231,7 +232,7 @@ describe('deleteCodexTranscript', () => {
       CODEX_MANAGED_TEST: '1',
     };
     await deleteCodexTranscript(input);
-    expect(ended(bin).env).toEqual({
+    expect(withoutTestProcessEnv(ended(bin).env)).toEqual({
       PATH: '/usr/bin:/bin',
       ...input.config.connectivity,
       USER: 'test',

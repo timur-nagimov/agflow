@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { killOwnedProcesses, type CleanupHost } from '../src/process-cleanup';
-import type { PsRow } from '../../runner/src/processes';
+import type { PsRow } from '../src/process-table';
 
 const scope = 'fixture-scope';
 const row = (pid: number, extra: Partial<PsRow> = {}): PsRow => ({
@@ -127,6 +127,44 @@ test('a group published during a process snapshot is rescanned before being reti
   };
   expect(killOwnedProcesses(scope, h.io, 999)).toBe(1);
   expect(h.signals).toContainEqual([-101, 'SIGKILL']);
+});
+
+test('continuous registry publication reaches a final kill pass without retiring unseen records', () => {
+  const groups = new Map<string, { scope: string; pid: number; lstart: string }>();
+  const h = host([[row(101)]], groups);
+  let scans = 0;
+  h.io.snapshot = () => {
+    // Fail synchronously instead of letting the regression itself hang the test runner.
+    if (++scans > 128) throw new Error('unbounded registry rescan');
+    groups.set(`launch-${scans}`, { scope, pid: 2000 + scans, lstart: row(101).lstart });
+    return [row(101), row(500, { command: 'unrelated' })];
+  };
+  expect(killOwnedProcesses(scope, h.io, 999)).toBe(1);
+  expect(scans).toBeLessThanOrEqual(128);
+  expect(h.signals).toContainEqual([-101, 'SIGKILL']);
+  expect(h.signals.every(([pid]) => Math.abs(pid) === 101)).toBe(true);
+  // Neither the last discovery snapshot nor the final identity check saw these launches in ps.
+  expect(groups.has(`launch-${scans - 1}`)).toBe(true);
+  expect(groups.has(`launch-${scans}`)).toBe(true);
+});
+
+test('continuous descendant discovery reaches a final kill pass and preserves shared-group safety', () => {
+  const parent = row(101, { pgid: 998 });
+  const bystander = row(500, { pgid: 998, command: 'unrelated' });
+  const rows = [parent, bystander];
+  const h = host([rows]);
+  let scans = 0;
+  h.io.snapshot = () => {
+    if (++scans > 128) throw new Error('unbounded descendant rescan');
+    rows.push(row(2000 + scans, { ppid: 101, pgid: 998, command: 'env -i sleep 30' }));
+    return [...rows];
+  };
+  const killed = killOwnedProcesses(scope, h.io, 999);
+  expect(killed).toBeGreaterThan(1);
+  expect(scans).toBeLessThanOrEqual(128);
+  expect(h.signals.filter(([, signal]) => signal === 'SIGKILL')).toHaveLength(killed);
+  expect(h.signals).toContainEqual([101, 'SIGKILL']);
+  expect(h.signals.every(([pid]) => pid === 101 || pid > 2000)).toBe(true);
 });
 
 test('kills an orphaned detached group and descendants with a cleared environment', () => {

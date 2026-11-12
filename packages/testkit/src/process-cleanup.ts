@@ -5,10 +5,16 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { constants, tmpdir } from 'node:os';
-import { parsePs, PS_COLUMNS, PS_ENV, sameProcess, type PsRow } from '../../runner/src/processes';
+import { parsePs, PS_COLUMNS, PS_ENV, sameProcess, type PsRow } from './process-table';
 
 export const PROCESS_SCOPE = 'AGFLOW_TEST_PROCESS_SCOPE';
 const GROUP_REGISTRY = 'AGFLOW_TEST_PROCESS_GROUP_REGISTRY';
+
+/** For exact spawn-environment assertions: retain every variable except the two test-only ownership markers. */
+export function withoutTestProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => name !== PROCESS_SCOPE && name !== GROUP_REGISTRY));
+}
+
 interface GroupRecord { scope: string; pid: number; lstart: string; pgid?: number; members?: PsRow[] }
 export interface CleanupHost {
   snapshot(): PsRow[];
@@ -79,21 +85,32 @@ function ownedIn(rows: PsRow[], scope: string, ownPid: number, host: CleanupHost
 
 /** Freeze before the final descendant scan, then kill groups only when all their live members belong to us. */
 export function killOwnedProcesses(scope: string, host: CleanupHost, ownPid = process.pid): number {
+  // Writers and forking processes may never quiesce. Both discovery loops share a bounded budget, leaving
+  // one final identity-checked SIGKILL pass even when discovery cannot reach a fixed point.
+  const deadline = performance.now() + 1000;
+  let snapshotsLeft = 32;
+  const canRescan = () => snapshotsLeft > 0 && performance.now() < deadline;
+  const snapshot = () => { snapshotsLeft--; return host.snapshot(); };
   const scan = (known = new Map<number, PsRow>()): Map<number, PsRow> => {
     for (;;) {
       const before = new Map(host.groups?.());
-      const rows = host.snapshot();
+      const rows = snapshot();
       const after = new Map(host.groups?.());
       // A writer may publish after ps captured the process table. Do not retire that new record using old rows.
-      if ([...after].some(([id, group]) => inScope(group.scope, scope) && !before.has(id))) continue;
+      if ([...after].some(([id, group]) => inScope(group.scope, scope) && !before.has(id))) {
+        if (canRescan()) continue;
+        // Leave late publications for the next cleanup pass; only pre-snapshot records can be evaluated here.
+        return ownedIn(rows, scope, ownPid, host,
+          new Map([...after].filter(([id]) => before.has(id))), known);
+      }
       return ownedIn(rows, scope, ownPid, host, after, known);
     }
   };
   let owned = scan();
   if (!owned.size) return 0;
   const frozen = new Set<string>();
-  for (;;) {
-    const fresh = host.snapshot();
+  while (canRescan()) {
+    const fresh = snapshot();
     const current = new Map(fresh.map(row => [row.pid, row]));
     for (const row of owned.values()) {
       const now = current.get(row.pid);
@@ -103,6 +120,7 @@ export function killOwnedProcesses(scope: string, host: CleanupHost, ownPid = pr
       host.signal(row.pid, 'SIGSTOP');
       frozen.add(key);
     }
+    if (!canRescan()) break;
     const next = scan(owned);
     owned = next;
     if ([...next.values()].every(row => frozen.has(`${row.pid}:${row.lstart}`))) break;
@@ -134,7 +152,10 @@ const rootScope = `${inherited ? `${inherited}.` : ''}${randomUUID()}`;
 interface Scope { id: string; closed: boolean }
 const root: Scope = { id: rootScope, closed: false };
 const context = new AsyncLocalStorage<Scope>();
-function activeScope(): Scope { return context.getStore() ?? root; }
+// Bun 1.3.11 can invoke afterEach without the async test body's context. Keep the hook's owner separately;
+// never mistake that missing context for the root scope. Async continuations still keep their original scope.
+let testScope: Scope | undefined;
+function activeScope(): Scope { return context.getStore() ?? testScope ?? root; }
 function openScope(): string {
   const current = activeScope();
   if (current.closed) throw new Error('test scope already closed: refusing to start a late resource');
@@ -253,7 +274,8 @@ export function installProcessTracking(): void {
 }
 
 export function beginTestProcessScope(): void {
-  context.enterWith({ id: `${rootScope}.${randomUUID()}`, closed: false });
+  testScope = { id: `${rootScope}.${randomUUID()}`, closed: false };
+  context.enterWith(testScope);
 }
 
 export async function waitForProcessExits(exits: Promise<number>[], timeoutMs: number): Promise<void> {
@@ -267,17 +289,38 @@ export async function waitForProcessExits(exits: Promise<number>[], timeoutMs: n
 
 /** Hooks await reaping as well as killing. A timeout is a cleanup failure, never silently ignored. */
 export async function cleanupTestProcesses(all = false): Promise<void> {
-  const current = all ? root : activeScope();
-  const finished = current.id;
+  const current = all ? root : testScope;
+  if (!current) return;
   current.closed = true;
+  // Cleanup may itself spawn ps/git or close a resource asynchronously. Give only those callbacks an open
+  // context with the same ownership id; a timer left by the test must continue to see the closed test scope.
+  const cleaning: Scope = { id: current.id, closed: false };
   try {
-    const closing: Promise<unknown>[] = [];
-    for (const [close, owner] of resources) {
-      if (!all && owner !== finished) continue;
-      resources.delete(close);
-      closing.push(Promise.resolve().then(close));
+    await context.run(cleaning, () => cleanupScope(current, all));
+  } finally {
+    cleaning.closed = true;
+    if (testScope === current) testScope = undefined;
+  }
+}
+
+async function cleanupScope(current: Scope, all: boolean): Promise<void> {
+  const finished = current.id;
+  const closeResources = async () => {
+    const failures: unknown[] = [];
+    for (;;) {
+      const closing: Promise<unknown>[] = [];
+      for (const [close, owner] of resources) {
+        if (!all && owner !== finished) continue;
+        resources.delete(close);
+        closing.push(Promise.resolve().then(close));
+      }
+      if (!closing.length) break;
+      const results = await Promise.allSettled(closing);
+      for (const result of results) if (result.status === 'rejected') failures.push(result.reason);
     }
-    const closed = Promise.allSettled(closing);
+    if (failures.length) throw new AggregateError(failures, 'test cleanup failed');
+  };
+  const reap = async () => {
     if (all ? dirty.size > 0 : dirty.has(finished)) {
       const deadline = Date.now() + 3000;
       while (killOwnedProcesses(finished, system)) {
@@ -288,19 +331,21 @@ export async function cleanupTestProcesses(all = false): Promise<void> {
         [...children].filter(([, owner]) => all || owner === finished).map(([proc]) => proc.exited),
         deadline - Date.now(),
       );
-      if (all) dirty.clear();
-      else dirty.delete(finished);
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const results = await Promise.race([closed, new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('test resources did not close')), 3000);
-      })]);
-      const failures = results.filter(result => result.status === 'rejected');
-      if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'test cleanup failed');
-    } finally { clearTimeout(timer); }
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const results = await Promise.allSettled([reap(), Promise.race([closeResources(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('test resources did not close')), 3000);
+    })])]);
+    const failures = results.filter(result => result.status === 'rejected');
+    if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'test cleanup failed');
   } finally {
-    context.enterWith(root);
+    clearTimeout(timer);
+    // A cleanup callback can have spawned after the first scan (or failed after spawning).
+    await reap();
+    if (all) dirty.clear();
+    else dirty.delete(finished);
   }
 }
 

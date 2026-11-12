@@ -1,3 +1,4 @@
+import { withoutTestProcessEnv } from '@agflow/testkit/src/process-cleanup';
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
   mkdirSync,
@@ -411,8 +412,8 @@ describe('the record', () => {
       cwd: dir,
       exit: { reason: 'eof', code: 0, signal: null },
     });
-    // Exactly what the spawner passed: nothing added on the way, so a leaked variable shows.
-    expect(run?.env).toEqual({ AGFLOW_MARKER: 'm-1', CODEX_HOME: join(dir, 'codex-home'), PATH: '/usr/bin:/bin' });
+    // Exactly what the spawner passed, except testkit ownership markers; every other leaked variable shows.
+    expect(withoutTestProcessEnv(run!.env)).toEqual({ AGFLOW_MARKER: 'm-1', CODEX_HOME: join(dir, 'codex-home'), PATH: '/usr/bin:/bin' });
     expect(run?.startedAt).toBeGreaterThanOrEqual(before);
     expect(run?.initializedAt).toBeGreaterThanOrEqual((run?.startedAt as number) + 200);
     expect(run?.notifications.map((notification) => notification.method)).toEqual(['initialized']);

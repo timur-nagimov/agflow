@@ -2,8 +2,8 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { parsePs, PS_COLUMNS, PS_ENV } from '../../runner/src/processes';
-import { cleanupTestProcesses } from '../src/process-cleanup';
+import { parsePs, PS_COLUMNS, PS_ENV } from '../src/process-table';
+import { cleanupTestProcesses, registerTestCleanup } from '../src/process-cleanup';
 
 const root = resolve(import.meta.dir, '../../..');
 const agent = join(root, 'packages/testkit/src/fake-agent.ts');
@@ -13,6 +13,31 @@ function marked(marker: string) {
   if (ps.exitCode !== 0) throw new Error('ps failed');
   return parsePs(ps.stdout.toString()).filter(row => !row.stat.startsWith('Z') && row.command.includes(marker));
 }
+
+test('cleanup allows sync and async spawns and reaps a child created by a cleanup callback', async () => {
+  marked('process-inspection-preflight');
+  let child: Bun.Subprocess | undefined;
+  let watchdogFired = false;
+  let nestedClosed = false;
+  const watchdog = setTimeout(() => { watchdogFired = true; child?.kill('SIGKILL'); }, 4500);
+  registerTestCleanup(async () => {
+    await Bun.sleep(1);
+    expect(Bun.spawnSync(['/usr/bin/true']).exitCode).toBe(0);
+    child = Bun.spawn(['/bin/sleep', '30'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' });
+    registerTestCleanup(() => { nestedClosed = true; });
+  });
+  try {
+    await cleanupTestProcesses();
+    expect(child).toBeDefined();
+    expect(await child!.exited).not.toBe(0);
+    expect(nestedClosed).toBe(true);
+    expect(watchdogFired).toBe(false);
+  } finally {
+    clearTimeout(watchdog);
+    child?.kill('SIGKILL');
+    if (child) await child.exited;
+  }
+}, 7000);
 
 test('cleanup reaps a non-detached platform child without waiting for its natural exit', async () => {
   marked('process-inspection-preflight');

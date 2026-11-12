@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { claudeRecording, FAKE_CLAUDE_BIN, fakeClaudeEnv } from '@agflow/testkit/src/fake-claude';
+import { withoutTestProcessEnv } from '@agflow/testkit/src/process-cleanup';
 import {
   query,
   type SDKMessage,
@@ -160,7 +161,8 @@ describe('the detached spawn hook', () => {
         {},
         { args, cwd, env: { AGFLOW_VALUE: 'two words', AGFLOW_EMPTY: '', AGFLOW_UNSET: undefined } },
       );
-      expect(JSON.parse(await readAll(proc.stdout))).toEqual({
+      const observed = JSON.parse(await readAll(proc.stdout));
+      expect({ ...observed, env: withoutTestProcessEnv(observed.env) }).toEqual({
         executable: process.execPath,
         args: args.slice(1),
         cwd,
