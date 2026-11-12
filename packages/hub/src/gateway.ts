@@ -2,7 +2,6 @@
 // position and the replay, inbound events, and the commands that follow. The transport is the caller's: Bun's
 // WebSocket handlers or an in-memory test connection hand the gateway a LinkSocket and every message and close.
 import { CLOSE_CODES, type HubMessage, type RunnerMessage, parseRunnerMessage } from '@agflow/core';
-import { findAttempt } from './attempt-store';
 import { markFactsStale, renewLeases } from './attempts';
 import { slideSession } from './auth';
 import { markSent, pendingCommands, recordResult, toWireCommand } from './commands';
@@ -369,9 +368,8 @@ export class Gateway implements RunnerLink {
   }
 
   /**
-   * Sends pending commands in seq order, withholding ref consumers while a preceding vault refresh is pending.
-   * Deferred starts/resumes also hold their attempt's later lifecycle work. Live-session controls and other
-   * attempts can proceed. A command that cannot be built stops the flush there.
+   * Sends the runner the pending commands its current link has not had yet, in seq order. A command that cannot be
+   * built stops the flush there: the ones before it still go out, the ones after it wait, so the order holds.
    */
   flush(runnerId: string): void {
     const connection = this.links.get(runnerId);
@@ -379,25 +377,9 @@ export class Gateway implements RunnerLink {
     const { ctx } = this;
     const messages = tx(ctx, () => {
       const built: CommandMessage[] = [];
-      const refreshingTasks = new Set<string>();
-      const deferredAttempts = new Set<string>();
       for (const row of pendingCommands(ctx, runnerId, connection.protocol)) {
-        if (row.command.kind === 'refresh_vault') refreshingTasks.add(row.command.taskId);
-        if (connection.sent.has(row.id)) continue;
-        const starts = row.kind === 'start_attempt' || row.kind === 'resume_attempt';
-        const immediate = row.kind === 'interrupt' || row.kind === 'decide_approval';
-        const target = row.command.kind === 'start_attempt'
-          ? row.command.attempt
-          : row.attemptId === null ? null : findAttempt(ctx, row.attemptId);
-        // Leads review work across tasks; workers consume refreshes for their own task. Unknown targets wait
-        // conservatively, as a replay may no longer have an attempt row to identify the consumer.
-        const needsRefresh = refreshingTasks.size > 0 &&
-          (target === null || target.role === 'lead' || (target.taskId !== null && refreshingTasks.has(target.taskId)));
-        if (
-          (needsRefresh && (starts || row.kind === 'deliver')) ||
-          (!immediate && row.attemptId !== null && deferredAttempts.has(row.attemptId))
-        ) {
-          if (starts && row.attemptId !== null) deferredAttempts.add(row.attemptId);
+        if (connection.sent.has(row.id)) {
+          if (row.kind === 'refresh_vault') break;
           continue;
         }
         try {
@@ -412,6 +394,9 @@ export class Gateway implements RunnerLink {
           this.log(`building command ${row.id} for runner ${runnerId} failed`, error);
           break;
         }
+        // Runner commands and attempt deliveries use separate executor queues. Wait for the fetch result
+        // before sending a start, resume or delivery that lets the agent read the refreshed branch.
+        if (row.kind === 'refresh_vault') break;
       }
       return built;
     });
