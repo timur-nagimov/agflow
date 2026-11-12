@@ -107,11 +107,13 @@ import {
   addNote,
   findTask,
   getTask,
+  listTasks,
   move,
   overlappingPathHolder,
   setAgentTask,
   writeTask,
 } from './task-store';
+import { refreshLeadSubmission } from './lead-review';
 import { clip } from './text';
 
 export interface StartAttemptInput {
@@ -311,6 +313,11 @@ export function startRunnerAttempt(ctx: HubContext, input: StartAttemptInput): S
 function claim(ctx: HubContext, emit: Emit, task: Task | null, attempt: Attempt, actor: string): void {
   if (!task) {
     takeSeat(ctx, emit, attempt.agentId, 'runner', actor);
+    for (const pending of listTasks(ctx)) {
+      if (pending.status === 'submitted') {
+        refreshLeadSubmission(ctx, pending.id, pending.submission?.branch ?? pending.branch);
+      }
+    }
     return;
   }
   const branch = branchFor(task, attempt.fence.epoch);

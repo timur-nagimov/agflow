@@ -58,6 +58,7 @@ import {
   waitingReason,
   writeTask,
 } from './task-store';
+import { refreshLeadSubmission, submissionReviewInstruction } from './lead-review';
 import { clip } from './text';
 
 // The reads moved to task-store.ts; callers of this module keep importing them from here.
@@ -675,11 +676,12 @@ export function submitTask(
     });
     setAgentTask(ctx, agent.id, null);
     holdLiveAttempt(ctx, emit, task, `agent:${agent.id}`);
+    refreshLeadSubmission(ctx, id, branch);
     insertMessage(ctx, emit, {
       from: 'system',
       to: 'lead',
       taskId: id,
-      body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\n${wrote(agent.id, clip(input.summary, 1500))}\nReview it with accept_task or reject_task.`,
+      body: `${id} ("${clip(task.title, 120)}") was submitted by ${agent.id} for review${branch ? ` on branch ${branch}` : ''}.\n${wrote(agent.id, clip(input.summary, 1500))}\n${submissionReviewInstruction(branch)}`,
     });
     return getTask(ctx, id);
   });

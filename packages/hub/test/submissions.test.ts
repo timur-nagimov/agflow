@@ -2,9 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import type { RawRunnerEvent, RunnerEventData } from '@agflow/core';
 import { ACTIVE_MS } from '../src/agents';
 import { attemptLog, getAttempt, updateAttempt } from '../src/attempt-store';
-import { endAttempt, expireRunnerLeases, requestStop, resumeAttempt } from '../src/attempts';
+import { endAttempt, expireRunnerLeases, requestStop, resumeAttempt, startRunnerAttempt } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
 import { pendingCommands } from '../src/commands';
+import { flushDeliveries } from '../src/delivery';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
 import { listMessages } from '../src/messages';
@@ -12,7 +13,7 @@ import { branchHeadOf, findSubmission, insertSubmission, pendingSubmissionOf } f
 import { expireSubmissions, requestSubmission } from '../src/submissions';
 import { getTask, writeTask } from '../src/task-store';
 import { claimTask, createTasks, getTaskDetail, rejectTask, submitTask, unblockTask } from '../src/tasks';
-import { type RunnerAttempt, addAgent, addRunnerAttempt, newTask } from './helpers';
+import { type RunnerAttempt, addAgent, addRunner, addRunnerAttempt, newTask } from './helpers';
 import { createTestHub } from './http-helpers';
 
 type Hub = ReturnType<typeof createTestHub>;
@@ -607,5 +608,66 @@ describe('outcomes that come late', () => {
     });
     expect(toAgent(hub, next.agent.id)[0]).toContain(`git fetch origin && git merge origin/${held.task.branch}`);
     expect(listMessages(hub.ctx, { target: 'lead' })[0]?.body).toContain(`moved to ${sha('c')}`);
+  });
+});
+
+
+describe('branches for a runner lead to review', () => {
+  function seat(hub: Hub) {
+    const runnerId = addRunner(hub.ctx, { owner: 'bob' });
+    const { attempt } = startRunnerAttempt(hub.ctx, { runnerId, taskId: null, role: 'lead', vendor: 'claude' });
+    updateAttempt(hub.ctx, attempt.id, { status: 'running', phase: 'idle' });
+    return { runnerId, attempt };
+  }
+
+  function checkRefresh(hub: Hub, runnerId: string, taskId: string, branch: string) {
+    hub.clock.advance(hub.ctx.config.deliveryBatchMs);
+    flushDeliveries(hub.ctx);
+    const commands = pendingCommands(hub.ctx, runnerId, 1);
+    const refresh = commands.findLast((row) => row.kind === 'refresh_vault');
+    expect(refresh?.command).toEqual({ kind: 'refresh_vault', taskId, refs: [`refs/heads/${branch}`] });
+    const deliver = commands.findLast((row) => row.kind === 'deliver');
+    expect(deliver).toBeDefined();
+    expect(refresh!.seq).toBeLessThan(deliver!.seq);
+    expect(listMessages(hub.ctx, { target: 'lead' })[0]?.body).toContain('git fetch origin');
+  }
+
+  test('a submission and resubmission refresh the other runner before review delivery', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    const lead = seat(hub);
+    expect(lead.runnerId).not.toBe(held.runner.id);
+    report(hub, held, pushed('S-1'));
+    checkRefresh(hub, lead.runnerId, taskId, held.task.branch!);
+    rejectTask(hub.ctx, taskId, `agent:${lead.attempt.agentId}`, 'Please revise.');
+    requestSubmission(hub.ctx, taskId, held.agent, work);
+    report(hub, held, pushed('S-2', sha('b')));
+    checkRefresh(hub, lead.runnerId, taskId, held.task.branch!);
+    expect(pendingCommands(hub.ctx, lead.runnerId, 1).filter((row) => row.kind === 'refresh_vault')).toHaveLength(2);
+  });
+
+  test('seating a runner lead refreshes waiting submissions before its start', async () => {
+    const { hub, held, taskId } = await pendingSetup();
+    report(hub, held, pushed('S-1'));
+    const lead = seat(hub);
+    const commands = pendingCommands(hub.ctx, lead.runnerId, 1);
+    expect(commands[0]?.command).toEqual({ kind: 'refresh_vault', taskId, refs: [`refs/heads/${held.task.branch}`] });
+    expect(commands[1]?.kind).toBe('start_attempt');
+  });
+
+  test('a live-chat submission also refreshes its chosen branch for the runner lead', () => {
+    const hub = createTestHub();
+    const lead = seat(hub);
+    const worker = addAgent(hub.ctx);
+    const task = createTasks(hub.ctx, [newTask()], 'user:alice')[0]!;
+    claimTask(hub.ctx, task.id, worker);
+    submitTask(hub.ctx, task.id, worker, { ...work, branch: 'person-review', headSha: sha('c') });
+    checkRefresh(hub, lead.runnerId, task.id, 'person-review');
+  });
+
+  test.each(['empty', 'live'] as const)('no refresh with a %s lead seat', async (kind) => {
+    const { hub, held } = await pendingSetup();
+    if (kind === 'live') addAgent(hub.ctx, 'bob', 'lead');
+    report(hub, held, pushed('S-1'));
+    expect(hub.ctx.db.query("SELECT id FROM runner_commands WHERE kind = 'refresh_vault'").all()).toEqual([]);
   });
 });
