@@ -306,6 +306,87 @@ describe('FactsTracker', () => {
     expect(await turn(0)).toBe(1);
   });
 
+  test('new review tools end the no-progress streak before the lead turn completes', async () => {
+    const { facts } = tracker();
+    await facts.start();
+    for (let i = 0; i < 3; i += 1) {
+      facts.observe(turnStarted);
+      facts.observe(turnEnded(0));
+      await facts.settled();
+    }
+    const limits: StallLimits = {
+      stallMs: 10 * MINUTE,
+      toolCapMs: 30 * MINUTE,
+      maxContinuations: 25,
+      activeBudgetMs: 4 * 60 * MINUTE,
+    };
+    facts.setPhase('idle');
+    expect(facts.facts().turnsWithoutProgress).toBe(3);
+    expect(judgeStall('lead', facts.facts(), limits)).toBeNull();
+    facts.setPhase('turn');
+    facts.observe(turnStarted);
+    facts.observe(toolStarted('fetch', 'mcp__agflow__fetch_submission', '{"task_id":"T-1"}'));
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    expect(judgeStall('lead', facts.facts(), limits)).toBeNull();
+    facts.observe(toolEnded('fetch'));
+    // Progress persists between tools, including while the model decides how to review the fetched branch.
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    expect(judgeStall('lead', facts.facts(), limits)).toBeNull();
+    facts.observe(toolStarted('review', 'Bash', 'git fetch origin submitted', 'git fetch origin submitted'));
+    expect(judgeStall('lead', facts.facts(), limits)).toBeNull();
+    facts.observe(toolEnded('review'));
+    facts.observe(turnEnded(2));
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    await facts.settled();
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    facts.observe(turnStarted);
+    facts.observe(turnEnded(0));
+    await facts.settled();
+    expect(facts.facts().turnsWithoutProgress).toBe(1);
+  });
+
+  test('a vendor-failed tool turn leaves the completed no-progress count unchanged', async () => {
+    const { facts } = tracker();
+    await facts.start();
+    facts.observe(turnStarted);
+    facts.observe(turnEnded(0));
+    await facts.settled();
+    facts.observe(turnStarted);
+    facts.observe(toolStarted('fetch', 'mcp__agflow__fetch_submission', '{"task_id":"T-1"}'));
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    facts.observe(turnEnded(1, 'failed'));
+    await facts.settled();
+    expect(facts.facts().turnsWithoutProgress).toBe(1);
+  });
+
+  test('pending fingerprints cannot report an old no-progress streak after a newer tool call', async () => {
+    let pending: Promise<string> | undefined;
+    const { facts } = tracker({ fingerprint: () => pending ?? Promise.resolve('same') });
+    await facts.start();
+    let release = () => {};
+    pending = new Promise((resolve) => {
+      release = () => resolve('same');
+    });
+    facts.observe(turnStarted);
+    facts.observe(turnEnded(0));
+    const olderTurn = facts.settled();
+    facts.observe(turnStarted);
+    facts.observe(toolStarted('fetch', 'mcp__agflow__fetch_submission', '{"task_id":"T-1"}'));
+    release();
+    await olderTurn;
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    // The next turn may start before the tool turn's fingerprint finishes, too.
+    facts.observe(toolEnded('fetch'));
+    facts.observe(turnEnded(1));
+    facts.observe(turnStarted);
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    await facts.settled();
+    expect(facts.facts().turnsWithoutProgress).toBe(0);
+    facts.observe(turnEnded(0));
+    await facts.settled();
+    expect(facts.facts().turnsWithoutProgress).toBe(1);
+  });
+
   test('fsAgeMs follows changes in the clone but not in .agflow/run/; commitAgeMs follows commits', async () => {
     const repo = await originRepo({ 'README.md': '# demo\n' });
     cleanups.push(() => repo.remove());

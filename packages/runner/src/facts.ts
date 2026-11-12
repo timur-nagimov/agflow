@@ -76,6 +76,8 @@ export class FactsTracker {
   private callsBeforeTurn: { lastCall: string | null; repeatedCalls: number } | null = null;
   private turns = 0;
   private turnsWithoutProgress = 0;
+  /** Tool progress is visible immediately, until that turn's fingerprint commits its count (or the turn fails). */
+  private readonly toolProgressTurns = new Set<number>();
   private continuations = 0;
   private contextUsed: number | null = null;
   private fingerprint: string | null = null;
@@ -151,6 +153,7 @@ export class FactsTracker {
         this.callsBeforeTurn = { lastCall: this.lastCall, repeatedCalls: this.repeatedCalls };
         return;
       case 'tool_started': {
+        this.toolProgressTurns.add(this.turns);
         const { name, command } = event;
         const capMs = capForCommand(this.options.toolCaps, command);
         this.tools.set(event.toolId, { name, command, startedAt: now, capMs });
@@ -171,6 +174,7 @@ export class FactsTracker {
           // The vendor failed the turn: its calls count toward no loop.
           ({ lastCall: this.lastCall, repeatedCalls: this.repeatedCalls } = this.callsBeforeTurn);
         }
+        if (event.outcome !== 'completed') this.toolProgressTurns.delete(this.turns);
         this.callsBeforeTurn = null;
         return;
       case 'context':
@@ -220,7 +224,7 @@ export class FactsTracker {
       fsAgeMs: this.lastFsAt === null ? null : now - this.lastFsAt,
       commitAgeMs: this.lastCommitAt === null ? null : now - this.lastCommitAt,
       turns: this.turns,
-      turnsWithoutProgress: this.turnsWithoutProgress,
+      turnsWithoutProgress: this.toolProgressTurns.size > 0 ? 0 : this.turnsWithoutProgress,
       repeatedCalls: this.repeatedCalls,
       continuations: this.continuations,
       vendorErrorMs: this.vendorErrorSince === null ? 0 : now - this.vendorErrorSince,
@@ -235,13 +239,16 @@ export class FactsTracker {
 
   /** A completed turn with no tool call and no change to the fingerprint made no progress. */
   private afterCompletedTurn(toolCalls: number): void {
+    const turn = this.turns;
     this.progress = this.progress.then(async () => {
       const fingerprint = await this.options.fingerprint().catch(() => null);
-      // An unreadable clone tells nothing either way: the count stays.
-      if (fingerprint === null) return;
-      const unchanged = fingerprint === this.fingerprint;
-      this.fingerprint = fingerprint;
-      this.turnsWithoutProgress = toolCalls === 0 && unchanged ? this.turnsWithoutProgress + 1 : 0;
+      // A tool proves progress even if the clone cannot be read. Otherwise an unreadable clone tells nothing.
+      if (toolCalls > 0) this.turnsWithoutProgress = 0;
+      else if (fingerprint !== null) {
+        this.turnsWithoutProgress = fingerprint === this.fingerprint ? this.turnsWithoutProgress + 1 : 0;
+      }
+      if (fingerprint !== null) this.fingerprint = fingerprint;
+      this.toolProgressTurns.delete(turn);
     });
   }
 
