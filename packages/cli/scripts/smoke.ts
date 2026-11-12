@@ -1,10 +1,12 @@
-import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ScriptResources } from '../../../scripts/resources';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
-const base = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-smoke-cli-')));
+await using resources = new ScriptResources();
+const base = resources.directory(join(tmpdir(), 'agflow-smoke-cli-'));
 const port = 8797;
 const hubUrl = `http://localhost:${port}`;
 const cli = join(import.meta.dir, '..', 'src', 'main.ts');
@@ -25,7 +27,7 @@ function sh(cmd: string[], cwd: string, input?: string): string {
   return result.stdout.toString().trim();
 }
 
-const hub = Bun.spawn(['bun', hubMain], {
+const hub = resources.child(Bun.spawn(['bun', hubMain], {
   env: {
     ...env,
     AGFLOW_AUTH: 'dev',
@@ -38,7 +40,7 @@ const hub = Bun.spawn(['bun', hubMain], {
   },
   stdout: 'ignore',
   stderr: 'inherit',
-});
+}));
 
 try {
   for (let attempt = 0; ; attempt++) {
@@ -61,7 +63,7 @@ try {
   check((await web('POST', '/api/tasks', taskBody)).ok, 'task created');
 
   // agflow login prints a link; the person approves it.
-  const login = Bun.spawn(['bun', cli, 'login', '--hub', hubUrl], { env, stdout: 'pipe', stderr: 'inherit' });
+  const login = resources.child(Bun.spawn(['bun', cli, 'login', '--hub', hubUrl], { env, stdout: 'pipe', stderr: 'inherit' }));
   const reader = login.stdout.getReader();
   let printed = '';
   while (!printed.includes('code=')) {
@@ -98,6 +100,7 @@ try {
   // The MCP bridge: hello, list, claim, commit, submit.
   const transport = new StdioClientTransport({ command: 'bun', args: [cli, 'mcp', '--vendor', 'codex'], cwd: work, env, stderr: 'inherit' });
   const mcp = new Client({ name: 'agflow-smoke', version: '0.0.0' });
+  resources.defer(() => mcp.close());
   await mcp.connect(transport);
   const call = async (name: string, args: Record<string, unknown> = {}) => {
     const result = await mcp.callTool({ name, arguments: args });
@@ -122,5 +125,5 @@ try {
   check(JSON.parse(hook('stop', { session_id: 'smoke-session', stop_hook_active: false })).decision === undefined, 'the stop hook allows stopping');
   console.log('smoke test passed: login, join, hooks, the MCP bridge, claim, push and submit work end to end');
 } finally {
-  hub.kill();
+  await resources.close();
 }

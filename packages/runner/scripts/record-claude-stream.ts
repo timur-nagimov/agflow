@@ -21,6 +21,7 @@ import {
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
+import { ScriptResources } from '../../../scripts/resources';
 import type { Vendor } from '@agflow/core';
 import { startRefusingProxy } from '@agflow/testkit';
 import {
@@ -126,84 +127,92 @@ export interface ScratchLaunch {
  */
 export function scratchLaunch(options: ScratchLaunchOptions): ScratchLaunch {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-record-')));
-  const scratchPaths = runnerPaths(join(root, 'agflow'));
-  const home = options.live ? homedir() : join(root, 'home');
-  let paths = scratchPaths;
-  let homes: Record<Vendor, string> = { claude: scratchPaths.homes.claude, codex: scratchPaths.homes.codex };
-  if (options.live) {
-    // The runner's Claude home as M2b gives it: the CLI finds its login by that exact CLAUDE_CONFIG_DIR string.
-    paths = runnerPaths(options.runnerHome ?? agflowHome());
-    homes = vendorHomes(loadRunnerConfig(paths.config), paths);
-    liveClaudeBinary(paths);
+  let allocatedTmp: string | undefined;
+  try {
+    const scratchPaths = runnerPaths(join(root, 'agflow'));
+    const home = options.live ? homedir() : join(root, 'home');
+    let paths = scratchPaths;
+    let homes: Record<Vendor, string> = { claude: scratchPaths.homes.claude, codex: scratchPaths.homes.codex };
+    if (options.live) {
+      // The runner's Claude home as M2b gives it: the CLI finds its login by that exact CLAUDE_CONFIG_DIR string.
+      paths = runnerPaths(options.runnerHome ?? agflowHome());
+      homes = vendorHomes(loadRunnerConfig(paths.config), paths);
+      liveClaudeBinary(paths);
+    }
+    const clone = scratchPaths.clone('p', 'T-1-a1');
+    const baseCheckout = scratchPaths.baseCheckout('p', '000000000000');
+    for (const dir of [home, clone, baseCheckout, homes.claude]) mkdirSync(dir, { recursive: true });
+    ensureClaudeEmptyDir(homes.claude);
+    const git = Bun.spawnSync(['git', 'init', '-q', clone], { env: { PATH: '/usr/bin:/bin', HOME: home } });
+    if (git.exitCode !== 0) throw new Error(`git init failed: ${git.stderr.toString()}`);
+    writeFileSync(join(clone, 'README.md'), '# Scratch project\n');
+    if (!options.live) {
+      const link = join(paths.runner, vendorBinary('claude', CLAUDE_CLI_VERSION));
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(resolve(options.bin), link);
+    }
+    const claudeHome = homes.claude;
+    const tmpDir = makeAttemptTmpDir();
+    allocatedTmp = tmpDir;
+    const agflow = options.agflow ?? STUB_AGFLOW;
+    const env: Record<string, string> = {
+      HOME: home,
+      USER: process.env.USER ?? 'agent',
+      LOGNAME: process.env.LOGNAME ?? process.env.USER ?? 'agent',
+      LANG: 'en_US.UTF-8',
+      SHELL: process.env.SHELL ?? '/bin/zsh',
+      TERM: 'dumb',
+      PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+      NODE_USE_SYSTEM_CA: '1',
+      CLAUDE_CONFIG_DIR: claudeHome,
+      CLAUDE_CODE_TMPDIR: tmpDir,
+      CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+      DISABLE_AUTOUPDATER: '1',
+      AGFLOW_CLONE: clone,
+      ...options.env,
+    };
+    const launch: AgentLaunch = {
+      attemptId: 'T-1-a1',
+      role: 'worker',
+      model: options.model,
+      cliVersion: CLAUDE_CLI_VERSION,
+      clone,
+      baseCheckout,
+      projectConfigVerified: true,
+      tmpDir,
+      env,
+      bridge: {
+        command: agflow.command,
+        args: [...agflow.args, 'mcp', '--vendor', 'claude', '--runner'],
+        env: { AGFLOW_CLONE: clone },
+        tools: STUB_BRIDGE_TOOLS,
+      },
+      profile: options.profile ?? standardProfile,
+      brief: stubBrief(clone),
+      firstPrompt: '',
+      resume: null,
+      logFile: join(root, 'attempt.log'),
+      registerProcess: () => {},
+    };
+    return {
+      root,
+      paths,
+      vendorHomes: homes,
+      clone,
+      agflow,
+      launch,
+      cleanup: () => {
+        // A live run leaves its scratch project directory in the runner's real Claude home; nothing else is there.
+        if (options.live) rmSync(claudeProjectDir(claudeHome, clone), { recursive: true, force: true });
+        rmSync(root, { recursive: true, force: true });
+        rmSync(tmpDir, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    if (allocatedTmp) rmSync(allocatedTmp, { recursive: true, force: true });
+    throw error;
   }
-  const clone = scratchPaths.clone('p', 'T-1-a1');
-  const baseCheckout = scratchPaths.baseCheckout('p', '000000000000');
-  for (const dir of [home, clone, baseCheckout, homes.claude]) mkdirSync(dir, { recursive: true });
-  ensureClaudeEmptyDir(homes.claude);
-  const git = Bun.spawnSync(['git', 'init', '-q', clone], { env: { PATH: '/usr/bin:/bin', HOME: home } });
-  if (git.exitCode !== 0) throw new Error(`git init failed: ${git.stderr.toString()}`);
-  writeFileSync(join(clone, 'README.md'), '# Scratch project\n');
-  if (!options.live) {
-    const link = join(paths.runner, vendorBinary('claude', CLAUDE_CLI_VERSION));
-    mkdirSync(dirname(link), { recursive: true });
-    symlinkSync(resolve(options.bin), link);
-  }
-  const claudeHome = homes.claude;
-  const tmpDir = makeAttemptTmpDir();
-  const agflow = options.agflow ?? STUB_AGFLOW;
-  const env: Record<string, string> = {
-    HOME: home,
-    USER: process.env.USER ?? 'agent',
-    LOGNAME: process.env.LOGNAME ?? process.env.USER ?? 'agent',
-    LANG: 'en_US.UTF-8',
-    SHELL: process.env.SHELL ?? '/bin/zsh',
-    TERM: 'dumb',
-    PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
-    NODE_USE_SYSTEM_CA: '1',
-    CLAUDE_CONFIG_DIR: claudeHome,
-    CLAUDE_CODE_TMPDIR: tmpDir,
-    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
-    DISABLE_AUTOUPDATER: '1',
-    AGFLOW_CLONE: clone,
-    ...options.env,
-  };
-  const launch: AgentLaunch = {
-    attemptId: 'T-1-a1',
-    role: 'worker',
-    model: options.model,
-    cliVersion: CLAUDE_CLI_VERSION,
-    clone,
-    baseCheckout,
-    projectConfigVerified: true,
-    tmpDir,
-    env,
-    bridge: {
-      command: agflow.command,
-      args: [...agflow.args, 'mcp', '--vendor', 'claude', '--runner'],
-      env: { AGFLOW_CLONE: clone },
-      tools: STUB_BRIDGE_TOOLS,
-    },
-    profile: options.profile ?? standardProfile,
-    brief: stubBrief(clone),
-    firstPrompt: '',
-    resume: null,
-    logFile: join(root, 'attempt.log'),
-    registerProcess: () => {},
-  };
-  return {
-    root,
-    paths,
-    vendorHomes: homes,
-    clone,
-    agflow,
-    launch,
-    cleanup: () => {
-      // A live run leaves its scratch project directory in the runner's real Claude home; nothing else is there.
-      if (options.live) rmSync(claudeProjectDir(claudeHome, clone), { recursive: true, force: true });
-      rmSync(root, { recursive: true, force: true });
-      rmSync(tmpDir, { recursive: true, force: true });
-    },
-  };
 }
 
 /**
@@ -288,7 +297,7 @@ export interface ScenarioRun {
 }
 
 /** Runs one scenario through the SDK with buildQueryOptions and records every line both ways. */
-export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaunch): Promise<ScenarioRun> {
+export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaunch, resources?: ScriptResources): Promise<ScenarioRun> {
   const events: TeeEvent[] = [];
   const waiters = new Set<() => void>();
   const notify = () => {
@@ -338,6 +347,10 @@ export async function runScenario(scenario: ClaudeScenario, scratch: ScratchLaun
       }) as typeof stdin.write;
     }
     proc.on('exit', (code, signal) => exited.resolve({ code, signal }));
+    resources?.child({
+      kill: (signal) => { if (proc.exitCode === null && proc.signalCode === null) killGroup(proc, signal as NodeJS.Signals); },
+      exited: exited.promise.then(({ code }) => code ?? 0),
+    });
     options.signal?.addEventListener('abort', () => killGroup(proc, 'SIGTERM'), { once: true });
     return proc as unknown as SpawnedProcess;
   };
@@ -1237,15 +1250,20 @@ export async function recordClaudeStream(options: RecordClaudeStreamOptions = {}
       continue;
     }
     log(`recording ${scenario.name}${options.live ? ' (live)' : ''}`);
-    const server = options.live ? null : await startScriptedAnthropic({ handler: scenario.handler });
-    const proxy = options.live ? null : await startRefusingProxy();
+    await using resources = new ScriptResources();
+    const server = options.live ? null : await resources.acquire(
+      startScriptedAnthropic({ handler: scenario.handler }), (server) => server.close(),
+    );
+    const proxy = options.live ? null : await resources.acquire(startRefusingProxy(), (proxy) => proxy.close());
     const env =
       server && proxy
         ? claudeTestEnv({ baseUrl: server.url, proxyUrl: proxy.url, maxRetries: scenario.maxRetries })
         : {};
     const scratch = scratchLaunch({ bin, model, env, live: options.live });
+    resources.defer(() => scratch.cleanup());
     try {
-      const run = await runScenario(scenario, scratch);
+      const run = await runScenario(scenario, scratch, resources);
+      resources.checkOpen();
       const transcript = scenario.failsToStart
         ? null
         : assertTranscriptPlacement(scratch.vendorHomes.claude, scratch.clone, run.finalSessionId);
@@ -1289,9 +1307,7 @@ export async function recordClaudeStream(options: RecordClaudeStreamOptions = {}
         log(`  unscripted request: ${request.endpoint} ${request.userTexts.at(-1)?.slice(0, 80) ?? ''}`);
       }
     } finally {
-      scratch.cleanup();
-      await server?.close();
-      await proxy?.close();
+      await resources.close();
     }
   }
   return written;

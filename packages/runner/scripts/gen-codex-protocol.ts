@@ -8,10 +8,11 @@
 //
 // The version check and the generator run with scratch HOME and CODEX_HOME directories, so they never read or write
 // ~/.codex.
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import { ScriptResources } from '../../../scripts/resources';
 import { CODEX_VERSION, codexBinaryVersion, findCodexBinary } from '../src/adapters/codex/binary';
 
 const GENERATE_TIMEOUT_MS = 120_000;
@@ -40,7 +41,8 @@ if (version !== CODEX_VERSION) {
   fail(`${bin} is codex ${version ?? 'of an unreadable version'}, expected ${CODEX_VERSION}`);
 }
 
-const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-codex-gen-')));
+await using resources = new ScriptResources();
+const scratch = resources.directory(join(tmpdir(), 'agflow-codex-gen-'));
 let failure: string | null = null;
 try {
   const home = join(scratch, 'home');
@@ -48,14 +50,14 @@ try {
   const staging = join(scratch, 'protocol');
   mkdirSync(home);
   mkdirSync(codexHome);
-  const proc = Bun.spawn([bin, 'app-server', 'generate-ts', '--out', staging], {
+  const proc = resources.child(Bun.spawn([bin, 'app-server', 'generate-ts', '--out', staging], {
     cwd: scratch,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home, CODEX_HOME: codexHome, LANG: 'en_US.UTF-8' },
     stdin: 'ignore',
     stdout: 'inherit',
     stderr: 'inherit',
     timeout: GENERATE_TIMEOUT_MS,
-  });
+  }));
   const code = await proc.exited;
   if (code !== 0 || !existsSync(staging)) {
     failure = `codex app-server generate-ts failed (exit ${code})`;
@@ -65,7 +67,7 @@ try {
     cpSync(staging, out, { recursive: true });
   }
 } finally {
-  rmSync(scratch, { recursive: true, force: true });
+  await resources.close();
 }
 if (failure) fail(failure);
 console.log(`gen-codex-protocol: wrote the codex ${CODEX_VERSION} protocol to ${out}`);
