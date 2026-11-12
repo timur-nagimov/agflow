@@ -1288,7 +1288,7 @@ Messages that the ended lead received but never acknowledged become unread again
   During a take-over the runner reports no `attempt.exited`. If the take-over fails after the agent stopped, the runner still reports `attempt.taken_over`, with `commands.local` null and the error.
 - **Completion.** The attempt ends `taken_over` when `attempt.taken_over` arrives, or at lease expiry or the stop timeout. Without the event, the page shows only the "anywhere" command.
 - **The commands shown** use the runner's pinned binaries of the attempt's own CLI version, because a resume must use the same CLI version that wrote the session. The runner core builds them (not the adapters):
-  - on the runner's laptop: `cd <clone> && CLAUDE_CONFIG_DIR=<runner claude home> ~/.agflow/runner/vendor/claude/<version>/claude --resume <session>`, or `cd <clone> && CODEX_HOME=<runner codex home> ~/.agflow/runner/vendor/codex/<version>/bin/codex resume --no-daemon <thread>`;
+  - on the runner's laptop: `cd <clone> && CLAUDE_CONFIG_DIR=<runner claude home> ~/.agflow/runner/vendor/claude/<version>/claude --resume <session>`, or `cd <clone> && CODEX_HOME=<runner codex home> ~/.agflow/runner/vendor/codex/<version>/bin/codex resume --no-daemon -s workspace-write -c 'sandbox_workspace_write.writable_roots=["<clone>/.git"]' <thread>` (Codex protects `.git` inside its workspace-write sandbox, so the person gets the writable root the agent had and can commit from the resumed session);
   - anywhere: `git fetch origin <work ref> && git switch -c agflow/T-42-<slug> FETCH_HEAD`, and when done, `git push origin HEAD:<wipRefPrefix>T-42/takeover-<login>`. The hub keeps that take-over ref in `Attempt.takeover.ref`, so the page can offer it for a hand-back.
 
 **Hand back** (the same person, or anyone if the runner is gone, which means not `online`; `POST /api/tasks/:id/handback { source }`).
@@ -1978,7 +1978,7 @@ query({
 
 - **Stop:** `turn/interrupt`, then stdin EOF (app-server exits and kills its commands, including background ones that outlived their turn), then SIGTERM and SIGKILL of the recorded groups.
 - **Crash recovery** needs no cleanup: after a SIGKILL, a new process resumes the thread at once, even though the writer-lock file stays. Resume failures follow section 7.4.
-- **Take-over:** the app-server must exit, because `thread/unsubscribe` keeps the single-writer lock. The person then runs `codex resume --no-daemon <thread>` in the clone with the runner's `CODEX_HOME`. Hand-back stops any daemon in that home first; the runner core does that and builds the commands, so the adapter needs no take-over hooks.
+- **Take-over:** the app-server must exit, because `thread/unsubscribe` keeps the single-writer lock. The person then runs `codex resume --no-daemon -s workspace-write -c 'sandbox_workspace_write.writable_roots=["<clone>/.git"]' <thread>` in the clone with the runner's `CODEX_HOME`. Hand-back stops any daemon in that home first; the runner core does that and builds the commands, so the adapter needs no take-over hooks.
 
 ## 10. Bridge and hooks
 

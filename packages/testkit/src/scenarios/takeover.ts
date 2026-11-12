@@ -253,7 +253,7 @@ async function checkTakeover(
   const resume =
     attempt.vendor === 'claude'
       ? `CLAUDE_CONFIG_DIR=${home} ${binary} --resume ${session}`
-      : `CODEX_HOME=${home} ${binary} resume --no-daemon ${session}`;
+      : `CODEX_HOME=${home} ${binary} resume --no-daemon -s workspace-write -c 'sandbox_workspace_write.writable_roots=["${clone}/.git"]' ${session}`;
   const local = `cd ${clone} && ${resume}`;
   // With scripted models, the session is the one a1's requests carried; real models record none.
   const seen = scripted ? [...new Set(models.requestsFor(a1).map(sessionOf))] : [];

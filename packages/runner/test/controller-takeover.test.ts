@@ -248,7 +248,7 @@ describe('AttemptController: take-over', () => {
       error: null,
     });
     expect(of('T-5-a1')?.data.commands).toEqual({
-      local: `cd ${realpathSync(cloneOf(f, 'T-5-a1'))} && CODEX_HOME=${homes.codex} ${codexBinary} resume --no-daemon ${sessionOf(f, 'T-5-a1')}`,
+      local: `cd ${realpathSync(cloneOf(f, 'T-5-a1'))} && CODEX_HOME=${homes.codex} ${codexBinary} resume --no-daemon -s workspace-write -c 'sandbox_workspace_write.writable_roots=["${realpathSync(cloneOf(f, 'T-5-a1'))}/.git"]' ${sessionOf(f, 'T-5-a1')}`,
       anywhere: takeoverAnywhereCommand({
         ref: 'refs/agflow/T-5/a1',
         branch: 'agflow/T-5-other',
@@ -329,7 +329,8 @@ describe('takeoverCommands', () => {
     });
     const codex = { ...local, vendor: 'codex' as const, sessionRef: 'thread-1', home: '/h/codex' };
     expect(takeoverCommands({ ...base, local: codex }).local).toBe(
-      'cd /w/clone && CODEX_HOME=/h/codex /r/vendor/codex/2.1.0/bin/codex resume --no-daemon thread-1',
+      'cd /w/clone && CODEX_HOME=/h/codex /r/vendor/codex/2.1.0/bin/codex resume --no-daemon -s workspace-write ' +
+        `-c 'sandbox_workspace_write.writable_roots=["/w/clone/.git"]' thread-1`,
     );
   });
 
