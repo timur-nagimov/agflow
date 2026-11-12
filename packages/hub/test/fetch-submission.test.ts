@@ -13,12 +13,12 @@ import { createTestHub } from './http-helpers';
 const HEAD = 'a'.repeat(40);
 const branch = 'person-review';
 const ref = `refs/heads/${branch}`;
-function setup(live = false) {
+function setup(live = false, headSha = HEAD) {
   const hub = createTestHub();
   const worker = addAgent(hub.ctx);
   const task = createTasks(hub.ctx, [newTask()], 'user:alice')[0]!;
   claimTask(hub.ctx, task.id, worker);
-  submitTask(hub.ctx, task.id, worker, { summary: 'Ready', evidence: [], branch, headSha: HEAD });
+  submitTask(hub.ctx, task.id, worker, { summary: 'Ready', evidence: [], branch, headSha });
   const lead = live ? { agent: addAgent(hub.ctx, 'alice', 'lead'), attempt: null } : addRunnerLead(hub.ctx);
   const auth = lead.attempt ? { headers: { authorization: `Bearer ${mintAgentToken(hub.ctx, lead.attempt)}` } }
     : { user: 'alice', agent: lead.agent.id };
@@ -42,6 +42,40 @@ describe('fetch_submission', () => {
     expect((await poll(id)).json.request).toMatchObject({ status: 'ok', branch, head_sha: HEAD, error: null });
     expect(buildBrief(hub.ctx, lead.agent)).toContain('fetch_submission');
     expect(buildBrief(hub.ctx, lead.agent)).toContain('FETCH_HEAD');
+  });
+
+  test.each([7, 39])('fetches a submission accepted by the API with a %i-character head SHA', async (length) => {
+    const hub = createTestHub();
+    const worker = addAgent(hub.ctx);
+    const task = createTasks(hub.ctx, [newTask()], 'user:alice')[0]!;
+    claimTask(hub.ctx, task.id, worker);
+    const headSha = HEAD.slice(0, length);
+    const submitted = await hub.call('POST', `/api/tasks/${task.id}/submit`, {
+      user: 'alice', agent: worker.id, body: { summary: 'Ready', evidence: [], branch, headSha },
+    });
+    expect(submitted.status).toBe(200);
+    expect(submitted.json.task.submission.headSha).toBe(headSha);
+    const lead = addRunnerLead(hub.ctx);
+    const auth = { headers: { authorization: `Bearer ${mintAgentToken(hub.ctx, lead.attempt)}` } };
+    const requested = await hub.call('POST', '/api/fetch-submission', { ...auth, body: { task_id: task.id } });
+    expect(requested.status).toBe(202);
+    const id = requested.json.request.id;
+    expect(requested.json.request).toMatchObject({ status: 'pending', head_sha: headSha });
+    recordResult(hub.ctx, lead.attempt.runnerId!, { commandId: id, ok: true, data: { refs: { [ref]: HEAD } } });
+    const fetched = await hub.call('GET', `/api/fetch-submission/${id}`, auth);
+    expect(fetched.json.request).toMatchObject({ status: 'ok', branch, head_sha: HEAD, error: null });
+  });
+
+  test.each([
+    HEAD.slice(0, 7), HEAD.slice(0, 39), `${HEAD}a`, `${HEAD.slice(0, 39)}g`,
+    'b'.repeat(40), null, 123,
+  ])('refuses an invalid or mismatched runner SHA for an abbreviated submission: %j', async (fetchedSha) => {
+    const { hub, lead, request, poll } = setup(false, HEAD.slice(0, 7));
+    const id = (await request()).json.request.id;
+    recordResult(hub.ctx, lead.attempt!.runnerId!, { commandId: id, ok: true, data: { refs: { [ref]: fetchedSha } } });
+    const read = (await poll(id)).json.request;
+    expect(read.status).toBe('failed');
+    expect(read.error).toContain('submitted head');
   });
 
   test.each([

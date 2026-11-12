@@ -44,8 +44,12 @@ function result(ctx: HubContext, row: CommandRow): FetchSubmissionRequest {
   else if (row.status === 'failed') error = row.result?.error ?? 'the runner fetch failed without a message';
   else if (row.status === 'done') {
     const data = row.result?.data as { refs?: Record<string, unknown> } | undefined;
-    if (data?.refs?.[ref] !== head.head_sha) {
+    const fetchedSha = data?.refs?.[ref];
+    // Live submissions may record the 7–40 character SHA accepted by CommitShaSchema.
+    if (typeof fetchedSha !== 'string' || !/^[0-9a-f]{40}$/.test(fetchedSha) || !fetchedSha.startsWith(head.head_sha)) {
       error = `the runner vault did not confirm ${ref} at the submitted head ${head.head_sha}; call fetch_submission again`;
+    } else {
+      head.head_sha = fetchedSha;
     }
   }
   return { id: row.id, ...head, status: error ? 'failed' : row.status === 'pending' ? 'pending' : 'ok', error };
