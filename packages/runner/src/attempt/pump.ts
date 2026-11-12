@@ -105,6 +105,7 @@ export class EventPump {
   private readonly approvals = new Map<string, string>();
   private readonly approvalIds = new Map<string, string>();
   private readonly tools = new Set<string>();
+  private readonly backgroundTools = new Set<string>();
   private readonly descendants = new DescendantTracker();
   private snapshotTimer: ReturnType<typeof setInterval> | null = null;
   private snapshotting: Promise<void> = Promise.resolve();
@@ -156,8 +157,8 @@ export class EventPump {
         setPhase('turn');
         return;
       case 'turn_ended':
-        this.tools.clear();
-        this.stopSnapshots();
+        for (const id of this.tools) if (!this.backgroundTools.has(id)) this.tools.delete(id);
+        if (this.tools.size === 0) this.stopSnapshots();
         setPhase('idle');
         this.activity(...this.turnSummary(event));
         return;
@@ -166,8 +167,12 @@ export class EventPump {
         this.activity('tool', `${event.name}: ${event.command ?? event.input}`);
         this.startSnapshots();
         return;
+      case 'tool_backgrounded':
+        if (this.tools.has(event.toolId)) this.backgroundTools.add(event.toolId);
+        return;
       case 'tool_ended':
         this.tools.delete(event.toolId);
+        this.backgroundTools.delete(event.toolId);
         if (this.tools.size === 0) this.stopSnapshots();
         if (event.terminal === 'handoff') this.handoffCount += 1;
         return;

@@ -52,6 +52,7 @@ interface ToolInFlight {
   startedAt: number;
   /** capForCommand's cap for the command. */
   capMs: number;
+  background?: boolean;
 }
 
 /** A path the tree watcher reports that is the runner's own: .agflow/run/ and the .agflow directory holding it. */
@@ -162,11 +163,25 @@ export class FactsTracker {
         this.lastCall = call;
         return;
       }
+      case 'tool_backgrounded': {
+        const tool = this.tools.get(event.toolId);
+        if (tool) tool.background = true;
+        return;
+      }
+      case 'tool_progress':
+        // Waiting on a command is interleaved activity (e.g. with check_inbox), not another identical call.
+        // Only a known, still-open tool can break the sequence; its original clock and cap stay intact.
+        if (this.tools.has(event.toolId)) {
+          this.toolProgressTurns.add(this.turns);
+          this.lastCall = null;
+          this.repeatedCalls = 0;
+        }
+        return;
       case 'tool_ended':
         this.tools.delete(event.toolId);
         return;
       case 'turn_ended':
-        this.tools.clear();
+        for (const [id, tool] of this.tools) if (!tool.background) this.tools.delete(id);
         if (event.outcome === 'completed') {
           this.vendorErrorSince = null;
           this.afterCompletedTurn(event.toolCalls);
@@ -243,7 +258,7 @@ export class FactsTracker {
     this.progress = this.progress.then(async () => {
       const fingerprint = await this.options.fingerprint().catch(() => null);
       // A tool proves progress even if the clone cannot be read. Otherwise an unreadable clone tells nothing.
-      if (toolCalls > 0) this.turnsWithoutProgress = 0;
+      if (toolCalls > 0 || this.toolProgressTurns.has(turn)) this.turnsWithoutProgress = 0;
       else if (fingerprint !== null) {
         this.turnsWithoutProgress = fingerprint === this.fingerprint ? this.turnsWithoutProgress + 1 : 0;
       }

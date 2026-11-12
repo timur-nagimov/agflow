@@ -121,6 +121,8 @@ export interface ShellReplyOptions {
   /** Asks to run outside the sandbox, which raises an approval request with this justification. */
   escalate?: { justification: string };
   callId?: string;
+  /** Exercise the live agent pattern: short exec polls interleaved with agflow inbox checks. */
+  pollInbox?: boolean;
 }
 
 /**
@@ -136,15 +138,19 @@ function shellSource(options: ShellReplyOptions): string {
     ...(options.escalate
       ? { sandbox_permissions: 'require_escalated', justification: options.escalate.justification }
       : {}),
-    yield_time_ms: Math.max(EXEC_COMMAND_MIN_YIELD_MS, Math.min(timeoutMs, EXEC_COMMAND_MAX_YIELD_MS)),
+    yield_time_ms: Math.max(
+      EXEC_COMMAND_MIN_YIELD_MS,
+      Math.min(timeoutMs, options.pollInbox ? POLL_MIN_MS : EXEC_COMMAND_MAX_YIELD_MS),
+    ),
   };
-  const pollMs = `Math.min(${POLL_MAX_MS}, Math.max(${POLL_MIN_MS}, deadline - Date.now()))`;
+  const pollMs = `Math.min(${options.pollInbox ? POLL_MIN_MS : POLL_MAX_MS}, Math.max(${POLL_MIN_MS}, deadline - Date.now()))`;
   return [
     `// @exec: ${JSON.stringify({ yield_time_ms: timeoutMs + EXEC_GRACE_MS })}`,
     `const deadline = Date.now() + ${timeoutMs};`,
     `let result = await tools.exec_command(${JSON.stringify(args)});`,
     `let output = result.output ?? '';`,
     'while (result.exit_code === undefined && result.session_id !== undefined && Date.now() < deadline) {',
+    ...(options.pollInbox ? ['  text(await tools.mcp__agflow__check_inbox({}));'] : []),
     `  result = await tools.write_stdin({ session_id: result.session_id, chars: '', yield_time_ms: ${pollMs} });`,
     `  output += result.output ?? '';`,
     '}',

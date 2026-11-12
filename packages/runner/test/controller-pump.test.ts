@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { InjectedMessage } from '@agflow/core';
 import { FakeAdapter, type FakeAdapterOptions, type FakeScript, type TranscriptLine } from '@agflow/testkit';
 import type { AgentSession, VendorAdapter } from '../src/adapters/types';
-import { APPROVAL_DETAIL_FIELD_MAX_BYTES, APPROVAL_NOT_FORWARDED, APPROVAL_SUMMARY_MAX } from '../src/attempt/pump';
+import { APPROVAL_DETAIL_FIELD_MAX_BYTES, APPROVAL_NOT_FORWARDED, APPROVAL_SUMMARY_MAX, EventPump, type EventPumpOptions } from '../src/attempt/pump';
 import type { Outbox } from '../src/outbox';
 import { listProcesses } from '../src/processes';
 import type { Notification } from '../src/seams';
@@ -362,4 +362,21 @@ describe('AttemptController: the event pump', () => {
     const [row] = await listProcesses([tool?.pgid as number]);
     expect(row?.command).toBe('sleep 30');
   }, 60_000);
+});
+
+test('the pump keeps a background command in flight across turns until it actually ends', async () => {
+  const reports: unknown[] = [];
+  const pump = new EventPump({ report: (e: unknown) => reports.push(e), setPhase: () => {}, root: async () => null,
+    spec: { attemptId: 'T-1-a1' } } as unknown as EventPumpOptions);
+  try {
+    await pump.handle({ type: 'tool_started', toolId: 'bash', name: 'Bash', input: '{}', command: 'bun test' });
+    await pump.handle({ type: 'tool_backgrounded', toolId: 'bash' });
+    await pump.handle({ type: 'turn_ended', outcome: 'completed', toolCalls: 1, error: null, errorKind: null });
+    expect(pump.toolInFlight).toBe(true);
+    const count = reports.length;
+    await pump.handle({ type: 'tool_progress', toolId: 'bash' });
+    expect(reports).toHaveLength(count);
+    await pump.handle({ type: 'tool_ended', toolId: 'bash', ok: true, denied: false, terminal: null, hubUnreachable: false });
+    expect(pump.toolInFlight).toBe(false);
+  } finally { pump.close(); }
 });

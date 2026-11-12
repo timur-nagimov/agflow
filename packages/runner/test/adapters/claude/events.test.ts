@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { BRIDGE_ANSWERS } from '@agflow/core';
+import { BRIDGE_ANSWERS, judgeStall } from '@agflow/core';
 import { loadRecording } from '@agflow/testkit/src/fake-claude';
 import { CLAUDE_TOOL_INPUT_MAX, ClaudeEventMapper } from '../../../src/adapters/claude/events';
+import { FactsTracker } from '../../../src/facts';
 import type { AgentEvent } from '../../../src/adapters/types';
 
 type Frame = Record<string, unknown>;
@@ -454,4 +455,59 @@ describe('ClaudeEventMapper.ended', () => {
     expect(mapper.turnRunning).toBe(false);
     expect(mapper.ended('claude exited with code 0')).toEqual([ended('task:task-1', { ok: false })]);
   });
+});
+
+describe('background Bash polling', () => {
+  for (const [name, input] of [
+    ['TaskOutput', { task_id: 'bg-1', block: true, timeout: 1000 }],
+    ['BashOutput', { bash_id: 'bg-1' }],
+    ['Read', { file_path: '/tmp/bg-1.output' }],
+    ['Bash', { command: "cat '/tmp/bg-1.output'" }],
+    ['Bash', { command: 'tail -n 20 /tmp/bg-1.output' }],
+  ] as const) {
+    test(`${name} ${JSON.stringify(input)} polls keep the original command open`, () => {
+      const mapper = new ClaudeEventMapper();
+      const events = mapAll(mapper, [init(), assistant([toolUse('bash', 'Bash', { command: 'bun test', run_in_background: true })]),
+        { type: 'system', subtype: 'task_started', task_id: 'bg-1', tool_use_id: 'bash', task_type: 'local_bash' },
+        toolResult('bash', 'Command running in background with ID: bg-1. Output is being written to: /tmp/bg-1.output', false, { tool_use_result: { backgroundTaskId: 'bg-1' } }),
+        ...Array.from({ length: 5 }, (_, n) => [assistant([toolUse(`poll-${n}`, name, input)]), toolResult(`poll-${n}`, 'still running')]).flat(),
+      ]);
+      expect(events.filter(e => e.type === 'tool_started')).toEqual([
+        { type: 'tool_started', toolId: 'bash', name: 'Bash', input: JSON.stringify({ command: 'bun test', run_in_background: true }), command: 'bun test' },
+      ]);
+      expect(events.filter(e => e.type === 'tool_ended')).toEqual([]);
+      expect(events.filter(e => e.type === 'tool_progress')).toHaveLength(5);
+      expect(events).toContainEqual({ type: 'tool_backgrounded', toolId: 'bash' });
+      expect(mapper.map(result()).filter(e => e.type === 'tool_ended')).toEqual([]);
+      expect(mapper.map({ type: 'system', subtype: 'task_notification', task_id: 'bg-1', status: 'completed' })).toEqual([ended('bash')]);
+      // Reading an ended task's output is a normal call again, so repeated finished calls remain detectable.
+      expect(mapper.map(assistant([toolUse('after', name, input)]))).toContainEqual(expect.objectContaining({ type: 'tool_started', toolId: 'after' }));
+    });
+  }
+
+  test('a background result without a task_started frame also keeps its Bash call open', () => {
+    const mapper = new ClaudeEventMapper();
+    const mapped = mapAll(mapper, [init(), assistant([toolUse('bash', 'Bash', { command: 'cargo test' })]),
+      toolResult('bash', 'running', false, { tool_use_result: { backgroundTaskId: 'bg-1' } }),
+      assistant([toolUse('poll', 'TaskOutput', { task_id: 'bg-1' })]),
+    ]);
+    expect(mapped.filter(e => e.type === 'tool_ended')).toEqual([]);
+    expect(mapped).toContainEqual({ type: 'tool_progress', toolId: 'bash' });
+    expect(mapper.ended('crashed').filter(e => e.type === 'tool_ended')).toEqual([ended('bash', { ok: false })]);
+  });
+});
+
+test('three finished identical Bash commands still trigger the loop rule', () => {
+  const mapper = new ClaudeEventMapper();
+  const events = mapAll(mapper, [init(), ...Array.from({ length: 3 }, (_, n) => [
+    assistant([toolUse(`bash-${n}`, 'Bash', { command: 'bun test' })]), toolResult(`bash-${n}`, 'passed'),
+  ]).flat()]);
+  const facts = new FactsTracker({ attemptId: 'T-1-a1', fence: { epoch: 1, counter: 1 }, clone: import.meta.dir,
+    toolCaps: { defaultMs: 30_000, longMs: 90_000, checks: [] }, clock: { awakeNow: () => 0 }, fingerprint: async () => 'same', phase: 'turn' });
+  try {
+    for (const event of events) facts.observe(event);
+    expect(facts.facts()).toMatchObject({ tool: null, repeatedCalls: 3 });
+    expect(judgeStall('worker', facts.facts(), { stallMs: 10_000, toolCapMs: 30_000,
+      maxContinuations: 25, activeBudgetMs: 100_000 })?.cause).toBe('stall_loop');
+  } finally { facts.close(); }
 });

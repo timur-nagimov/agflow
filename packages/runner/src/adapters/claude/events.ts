@@ -10,6 +10,7 @@ import type { AgentEvent, TerminalTool } from '../types';
 import { isRecord } from './json';
 import { classifyResult } from './outcome';
 import { isPaidUsageNotice, QuotaBook } from './quota';
+import { splitShellCommands } from './shell-words';
 
 /** The longest tool input a tool_started carries, as JSON: enough to tell repeated calls apart (6.8). */
 export const CLAUDE_TOOL_INPUT_MAX = 4_000;
@@ -50,6 +51,8 @@ export class ClaudeEventMapper {
   private assistantError: SDKAssistantMessageError | null = null;
   /** The main thread's calls without a tool_result yet, by tool_use id. */
   private readonly tools = new Map<string, string>();
+  /** Bash tasks stay attached to their original tool id, command and start time. */
+  private readonly bashTasks = new Map<string, { toolId: string; output: string | null; background: boolean }>();
   /** Calls a system/permission_denied frame named before their tool_result. */
   private readonly deniedCalls = new Set<string>();
   /** The runner's message id of each sent uuid not yet acknowledged, and whether it was delivered. */
@@ -99,6 +102,7 @@ export class ClaudeEventMapper {
     for (const id of this.tasks) end(`${TASK_TOOL_PREFIX}${id}`);
     this.tools.clear();
     this.tasks.clear();
+    this.bashTasks.clear();
     this.deniedCalls.clear();
     if (this.inTurn) {
       events.push({ type: 'turn_ended', outcome: 'failed', toolCalls: this.toolCalls, error, errorKind: null });
@@ -164,6 +168,11 @@ export class ClaudeEventMapper {
       case 'task_started':
         // Ambient tasks are housekeeping, not activity.
         if (typeof frame.task_id !== 'string' || frame.skip_transcript === true || frame.ambient === true) return;
+        if (typeof frame.tool_use_id === 'string' && this.tools.get(frame.tool_use_id) === 'Bash') {
+          const previous = this.bashTasks.get(frame.task_id);
+          this.bashTasks.set(frame.task_id, previous ?? { toolId: frame.tool_use_id, output: null, background: false });
+          return;
+        }
         // A foreground task runs inside the main-thread call that spawned it, already a tool in flight; a second
         // start would hide that call's repeats from the loop rule (6.8).
         if (
@@ -187,8 +196,20 @@ export class ClaudeEventMapper {
           this.taskStarts(frame.task_id, frame.patch.description, events);
         }
         return;
-      case 'task_notification':
+      case 'task_notification': {
         if (typeof frame.task_id !== 'string' || typeof frame.status !== 'string') return;
+        const bash = this.bashTasks.get(frame.task_id);
+        if (bash) {
+          this.bashTasks.delete(frame.task_id);
+          if (bash.background) {
+            this.tools.delete(bash.toolId);
+            events.push({
+              type: 'tool_ended', toolId: bash.toolId, ok: frame.status === 'completed',
+              denied: false, terminal: null, hubUnreachable: false,
+            });
+          }
+          return;
+        }
         this.foregroundTasks.delete(frame.task_id);
         if (!this.tasks.delete(frame.task_id)) return;
         events.push({
@@ -200,6 +221,7 @@ export class ClaudeEventMapper {
           hubUnreachable: false,
         });
         return;
+      }
       case 'notification':
         this.notice(frame.text, events);
         return;
@@ -306,9 +328,18 @@ export class ClaudeEventMapper {
           events.push({ type: 'quota', accountId: this.accountId, quota: this.quota.paidUsageInUse(this.accountId) });
         }
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+        const input = isRecord(block.input) ? block.input : {};
+        const taskId = block.name === 'TaskOutput' ? input.task_id : block.name === 'BashOutput' ? input.bash_id : null;
+        const output = block.name === 'Read' ? input.file_path : block.name === 'Bash' ? outputRead(input.command) : null;
+        const bash = typeof taskId === 'string'
+          ? this.bashTasks.get(taskId)
+          : [...this.bashTasks.values()].find((task) => task.output !== null && task.output === output);
+        if (bash?.background && this.tools.has(bash.toolId)) {
+          events.push({ type: 'tool_progress', toolId: bash.toolId });
+          continue;
+        }
         this.toolCalls += 1;
         this.tools.set(block.id, block.name);
-        const input = isRecord(block.input) ? block.input : {};
         events.push({
           type: 'tool_started',
           toolId: block.id,
@@ -331,6 +362,13 @@ export class ClaudeEventMapper {
       const id = block.tool_use_id;
       const name = this.tools.get(id);
       if (name === undefined) continue;
+      const background = isRecord(frame.tool_use_result) ? frame.tool_use_result.backgroundTaskId : null;
+      if (name === 'Bash' && block.is_error !== true && typeof background === 'string') {
+        const output = resultText(block.content).match(/Output is being written to: ([^\n]+)/)?.[1]?.trim() ?? null;
+        this.bashTasks.set(background, { toolId: id, output, background: true });
+        events.push({ type: 'tool_backgrounded', toolId: id });
+        continue;
+      }
       this.tools.delete(id);
       const failed = block.is_error === true;
       const announced = this.deniedCalls.delete(id);
@@ -356,6 +394,8 @@ export class ClaudeEventMapper {
       ),
     );
     for (const id of this.tools.keys()) {
+      if ([...this.bashTasks.values()].some((task) => task.toolId === id && task.background)) continue;
+      this.tools.delete(id);
       events.push({
         type: 'tool_ended',
         toolId: id,
@@ -365,7 +405,6 @@ export class ClaudeEventMapper {
         hubUnreachable: false,
       });
     }
-    this.tools.clear();
     this.deniedCalls.clear();
     this.acknowledge(frame.user_message_uuids, events);
     const used = this.contextUsed(frame.modelUsage);
@@ -475,4 +514,22 @@ function number(value: unknown): string {
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+/** Only a simple read of the known task output is a poll; other commands and compound scripts remain calls. */
+function outputRead(command: unknown): string | null {
+  if (typeof command !== 'string') return null;
+  const parsed = splitShellCommands(command);
+  if (!parsed.ok || parsed.commands.length !== 1) return null;
+  const call = parsed.commands[0]!;
+  if (call.redirects.length !== 0) return null;
+  const [executable, ...args] = call.words;
+  const name = executable?.split('/').at(-1);
+  if (!['cat', 'tail', 'head'].includes(name ?? '')) return null;
+  if (args.length === 1) return args[0]!;
+  if (args.length === 2 && args[0] === '--') return args[1]!;
+  if (name !== 'cat' && args.length === 3 && ['-n', '-c'].includes(args[0]!) && /^\d+$/.test(args[1]!)) {
+    return args[2]!;
+  }
+  return null;
 }

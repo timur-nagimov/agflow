@@ -96,6 +96,65 @@ function toolEnded(toolId: string): AgentEvent {
 }
 
 describe('FactsTracker', () => {
+  test('turns spent polling a background command do not become no-progress turns', async () => {
+    const { facts } = tracker();
+    await facts.start();
+    facts.observe(turnStarted);
+    facts.observe(toolStarted('bash', 'Bash', 'cargo test', 'cargo test'));
+    facts.observe({ type: 'tool_backgrounded', toolId: 'bash' });
+    facts.observe(turnEnded(1));
+    await facts.settled();
+    for (let n = 0; n < 4; n++) {
+      facts.observe(turnStarted);
+      facts.observe({ type: 'tool_progress', toolId: 'bash' });
+      facts.observe(turnEnded(0));
+      await facts.settled();
+      expect(facts.facts().turnsWithoutProgress).toBe(0);
+    }
+  });
+
+  test('a background command keeps its original age and cap between turns', () => {
+    const { source, clock, facts } = tracker();
+    facts.observe(turnStarted);
+    facts.observe(toolStarted('bash', 'Bash', 'cargo test', 'cargo test'));
+    facts.observe({ type: 'tool_backgrounded', toolId: 'bash' });
+    awake(source, clock, MINUTE);
+    facts.observe(turnEnded(1));
+    facts.observe(turnStarted);
+    awake(source, clock, MINUTE);
+    facts.observe({ type: 'tool_progress', toolId: 'bash' });
+    expect(facts.facts().tool).toMatchObject({ command: 'cargo test', long: true, capMs: CAPS.longMs, ageMs: 2 * MINUTE });
+    facts.observe(toolEnded('bash'));
+    expect(facts.facts().tool).toBeNull();
+  });
+
+  test('polling an open command breaks an inbox-call sequence without resetting its cap or age', () => {
+    const { source, clock, facts } = tracker();
+    facts.setPhase('turn');
+    facts.observe(turnStarted);
+    facts.observe(toolStarted('exec', 'exec_command', 'bun test', 'bun test'));
+    for (let n = 0; n < 5; n++) {
+      awake(source, clock, MINUTE);
+      facts.observe({ type: 'tool_progress', toolId: 'exec' });
+      facts.observe(toolStarted(`inbox-${n}`, 'mcp__agflow__check_inbox', '{}'));
+      facts.observe(toolEnded(`inbox-${n}`));
+      expect(facts.facts().repeatedCalls).toBe(1);
+    }
+    expect(facts.facts().tool).toMatchObject({ command: 'bun test', long: true, capMs: CAPS.longMs, ageMs: 5 * MINUTE });
+    awake(source, clock, CAPS.longMs);
+    facts.observe({ type: 'tool_progress', toolId: 'exec' });
+    expect(judgeStall('worker', facts.facts(), { stallMs: MINUTE, toolCapMs: CAPS.defaultMs,
+      maxContinuations: 25, activeBudgetMs: 24 * 60 * MINUTE })?.cause).toBe('stall_hung_tool');
+    facts.observe(toolEnded('exec'));
+    for (let n = 0; n < 3; n++) {
+      facts.observe(toolStarted(`repeat-${n}`, 'exec_command', 'bun test', 'bun test'));
+      facts.observe(toolEnded(`repeat-${n}`));
+      // A stale/unknown progress event cannot erase a real loop.
+      facts.observe({ type: 'tool_progress', toolId: 'exec' });
+    }
+    expect(facts.facts().repeatedCalls).toBe(3);
+  });
+
   test('eventAgeMs and tool.ageMs grow with awake time and leave out a sleep gap', () => {
     const { source, clock, facts } = tracker();
     facts.setPhase('turn');
