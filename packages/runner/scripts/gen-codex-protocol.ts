@@ -32,16 +32,16 @@ function fail(message: string): never {
 if (existsSync(out) && readdirSync(out).length > 0 && !existsSync(join(out, 'VERSION'))) {
   fail(`${out} is not a protocol directory (it has files but no VERSION), so it is not replaced`);
 }
-const bin = values.bin === undefined ? await findCodexBinary() : resolve(values.bin);
+await using resources = new ScriptResources();
+const bin = values.bin === undefined ? await resources.waitFor(findCodexBinary()) : resolve(values.bin);
 if (!bin) {
   fail(`no codex ${CODEX_VERSION} found: set AGFLOW_CODEX_BIN or run \`bun run vendor:install\``);
 }
-const version = await codexBinaryVersion(bin);
+const version = await resources.waitFor(codexBinaryVersion(bin));
 if (version !== CODEX_VERSION) {
   fail(`${bin} is codex ${version ?? 'of an unreadable version'}, expected ${CODEX_VERSION}`);
 }
 
-await using resources = new ScriptResources();
 const scratch = resources.directory(join(tmpdir(), 'agflow-codex-gen-'));
 let failure: string | null = null;
 try {
