@@ -2258,16 +2258,23 @@ Parallel plans avoid editing the same files: the runner core pre-declares the sh
   Every `Bun.spawn`/`spawnSync` (including Bun's implementation of Node `child_process.spawn`) receives a unique,
   inherited test scope marker. Child Bun programs preload only the spawn instrumentation, so deliberately clean
   environments still carry ownership; agent and runner exits keep their normal behavior. macOS hides the environment
-  of platform binaries such as `sh`, so detached process groups started by tests (also by child Bun programs, through a
-  shared scratch registry) are recorded with their leader's start time and killed as a whole even after the leader
-  exited; a group whose leader is gone and which is empty is retired, so a reused pgid is never signalled. Teardown can therefore
-  find detached and reparented tools even after their parent has exited. After each test's own cleanup, the backstop
+  of platform binaries such as `sh`, so live asynchronous children, both detached and non-detached, have their
+  PID/start-time/group identities recorded in a shared scratch registry, also by child Bun programs. Detached group
+  records include observed members: claiming unmarked members requires a surviving recorded or previously verified
+  identity in that group. A PGID and a start-time lower bound alone do not prove continuity; a group may disappear
+  and its PGID be reused between snapshots without an empty group ever being observed. Records without continuity
+  are retired. Non-detached records seed descendant discovery without claiming unrelated members of a shared group.
+  This finds recorded, reparented tools while an identity survives. After each test's own cleanup, the backstop
   freezes and rescans owned trees, checks PID/start-time identities and scope markers, kills owned groups with
-  SIGKILL (individual PIDs for groups shared with unrelated processes), and waits for exit. Async continuations of
+  SIGKILL (individual PIDs for groups shared with unrelated processes), and waits for exit within a three-second
+  cleanup deadline. An unreaped child fails cleanup instead of hanging indefinitely. Async continuations of
   a finished test cannot start more processes or servers. Suite teardown and synchronous process-exit/signal hooks
   are the final backstops. A failed process scan or failed cleanup fails the run; it is never silently skipped.
   This uses `ps` on macOS and Linux; run process tests outside a sandbox that denies process inspection. Like any
-  in-process exit hook, it cannot run after SIGKILL of the test runner itself.
+  in-process exit hook, it cannot run after SIGKILL of the test runner itself. This is a best-effort backstop, not
+  an absolute PID-reuse guarantee: `ps` identities have second-resolution timestamps and inspection/signalling races
+  remain. If a child exits before its identity is captured (including `spawnSync`), unmarked orphans without another
+  verified identity cannot safely be claimed. Fixtures remain responsible for such processes' normal cleanup.
   Bun servers are also tracked; scripted Anthropic holds and refusing-proxy sockets have explicit cleanup hooks.
   A child-`bun test` regression deliberately passes, fails, times out and exits with a detached fake-agent loop,
   then checks the process table for its unique marker. Existing fixture cleanup remains responsible for normal

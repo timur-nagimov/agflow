@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parsePs, PS_COLUMNS, PS_ENV } from '../../runner/src/processes';
+import { cleanupTestProcesses } from '../src/process-cleanup';
 
 const root = resolve(import.meta.dir, '../../..');
 const agent = join(root, 'packages/testkit/src/fake-agent.ts');
@@ -12,6 +13,22 @@ function marked(marker: string) {
   if (ps.exitCode !== 0) throw new Error('ps failed');
   return parsePs(ps.stdout.toString()).filter(row => !row.stat.startsWith('Z') && row.command.includes(marker));
 }
+
+test('cleanup reaps a non-detached platform child without waiting for its natural exit', async () => {
+  marked('process-inspection-preflight');
+  const child = Bun.spawn(['/bin/sleep', '30'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' });
+  let watchdogFired = false;
+  const watchdog = setTimeout(() => { watchdogFired = true; child.kill('SIGKILL'); }, 4500);
+  try {
+    await cleanupTestProcesses();
+    expect(watchdogFired).toBe(false);
+    expect(await child.exited).not.toBe(0);
+  } finally {
+    clearTimeout(watchdog);
+    child.kill('SIGKILL');
+    await child.exited;
+  }
+}, 7000);
 
 for (const outcome of ['pass', 'fail', 'timeout', 'exit'] as const) {
   test(`test preload cleans detached fake tools after ${outcome}`, async () => {

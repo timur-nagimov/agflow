@@ -1,5 +1,5 @@
-// Test-only ownership: environment markers plus recorded detached groups. macOS hides the environment of platform
-// binaries, so group records also cover orphaned shells after their instrumented Bun parent has exited.
+// Test-only ownership: environment markers plus recorded process identities. macOS hides the environment of
+// platform binaries; group ownership requires a surviving verified member, even after the leader has exited.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -9,7 +9,7 @@ import { parsePs, PS_COLUMNS, PS_ENV, sameProcess, type PsRow } from '../../runn
 
 export const PROCESS_SCOPE = 'AGFLOW_TEST_PROCESS_SCOPE';
 const GROUP_REGISTRY = 'AGFLOW_TEST_PROCESS_GROUP_REGISTRY';
-interface GroupRecord { scope: string; pid: number; lstart: string }
+interface GroupRecord { scope: string; pid: number; lstart: string; pgid?: number; members?: PsRow[] }
 export interface CleanupHost {
   snapshot(): PsRow[];
   signal(pid: number, signal: NodeJS.Signals): void;
@@ -41,12 +41,25 @@ function ownedIn(rows: PsRow[], scope: string, ownPid: number, host: CleanupHost
   const recorded = new Set<number>();
   for (const [id, group] of records) {
     if (!inScope(group.scope, scope)) continue;
+    const pgid = group.pgid ?? group.pid;
+    const survivors = live.filter(row =>
+      group.members?.some(member => sameOwnedProcess(member, row, scope)) ??
+      (sameProcess(row, group) && row.pgid === pgid));
+    // Shared groups confer no ownership. Only recorded identities seed descendant discovery.
+    if (pgid !== group.pid) {
+      if (!survivors.length) host.forgetGroup?.(id);
+      for (const row of survivors) recorded.add(row.pid);
+      continue;
+    }
     const members = rows.filter(row => row.pgid === group.pid && !row.stat.startsWith('Z'));
     const leader = rows.find(row => row.pid === group.pid);
     const start = Date.parse(`${group.lstart} GMT`);
-    // An existing group reserves its pgid, even without its leader. Retire the record as soon as it empties;
-    // also reject reused leaders and members predating the launch. Never claim our own group.
+    // A pgid and a start-time lower bound cannot prove continuity: the entire group may have been replaced
+    // between snapshots. Require a recorded (or previously verified) member to survive in this group.
+    const continuous = members.some(row => survivors.some(member => member.pid === row.pid) ||
+      (known.has(row.pid) && sameOwnedProcess(known.get(row.pid)!, row, scope)));
     if (group.pid <= 1 || !members.length || members.some(row => row.pid === ownPid) ||
+      !continuous ||
       (leader && (!sameProcess(leader, group) || leader.pgid !== group.pid)) ||
       members.some(row => !(Date.parse(`${row.lstart} GMT`) >= start))) {
       host.forgetGroup?.(id);
@@ -150,15 +163,17 @@ function groupRecords(): Map<string, GroupRecord> {
   }));
 }
 
-function recordDetached(pid: number, scope: string, started: number): void {
+function recordChild(proc: Bun.Subprocess, scope: string): void {
+  if (proc.exitCode !== null) return;
   const rows = system.snapshot();
-  const leader = rows.find(row => row.pid === pid);
-  const members = rows.filter(row => row.pgid === pid && !row.stat.startsWith('Z'));
-  if (!members.length) return;
-  // A very short-lived leader may already have exited. Its spawn time (rounded like ps to seconds) is then
-  // the lower bound for surviving members; a live leader always supplies the exact ps identity.
-  const lstart = leader?.lstart ?? new Date(started).toUTCString().replace(',', '').replace(' GMT', '');
-  const record: GroupRecord = { scope, pid, lstart };
+  const child = rows.find(row => row.pid === proc.pid && row.ppid === process.pid && !row.stat.startsWith('Z'));
+  // Never invent an identity from spawn time if the child exited before it could be observed.
+  if (!child || proc.exitCode !== null) return;
+  const members = rows.filter(row => !row.stat.startsWith('Z') &&
+    (row.pid === child.pid || (child.pgid === child.pid && row.pgid === child.pgid)));
+  const record: GroupRecord = { scope, pid: child.pid, pgid: child.pgid, lstart: child.lstart,
+    // ps e contains environments: retain only the ownership marker, never the rest of the command/environment.
+    members: members.map(row => ({ ...row, command: marked(row, scope) ? `${PROCESS_SCOPE}=${scope}` : '' })) };
   const file = join(groupRegistry(), randomUUID());
   writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
   renameSync(file, `${file}.json`); // Readers never see a partial record, including when writers run concurrently.
@@ -216,19 +231,17 @@ export function installProcessTracking(): void {
   Bun.spawn = ((command: string[] | Record<string, unknown>, options: Record<string, unknown> = {}) => {
     const input = Array.isArray(command) ? optionsFor(command, options) :
       optionsFor(command.cmd as string[], command);
-    const started = Date.now();
     const proc = rawSpawn(input.cmd, input);
     children.set(proc, activeScope().id);
     void proc.exited.finally(() => children.delete(proc));
-    if (input.detached) recordDetached(proc.pid, activeScope().id, started);
+    recordChild(proc, activeScope().id);
     return proc;
   }) as typeof Bun.spawn;
   Bun.spawnSync = ((command: string[] | Record<string, unknown>, options: Record<string, unknown> = {}) => {
     const input = Array.isArray(command) ? optionsFor(command, options) :
       optionsFor(command.cmd as string[], command);
-    const started = Date.now();
     const result = rawSpawnSync(input.cmd, input);
-    if (input.detached) recordDetached(result.pid, activeScope().id, started);
+    // The child has already exited: its old pid/pgid is not evidence of ownership of any survivors.
     return result;
   }) as typeof Bun.spawnSync;
   Bun.serve = ((options: Parameters<typeof Bun.serve>[0]) => {
@@ -241,6 +254,15 @@ export function installProcessTracking(): void {
 
 export function beginTestProcessScope(): void {
   context.enterWith({ id: `${rootScope}.${randomUUID()}`, closed: false });
+}
+
+export async function waitForProcessExits(exits: Promise<number>[], timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([Promise.all(exits), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('test processes did not exit')), Math.max(0, timeoutMs));
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
 /** Hooks await reaping as well as killing. A timeout is a cleanup failure, never silently ignored. */
@@ -262,7 +284,10 @@ export async function cleanupTestProcesses(all = false): Promise<void> {
         if (Date.now() >= deadline) throw new Error('test processes survived SIGKILL');
         await Bun.sleep(10);
       }
-      await Promise.all([...children].filter(([, owner]) => all || owner === finished).map(([proc]) => proc.exited));
+      await waitForProcessExits(
+        [...children].filter(([, owner]) => all || owner === finished).map(([proc]) => proc.exited),
+        deadline - Date.now(),
+      );
       if (all) dirty.clear();
       else dirty.delete(finished);
     }
