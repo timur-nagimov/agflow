@@ -5,6 +5,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { join } from 'node:path';
 import type { BackupKind } from '../../../hub/src/backup';
 import type { HubConfig } from '../../../hub/src/context';
+import { bindTestProcessScope } from '../process-cleanup';
 import { trackProcess } from './proc';
 
 const HUB_SRC = join(import.meta.dir, '../../../hub/src');
@@ -271,12 +272,12 @@ function createHubProcess(options: HubProcessOptions, port: number): HubProcess 
     get running() {
       return running();
     },
-    start,
+    start: bindTestProcessScope(start),
     stop,
-    async restart() {
+    restart: bindTestProcessScope(async () => {
       await stop();
       await start();
-    },
+    }),
     kill,
     backups,
     restore,

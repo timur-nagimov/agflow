@@ -161,6 +161,23 @@ function openScope(): string {
   if (current.closed) throw new Error('test scope already closed: refusing to start a late resource');
   return current.id;
 }
+
+/** Keep a restartable fixture's resources in the scope that created it, including replacements started by a test. */
+export function bindTestProcessScope<Args extends unknown[], Result>(
+  callback: (...args: Args) => Result,
+): (...args: Args) => Result {
+  if (!installed) return callback;
+  openScope();
+  const owner = activeScope();
+  return (...args) => {
+    // A timed-out caller cannot use a longer-lived fixture to escape its closed scope.
+    openScope();
+    return context.run(owner, () => {
+      openScope();
+      return callback(...args);
+    });
+  };
+}
 let installed = false;
 let exitHooked = false;
 const dirty = new Set<string>();
