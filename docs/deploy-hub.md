@@ -14,7 +14,8 @@ export NETWORK_ID=enp_REPLACE
 export SUBNET_ID=e9b_REPLACE
 export ZONE=ru-central1-a
 export ADMIN_CIDR=203.0.113.10/32   # replace with your SSH source IP/CIDR
-export SSH_PUBLIC_KEY_FILE="$HOME/.ssh/id_ed25519.pub"+bash deploy/hub/yc-create.sh --execute
+export SSH_PUBLIC_KEY_FILE="$HOME/.ssh/id_ed25519.pub"
+bash deploy/hub/yc-create.sh --execute
 ```
 
 [yc-create.sh](../deploy/hub/yc-create.sh) creates a security group allowing SSH only from `ADMIN_CIDR`, public TCP 80/443, and outbound traffic; **8787 is never public**. It reserves an IPv4 address, creates the VM and attaches its boot disk to a daily 03:00 UTC snapshot schedule retaining seven snapshots. Boot-disk auto-delete is disabled. It prints resource IDs and an `sslip.io` hostname. It is a creation recipe, not an idempotent reconciler: after a partial failure inspect resources by name before retrying. Resources and reserved addresses continue to incur costs until removed.
