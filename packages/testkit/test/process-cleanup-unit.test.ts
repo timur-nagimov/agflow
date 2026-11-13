@@ -218,6 +218,73 @@ test('a recycled marked pid cannot inherit ownership even within the same ps tim
   expect(h.signals).toEqual([]);
 });
 
+test('a recorded identity survives exec with a cleared environment and owns unmarked descendants', () => {
+  const before = row(101, { identity: 'darwin:1762948800:123456' });
+  const after = { ...before, command: '/bin/sleep 30' };
+  const descendant = row(102, { ppid: 101, pgid: 101, command: '/bin/sleep 30', identity: 'darwin:1762948800:123457' });
+  const groups = new Map([['child', { scope, pid: before.pid, lstart: before.lstart, members: [before] }]]);
+  const h = host([[after, descendant]], groups);
+  expect(killOwnedProcesses(scope, h.io, 999)).toBe(2);
+  expect(h.signals).toContainEqual([-101, 'SIGKILL']);
+});
+
+test('an orphaned recorded member survives exec after its group leader exits', () => {
+  const before = row(102, { pgid: 101, identity: 'darwin:1762948800:123456' });
+  const after = { ...before, command: '/bin/sleep 30' };
+  const groups = new Map([['child', { scope, pid: 101, lstart: before.lstart, members: [before] }]]);
+  const h = host([[after]], groups);
+  expect(killOwnedProcesses(scope, h.io, 999)).toBe(1);
+  expect(h.signals).toContainEqual([-101, 'SIGKILL']);
+});
+
+test('exec during the freeze or final kill scan preserves ownership', () => {
+  const before = row(101, { identity: 'linux:123456' });
+  const after = { ...before, command: '/bin/sleep 30' };
+  for (const snapshots of [[[before], [after]], [[before], [before], [before], [after]]]) {
+    const h = host(snapshots);
+    expect(killOwnedProcesses(scope, h.io, 999)).toBe(1);
+    expect(h.signals).toContainEqual([-101, 'SIGKILL']);
+  }
+});
+
+test('kernel identities reject same-second reuse of marked and unmarked processes', () => {
+  for (const command of ['unrelated', `sh AGFLOW_TEST_PROCESS_SCOPE=${scope}`]) {
+    const before = row(101, { identity: 'darwin:1762948800:123456', command });
+    const reused = { ...before, identity: 'darwin:1762948800:654321', command: 'unrelated' };
+    const groups = new Map([['child', { scope, pid: 101, lstart: before.lstart, members: [before] }]]);
+    for (const snapshots of [[[reused]], [[before], [reused]], [[before], [before], [before], [reused]]]) {
+      const h = host(snapshots, new Map(groups));
+      expect(killOwnedProcesses(scope, h.io, 999)).toBe(0);
+      expect(h.signals.filter(([, signal]) => signal === 'SIGKILL')).toEqual([]);
+    }
+  }
+});
+
+test('a live direct-child handle seeds ownership after exec without adopting its shared group', () => {
+  const child = row(101, { ppid: 999, pgid: 998, command: '/bin/sleep 30' });
+  const descendant = row(102, { ppid: 101, pgid: 998, command: '/bin/sleep 30' });
+  const bystander = row(103, { pgid: 998, command: 'unrelated' });
+  const h = host([[child, descendant, bystander]]);
+  h.io.ownsChild = (pid, owner) => pid === 101 && owner === scope;
+  expect(killOwnedProcesses(scope, h.io, 999)).toBe(2);
+  expect(h.signals).toEqual([[101, 'SIGSTOP'], [102, 'SIGSTOP'], [101, 'SIGKILL'], [102, 'SIGKILL']]);
+});
+
+test('an exited direct-child handle cannot seed ownership of a reused pid', () => {
+  const h = host([[row(101, { command: 'unrelated' })]]);
+  h.io.ownsChild = () => false;
+  expect(killOwnedProcesses(scope, h.io, 999)).toBe(0);
+  expect(h.signals).toEqual([]);
+});
+
+test('an unverifiable row cannot own a process and still blocks group-wide signals', () => {
+  const parent = row(101, { identity: 'birth-1' });
+  const unknown = row(102, { identity: null, ppid: 101, pgid: 101 });
+  const h = host([[parent, unknown]]);
+  expect(killOwnedProcesses(scope, h.io, 999)).toBe(1);
+  expect(h.signals).toEqual([[101, 'SIGSTOP'], [101, 'SIGKILL']]);
+});
+
 test('a timed-out test continuation cannot start a new server after its cleanup', async () => {
   const { cleanupTestProcesses } = await import('../src/process-cleanup');
   const later = new Promise<string>((resolve) => {

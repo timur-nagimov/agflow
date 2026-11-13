@@ -6,6 +6,7 @@ import { mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSy
 import { basename, join } from 'node:path';
 import { constants, tmpdir } from 'node:os';
 import { parsePs, PS_COLUMNS, PS_ENV, sameProcess, type PsRow } from './process-table';
+import { identifyProcesses } from './process-identity';
 
 export const PROCESS_SCOPE = 'AGFLOW_TEST_PROCESS_SCOPE';
 const GROUP_REGISTRY = 'AGFLOW_TEST_PROCESS_GROUP_REGISTRY';
@@ -21,6 +22,7 @@ export interface CleanupHost {
   signal(pid: number, signal: NodeJS.Signals): void;
   groups?(): ReadonlyMap<string, GroupRecord>;
   forgetGroup?(id: string): void;
+  ownsChild?(pid: number, scope: string): boolean;
 }
 
 function inScope(owner: string, scope: string): boolean {
@@ -36,20 +38,25 @@ function marked(row: PsRow, scope: string): boolean {
   });
 }
 
-function sameOwnedProcess(before: PsRow, now: PsRow, scope: string): boolean {
-  return sameProcess(before, now) && before.pgid === now.pgid &&
-    (!marked(before, scope) || marked(now, scope));
+function sameOwnedProcess(before: PsRow, now: PsRow, scope: string, host: CleanupHost): boolean {
+  if (before.identity === null || now.identity === null) return false;
+  if (!sameProcess(before, now) || before.pgid !== now.pgid) return false;
+  if (before.identity !== undefined || now.identity !== undefined) {
+    return before.identity !== undefined && before.identity === now.identity;
+  }
+  // Keep the legacy marker-loss guard when no kernel identity was supplied, unless a live handle proves ownership.
+  return host.ownsChild?.(now.pid, scope) === true || !marked(before, scope) || marked(now, scope);
 }
 
 function ownedIn(rows: PsRow[], scope: string, ownPid: number, host: CleanupHost,
   records: ReadonlyMap<string, GroupRecord>, known: Map<number, PsRow>) {
-  const live = rows.filter(row => row.pid > 1 && row.pid !== ownPid && !row.stat.startsWith('Z'));
+  const live = rows.filter(row => row.pid > 1 && row.pid !== ownPid && !row.stat.startsWith('Z') && row.identity !== null);
   const recorded = new Set<number>();
   for (const [id, group] of records) {
     if (!inScope(group.scope, scope)) continue;
     const pgid = group.pgid ?? group.pid;
     const survivors = live.filter(row =>
-      group.members?.some(member => sameOwnedProcess(member, row, scope)) ??
+      group.members?.some(member => sameOwnedProcess(member, row, scope, host)) ??
       (sameProcess(row, group) && row.pgid === pgid));
     // Shared groups confer no ownership. Only recorded identities seed descendant discovery.
     if (pgid !== group.pid) {
@@ -63,19 +70,21 @@ function ownedIn(rows: PsRow[], scope: string, ownPid: number, host: CleanupHost
     // A pgid and a start-time lower bound cannot prove continuity: the entire group may have been replaced
     // between snapshots. Require a recorded (or previously verified) member to survive in this group.
     const continuous = members.some(row => survivors.some(member => member.pid === row.pid) ||
-      (known.has(row.pid) && sameOwnedProcess(known.get(row.pid)!, row, scope)));
+      (known.has(row.pid) && sameOwnedProcess(known.get(row.pid)!, row, scope, host)));
     if (group.pid <= 1 || !members.length || members.some(row => row.pid === ownPid) ||
       !continuous ||
       (leader && (!sameProcess(leader, group) || leader.pgid !== group.pid)) ||
+      (leader && group.members?.some(member => member.pid === leader.pid &&
+        !sameOwnedProcess(member, leader, scope, host))) ||
       members.some(row => !(Date.parse(`${row.lstart} GMT`) >= start))) {
       host.forgetGroup?.(id);
       continue;
     }
     for (const row of members) recorded.add(row.pid);
   }
-  const owned = new Map(live.filter(row => marked(row, scope) ||
+  const owned = new Map(live.filter(row => marked(row, scope) || host.ownsChild?.(row.pid, scope) ||
     recorded.has(row.pid) ||
-    (known.has(row.pid) && sameOwnedProcess(known.get(row.pid)!, row, scope))).map(row => [row.pid, row]));
+    (known.has(row.pid) && sameOwnedProcess(known.get(row.pid)!, row, scope, host))).map(row => [row.pid, row]));
   for (;;) {
     const children = live.filter(row => !owned.has(row.pid) && owned.has(row.ppid));
     if (!children.length) return owned;
@@ -114,8 +123,8 @@ export function killOwnedProcesses(scope: string, host: CleanupHost, ownPid = pr
     const current = new Map(fresh.map(row => [row.pid, row]));
     for (const row of owned.values()) {
       const now = current.get(row.pid);
-      if (!now || !sameOwnedProcess(row, now, scope)) continue;
-      const key = `${row.pid}:${row.lstart}`;
+      if (!now || !sameOwnedProcess(row, now, scope, host)) continue;
+      const key = `${row.pid}:${row.identity ?? row.lstart}`;
       if (frozen.has(key)) continue;
       host.signal(row.pid, 'SIGSTOP');
       frozen.add(key);
@@ -123,13 +132,13 @@ export function killOwnedProcesses(scope: string, host: CleanupHost, ownPid = pr
     if (!canRescan()) break;
     const next = scan(owned);
     owned = next;
-    if ([...next.values()].every(row => frozen.has(`${row.pid}:${row.lstart}`))) break;
+    if ([...next.values()].every(row => frozen.has(`${row.pid}:${row.identity ?? row.lstart}`))) break;
   }
   const rows = host.snapshot();
   const current = new Map(rows.map(row => [row.pid, row]));
   const valid = new Map([...owned].filter(([pid, row]) => {
     const now = current.get(pid);
-    return now && sameOwnedProcess(row, now, scope);
+    return now && sameOwnedProcess(row, now, scope, host);
   }));
   const groups = new Set<number>();
   for (const row of valid.values()) {
@@ -226,14 +235,23 @@ export function registerTestCleanup(close: () => void | Promise<unknown>): () =>
 
 const system: CleanupHost = {
   groups: groupRecords,
+  ownsChild(pid, scope) {
+    for (const [proc, owner] of children) {
+      // The getters poll the subprocess, including exits not yet delivered to its exited promise callback.
+      if (proc.pid === pid && inScope(owner, scope) && proc.exitCode === null && proc.signalCode === null) return true;
+    }
+    return false;
+  },
   forgetGroup(id) { rmSync(join(registry!, id), { force: true }); },
   snapshot() {
     // Never print this output: `ps e` contains environments. A clean ps environment keeps the scanner unmarked.
-    const result = rawSpawnSync(['ps', 'eww', '-axo', PS_COLUMNS], {
-      env: { PATH: process.env.PATH, ...PS_ENV }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+    return identifyProcesses(() => {
+      const result = rawSpawnSync(['ps', 'eww', '-axo', PS_COLUMNS], {
+        env: { PATH: process.env.PATH, ...PS_ENV }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+      });
+      if (result.exitCode !== 0) throw new Error(`test process cleanup: ps exited ${result.exitCode}`);
+      return parsePs(result.stdout.toString());
     });
-    if (result.exitCode !== 0) throw new Error(`test process cleanup: ps exited ${result.exitCode}`);
-    return parsePs(result.stdout.toString());
   },
   signal(pid, signal) {
     try { process.kill(pid, signal); }
@@ -242,6 +260,9 @@ const system: CleanupHost = {
     }
   },
 };
+
+/** Unscoped process snapshot for inspection after a test scope closed (never spawns through the tracked Bun.spawn). */
+export function snapshotProcesses(): PsRow[] { return system.snapshot(); }
 
 function optionsFor(command: string[], options: Record<string, unknown>) {
   const scope = openScope();

@@ -7,6 +7,8 @@ export interface PsRow {
   stat: string;
   lstart: string;
   command: string;
+  /** Exec-stable kernel birth time; null means the snapshot could not verify this row. */
+  identity?: string | null;
 }
 
 export const PS_COLUMNS = 'pid=,ppid=,pgid=,stat=,lstart=,command=';
