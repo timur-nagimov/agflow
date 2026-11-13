@@ -140,6 +140,12 @@ export interface HubConfig extends HubRunnerSettings {
    * the tasks the lead granted (design 5, Unattended options). Off by default: agents then reach nothing outside.
    */
   agentFetch?: boolean | undefined;
+  /**
+   * AGFLOW_LEAD_APPROVALS: the agent holding the lead seat may answer the approvals of other agents' attempts with its
+   * agent token (design 6.10, Who may answer): decline any of them, approve only those of a runner whose vendor reports
+   * no managed device policy. Off by default: only the owner answers, in a browser.
+   */
+  leadApprovals?: boolean | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */

@@ -184,6 +184,7 @@ export function loadConfig(env: Env): LoadedConfig {
   }
   const needMerge = switchOf(env, 'AGFLOW_DEPENDENCIES_NEED_MERGE');
   const agentFetch = switchOf(env, 'AGFLOW_AGENT_FETCH');
+  const leadApprovals = switchOf(env, 'AGFLOW_LEAD_APPROVALS');
   const testMode = env.AGFLOW_TEST === '1';
   if (env.AGFLOW_TEST_CONFIG && !testMode) throw new Error('AGFLOW_TEST_CONFIG is honoured only with AGFLOW_TEST=1');
   const config: HubConfig = {
@@ -205,6 +206,7 @@ export function loadConfig(env: Env): LoadedConfig {
     operatorUser,
     dependenciesNeedMerge: needMerge,
     agentFetch,
+    leadApprovals,
   };
   const overrides = env.AGFLOW_TEST_CONFIG ? testOverrides(env.AGFLOW_TEST_CONFIG) : {};
   Object.assign(config, overrides);

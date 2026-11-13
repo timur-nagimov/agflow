@@ -503,6 +503,15 @@ export interface Approval {
   decidedAt: number | null;
 }
 
+/**
+ * A pending approval as GET /api/approvals lists it for the agent holding the lead seat (design 6.10, Who may answer).
+ * leadMayApprove is false on a runner whose vendor reports a managed device policy, or that the hub cannot find: the
+ * lead may only decline that one, or leave it to the owner.
+ */
+export interface LeadApproval extends Approval {
+  leadMayApprove: boolean;
+}
+
 export interface SubmissionRecord {
   /** 'S-<n>' */
   id: string;
