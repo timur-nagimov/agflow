@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { NewTaskSchema, type SubmitError } from '@agflow/core';
 import { recordResult } from '@agflow/hub/src/commands';
 import { requestSubmission } from '@agflow/hub/src/submissions';
@@ -63,6 +66,7 @@ async function bridgeFor(
     runner: {
       attemptId: agent.attempt.id,
       role,
+      clone: mkdtempSync(join(tmpdir(), 'agflow-bridge-clone-')),
       pollMs: 5,
       pollMaxMs: options.pollMaxMs ?? 5_000,
       now: () => clock.t,
@@ -114,6 +118,13 @@ function prepared(hub: HubFixture, agent: RunnerAgent, outcome: { ok: boolean; e
   tx(hub.ctx, (emit) => onPrepared(hub.ctx, emit, agent.attempt, { requestId: row.id, ...outcome }));
 }
 
+/**
+ * The unattended options' tools (design 5, 6.10), which the bridge serves and the runner's list does not name: those
+ * options leave the runner as it is. A Codex thread needs every name of the runner's list from its bridge and only
+ * warns about others, so these are the whole difference between the two, and any other is a drift.
+ */
+const UNATTENDED_TOOLS = { worker: ['fetch_url'], lead: ['grant_internet', 'revoke_internet', 'list_approvals', 'decide_approval', 'fetch_url'] } as const;
+
 const SHARED = ['hello', 'get_brief', 'get_goal', 'list_tasks', 'get_task', 'check_inbox', 'ack_messages', 'send_message', 'search'];
 
 describe('the runner tool sets', () => {
@@ -127,6 +138,7 @@ describe('the runner tool sets', () => {
       'release_task',
       'submit',
       'prepare_dependencies',
+      'fetch_url',
     ]);
     // A runner attempt's release stops the attempt: M1's answer, that the task is ready again, would be wrong.
     expect(runnerWorkerTools.find((tool) => tool.name === 'release_task')).not.toBe(workerTools.find((tool) => tool.name === 'release_task'));
@@ -142,12 +154,17 @@ describe('the runner tool sets', () => {
       'mark_merged',
       'add_goal_note',
       'get_events',
+      'grant_internet',
+      'revoke_internet',
       'request_agents',
       'replace_agent',
       'stop_agent',
       'write_handoff',
       'get_lead_notes',
       'fetch_submission',
+      'list_approvals',
+      'decide_approval',
+      'fetch_url',
     ]);
     for (const tools of [runnerWorkerTools, runnerLeadTools]) {
       const names = tools.map((tool) => tool.name);
@@ -160,11 +177,51 @@ describe('the runner tool sets', () => {
     expect(runnerToolsFor('lead')).toBe(runnerLeadTools);
   });
 
-  test("the runner's BRIDGE_TOOL_NAMES name exactly the tools each role's bridge serves", () => {
+  test("the runner's BRIDGE_TOOL_NAMES are all served, and the bridge serves nothing more than them and the unattended options' tools", () => {
     for (const role of ['worker', 'lead'] as const) {
       const served = runnerToolsFor(role).map((tool) => tool.name);
-      expect([...BRIDGE_TOOL_NAMES[role]].sort()).toEqual(served.sort());
+      expect([...BRIDGE_TOOL_NAMES[role], ...UNATTENDED_TOOLS[role]].sort()).toEqual(served.sort());
     }
+  });
+});
+
+describe("the unattended options' tools against the hub", () => {
+  test("a runner lead grants and revokes a task's internet access with its agent token; a worker's bridge has no such tool", async () => {
+    const hub = hubFixture({ agentFetch: true });
+    const worker = runnerAgent(hub);
+    const lead = runnerAgent(hub, 'lead');
+    const taskId = worker.task?.id as string;
+    const leadBridge = await bridgeFor(lead);
+    expect(await leadBridge.call('grant_internet', { task_id: taskId, reason: 'It needs the published schema.' })).toEqual({
+      text: expect.stringContaining(`${taskId} has internet access`),
+      isError: false,
+    });
+    expect(getTask(hub.ctx, taskId).fetchGranted).toBe(true);
+    const workerBridge = await bridgeFor(worker);
+    expect((await workerBridge.call('grant_internet', { task_id: taskId, reason: 'mine' })).isError).toBe(true);
+    expect((await workerBridge.call('revoke_internet', { task_id: taskId })).isError).toBe(true);
+    expect(getTask(hub.ctx, taskId).fetchGranted).toBe(true);
+    expect(await leadBridge.call('revoke_internet', { task_id: taskId })).toEqual({ text: expect.stringContaining(`${taskId} has no internet access`), isError: false });
+    expect(getTask(hub.ctx, taskId).fetchGranted).toBe(false);
+  });
+
+  test('with the settings off the hub refuses the grant, the fetch and the approvals, each as an error result in its own words', async () => {
+    const hub = hubFixture();
+    const worker = runnerAgent(hub);
+    const lead = runnerAgent(hub, 'lead');
+    const leadBridge = await bridgeFor(lead);
+    const grant = await leadBridge.call('grant_internet', { task_id: worker.task?.id, reason: 'docs' });
+    expect(grant).toEqual({ text: expect.stringContaining('agflow hub: internet access for agents is off'), isError: true });
+    for (const [name, args] of [
+      ['list_approvals', {}],
+      ['decide_approval', { id: '0b0e7c3a-5d1f-4c59-9d0e-2f6f3b1a7c11', decision: 'approve' }],
+      ['fetch_url', { url: 'https://example.com/', save_as: 'page.html' }],
+    ] as const) {
+      const answer = await leadBridge.call(name, args);
+      expect({ name, isError: answer.isError, fromHub: answer.text.startsWith('agflow hub: ') }).toEqual({ name, isError: true, fromHub: true });
+    }
+    const asWorker = await (await bridgeFor(worker)).call('fetch_url', { url: 'https://example.com/', save_as: 'page.html' });
+    expect(asWorker).toEqual({ text: expect.stringMatching(/^agflow hub: /), isError: true });
   });
 });
 

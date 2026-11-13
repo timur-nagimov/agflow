@@ -4,6 +4,7 @@ import { getAgent } from '@agflow/hub/src/agents';
 import { listGoalNotes, updateGoal } from '@agflow/hub/src/goal';
 import { blockTask, claimTask, createTasks, getTask, submitTask } from '@agflow/hub/src/tasks';
 import { type ToolContext, allTools } from '../src/mcp/tools';
+import { z } from 'zod';
 import { type LiveAgent, hubFixture } from './fixture';
 
 const call = (name: string, args: Record<string, unknown>, ctx: ToolContext) => {
@@ -75,10 +76,49 @@ describe('lead tools', () => {
     );
   });
 
-  test('all 28 tools are registered with unique names', () => {
+  test('the lead grants a task internet access with a reason and revokes it; a worker cannot, and nobody can while the setting is off', async () => {
+    const hub = hubFixture({ agentFetch: true });
+    const lead = as(hub.liveAgent('alice', 'lead'), 'lead');
+    const worker = as(hub.liveAgent('bob'), 'worker');
+    createTasks(hub.ctx, [NewTaskSchema.parse(spec('One'))], 'user:alice');
+    expect(await call('grant_internet', { task_id: 'T-1', reason: 'It needs the API reference at docs.example.com.' }, lead)).toBe(
+      'T-1 has internet access: its Claude agents may use fetch_url. Revoke it with revoke_internet once the task no longer needs it.',
+    );
+    expect(getTask(hub.ctx, 'T-1').fetchGranted).toBe(true);
+    await expect(call('grant_internet', { task_id: 'T-1', reason: 'I want it.' }, worker)).rejects.toThrow('only the lead or a person');
+    await expect(call('revoke_internet', { task_id: 'T-1' }, worker)).rejects.toThrow('only the lead or a person');
+    expect(getTask(hub.ctx, 'T-1').fetchGranted).toBe(true);
+    expect(await call('revoke_internet', { task_id: 'T-1' }, lead)).toBe('T-1 has no internet access: fetch_url is refused for it from now on.');
+    expect(getTask(hub.ctx, 'T-1').fetchGranted).toBe(false);
+    await expect(call('grant_internet', { task_id: 'T-9', reason: 'x' }, lead)).rejects.toThrow('T-9');
+
+    const off = hubFixture();
+    const offLead = as(off.liveAgent('alice', 'lead'), 'lead');
+    createTasks(off.ctx, [NewTaskSchema.parse(spec('One'))], 'user:alice');
+    await expect(call('grant_internet', { task_id: 'T-1', reason: 'docs' }, offLead)).rejects.toThrow('internet access for agents is off');
+    expect(getTask(off.ctx, 'T-1').fetchGranted).toBe(false);
+  });
+
+  test('grant_internet needs a reason of 1 to 500 characters, and both tools say when to use them', () => {
+    const grant = allTools.find((t) => t.name === 'grant_internet');
+    const revoke = allTools.find((t) => t.name === 'revoke_internet');
+    const input = z.strictObject(grant?.input ?? {});
+    expect(input.safeParse({ task_id: 'T-1', reason: 'x'.repeat(500) }).success).toBe(true);
+    for (const args of [{ task_id: 'T-1' }, { task_id: 'T-1', reason: '' }, { task_id: 'T-1', reason: 'x'.repeat(501) }, { task_id: 'one', reason: 'x' }]) {
+      expect(input.safeParse(args).success).toBe(false);
+    }
+    for (const part of ['Lead:', 'only', 'outside data', 'why', 'revoke', 'untrusted']) expect(grant?.description, part).toContain(part);
+    for (const part of ['Lead:', 'no longer needs']) expect(revoke?.description, part).toContain(part);
+  });
+
+  test('all 30 tools are registered with unique names', () => {
     const names = allTools.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
-    expect(names).toHaveLength(28);
+    expect(names).toHaveLength(30);
     expect(names).toContain('fetch_submission');
+    // The live bridge serves the lead's grant tools, and none of a runner agent's own.
+    expect(names).toContain('grant_internet');
+    expect(names).toContain('revoke_internet');
+    for (const runnerOnly of ['fetch_url', 'list_approvals', 'decide_approval']) expect(names).not.toContain(runnerOnly);
   });
 });
