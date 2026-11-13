@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync, realpathSync } from 'node:fs';
-import { BRIDGE_TOOL_NAMES } from '../../src/adapters/bridge-tools';
+import { BRIDGE_TOOL_NAMES, BRIDGE_UNNAMED_TOOLS } from '../../src/adapters/bridge-tools';
 import { CODEX_VERSION } from '../../src/adapters/codex/binary';
 import { appServerArgs, appServerEnv, codexToolsNote, threadOverrides } from '../../src/adapters/codex/config';
 import type { ResultOf } from '../../src/adapters/codex/methods';
@@ -130,6 +130,18 @@ describe('CodexSession.start', () => {
     expect(readCodexRecord(f.bin)[0]!.requests[1]!.params).toHaveProperty(
       'developerInstructions', `${f.launch.brief}\n\n${codexToolsNote(f.launch.bridge.tools)}`,
     );
+  });
+
+  test('does not warn about the tools every bridge serves unnamed', async () => {
+    const f = setup({ 'mcpServerStatus/list': { result: mcp(['agflow'], null, [...BRIDGE_TOOL_NAMES.worker, ...BRIDGE_UNNAMED_TOOLS]) } });
+    const session = await CodexSession.start(f.launch, f.options);
+    await session.close();
+    expect((await collect(session.events)).filter((event) => event.type === 'warning')).toEqual([]);
+    // Unnamed means unnamed: a Codex agent is not told about a tool that refuses it.
+    expect(readCodexRecord(f.bin)[0]!.requests[1]!.params).toHaveProperty(
+      'developerInstructions', `${f.launch.brief}\n\n${codexToolsNote(f.launch.bridge.tools)}`,
+    );
+    expect(BRIDGE_UNNAMED_TOOLS).toEqual(['fetch_url']);
   });
 
   for (const toolsError of [null, 'tools/list failed\n  bridge said no']) {

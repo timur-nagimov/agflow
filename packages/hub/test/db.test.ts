@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getAgent } from '../src/agents';
@@ -49,7 +49,7 @@ function v1Database(path: string, leadSeenAt: number): void {
 }
 
 describe('openDb', () => {
-  test('creates every table, column and index of schema version 2', () => {
+  test('creates every table, column and index of schema versions 2 and 3', () => {
     const db = openDb(':memory:', NOW);
     const tables = names(db, 'table');
     for (const name of [
@@ -74,6 +74,8 @@ describe('openDb', () => {
       'runner_event_rejects',
       'approvals',
       'lead_notes',
+      'task_fetch_grants',
+      'agent_fetches',
     ]) {
       expect(tables).toContain(name);
     }
@@ -93,8 +95,23 @@ describe('openDb', () => {
       ]),
     );
     expect(columns(db, 'task_notes')).toContain('attempt_id');
+    expect(columns(db, 'task_fetch_grants')).toEqual(['task_id', 'granted_by', 'reason', 'granted_at']);
+    expect(columns(db, 'agent_fetches')).toEqual([
+      'id',
+      'at',
+      'attempt_id',
+      'task_id',
+      'agent_id',
+      'url',
+      'final_url',
+      'status',
+      'error',
+      'bytes',
+      'detail',
+    ]);
     expect(names(db, 'index')).toEqual(
       expect.arrayContaining([
+        'agent_fetches_attempt',
         'attempts_task_number',
         'attempts_one_open',
         'attempts_status',
@@ -110,14 +127,87 @@ describe('openDb', () => {
     expect(versions).toEqual([
       { version: 1, applied_at: NOW },
       { version: 2, applied_at: NOW },
+      { version: 3, applied_at: NOW },
     ]);
+  });
+
+  test('a schema version 2 database gains the internet grants and the record of fetches, and keeps its rows', () => {
+    const db = openDb(':memory:', NOW);
+    // As a hub before version 3 left it.
+    db.run('DROP TABLE task_fetch_grants');
+    db.run('DROP TABLE agent_fetches');
+    db.run('DELETE FROM schema_migrations WHERE version = 3');
+    db.run("INSERT INTO goal_versions (version, text, author, created_at) VALUES (1, 'goal', 'user:alice', 0)");
+    migrate(db, NOW + MINUTE);
+    expect(db.query('SELECT version, applied_at FROM schema_migrations WHERE version = 3').get()).toEqual({
+      version: 3,
+      applied_at: NOW + MINUTE,
+    });
+    expect(db.query('SELECT COUNT(*) AS n FROM task_fetch_grants').get()).toEqual({ n: 0 });
+    expect(db.query('SELECT COUNT(*) AS n FROM agent_fetches').get()).toEqual({ n: 0 });
+    expect(db.query('SELECT COUNT(*) AS n FROM goal_versions').get()).toEqual({ n: 1 });
+  });
+
+  test("the runbook's way back from schema version 3 leaves a whole version 2 database, which takes the upgrade again", () => {
+    const runbook = readFileSync(join(import.meta.dir, '../../../docs/deploy-hub.md'), 'utf8');
+    // The statements the runbook feeds to sqlite3 on the stopped hub's database.
+    const statements = /sqlite3 \/var\/lib\/agflow\/data\/agflow\.db <<'SQL'\n([\s\S]*?)\nSQL\n/.exec(runbook)?.[1];
+    if (!statements) throw new Error('the runbook shows no statements for the way back from schema version 3');
+    const db = openDb(tempDbPath(), NOW);
+    // A hub that ran on version 3: a task, an event, a grant and a recorded fetch.
+    db.run(
+      `INSERT INTO tasks (id, seq, status, contract, goal_version, created_by, created_at, updated_at)
+       VALUES ('T-1', 1, 'ready', '{}', 0, 'user:alice', 1, 1)`,
+    );
+    db.run("INSERT INTO events (ts, type, actor, subject, data) VALUES (1, 'task.fetch_granted', 'user:alice', 'T-1', '{}')");
+    db.run("INSERT INTO task_fetch_grants (task_id, granted_by, reason, granted_at) VALUES ('T-1', 'user:alice', 'why', 1)");
+    db.run(
+      `INSERT INTO agent_fetches (at, attempt_id, task_id, agent_id, url, bytes)
+       VALUES (1, 'T-1-a1', 'T-1', 'A-1', 'https://example.com/', 0)`,
+    );
+    const objects = () =>
+      (
+        db
+          .query("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+          .all() as { type: string; name: string; sql: string }[]
+      ).map((object) => `${object.type} ${object.name}: ${object.sql}`);
+    const version3 = objects();
+    db.run(statements);
+    // What the previous release asks of a database at its start: no version above the 2 it knows, and a sound file.
+    expect(db.query('SELECT MAX(version) AS v FROM schema_migrations').get()).toEqual({ v: 2 });
+    expect(db.query('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
+    expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    // Only what version 3 added is gone; everything else stays, the events of the grants included.
+    const version2 = objects();
+    expect(version3.filter((object) => !version2.includes(object)).map((object) => object.split(':')[0])).toEqual([
+      'index agent_fetches_attempt',
+      'table agent_fetches',
+      'table task_fetch_grants',
+    ]);
+    expect(version2.filter((object) => !version3.includes(object))).toEqual([]);
+    expect(db.query('SELECT (SELECT COUNT(*) FROM tasks) AS tasks, (SELECT COUNT(*) FROM events) AS events').get()).toEqual({
+      tasks: 1,
+      events: 1,
+    });
+    // Nothing of version 3 is left behind, or its step could not run again: the upgrade applies, and gives its schema.
+    migrate(db, NOW + MINUTE);
+    expect(objects()).toEqual(version3);
+    expect(db.query('SELECT version, applied_at FROM schema_migrations WHERE version = 3').get()).toEqual({
+      version: 3,
+      applied_at: NOW + MINUTE,
+    });
+    expect(db.query('SELECT (SELECT COUNT(*) FROM task_fetch_grants) AS grants, (SELECT COUNT(*) FROM agent_fetches) AS fetches').get()).toEqual({
+      grants: 0,
+      fetches: 0,
+    });
+    db.close();
   });
 
   test('migrating twice is a no-op', () => {
     const db = openDb(':memory:', NOW);
     migrate(db, NOW + MINUTE);
     const row = db.query('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number };
-    expect(row.n).toBe(2);
+    expect(row.n).toBe(3);
     expect((db.query('SELECT COUNT(*) AS n FROM hub_state').get() as { n: number }).n).toBe(1);
   });
 
@@ -126,7 +216,7 @@ describe('openDb', () => {
     const db = openDb(path, NOW);
     db.run('INSERT INTO schema_migrations (version, applied_at) VALUES (1000, 0)');
     db.close();
-    expect(() => openDb(path, NOW)).toThrow('database schema version 1000 is newer than this hub supports (2)');
+    expect(() => openDb(path, NOW)).toThrow('database schema version 1000 is newer than this hub supports (3)');
   });
 
   test('a version 1 database keeps its data and gets the defaults', () => {

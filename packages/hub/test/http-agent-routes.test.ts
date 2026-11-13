@@ -40,6 +40,11 @@ const DESIGN_TABLE = [
   'POST /api/agents/:id/replace',
   'POST /api/lead/handoff',
   'GET /api/lead/notes',
+  'POST /api/fetch',
+  'POST /api/tasks/:id/fetch-grant',
+  'DELETE /api/tasks/:id/fetch-grant',
+  'GET /api/approvals',
+  'POST /api/approvals/:id',
 ];
 
 /** A path that the route pattern matches: each parameter becomes a sample segment, a wildcard a sample page. */
@@ -49,7 +54,7 @@ function concrete(pattern: string): string {
 
 describe('the agent-token route allowlist', () => {
   test("the allowlist is exactly design 6.5's table", () => {
-    expect(DESIGN_TABLE).toHaveLength(34);
+    expect(DESIGN_TABLE).toHaveLength(39);
     expect(AGENT_ROUTES.map((route) => `${route.method} ${route.path}`).sort()).toEqual([...DESIGN_TABLE].sort());
   });
 
@@ -62,7 +67,8 @@ describe('the agent-token route allowlist', () => {
 
   test('every mounted route matches an allowlist entry or answers an agent token 403 agent_not_allowed', async () => {
     // A web build directory mounts the static catch-all too, so the walk covers every route the hub can have.
-    const hub = createTestHub({ webDist: '/nonexistent/agflow-web-dist' });
+    // AGFLOW_LEAD_APPROVALS is on, so the two approval routes answer for themselves; the next test covers it off.
+    const hub = createTestHub({ webDist: '/nonexistent/agflow-web-dist', leadApprovals: true });
     const { attempt } = addRunnerAttempt(hub.ctx);
     const token = mintAgentToken(hub.ctx, attempt);
     const routes = hub.app.routes.filter((route) => route.method !== 'ALL');
@@ -86,6 +92,54 @@ describe('the agent-token route allowlist', () => {
     expect(refused).toContain('GET /*');
   });
 
+  test('the approval routes are open to agent tokens only with AGFLOW_LEAD_APPROVALS on; off, they answer as an unlisted route', async () => {
+    const id = 'f00dfeed-0000-4000-8000-000000000000';
+    const routes: [string, string][] = [
+      ['GET', '/api/approvals'],
+      ['HEAD', '/api/approvals'],
+      ['POST', `/api/approvals/${id}`],
+    ];
+    for (const leadApprovals of [undefined, false]) {
+      const hub = createTestHub({ leadApprovals });
+      const worker = addRunnerAttempt(hub.ctx);
+      const lead = addRunnerLead(hub.ctx);
+      for (const attempt of [worker.attempt, lead.attempt]) {
+        const headers = { authorization: `Bearer ${mintAgentToken(hub.ctx, attempt)}` };
+        for (const [method, path] of routes) {
+          const answer = await hub.call(method, path, { headers, body: method === 'POST' ? { decision: 'approve' } : undefined });
+          const unlisted = await hub.call(method, '/api/runners', { headers });
+          expect([method, answer.status, unlisted.status]).toEqual([method, 403, 403]);
+          if (method === 'HEAD') continue;
+          expect(answer.json).toEqual({ error: 'agent_not_allowed', message: `an agent token cannot use ${method} ${path}` });
+          expect(Object.keys(answer.json)).toEqual(Object.keys(unlisted.json));
+        }
+      }
+    }
+    const hub = createTestHub({ leadApprovals: true });
+    const worker = addRunnerAttempt(hub.ctx);
+    const lead = addRunnerLead(hub.ctx);
+    const auth = (attempt: typeof lead.attempt) => ({ headers: { authorization: `Bearer ${mintAgentToken(hub.ctx, attempt)}` } });
+    for (const [method, path] of routes.filter(([method]) => method !== 'HEAD')) {
+      const body = method === 'POST' ? { decision: 'approve' } : undefined;
+      const byWorker = await hub.call(method, path, { ...auth(worker.attempt), body });
+      expect([method, byWorker.status, byWorker.json.error]).toEqual([method, 403, 'approval_not_lead']);
+      const byLead = await hub.call(method, path, { ...auth(lead.attempt), body });
+      expect([method, byLead.status]).toEqual([method, method === 'GET' ? 200 : 404]);
+      // Runner identity comes only from agt_: a session cannot name the runner lead to answer as it.
+      const impersonated = await hub.call(method, path, { user: 'alice', agent: lead.agent.id, body });
+      expect([method, impersonated.status, impersonated.json.error]).toEqual([method, 403, 'forbidden']);
+    }
+    // Nothing else under the approvals paths is open to an agent token.
+    for (const [method, path] of [
+      ['GET', `/api/approvals/${id}`],
+      ['DELETE', `/api/approvals/${id}`],
+      ['POST', '/api/approvals'],
+      ['POST', `/api/approvals/${id}/approve`],
+    ]) {
+      expect([method, path, isAgentRouteAllowed(method as string, path as string)]).toEqual([method, path, false]);
+    }
+  });
+
   test('live, CLI sign-in, agent list, claim and resume-claim refuse agent tokens; the reads are allowed', () => {
     const refused: [string, string][] = [
       ['POST', '/api/live/session-start'],
@@ -99,7 +153,6 @@ describe('the agent-token route allowlist', () => {
       ['POST', '/api/tasks/T-1/claim'],
       ['POST', '/api/tasks/T-1/resume-claim'],
       ['POST', '/api/tasks/T-1/release-claim'],
-      ['GET', '/api/approvals'],
       ['GET', '/api/runners'],
       ['GET', '/api/attempts'],
       ['GET', '/api/attempts/T-1-a1'],
@@ -153,10 +206,15 @@ describe('the agent-token route allowlist', () => {
       ['POST', '/api/agents/:id/replace'],
       ['POST', '/api/lead/handoff'],
       ['GET', '/api/lead/notes'],
+      ['POST', '/api/tasks/:id/fetch-grant'],
+      ['DELETE', '/api/tasks/:id/fetch-grant'],
+      ['GET', '/api/approvals'],
+      ['POST', '/api/approvals/:id'],
     ];
     for (const [method, path] of lead) expect([method, path, access(method, path)]).toEqual([method, path, 'lead']);
     expect(access('GET', '/api/tasks')).toBe('read');
     expect(access('GET', '/api/submissions/:id')).toBe('own');
+    expect(access('POST', '/api/fetch')).toBe('own');
     expect(access('POST', '/api/inbox')).toBe('self');
     expect(new Set(AGENT_ROUTES.map((route) => `${route.method} ${route.path}`)).size).toBe(AGENT_ROUTES.length);
   });

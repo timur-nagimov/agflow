@@ -114,7 +114,7 @@ Agents run as the laptop owner's user. Four boundaries contain them, and tests i
    - A runner agent cannot be impersonated with the owner's CLI token.
 4. **Git.** Agents cannot push: no route to the host, no credentials, and `protocol.allow=never`. Only the runner pushes, from the vault, which agents cannot write.
 
-**Approvals.** Boundaries 1 and 2 hold only until the owner approves an escalation. Codex runs an approved command outside the sandbox, with network and the owner's full write access. Package managers also run lifecycle scripts from manifests the agent can edit. So the runner never answers an approval request itself, on any device: every request goes to the owner, and the Approvals view says what approving means (section 6.10).
+**Approvals.** Boundaries 1 and 2 hold only until the owner approves an escalation. Codex runs an approved command outside the sandbox, with network and the owner's full write access. Package managers also run lifecycle scripts from manifests the agent can edit. So the runner never answers an approval request itself, on any device: every request goes to the owner, and the Approvals view says what approving means (section 6.10). With `AGFLOW_LEAD_APPROVALS=1` the lead may answer some of them too (Unattended options, below).
 
 **Text from agents.** Text an agent wrote never reaches another agent unquoted or as hub-authored instructions. This covers notes, handoffs, commit messages, transcript tails, restatements and messages.
 
@@ -124,7 +124,7 @@ Both sandboxes also let agent commands read the argv and environment of every pr
 
 **Attempts on one laptop trust each other.** Agent tokens sit in the vendor processes' environment (and, for Claude, in its argv through the MCP config). Other same-user processes can read them. Fencing, short token life and boundary 1 limit the effect.
 
-**Device policy.** agflow never works around an organisation's policy. On a device whose Codex policy is managed, nothing changes, because the runner already answers no approval.
+**Device policy.** agflow never works around an organisation's policy. On a device whose Codex policy is managed, nothing changes, because the runner already answers no approval. No setting lets an agent approve a request there (Unattended options, below).
 
 **Residual risks:**
 - **Shell profile.** The mitigation is implemented: the adapter sets `ZDOTDIR=<claudeHome>/agflow-empty`, drops any incoming `CLAUDE_CODE_SHELL`, and sets `CLAUDE_CODE_SHELL=/bin/zsh` unless the basename of `SHELL` is already `zsh`. Only the snapshot sources the owner's `~/.zshrc` outside the sandbox, once per Claude process, with the agent's environment. `~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc` do not run around agent commands. The snapshot remains an accepted residual risk.
@@ -133,6 +133,47 @@ Both sandboxes also let agent commands read the argv and environment of every pr
 - **The `auto` profile.** Claude's classifier decides Bash commands that would otherwise prompt, within the sandbox. The guard still confines `Edit` and `Write`.
 - **The CLI's own writes into `HOME`.** Even with its own config directory, the Claude CLI process (not the agent's tools) writes `~/.claude/bridge-spawn`, `~/Library/Caches/claude-cli-nodejs/<slug>/mcp-logs-agflow/` and `~/.config/anthropic` into the owner's home.
 - **Keychain.** Denying reads of `~/Library/Keychains` blocks `security` lookups. This was verified with `sandbox-exec`, and inside Codex's sandbox. A plan test checks it with a throwaway item: the lookup must succeed outside the sandbox and fail inside.
+
+### Unattended options
+
+Two hub settings let a project run with no person in the loop. Both are off by default, and with both off everything above holds as written. Neither changes the protocol between hub and runner or what a runner allows its agents. The runner's only part is to name the lead's four new tools to a Codex lead (section 10).
+
+**Internet through the hub (`AGFLOW_AGENT_FETCH=1`).**
+- **What it is for.** Some tasks need outside data: a specification, an API's documentation, a public data file. Without the setting a person has to bring it into the repository.
+- **What it changes.** The hub downloads one public URL at a time for a Claude agent (`POST /api/fetch`), and the bridge writes the bytes into the agent's clone. The lead's own attempt may ask; a worker's attempt may ask only after the lead seat holder, or a person, granted its task (`POST /api/tasks/:id/fetch-grant`, with a reason). There is no list of allowed sites and no person in between: the lead decides which task needs it.
+- **How long a grant lasts.** A grant belongs to the task, not to an attempt: the task's next attempt fetches on it, and a second grant of a granted task changes nothing. It ends in one of three ways, each recorded as `task.fetch_revoked`:
+  - the lead or a person takes it back (`DELETE` on the grant's route), which works whatever the setting says;
+  - the task closes (accepted, merged, cancelled or failed): the hub ends the grant in the same transaction, so no closed task holds one, and a task that opens again starts without;
+  - the hub starts with the setting off: it ends every grant it finds and names their tasks in its log, so nothing comes back to life when the setting is turned on again. While the setting is off no task reads as granted.
+- **How the agent learns of it.** The agent assigned at the moment of the grant gets a message with the reason. The task pack says that the task has internet access, in agflow's own words and with the same rules, and it is composed for every start and resume. So a task granted before it was dispatched, and every successor, read it there.
+- **What stays.**
+  - Agents still have no network of their own. Boundary 1 is unchanged; the request travels over the bridge's existing connection to the hub.
+  - Only runner agent tokens can fetch, and only for an open attempt. People's tokens cannot, and a worker cannot grant itself anything: granting needs the lead seat.
+  - A stop request ends an attempt's fetching at once, as it ends its submissions and preparation requests: the next fetch answers 409 `fetch_attempt_stopping`, though the attempt stays open until its agent exits or the stop times out. A cancel of the task and the agent's own release are stop requests too, and the rule holds for the lead's attempt as for a worker's. A fetch already under way finishes, within the fetch's own time limit.
+  - A worker's grant counts only while its task is open and names this attempt as its current one.
+  - Codex agents get no fetch, with or without a grant. Their sandbox does not keep them from reading the owner's files (Reads, above), so an outbound channel would let them leak those files.
+  - The hub fetches public addresses only. It refuses loopback, private, link-local and other non-public addresses in every spelling, in every DNS answer and after every redirect, and it connects to the address it checked, so a second DNS answer cannot redirect the request.
+  - It follows at most 5 redirects, takes at most 20 s, refuses bodies over 10 MB and limits the rate of requests (429: the agent retries a little later).
+  - The hub owns the socket of every request (`socket-transport.ts`), because a general HTTP client gives no bound on what a site may send before the body. The head of an answer is capped at 64 KiB; the connection is closed the moment an answer is dropped (a redirect, an over-long body, an encoding the hub does not read); TLS is verified against the host name; proxies named in the hub's environment are never used.
+  - Every request the hub made, or refused by its URL and address rules, is recorded in the hub's `agent_fetches` table: the time, the attempt, task and agent, the whole URL the agent sent, where the redirects ended, the HTTP status or the error, and the size. The row is written before anything of the request leaves the hub, and a request the hub cannot record is not made. The attempt's log shows the same requests, but it keeps only an attempt's newest 500 entries, so the table is the record that lasts (section 6.18 bounds it). No route reads the table, so no agent can: people query it on the hub ([the hub runbook, Unattended operation](../../deploy-hub.md#unattended-operation)).
+  - The bridge writes only inside the clone, never into `.git` or `.agflow`, and never through a symlink.
+  - Dependency preparation stays registries-only (section 7.7).
+- **What it weakens.** A granted Claude agent has a way to send data out, one URL at a time.
+- **Residual risks.**
+  - **Leaks.** A prompt-injected Claude agent with a grant can leak whatever its sandbox lets it read, through the URLs it asks for. So grant only the tasks that need outside data, and take a grant back once its task no longer needs it; at the latest it ends when the task closes. The lead's own attempt needs no grant, so the same holds for a prompt-injected lead for as long as the setting is on.
+  - **Untrusted pages.** A downloaded page is untrusted input to the agent that reads it. It can carry instructions written for agents.
+  - **The hub's address.** The hub makes the requests, so other sites see the hub's address, and limits or blocks they apply fall on the hub.
+
+**Approvals decided by the lead (`AGFLOW_LEAD_APPROVALS=1`).**
+- **What it is for.** An approval request waits for the runner's owner. An owner who does not answer loses the request and gets their account marked away, which stops that vendor on their runners until a person acts (section 6.10).
+- **What it changes.** The agent holding the lead seat may answer pending approvals too, through its agent token. It may decline any request that did not come from its own attempt, with a reason the asking agent sees. It may approve one only when the runner reports no managed device policy for that vendor. The hub sends the lead one message per request. A request that expires while such a lead could have answered marks nobody away.
+- **What stays.**
+  - The runner still answers no approval itself, and the owner may still answer in the browser; the first answer wins.
+  - A worker can never answer an approval, and the lead never answers its own requests.
+  - A managed device stays owner-approved: there the device's administrator requires the owner's own approval, so the lead may only decline. A runner or vendor the hub cannot find counts as managed, and so does a vendor the runner reports not ready: its policy was not read.
+  - Only an owner's decision clears an owner-away mark.
+- **What it weakens.** The lead's judgement stands in for the owner's. An approved command runs outside the sandbox with the owner's network and write access (Approvals, above), and now an agent can allow that on an unmanaged device.
+- **Residual risks.** A lead can be misled by the text of a worker's request. So the hub quotes the request as data, never as instructions, and tells the lead to decline anything that touches secrets or files outside the clone. That lowers the risk; it does not remove it. Turn the setting on only for runners whose owners accept an agent's decision in place of their own.
 
 ## 6. Hub
 
@@ -972,7 +1013,7 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 - **Route allowlist.** Agent principals are accepted only on the routes the bridge uses. Every other route answers **403 `agent_not_allowed`**, including:
   - `/api/live/*`, `/api/cli-login/*` and `GET /api/agents`;
   - claim and resume-claim;
-  - approvals, runners, attempts, take-over and the runner gateway.
+  - approvals (unless `AGFLOW_LEAD_APPROVALS=1`, in the table below), runners, attempts, take-over and the runner gateway.
 
   The list lives in one table in `packages/hub/src/http/agent-routes-allowed.ts`. A test enumerates every mounted route and checks that each is on the list or refuses an agent token.
 
@@ -987,6 +1028,9 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 | `POST /api/fetch-submission`, `GET /api/fetch-submission/:id` | lead only: the caller must hold the seat; polling is restricted to the lead attempt that requested the fetch (section 6.13) |
 | `POST /api/inbox`, `POST /api/inbox/ack`, `POST /api/messages` | |
 | lead routes: `POST /api/tasks`, `PATCH /api/tasks/:id`, `POST /api/tasks/:id/{cancel,accept,reject,unblock,merged}`, `POST /api/goal/notes`, `POST /api/staffing`, `POST /api/agents/:id/{stop,replace}`, `POST /api/lead/handoff`, `GET /api/lead/notes` | only while the agent holds the lead seat (section 6.11). Stop and replace apply only to runner agents. |
+| `POST /api/fetch` | every runner agent, for its own attempt: the hub downloads one public URL. Refused unless `AGFLOW_AGENT_FETCH=1`, for an attempt that was asked to stop (409 `fetch_attempt_stopping`), for Codex attempts, and for a worker whose open task holds no grant or names another attempt (section 5, Unattended options) |
+| `POST /api/tasks/:id/fetch-grant`, `DELETE /api/tasks/:id/fetch-grant` | lead only: grants a task internet access and takes it back. Granting answers 403 `fetch_disabled` unless `AGFLOW_AGENT_FETCH=1`; taking back works whatever the setting (section 5, Unattended options) |
+| `GET /api/approvals`, `POST /api/approvals/:id` | lead only, and only with `AGFLOW_LEAD_APPROVALS=1`: lists the pending approvals of other attempts and answers one; without the setting, 403 `agent_not_allowed` as on a route this table does not list (section 5, Unattended options) |
 
 `leadOrHuman` changes for every agent principal, live or runner: the agent must hold the seat (`hub_state.lead_agent_id`). For `fetch_submission`, a runner lead uses its ordinary agent token; there is no separate lead token. A live lead uses the M1 CLI token plus `X-Agflow-Agent` and gets the branch and head immediately. A person without an agent identity cannot call either fetch route.
 
@@ -1197,7 +1241,7 @@ It closes with: "No handoff note was written; the next step is unknown. Read the
 - If the reset is more than `quotaWaitMaxMs` (45 minutes) away, or unknown, the hub replaces the attempt (class `infra`, no handoff turn) — but only if a placement with quota exists right now. Otherwise the attempt stays in `quota_wait`, and with an unknown reset the runner retries its turn every `quotaUnknownMs`.
 
 **Approvals.** Only Codex raises approval requests in M2. Claude agents run with `permissionPrompts: 'none'`, so anything that would prompt is denied at once and the turn continues.
-- **The runner decides nothing.** Every request is relayed to the agent's owner, on every device.
+- **The runner decides nothing.** Every request is relayed to the hub for the agent's owner, on every device.
 - **Identity.**
   - The runner mints an approval id (UUID) for each vendor request and maps it, in memory, to (agent process instance, vendor request id).
   - `approval.requested` carries that id and the fence.
@@ -1210,11 +1254,22 @@ It closes with: "No handoff note was written; the next step is unknown. Read the
 
   `approve` maps only to Codex's `accept`, never to session-wide or policy-amending answers. A file-change request with a non-null `grantRoot` shows that root with the warning "approving may let the agent write anywhere under this root for the rest of the session". Its default action, like expiry, is decline.
 - **Expiry.** A request not answered within `AGFLOW_APPROVAL_MINUTES` (15) of the hub receiving it is declined. The agent sees the reason: "the owner did not answer; continue without it or declare_blocked". Time in `waiting_approval` counts toward neither budgets nor stall timers.
-- **Owner away.** After a timeout, the owner's account for that vendor becomes `ownerAway` until the owner acts: any approval decision, or a change to one of their runners (`PATCH /api/runners/:id`). While it is set, the scheduler places no new attempts of that vendor on the owner's runners. The lead gets one notice when ready work cannot be placed because of it, not one per request.
-- **Notifications.** The runner posts a macOS notification for each relayed request, with the summary and the Approvals address, `<hub>` followed by core's `APPROVALS_ROUTE` (`#/approvals`), in its text: a notification cannot open a link. The attempt controller relays the request and calls the runner's notifier; nothing is posted in test mode.
-- **Who may answer.** Only the owner, in a browser session. Every decision is an event.
 
-**Managed devices.** `managedPolicy` is detected at preflight (section 9.1) and shown on the Runners card. Because the runner never answers approvals, it changes no behaviour. It explains why so much needs the owner on such a device.
+  An expired request marks the owner away (next item) only when nobody but the owner could have answered it: `AGFLOW_LEAD_APPROVALS` is off, or no agent holds the lead seat at that moment, or the seat holder is the asking agent itself. Otherwise it is declined with a reason saying that nobody answered, and no one is marked away. With a lead answering, one missed request is no sign of an absent owner, and a mark would stop the vendor until a person acts.
+- **Owner away.** After such a timeout, the owner's account for that vendor becomes `ownerAway` until the owner acts: any approval decision of their own, or a change to one of their runners (`PATCH /api/runners/:id`). A lead's decision never clears it. While it is set, the scheduler places no new attempts of that vendor on the owner's runners. The lead gets one notice when ready work cannot be placed because of it, not one per request.
+- **Notifications.** The runner posts a macOS notification for each relayed request, with the summary and the Approvals address, `<hub>` followed by core's `APPROVALS_ROUTE` (`#/approvals`), in its text: a notification cannot open a link. The attempt controller relays the request and calls the runner's notifier; nothing is posted in test mode.
+- **Who may answer.** By default only the owner, in a browser session (`POST /api/approvals/:id { decision: 'approve' | 'decline' }`). Every decision is an event.
+
+  With `AGFLOW_LEAD_APPROVALS=1` the agent holding the lead seat may answer too, through its agent token (section 5, Unattended options). With the setting off, an agent token is refused as before.
+  - **Decline.** The lead may decline any pending approval that did not come from its own attempt. Declining is always safe: no command runs. A lead's decline needs a reason (1 to 500 characters). The asking agent sees it, so the lead says what to do instead.
+  - **Approve.** The lead may approve only when, in addition, the runner does not report `managedPolicy` for the asking attempt's vendor. A managed device policy means the device's administrator requires the owner's own approval: the lead never approves there, whatever the setting. It may decline the request or leave it to the owner. A runner or vendor entry the hub cannot find counts as managed, so the check fails closed. The reason is optional on approve.
+  - **First answer wins.** The owner may still answer in the browser. `decided_by` records `agent:<id>` for the lead. Only an owner's decision clears owner-away marks.
+  - **Notice.** When a request arrives while the setting is on and an agent other than the asking one holds the lead seat, the hub sends the lead one system message. It gives the approval id, the asking agent and its vendor, the task, the kind and the summary, and says whether the lead may approve the request or only decline it, and how to answer (`decide_approval`). The detail is quoted as untrusted data (`quoteLines`), like every text an agent wrote.
+  - **Listing.** `GET /api/approvals` with the lead's agent token returns `{ approvals }`: the pending approvals the lead may answer, every owner's, without those of its own attempt, oldest first. Each is the usual approval object plus `leadMayApprove: boolean`. People keep seeing their own.
+  - **Deciding.** `POST /api/approvals/:id` with the lead's agent token takes `{ decision: 'approve' | 'decline', reason?: string }` (reason up to 500 characters) and returns `{ approval }`. Each refusal has its own error code and a message the lead can act on: the caller does not hold the lead seat; the approval came from the lead's own attempt; approve on a managed or unknown runner vendor (the message says to decline it with a reason, or to leave it to the owner); a decline without a reason; no longer pending (409, as for people).
+  - **Bridge tools.** The lead's bridge offers `list_approvals()` and `decide_approval(id, decision, reason?)`.
+
+**Managed devices.** `managedPolicy` is detected at preflight (section 9.1) and shown on the Runners card. Because the runner never answers approvals, it changes nothing on the runner. It explains why so much needs the owner on such a device. On the hub it decides one thing: with `AGFLOW_LEAD_APPROVALS=1`, the lead may decline that vendor's requests there but never approve them.
 
 ### 6.11 The lead on runners
 
@@ -1406,8 +1461,8 @@ All request and response bodies have zod schemas in `packages/core/src/api-schem
 | `POST /api/agents/:id/replace` | person (browser), or the lead for runner workers | `{ reason }` → `{ attempt }`; 409 for live chats |
 | `POST /api/tasks/:id/takeover` | person (browser) | → `202 { attemptId }`; 409 `runner_offline`, `not_running` or `submission_pending` |
 | `POST /api/tasks/:id/handback` | person (browser) | `{ source: 'clone' \| { ref, sha } }` (sha: 40 hex) → `202 { attemptId }` |
-| `GET /api/approvals` | signed in | `?status=` (a comma list) → `{ approvals: Approval[] }`, the caller's own |
-| `POST /api/approvals/:id` | owner, browser | `{ decision: 'approve' \| 'decline' }` → `{ approval }` |
+| `GET /api/approvals` | signed in; with `AGFLOW_LEAD_APPROVALS=1`, the lead's agent token | `?status=` (a comma list) → `{ approvals: Approval[] }`, the caller's own. The lead: the pending ones it may answer (every owner's, none of its own attempt), oldest first, each with `leadMayApprove` |
+| `POST /api/approvals/:id` | owner, browser; with `AGFLOW_LEAD_APPROVALS=1`, the lead's agent token | `{ decision: 'approve' \| 'decline' }` → `{ approval }`. The lead adds `reason?` (1..500, required to decline); 403 `approval_not_lead`, `approval_own`, `approval_managed` (approve on a runner whose vendor reports a managed policy or is not ready, or that the hub cannot find), 400 `approval_reason_required`, 409 when no longer pending |
 | `POST /api/staffing` | seat holder or person | `{ count, vendor?, reason }` → `{ running, target }` |
 | `POST /api/tasks/:id/submit` | agent token (runner agent) | `{ summary, evidence }` only (a `branch` or `headSha` is a 400) → `202 { submission }` (live chats keep M1's `200 { task }`) |
 | `POST /api/agents/:id/interrupt` | person (browser) | → `{ ok }`; sends `interrupt` to a runner agent |
@@ -1435,7 +1490,7 @@ The types:
 - **approvals:** `approval.requested`, `approval.decided`, `approval.expired`, `approval.voided`;
 - **lead:** `lead.seat_changed`, `lead.rotated`;
 - **submissions:** `submission.pending`, `submission.recorded`, `submission.failed`;
-- **tasks:** `task.taken_over`, `task.handed_back`, `task.refs_deleted`;
+- **tasks:** `task.taken_over`, `task.handed_back`, `task.refs_deleted`, `task.fetch_granted`, `task.fetch_revoked` (the last two name the task and who decided; no attempt or runner applies. `task.fetch_revoked` is by `system` when the grant ended with its task, or at a start with `AGFLOW_AGENT_FETCH` off);
 - **guards:** `guard.plan_change`, `guard.dispatch_paused`;
 - **hub:** `system.recovery_started`, `system.recovery_ended`, `system.restored`.
 
@@ -1450,6 +1505,7 @@ Each removal runs on a daily timer outside the tick:
 | decided approvals | deleted after 90 days |
 | `runner_event_rejects` | deleted after 30 days |
 | `attempt_log` | at most 500 rows per attempt |
+| `agent_fetches` (section 5, Unattended options) | rows deleted after 90 days; at most 250,000 rows, the oldest going as each new one is written (this one on every insert, not on the timer). Each request is one row and an attempt gets 120 requests in 10 minutes, so one agent fetching at its limit without a pause needs 14 days to push a row out |
 | remote refs | 7 days after a task is merged, cancelled or failed, an online runner of the task's last attempt (or any runner) gets `delete_refs` for the refs under `<wipRefPrefix><task>/` whose sha the hub recorded (WIP, late work, hand-back), with fenced deletes. A successful result records `task.refs_deleted`; until then the daily run retries. Refs with no recorded sha (a take-over ref never handed back) stay. |
 
 ## 7. Runner
@@ -1991,15 +2047,19 @@ query({
 - It uses the token as its bearer, sends no `X-Agflow-Agent`, and reads no credentials file. It does not call the hub at startup.
 - `hello` answers "already connected".
 - **Tools follow `AGFLOW_ROLE`:**
-  - **workers:** the shared tools, `report_progress`, `write_handoff`, `declare_blocked`, `declare_impossible`, `release_task`, `submit` (section 6.13) and `prepare_dependencies` (section 7.7). Not `claim_task` or `resume_claim`: the task is assigned.
+  - **workers:** the shared tools, `report_progress`, `write_handoff`, `declare_blocked`, `declare_impossible`, `release_task`, `submit` (section 6.13) and `prepare_dependencies` (section 7.7). Not `claim_task` or `resume_claim`: the task is assigned. Also `fetch_url(url, save_as)` (section 5, Unattended options): it asks the hub to download one public URL and saves the answer into the agent's clone (`AGFLOW_CLONE`, never the bridge's own working directory).
   - **leads:** the shared tools and the M1 lead tools, plus:
     - `request_agents(count, vendor?, reason)`;
     - `replace_agent(agent_id, reason)` and `stop_agent(agent_id, reason, hold?)`, for runner agents only;
     - `write_handoff` with an optional task id (none: a lead handoff);
     - `get_lead_notes()`;
     - `fetch_submission(task_id)` (section 6.13): wait for the submitted branch in the runner vault, then fetch from `origin` and review `FETCH_HEAD`.
+    - `grant_internet(task_id, reason)` and `revoke_internet(task_id)` (section 5, Unattended options), which the live bridge serves too;
+    - `list_approvals()` and `decide_approval(id, decision, reason?)` (section 6.10), for a runner lead only;
+    - `fetch_url(url, save_as)`, as for workers; the lead needs no grant.
 
     No claim, resume-claim or submit.
+- **Names.** The runner names each role's tools to its agents (`BRIDGE_TOOL_NAMES`), which a Codex thread needs because it loads MCP tools on demand. `fetch_url` is served but named to nobody (`BRIDGE_UNNAMED_TOOLS`): it works for Claude agents only, and Claude lists its bridge's tools itself, so a Codex agent is not told about a tool that refuses it.
 - **Answers:**
   - **401 `attempt_ended`:** every tool answers "Your agflow attempt has ended (<reason>). Stop working; do not commit further."
   - **401 `attempt_refenced`:** "agflow is restarting your session; stop and wait."

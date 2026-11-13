@@ -2,6 +2,9 @@ import type { Database } from 'bun:sqlite';
 import { DEFAULT_INFRA_BACKOFF_MS, DEFAULT_WIP_REF_PREFIX } from '@agflow/core';
 import { openDb } from './db';
 import { type Emit, EventBus, insertEvent } from './events';
+import { FetchLimiter } from './fetch-limits';
+import { type PublicFetchLimits, type Resolver, type Transport, systemResolver } from './public-fetch';
+import { createSocketTransport } from './socket-transport';
 
 export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -133,6 +136,17 @@ export interface HubConfig extends HubRunnerSettings {
    * dependent's work starts from a main branch that holds it. Off by default (M2: acceptance counts).
    */
   dependenciesNeedMerge?: boolean | undefined;
+  /**
+   * AGFLOW_AGENT_FETCH: the hub downloads public URLs for Claude runner agents (POST /api/fetch), for the lead and for
+   * the tasks the lead granted (design 5, Unattended options). Off by default: agents then reach nothing outside.
+   */
+  agentFetch?: boolean | undefined;
+  /**
+   * AGFLOW_LEAD_APPROVALS: the agent holding the lead seat may answer the approvals of other agents' attempts with its
+   * agent token (design 6.10, Who may answer): decline any of them, approve only those of a runner whose vendor reports
+   * no managed device policy. Off by default: only the owner answers, in a browser.
+   */
+  leadApprovals?: boolean | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */
@@ -146,6 +160,21 @@ export interface RunnerLink {
 /** The link until the gateway installs itself: commands wait in runner_commands for the runner's next hello. */
 export const NO_RUNNER_LINK: RunnerLink = Object.freeze({ flush: () => {}, closeRunner: () => {} });
 
+/**
+ * What the hub fetches public URLs for agents with (design 5, Unattended options; agent-fetch.ts). Tests replace the
+ * resolver and the transport with tables and local servers, and the wait with one that moves their clock.
+ */
+export interface AgentFetchRuntime {
+  resolve: Resolver;
+  transport: Transport;
+  /** Waits for a host's slot. */
+  sleep: (ms: number) => Promise<void>;
+  /** The rate limits, in memory. */
+  limiter: FetchLimiter;
+  /** Overrides of the fetch's own limits (public-fetch.ts); none in production. */
+  limits: Partial<PublicFetchLimits>;
+}
+
 export interface HubContext {
   db: Database;
   bus: EventBus;
@@ -153,6 +182,7 @@ export interface HubContext {
   now: () => number;
   fetch: FetchFn;
   link: RunnerLink;
+  agentFetch: AgentFetchRuntime;
 }
 
 export interface ContextOptions {
@@ -161,7 +191,15 @@ export interface ContextOptions {
   now?: (() => number) | undefined;
   fetch?: FetchFn | undefined;
   link?: RunnerLink | undefined;
+  agentFetch?: Partial<AgentFetchRuntime> | undefined;
 }
+
+/**
+ * The fetch limiter's clock when the context is given none: one that only moves forward. The limiter remembers when
+ * hosts are free and when requests were counted, so on the wall clock a step back (a time sync) would leave hosts
+ * busy and requests counted until the clock had caught up. A context given a clock, as tests give one, limits by it.
+ */
+const steadyNow = (): number => Math.floor(performance.now());
 
 export function createContext(options: ContextOptions): HubContext {
   const now = options.now ?? (() => Date.now());
@@ -177,6 +215,14 @@ export function createContext(options: ContextOptions): HubContext {
     now,
     fetch: options.fetch ?? ((input, init) => fetch(input, init)),
     link: options.link ?? NO_RUNNER_LINK,
+    agentFetch: {
+      resolve: systemResolver,
+      transport: createSocketTransport(),
+      sleep: (ms) => Bun.sleep(ms),
+      limiter: new FetchLimiter(options.now ?? steadyNow),
+      limits: {},
+      ...options.agentFetch,
+    },
   };
 }
 

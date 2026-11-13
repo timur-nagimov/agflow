@@ -145,7 +145,7 @@ describe('restoreBackup', () => {
     db.close();
     expect(restoreBackup({ dbPath, backupPath: old, now: NOW }).epoch).toBe(2);
     const restored = new Database(dbPath, { readonly: true });
-    expect(restored.query('SELECT MAX(version) AS v FROM schema_migrations').get()).toEqual({ v: 2 });
+    expect(restored.query('SELECT MAX(version) AS v FROM schema_migrations').get()).toEqual({ v: 3 });
     expect(restored.query('SELECT epoch FROM project').get()).toEqual({ epoch: 2 });
     restored.close();
   });

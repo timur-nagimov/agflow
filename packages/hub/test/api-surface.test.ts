@@ -77,7 +77,7 @@ describe('the API surface', () => {
       return text.includes(`type: ${helper}(`) && returns(helper).some((line) => line.includes(`'${type}'`));
     };
     const types = Object.keys(HUB_EVENT_TYPES);
-    expect(types).toHaveLength(37);
+    expect(types).toHaveLength(39);
     expect(Object.keys(viaHelper).filter((type) => !types.includes(type))).toEqual([]);
     expect(types.filter((type) => !emitted(type))).toEqual([]);
   });

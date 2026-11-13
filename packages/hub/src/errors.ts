@@ -1,6 +1,6 @@
 import { BRIDGE_ANSWERS } from '@agflow/core';
 
-export type HubErrorStatus = 400 | 401 | 403 | 404 | 409 | 415 | 426;
+export type HubErrorStatus = 400 | 401 | 403 | 404 | 409 | 415 | 426 | 429 | 502 | 504;
 
 export class HubError extends Error {
   constructor(

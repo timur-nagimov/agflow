@@ -69,6 +69,8 @@ export function runnerToolContext(env: Record<string, string | undefined>): Runn
     runner: {
       attemptId: env.AGFLOW_ATTEMPT_ID as string,
       role,
+      // The bridge starts in a directory of the runner's, never in the clone (design 10), so the clone is named.
+      clone: env.AGFLOW_CLONE || undefined,
       pollMs: positiveMs(env.AGFLOW_BRIDGE_POLL_MS, DEFAULT_POLL_MS),
       pollMaxMs: positiveMs(env.AGFLOW_BRIDGE_POLL_MAX_MS, DEFAULT_POLL_MAX_MS),
     },

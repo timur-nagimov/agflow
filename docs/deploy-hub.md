@@ -94,6 +94,47 @@ If activation or server readiness fails, the script restores the previous symlin
 
 After deployment open the UI, sign in as each allowed user, check live Timeline updates, and connect one Mac runner. Check the Caddy certificate and runner reconnect after a hub restart. These are deployment acceptance checks, separate from the local regression suite.
 
+### Upgrading to schema version 3
+
+This release moves the database from schema version 2 to 3. Version 3 adds two tables: the internet grants
+(`task_fetch_grants`) and the record of what agents fetched (`agent_fetches`). Both stay empty unless
+`AGFLOW_AGENT_FETCH=1`. The hub migrates the database in place the first time it starts.
+
+The previous release cannot open a version 3 database: it stops at start with "database schema version 3 is newer
+than this hub supports (2)", and it cannot restore a backup written after the upgrade either. So a deployment that
+fails after the migration and rolls back leaves the previous hub unable to start.
+
+Before deploying, copy the newest backup aside, under a name the backup rotation does not remove:
+
+```bash
+sudo -u agflow sh -c 'cp -p "$(ls -t /var/lib/agflow/backups/agflow-*.db | head -n 1)" /var/lib/agflow/backups/before-schema-3.db'
+sudo ls -l /var/lib/agflow/backups/before-schema-3.db
+```
+
+The way back to the previous release does not need that backup, and keeps everything done since the upgrade except
+the grants and the record of fetches. Stop the hub and take out what version 3 added:
+
+```bash
+sudo systemctl stop agflow-hub
+sudo systemctl is-active agflow-hub    # should report inactive
+sudo apt-get install -y sqlite3        # once: the host template does not install it
+sudo -u agflow sqlite3 /var/lib/agflow/data/agflow.db <<'SQL'
+BEGIN;
+DROP TABLE agent_fetches;
+DROP TABLE task_fetch_grants;
+DELETE FROM schema_migrations WHERE version = 3;
+COMMIT;
+SQL
+```
+
+Then start the previous release. After a deployment that rolled back by itself it is already in place:
+`sudo systemctl start agflow-hub`. Otherwise deploy it with the usual command. It ignores `AGFLOW_AGENT_FETCH` and
+`AGFLOW_LEAD_APPROVALS` in `hub.env`. To keep the record of fetches, save it before the statements above:
+`sudo -u agflow sqlite3 /var/lib/agflow/data/agflow.db ".dump agent_fetches" > agent_fetches.sql`. Deploying this
+release again later migrates the database to version 3 again, with both tables empty. Restore
+`before-schema-3.db` only if the database itself is damaged: it brings back the state of that backup and loses
+what happened since.
+
 ## Add or remove a person
 
 Grant the colleague read/write access to the project repository on GitHub and add their GitHub login (not display name/email) to the comma-separated `AGFLOW_ALLOWED_USERS`. Then:
@@ -125,6 +166,68 @@ operator's person as the actor.
 
 With an operator that merges, also set `AGFLOW_DEPENDENCIES_NEED_MERGE=1`: a dependency then counts as done only once
 it is marked merged, so the hub releases dependent tasks after their dependencies are in `main`, not at acceptance.
+
+## Unattended operation
+
+By default a person merges accepted work, brings outside data into the repository and answers every approval request.
+Four opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
+after a change. The rules behind the last two are in the
+[M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
+
+- **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal, marking tasks
+  merged, unblocking and messaging the lead by hand. Risk: whoever reads the token acts as the operator's person on
+  those routes, so keep it on the server only.
+- **`AGFLOW_DEPENDENCIES_NEED_MERGE=1`.** Removes: checking that a dependency reached `main` before dependent work
+  starts. Risk: if nothing marks accepted tasks merged, dependent tasks wait forever. Set it only together with an
+  operator that merges.
+- **`AGFLOW_AGENT_FETCH=1`.** Removes: fetching outside data for agents. The hub downloads one public URL at a time
+  for a Claude agent, for the lead and for the tasks the lead granted internet access, and the agent's bridge saves
+  the file inside its clone. Agents still have no network of their own. Risk: an agent that reads hostile text can
+  leak whatever its sandbox lets it read, through the addresses it asks for; downloaded pages are untrusted input to
+  the agent; the requests come from this server's address. The hub refuses non-public addresses, caps time, size and
+  rate, and records every request ([What agents fetched](#what-agents-fetched)). The service unit adds a second
+  layer: `IPAddressDeny` keeps the hub process from link-local addresses, where a cloud's metadata service answers.
+  Grants belong on tasks that need outside data. A grant ends when the lead or a person takes it back, when its
+  task is accepted, merged, cancelled or failed, and when the hub starts with the setting off: turning the setting
+  off and restarting ends every grant, and the hub's journal names the tasks. An agent that was asked to stop
+  fetches nothing more.
+- **`AGFLOW_LEAD_APPROVALS=1`.** Removes: the runner owner answering each Codex approval request in a browser. The
+  agent holding the lead seat may decline other agents' requests, with a reason, and approve them when the device's
+  Codex policy is not managed. A request nobody answered in time is then declined without marking the owner away. The
+  owner can still answer first. Risk: an approved command runs outside the sandbox, with network access and write
+  access to all the owner's files, on the lead's judgement instead of the owner's, and a lead can be misled by the
+  text of a request.
+
+### What agents fetched
+
+With `AGFLOW_AGENT_FETCH=1` the hub records every request it made for an agent, or refused by its URL and address
+rules, in the `agent_fetches` table of its database: the time, the attempt, task and agent, the whole URL the agent
+sent, where the redirects ended, the HTTP status or the error, and the size. The row is written before the request
+leaves the server. An attempt's log in the UI shows the same requests, but only among the attempt's newest 500
+entries. The table keeps 90 days and at most 250,000 rows, and no page shows it yet. Read it on the server:
+
+```bash
+sudo apt-get install -y sqlite3     # once: the host template does not install it
+sudo -u agflow sqlite3 -readonly -header -column /var/lib/agflow/data/agflow.db \
+  "SELECT datetime(at / 1000, 'unixepoch') AS utc, attempt_id, coalesce(status, error, 'no outcome') AS outcome,
+          bytes, url, final_url, detail
+   FROM agent_fetches ORDER BY id DESC LIMIT 50"
+```
+
+Narrow it with `WHERE task_id = 'T-12'` or `WHERE agent_id = 'A-7'`. `WHERE error = 'fetch_address_refused'` finds
+requests for names that resolve inside your network; `detail` then holds the address, which the agent was not told.
+A row with no outcome is a request that was under way when the hub stopped. Requests made after a backup was taken
+are on record only in the database a restore puts aside (`agflow.db.replaced-*`): run the same query on that file.
+
+What still needs a person:
+
+- **Approvals on a managed device.** Where the device's administrator manages the Codex policy, the lead can only
+  decline. Approving stays with the owner, in the browser.
+- **Internet for Codex agents.** They never fetch, with or without a grant. Give outside-data tasks to Claude agents,
+  or commit the data.
+- **Runner sign-in.** A person runs `agflow login` on each Mac and completes the Claude and Codex logins that
+  `agflow runner setup` opens ([Joining from a Mac](#joining-from-a-mac)).
+- **Secrets.** API keys and other secrets are never handed out by the hub or by the lead. A person provides them.
 
 ## Joining from a Mac
 
@@ -170,7 +273,16 @@ sudo systemctl start agflow-hub
 sudo journalctl -u agflow-hub -n 100 --no-pager
 ```
 
-Restore refuses while the DB lock names a live process, validates/migrates the backup, keeps the replaced DB/WAL/SHM as `agflow.db.replaced-*`, advances epoch/counters and checkpoints the restored database. Keep those replaced files until recovery is verified. Never copy a backup over a running database or delete the lock to force a restore. After restart the recovery window (default 120 seconds) pauses dispatch/lease expiry/stall decisions while runners reconnect and replay retained work. Check task positions, the lead, both runners, capacity/drain settings and approvals before resuming. The README's [settings-sync restore limits](../README.md#backups-restore-and-known-limits) still apply.
+Restore refuses while the DB lock names a live process, validates/migrates the backup, keeps the replaced DB/WAL/SHM as `agflow.db.replaced-*`, advances epoch/counters and checkpoints the restored database. Keep those replaced files until recovery is verified. Never copy a backup over a running database or delete the lock to force a restore. After restart the recovery window (default 120 seconds) pauses dispatch/lease expiry/stall decisions while runners reconnect and replay retained work. Check task positions, the lead, both runners, capacity/drain settings, approvals and internet grants before resuming. The README's [settings-sync restore limits](../README.md#backups-restore-and-known-limits) still apply.
+
+A restore brings back the internet grants as the backup had them, so a grant that was taken back after the backup is in force again. List them before starting the hub:
+
+```bash
+sudo -u agflow sqlite3 -readonly -header -column /var/lib/agflow/data/agflow.db \
+  "SELECT task_id, granted_by, datetime(granted_at / 1000, 'unixepoch') AS utc FROM task_fetch_grants ORDER BY granted_at"
+```
+
+To end them all, start the hub once with `AGFLOW_AGENT_FETCH` unset: it ends every grant and names the tasks in its journal. Then set it again and restart; the lead grants anew where a task still needs outside data. To end single grants, tell the lead which tasks should lose theirs. The requests the hub made after the backup are on record only in the replaced database ([What agents fetched](#what-agents-fetched)).
 
 For VM loss, stop/fence the old VM before bringing up any replacement (never run two hubs against one project's runners). In the cloud console create a boot disk from the selected snapshot and a replacement VM in the same subnet/security group, then move the reserved public IP. Alternatively use `yc compute disk create --source-snapshot-id SNAPSHOT_ID --name RESTORED_DISK --zone ZONE`, followed by `yc compute instance create ... --use-boot-disk disk-id=RESTORED_DISK,auto-delete=false` with the same CPU/memory/network settings as the recipe. Disable automatic hub startup on the recovery VM while verifying files; keep public 80/443 closed until ready. Use serial console or an isolated recovery VM to do this before attaching the public IP.
 

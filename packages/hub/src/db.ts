@@ -353,6 +353,35 @@ CREATE TABLE lead_notes (
 );
 `;
 
+// Design 5, Unattended options. task_fetch_grants: the tasks whose Claude agents may ask the hub to download public
+// URLs. One row per granted task; revoking deletes it, and the grant and revoke events keep the history.
+// agent_fetches: the record of what the hub fetched for agents, one row for every request it made or refused by its
+// URL and address rules (fetch-record.ts, which also bounds it). A row with neither a status nor an error is a request
+// whose end the hub did not record: it was stopped while the request was under way.
+const SCHEMA_V3 = `
+CREATE TABLE task_fetch_grants (
+  task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+  granted_by TEXT NOT NULL,          -- agent:<id> or user:<login>
+  reason TEXT NOT NULL,
+  granted_at INTEGER NOT NULL
+);
+
+CREATE TABLE agent_fetches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,               -- when the request was made
+  attempt_id TEXT NOT NULL,
+  task_id TEXT,                      -- NULL for a lead's attempt
+  agent_id TEXT NOT NULL,
+  url TEXT NOT NULL,                 -- as the agent sent it, whole
+  final_url TEXT,                    -- where the redirects ended; NULL without an answer
+  status INTEGER,                    -- the site's HTTP status; NULL without an answer
+  error TEXT,                        -- without an answer, the code the agent was answered: fetch_url_refused, ...
+  bytes INTEGER NOT NULL,            -- of the body handed to the agent
+  detail TEXT                        -- a failure in words, with the address a refused name resolves to
+);
+CREATE INDEX agent_fetches_attempt ON agent_fetches (attempt_id, id);
+`;
+
 /** M1's lead seat: the lead chat seen within the last 15 minutes. Only the migration to schema version 2 reads it. */
 export const M1_LEAD_STALE_MS = 15 * 60_000;
 
@@ -374,6 +403,7 @@ const MIGRATIONS: readonly ((db: Database, now: number) => void)[] = [
     db.run(SCHEMA_V2);
     seedHubState(db, now);
   },
+  (db) => db.run(SCHEMA_V3),
 ];
 
 export function openDb(path: string, now: number): Database {

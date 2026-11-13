@@ -256,6 +256,28 @@ describe('loadConfig: runner settings', () => {
   });
 });
 
+describe('the unattended options', () => {
+  test('AGFLOW_AGENT_FETCH is off unless it is 1, and anything but 0 or 1 refuses to start', () => {
+    expect(loadConfig(base).config.agentFetch).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_AGENT_FETCH: '' }).config.agentFetch).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_AGENT_FETCH: '0' }).config.agentFetch).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_AGENT_FETCH: '1' }).config.agentFetch).toBe(true);
+    for (const value of ['yes', 'true', '2', ' 1', 'on']) {
+      expect(() => loadConfig({ ...base, AGFLOW_AGENT_FETCH: value })).toThrow('AGFLOW_AGENT_FETCH must be 0 or 1');
+    }
+  });
+
+  test('AGFLOW_LEAD_APPROVALS is off unless it is 1, and anything but 0 or 1 refuses to start', () => {
+    expect(loadConfig(base).config.leadApprovals).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_LEAD_APPROVALS: '' }).config.leadApprovals).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_LEAD_APPROVALS: '0' }).config.leadApprovals).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_LEAD_APPROVALS: '1' }).config.leadApprovals).toBe(true);
+    for (const value of ['yes', 'true', '2', ' 1', 'on']) {
+      expect(() => loadConfig({ ...base, AGFLOW_LEAD_APPROVALS: value })).toThrow('AGFLOW_LEAD_APPROVALS must be 0 or 1');
+    }
+  });
+});
+
 describe('makeConfig', () => {
   test('a HubConfig built in code spreads the runner defaults', () => {
     expect(makeConfig()).toMatchObject(HUB_RUNNER_DEFAULTS);

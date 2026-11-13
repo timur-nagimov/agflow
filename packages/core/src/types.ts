@@ -102,6 +102,23 @@ export interface Task extends TaskContract {
   workSha: string | null;
   /** Infra backoff: no dispatch before this time. */
   nextDispatchAt: number | null;
+  /** The lead or a person granted the task internet access: its Claude agents may use fetch_url (design 5). */
+  fetchGranted: boolean;
+}
+
+/** What POST /api/fetch answers: one public URL the hub downloaded for a runner agent (design 5, Unattended options). */
+export interface FetchedUrl {
+  /** The HTTP status of the last hop. */
+  status: number;
+  /** Where the redirects ended. */
+  finalUrl: string;
+  /** The response's Content-Type header, the only header passed on; null when it sent none. */
+  contentType: string | null;
+  /** The body's size after decompression. */
+  bytes: number;
+  /** The body's SHA-256, in hex. */
+  sha256: string;
+  bodyBase64: string;
 }
 
 export interface TaskNote {
@@ -484,6 +501,15 @@ export interface Approval {
   createdAt: number;
   expiresAt: number;
   decidedAt: number | null;
+}
+
+/**
+ * A pending approval as GET /api/approvals lists it for the agent holding the lead seat (design 6.10, Who may answer).
+ * leadMayApprove is false on a runner whose vendor reports a managed device policy, or that the hub cannot find: the
+ * lead may only decline that one, or leave it to the owner.
+ */
+export interface LeadApproval extends Approval {
+  leadMayApprove: boolean;
 }
 
 export interface SubmissionRecord {

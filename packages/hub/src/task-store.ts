@@ -8,6 +8,7 @@ import {
   type TaskNote,
   type TaskStatus,
   assertTransition,
+  isClosed,
   isDone,
   pathsOverlap,
 } from '@agflow/core';
@@ -42,16 +43,26 @@ export interface TaskRow {
   dispatch_hold_until: number | null;
   /** Not a column: TASK_SELECT counts the task's attempts. */
   attempt_count: number;
+  /** Not a column: 1 when the task holds an internet grant (task_fetch_grants). */
+  fetch_granted: number;
 }
 
-/** Selects task rows with their attempt count; add WHERE and ORDER BY clauses. */
+/** What a task's reading needs of the hub: whether AGFLOW_AGENT_FETCH is on. */
+type TaskReader = Pick<HubContext, 'config'>;
+
+/** Selects task rows with their attempt count and whether they hold an internet grant; add WHERE and ORDER BY clauses. */
 export const TASK_SELECT =
-  'SELECT tasks.*, (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id) AS attempt_count FROM tasks';
+  'SELECT tasks.*, (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id) AS attempt_count,' +
+  ' EXISTS (SELECT 1 FROM task_fetch_grants WHERE task_fetch_grants.task_id = tasks.id) AS fetch_granted FROM tasks';
 
 /** Submissions recorded before M2 carry no attempt or submission id. */
 type StoredSubmission = Omit<Submission, 'attemptId' | 'submissionId'> & Partial<Submission>;
 
-export function rowToTask(row: TaskRow): Task {
+/**
+ * The task of a row. Its fetchGranted is false while AGFLOW_AGENT_FETCH is off, whatever the database holds: nothing
+ * fetches then, so nothing reads as able to.
+ */
+export function rowToTask(ctx: TaskReader, row: TaskRow): Task {
   const contract = JSON.parse(row.contract) as TaskContract;
   return {
     ...contract,
@@ -76,12 +87,13 @@ export function rowToTask(row: TaskRow): Task {
     workRef: row.work_ref,
     workSha: row.work_sha,
     nextDispatchAt: row.next_dispatch_at,
+    fetchGranted: ctx.config.agentFetch === true && row.fetch_granted === 1,
   };
 }
 
 export function findTask(ctx: HubContext, id: string): Task | null {
   const row = ctx.db.query(`${TASK_SELECT} WHERE id = $id`).get({ id }) as TaskRow | null;
-  return row ? rowToTask(row) : null;
+  return row ? rowToTask(ctx, row) : null;
 }
 
 export function getTask(ctx: HubContext, id: string): Task {
@@ -98,7 +110,7 @@ export interface TaskFilter {
 export function listTasks(ctx: HubContext, filter: TaskFilter = {}): Task[] {
   const rows = ctx.db.query(`${TASK_SELECT} ORDER BY seq`).all() as TaskRow[];
   return rows
-    .map(rowToTask)
+    .map((row) => rowToTask(ctx, row))
     .filter(
       (task) =>
         (!filter.status || filter.status.includes(task.status)) && (!filter.assignee || task.assignee === filter.assignee),
@@ -182,13 +194,31 @@ export function writeTask(ctx: HubContext, id: string, changes: TaskChanges): vo
   ctx.db.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = $id`).run(params);
 }
 
+/**
+ * Ends the task's internet grant (design 5, Unattended options): the row goes, and task.fetch_revoked names who ended
+ * it. False, and no event, when the task held none. It lives here because every way a grant ends needs it: a revoke
+ * and a start with the setting off (agent-fetch.ts), and the close of its task (move, below).
+ */
+export function endFetchGrant(ctx: HubContext, emit: Emit, taskId: string, actor: string): boolean {
+  const removed = ctx.db.query('DELETE FROM task_fetch_grants WHERE task_id = $taskId').run({ taskId });
+  if (removed.changes === 0) return false;
+  emit({ type: 'task.fetch_revoked', actor, subject: taskId, data: { taskId, by: actor } });
+  return true;
+}
+
 export interface MoveOptions {
   changes?: Omit<TaskChanges, 'status'>;
   event?: string;
   data?: Record<string, unknown>;
 }
 
-/** Moves a task to a new status, applies the changes and emits one event. */
+/**
+ * Moves a task to a new status, applies the changes and emits one event. A move that closes the task also ends its
+ * internet grant, in the same transaction and as a revoke by the system: a grant is for work under way, so no closed
+ * task holds one, and a task that opens again (a merge that failed) starts without. Every status change goes through
+ * here, so every way of closing does. A move between open statuses leaves the grant: it is the task's, not an
+ * attempt's, and the task's next attempt fetches on it.
+ */
 export function move(
   ctx: HubContext,
   emit: Emit,
@@ -200,6 +230,7 @@ export function move(
   assertTransition(task.status, to);
   writeTask(ctx, task.id, { ...options.changes, status: to });
   emit({ type: options.event ?? `task.${to}`, actor, subject: task.id, data: { from: task.status, ...options.data } });
+  if (isClosed(to)) endFetchGrant(ctx, emit, task.id, 'system');
   return getTask(ctx, task.id);
 }
 

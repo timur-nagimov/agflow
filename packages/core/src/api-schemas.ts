@@ -49,6 +49,8 @@ import type {
   AttemptLogEntry,
   AttemptStatus,
   FailureClass,
+  FetchedUrl,
+  LeadApproval,
   LeadNote,
   LeadSeat,
   PrepareRequest,
@@ -244,30 +246,40 @@ export const AttemptLogEntrySchema = schemaFor<AttemptLogEntry>()(
   }),
 );
 
+const ApprovalFields = z.strictObject({
+  // Minted by the runner as a UUID (design 6.10).
+  id: z.uuid(),
+  attemptId: AttemptIdSchema,
+  fence: FenceSchema,
+  runnerId: RunnerIdSchema,
+  owner: Name,
+  taskId: TaskIdSchema.nullable(),
+  agentId: AgentIdSchema,
+  kind: ApprovalKindSchema,
+  summary: z.string(),
+  detail: ApprovalDetailSchema,
+  status: ApprovalStatusSchema,
+  decidedBy: Name.nullable(),
+  createdAt: NonNegativeInt,
+  expiresAt: NonNegativeInt,
+  decidedAt: NonNegativeInt.nullable(),
+});
+
+const APPROVAL_TASK = {
+  error: 'expected the task its attempt id names; a lead attempt has none',
+  path: ['taskId'],
+};
+
 export const ApprovalSchema = schemaFor<Approval>()(
-  z
-    .strictObject({
-      // Minted by the runner as a UUID (design 6.10).
-      id: z.uuid(),
-      attemptId: AttemptIdSchema,
-      fence: FenceSchema,
-      runnerId: RunnerIdSchema,
-      owner: Name,
-      taskId: TaskIdSchema.nullable(),
-      agentId: AgentIdSchema,
-      kind: ApprovalKindSchema,
-      summary: z.string(),
-      detail: ApprovalDetailSchema,
-      status: ApprovalStatusSchema,
-      decidedBy: Name.nullable(),
-      createdAt: NonNegativeInt,
-      expiresAt: NonNegativeInt,
-      decidedAt: NonNegativeInt.nullable(),
-    })
-    .refine((approval) => namesTask(approval.attemptId, approval.taskId), {
-      error: 'expected the task its attempt id names; a lead attempt has none',
-      path: ['taskId'],
-    }),
+  ApprovalFields.refine((approval) => namesTask(approval.attemptId, approval.taskId), APPROVAL_TASK),
+);
+
+/** An approval in the lead's listing (design 6.10, Who may answer): the approval, and whether the lead may approve it. */
+export const LeadApprovalSchema = schemaFor<LeadApproval>()(
+  ApprovalFields.extend({ leadMayApprove: z.boolean() }).refine(
+    (approval) => namesTask(approval.attemptId, approval.taskId),
+    APPROVAL_TASK,
+  ),
 );
 
 export const SubmissionRecordSchema = schemaFor<SubmissionRecord>()(
@@ -410,8 +422,14 @@ export const HandbackInputSchema = z.strictObject({
 /** GET /api/approvals?status=, the caller's own approvals. */
 export const ApprovalsQuerySchema = z.object({ status: param(commaList(ApprovalStatusSchema)) });
 
-/** POST /api/approvals/:id. Approve maps only to the vendor's one-time accept (design 6.10). */
-export const ApprovalDecisionInputSchema = z.strictObject({ decision: z.enum(['approve', 'decline']) });
+/**
+ * POST /api/approvals/:id. Approve maps only to the vendor's one-time accept (design 6.10). The reason is the lead's
+ * (AGFLOW_LEAD_APPROVALS): the asking agent reads it, and a lead's decline must carry one. A person's body has none.
+ */
+export const ApprovalDecisionInputSchema = z.strictObject({
+  decision: z.enum(['approve', 'decline']),
+  reason: z.string().min(1).max(500).optional(),
+});
 
 /** POST /api/staffing (request_agents): the hub clamps count to [0, cap]; a vendor sets the project's preference. */
 export const StaffingInputSchema = z.strictObject({
@@ -434,6 +452,15 @@ export const LeadHandoffInputSchema = HandoffInputSchema;
 
 /** PATCH /api/project: may the scheduler start leads on runners. */
 export const ProjectPatchInputSchema = z.strictObject({ runnerLeads: z.boolean() });
+
+/** POST /api/tasks/:id/fetch-grant: why the task needs data from outside; its event and the assignee's message quote it. */
+export const FetchGrantInputSchema = z.strictObject({ reason: z.string().min(1).max(500) });
+
+/** The longest URL the hub fetches for an agent, on the first hop and on every redirect. */
+export const FETCH_URL_MAX = 2000;
+
+/** POST /api/fetch: the hub applies its own rules to the URL (design 5); the schema only bounds it. */
+export const FetchUrlInputSchema = z.strictObject({ url: z.string().min(1).max(FETCH_URL_MAX) });
 
 // ---------------------------------------------------------------------------
 // Responses
@@ -463,6 +490,9 @@ export const AttemptResponseSchema = z.strictObject({ attempt: AttemptSchema });
 /** GET /api/approvals. */
 export const ApprovalsResponseSchema = z.strictObject({ approvals: z.array(ApprovalSchema) });
 
+/** GET /api/approvals with the lead's agent token: the pending approvals it may answer, oldest first. */
+export const LeadApprovalsResponseSchema = z.strictObject({ approvals: z.array(LeadApprovalSchema) });
+
 /** POST /api/approvals/:id. */
 export const ApprovalResponseSchema = z.strictObject({ approval: ApprovalSchema });
 
@@ -480,6 +510,18 @@ export const TakeoverResponseSchema = z.strictObject({ attemptId: AttemptIdSchem
 
 /** GET /api/lead/notes. */
 export const LeadNotesResponseSchema = z.strictObject({ notes: z.array(LeadNoteSchema) });
+
+/** POST /api/fetch. */
+export const FetchUrlResponseSchema = schemaFor<FetchedUrl>()(
+  z.strictObject({
+    status: z.number().int().min(100).max(599),
+    finalUrl: z.string(),
+    contentType: z.string().nullable(),
+    bytes: NonNegativeInt,
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    bodyBase64: z.string(),
+  }),
+);
 
 /** GET /api/runner/whoami: the CLI token's user. */
 export const WhoamiResponseSchema = z.strictObject({ user: Name });
@@ -571,7 +613,13 @@ export const HUB_EVENT_TYPES = {
   'agent.stopped': { category: 'agents', subject: 'task', data: [...OF_ATTEMPT, 'cause', 'reason'] },
   'agent.replaced': { category: 'agents', subject: 'task', data: [...OF_ATTEMPT, 'cause', 'reason'] },
   'approval.requested': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL, 'kind'] },
-  'approval.decided': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL, 'decision'] },
+  // reason: what the one who decided told the asking agent; the owner gives none.
+  'approval.decided': {
+    category: 'approvals',
+    subject: 'task',
+    data: [...OF_APPROVAL, 'decision'],
+    optionalData: ['reason'],
+  },
   'approval.expired': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL] },
   'approval.voided': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL] },
   // The seat after the change; kind none leaves the ids null.
@@ -587,6 +635,9 @@ export const HUB_EVENT_TYPES = {
   'task.handed_back': { category: 'tasks', subject: 'task', data: [...OF_ATTEMPT, 'source', 'ref', 'sha'] },
   // refs: the remote refs the runner deleted.
   'task.refs_deleted': { category: 'tasks', subject: 'task', data: ['taskId', 'runnerId', 'refs'] },
+  // by: the lead or the person who decided; reason: why the task needs data from outside, in their words.
+  'task.fetch_granted': { category: 'tasks', subject: 'task', data: ['taskId', 'by', 'reason'] },
+  'task.fetch_revoked': { category: 'tasks', subject: 'task', data: ['taskId', 'by'] },
   // call: create_tasks, update_task or cancel_task; count: the calls counted in the sliding hour, this one included.
   'guard.plan_change': { category: 'guards', subject: null, data: ['agentId', 'call', 'taskIds', 'count'] },
   // until: when worker dispatch resumes; agentId: the agent whose call reached the budget.

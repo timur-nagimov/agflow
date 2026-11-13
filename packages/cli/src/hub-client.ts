@@ -10,6 +10,7 @@ import {
 import type {
   Agent,
   AgentRole,
+  Approval,
   Attempt,
   FetchSubmissionRequest,
   GoalNote,
@@ -70,6 +71,26 @@ export type RunnerSubmitBody = z.input<typeof RunnerSubmitInputSchema>;
 export type StaffingBody = z.input<typeof StaffingInputSchema>;
 export type AgentStopBody = z.input<typeof AgentStopInputSchema>;
 
+/** An approval as GET /api/approvals lists it for the lead (design 6.10): the lead may approve it, or only decline it. */
+export type LeadApproval = Approval & { leadMayApprove?: boolean | undefined };
+
+/** The lead's answer to an approval; a decline carries the reason the asking agent sees. */
+export interface ApprovalDecisionBody {
+  decision: 'approve' | 'decline';
+  reason?: string | undefined;
+}
+
+/**
+ * How long the bridge waits for POST /api/fetch: the hub gives a download 20 s, follows redirects and sends up to
+ * 10 MB back, which the default timeout of a request would cut short.
+ */
+export const FETCH_URL_TIMEOUT_MS = 40_000;
+
+export interface RequestOptions {
+  /** This request's own timeout, instead of the client's. */
+  timeoutMs?: number | undefined;
+}
+
 export interface MessageBody {
   to: string;
   body: string;
@@ -102,7 +123,7 @@ export class HubClient {
     return this.token?.startsWith(AGENT_TOKEN_PREFIX) ?? false;
   }
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
     // The bridge header tells the hub this client can start a live claim from a WIP ref (design 10).
     const headers: Record<string, string> = { accept: 'application/json', [BRIDGE_HEADER]: String(BRIDGE_VERSION) };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
@@ -110,18 +131,21 @@ export class HubClient {
     if (this.agentId && !this.viaAgentToken) headers['x-agflow-agent'] = this.agentId;
     if (body !== undefined) headers['content-type'] = 'application/json';
     let response: Response;
+    let text: string;
     try {
       response = await this.fetchFn(`${this.baseUrl}${path}`, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(options?.timeoutMs ?? this.timeoutMs),
       });
+      // The timeout covers the body as well: an answer that stops arriving, or a connection lost half way, is the hub
+      // unreachable like one that never started, and no part of such an answer is used.
+      text = await response.text();
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       throw new HubClientError(0, 'unreachable', `cannot reach the agflow hub at ${this.baseUrl}: ${reason}`);
     }
-    const text = await response.text();
     let json: unknown = null;
     try {
       json = text ? JSON.parse(text) : null;
@@ -258,6 +282,10 @@ export class HubClient {
   submissionFetch(id: string) {
     return this.request<{ request: FetchSubmissionRequest }>('GET', `/api/fetch-submission/${q(id)}`);
   }
+  /** One public URL, downloaded by the hub (design 5). The answer is unchecked: fetch_url checks it before it trusts it. */
+  fetchUrl(url: string) {
+    return this.request<unknown>('POST', '/api/fetch', { url }, { timeoutMs: FETCH_URL_TIMEOUT_MS });
+  }
 
   // Lead
   createTasks(tasks: NewTaskInput[]) {
@@ -298,5 +326,21 @@ export class HubClient {
   }
   leadNotes() {
     return this.request<{ notes: LeadNote[] }>('GET', '/api/lead/notes');
+  }
+  grantFetch(taskId: string, reason: string) {
+    return this.request<{ task: Task }>('POST', `/api/tasks/${q(taskId)}/fetch-grant`, { reason });
+  }
+  revokeFetch(taskId: string) {
+    return this.request<{ task: Task }>('DELETE', `/api/tasks/${q(taskId)}/fetch-grant`);
+  }
+  /**
+   * The pending approvals the lead may answer (design 6.10), oldest first, each a LeadApproval; a person's token lists
+   * that person's own. Unchecked, like the answer to a decision: the caller checks what it reads.
+   */
+  approvals() {
+    return this.request<unknown>('GET', '/api/approvals');
+  }
+  decideApproval(id: string, body: ApprovalDecisionBody) {
+    return this.request<unknown>('POST', `/api/approvals/${q(id)}`, body);
   }
 }

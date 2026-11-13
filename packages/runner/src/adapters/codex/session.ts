@@ -7,6 +7,7 @@ import type { RunnerTestBlock } from '../../config';
 import type { Logger } from '../../log';
 import { boundedWait } from '../../processes';
 import { vendorBinary } from '../../vendor/pins';
+import { BRIDGE_UNNAMED_TOOLS } from '../bridge-tools';
 import type { AgentEvent, AgentLaunch, AgentSession, ExitInfo } from '../types';
 import { approvalFromRequest, decisionResponse, unattendedResponse, type FileChange } from './approvals';
 import { isFinalError, mergeRateLimits, quotaFromRateLimits, turnErrorKind } from './classify';
@@ -816,7 +817,7 @@ export class CodexSession implements AgentSession {
     if (unexpected.length > 0) {
       throw new Error(`codex thread lists user or plugin skills: ${unexpected.map((skill) => skill.name).join(', ')}`);
     }
-    return tools.filter((name) => !launch.bridge.tools.includes(name));
+    return tools.filter((name) => !launch.bridge.tools.includes(name) && !BRIDGE_UNNAMED_TOOLS.includes(name));
   }
 }
 

@@ -21,6 +21,13 @@ function positiveInt(env: Env, key: string, fallback: number, max = Infinity): n
   return value;
 }
 
+/** An opt-in switch: off when unset or empty, on only as "1". Anything else is a mistake worth stopping the start for. */
+function switchOf(env: Env, key: string): boolean {
+  const raw = env[key] ?? '';
+  if (raw !== '' && raw !== '0' && raw !== '1') throw new Error(`${key} must be 0 or 1`);
+  return raw === '1';
+}
+
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
 
@@ -175,10 +182,9 @@ export function loadConfig(env: Env): LoadedConfig {
       throw new Error('AGFLOW_OPERATOR_USER must be one of AGFLOW_ALLOWED_USERS');
     }
   }
-  const needMerge = env.AGFLOW_DEPENDENCIES_NEED_MERGE ?? '';
-  if (needMerge !== '' && needMerge !== '0' && needMerge !== '1') {
-    throw new Error('AGFLOW_DEPENDENCIES_NEED_MERGE must be 0 or 1');
-  }
+  const needMerge = switchOf(env, 'AGFLOW_DEPENDENCIES_NEED_MERGE');
+  const agentFetch = switchOf(env, 'AGFLOW_AGENT_FETCH');
+  const leadApprovals = switchOf(env, 'AGFLOW_LEAD_APPROVALS');
   const testMode = env.AGFLOW_TEST === '1';
   if (env.AGFLOW_TEST_CONFIG && !testMode) throw new Error('AGFLOW_TEST_CONFIG is honoured only with AGFLOW_TEST=1');
   const config: HubConfig = {
@@ -198,7 +204,9 @@ export function loadConfig(env: Env): LoadedConfig {
     webDist: env.AGFLOW_WEB_DIST,
     operatorToken,
     operatorUser,
-    dependenciesNeedMerge: needMerge === '1',
+    dependenciesNeedMerge: needMerge,
+    agentFetch,
+    leadApprovals,
   };
   const overrides = env.AGFLOW_TEST_CONFIG ? testOverrides(env.AGFLOW_TEST_CONFIG) : {};
   Object.assign(config, overrides);

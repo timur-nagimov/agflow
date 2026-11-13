@@ -11,6 +11,8 @@ import {
   ApprovalSchema,
   ApprovalsQuerySchema,
   ApprovalsResponseSchema,
+  LeadApprovalSchema,
+  LeadApprovalsResponseSchema,
   AttemptDetailResponseSchema,
   AttemptLogEntrySchema,
   AttemptResponseSchema,
@@ -21,6 +23,9 @@ import {
   BRIDGE_HEADER,
   BRIDGE_VERSION,
   HUB_EVENT_TYPES,
+  FetchGrantInputSchema,
+  FetchUrlInputSchema,
+  FetchUrlResponseSchema,
   HandbackInputSchema,
   type HubEventCategory,
   type HubEventSubject,
@@ -59,6 +64,7 @@ import type {
   AttemptFacts,
   AttemptLogEntry,
   Fence,
+  LeadApproval,
   LeadNote,
   LeadSeat,
   PrepareRequest,
@@ -313,6 +319,8 @@ describe('request bodies', () => {
     ['PrepareInputSchema', PrepareInputSchema, {}],
     ['LeadHandoffInputSchema', LeadHandoffInputSchema, { note: 'T-42 waits for review.' }],
     ['ProjectPatchInputSchema', ProjectPatchInputSchema, { runnerLeads: false }],
+    ['FetchGrantInputSchema', FetchGrantInputSchema, { reason: 'the task compares public price lists' }],
+    ['FetchUrlInputSchema', FetchUrlInputSchema, { url: 'https://example.com/data.csv' }],
   ];
 
   for (const [name, schema, body] of bodies) {
@@ -321,6 +329,32 @@ describe('request bodies', () => {
       expect(parses(schema, { ...body, bogus: 1 })).toBe(false);
     });
   }
+
+  test('an internet grant needs a reason of 1 to 500 characters, and a fetch a URL of at most 2000', () => {
+    expect(parses(FetchGrantInputSchema, { reason: '' })).toBe(false);
+    expect(parses(FetchGrantInputSchema, {})).toBe(false);
+    expect(parses(FetchGrantInputSchema, { reason: 'r'.repeat(500) })).toBe(true);
+    expect(parses(FetchGrantInputSchema, { reason: 'r'.repeat(501) })).toBe(false);
+    expect(parses(FetchUrlInputSchema, { url: '' })).toBe(false);
+    expect(parses(FetchUrlInputSchema, { url: `https://example.com/${'a'.repeat(1980)}` })).toBe(true);
+    expect(parses(FetchUrlInputSchema, { url: `https://example.com/${'a'.repeat(1981)}` })).toBe(false);
+    expect(parses(FetchUrlInputSchema, { url: 7 })).toBe(false);
+  });
+
+  test('a fetch answers the status, where it ended, the content type, the size, the digest and the body, and nothing else', () => {
+    const answer = {
+      status: 200,
+      finalUrl: 'https://example.com/data.csv',
+      contentType: 'text/csv',
+      bytes: 3,
+      sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      bodyBase64: 'YWJj',
+    };
+    expect(FetchUrlResponseSchema.parse(answer)).toEqual(answer);
+    expect(parses(FetchUrlResponseSchema, { ...answer, contentType: null })).toBe(true);
+    expect(parses(FetchUrlResponseSchema, { ...answer, headers: { 'set-cookie': 'a=b' } })).toBe(false);
+    expect(parses(FetchUrlResponseSchema, { ...answer, sha256: 'abc' })).toBe(false);
+  });
 
   test("a runner agent's submit body is { summary, evidence } only: the runner pushes, so a branch or headSha is refused", () => {
     expect(RunnerSubmitInputSchema.parse({ summary: 's', evidence: ['bun test: 42 pass'] })).toEqual({
@@ -433,6 +467,13 @@ describe('request bodies', () => {
     for (const decision of ['accept', 'approved', 'deny', '']) {
       expect([decision, parses(ApprovalDecisionInputSchema, { decision })]).toEqual([decision, false]);
     }
+    // The lead's reason (design 6.10, Who may answer): optional in the body, 1 to 500 characters when given.
+    expect(parses(ApprovalDecisionInputSchema, { decision: 'decline', reason: 'use the vendored copy' })).toBe(true);
+    expect(parses(ApprovalDecisionInputSchema, { decision: 'approve', reason: 'x'.repeat(500) })).toBe(true);
+    expect(parses(ApprovalDecisionInputSchema, { decision: 'decline', reason: '' })).toBe(false);
+    expect(parses(ApprovalDecisionInputSchema, { decision: 'decline', reason: 'x'.repeat(501) })).toBe(false);
+    expect(parses(ApprovalDecisionInputSchema, { decision: 'decline', reason: null })).toBe(false);
+    expect(parses(ApprovalDecisionInputSchema, { decision: 'decline', why: 'no' })).toBe(false);
     expect(parses(ProjectPatchInputSchema, { runnerLeads: true })).toBe(true);
     expect(parses(ProjectPatchInputSchema, {})).toBe(false);
     expect(parses(ProjectPatchInputSchema, { runnerLeads: 'off' })).toBe(false);
@@ -519,6 +560,11 @@ describe('responses', () => {
     ['AttemptResponseSchema', AttemptResponseSchema, { attempt: { ...attempt, stopRequested: takenOver.stopRequested } }],
     ['ApprovalsResponseSchema', ApprovalsResponseSchema, { approvals: [approval, declined] }],
     ['ApprovalResponseSchema', ApprovalResponseSchema, { approval: declined }],
+    [
+      'LeadApprovalsResponseSchema',
+      LeadApprovalsResponseSchema,
+      { approvals: [{ ...approval, leadMayApprove: false }, { ...approval, leadMayApprove: true }] },
+    ],
     ['StaffingResponseSchema', StaffingResponseSchema, { running: 2, target: 4 }],
     ['SubmissionResponseSchema', SubmissionResponseSchema, { submission }],
     ['PrepareResponseSchema', PrepareResponseSchema, { request: prepareRequest }],
@@ -548,6 +594,13 @@ describe('responses', () => {
     expect(parses(AttemptSchema, { ...takenOver, takeover: { ...takenOver.takeover, ref: 'takeover-timur' } })).toBe(false);
     expect(parses(ApprovalSchema, { ...approval, id: 'approval-1' })).toBe(false);
     expect(parses(ApprovalSchema, { ...approval, status: 'open' })).toBe(false);
+    // The lead's listing says of each approval whether the lead may approve it; a person's listing never does.
+    expectTypeOf<z.output<typeof LeadApprovalSchema>>().toEqualTypeOf<LeadApproval>();
+    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true })).toBe(true);
+    expect(parses(LeadApprovalSchema, approval)).toBe(false);
+    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: 'yes' })).toBe(false);
+    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true, taskId: 'T-41' })).toBe(false);
+    expect(parses(ApprovalSchema, { ...approval, leadMayApprove: true })).toBe(false);
     expect(parses(AttemptLogEntrySchema, { ...logEntry, kind: 'warning' })).toBe(false);
     expect(parses(AccountQuotaSchema, { ...account, accountId: null })).toBe(false);
     expect(parses(PrepareRequestSchema, { ...prepareRequest, id: 'P-1' })).toBe(false);
@@ -635,6 +688,8 @@ describe('the event catalogue', () => {
       'task.taken_over',
       'task.handed_back',
       'task.refs_deleted',
+      'task.fetch_granted',
+      'task.fetch_revoked',
       'guard.plan_change',
       'guard.dispatch_paused',
       'system.recovery_started',
@@ -691,7 +746,8 @@ describe('the event catalogue', () => {
       approval: ['approvalId', 'attemptId', 'taskId', 'agentId', 'runnerId'],
       lead: ['agentId', 'attemptId', 'runnerId'],
       submission: ['submissionId', 'attemptId', 'taskId', 'agentId', 'runnerId'],
-      task: ['taskId', 'runnerId'],
+      // A task event names its task; the ones a runner or an attempt caused name those too (checked below).
+      task: ['taskId'],
       guard: [],
       system: [],
     };
@@ -720,8 +776,15 @@ describe('the event catalogue', () => {
     ]);
     expect(data('attempt.late_work')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'ref', 'sha']);
     expect(HUB_EVENT_TYPES['attempt.late_work'].optionalData).toEqual(['submittedHead']);
+    // The reason is there only when the one who decided gave one: the lead on a decline, always.
+    expect(data('approval.decided')).toEqual(['approvalId', 'attemptId', 'taskId', 'agentId', 'runnerId', 'summary', 'decision']);
+    expect(HUB_EVENT_TYPES['approval.decided'].optionalData).toEqual(['reason']);
     expect(data('task.handed_back')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'source', 'ref', 'sha']);
     expect(data('task.refs_deleted')).toEqual(['taskId', 'runnerId', 'refs']);
+    // An internet grant is the lead's or a person's decision about a task: no attempt or runner applies.
+    expect(data('task.fetch_granted')).toEqual(['taskId', 'by', 'reason']);
+    expect(data('task.fetch_revoked')).toEqual(['taskId', 'by']);
+    expect(data('task.taken_over')).toContain('runnerId');
     expect(data('agent.stalled')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'cause', 'reason']);
     expect(data('approval.decided')).toEqual(['approvalId', 'attemptId', 'taskId', 'agentId', 'runnerId', 'summary', 'decision']);
     expect(data('guard.plan_change')).toEqual(['agentId', 'call', 'taskIds', 'count']);

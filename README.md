@@ -173,6 +173,8 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_WEB_DIST` | (unset) | Folder with the built web UI |
 | `AGFLOW_OPERATOR_TOKEN`, `AGFLOW_OPERATOR_USER` | (unset) | Server-only token for the operator routes (goal, mark merged, unblock, message) and the allowed login they act as; see [docs/deploy-hub.md](docs/deploy-hub.md#operator-access) |
 | `AGFLOW_DEPENDENCIES_NEED_MERGE` | `0` | `1`: a dependency is done only once it is merged, not when it is accepted, so dependents start from a main branch that holds it |
+| `AGFLOW_AGENT_FETCH` | `0` | `1`: the hub downloads public web pages for Claude runner agents, for the lead and for the tasks the lead grants internet access; an agent that reads hostile text can then leak what its sandbox lets it read through the addresses it asks for. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
+| `AGFLOW_LEAD_APPROVALS` | `0` | `1`: the agent holding the lead seat may answer the approval requests of other agents' Codex attempts: decline any of them with a reason, and approve those of a runner that reports no managed device policy, so a command the lead approves runs outside the sandbox on its owner's laptop without a person looking. The owner may still answer first. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
 | `AGFLOW_LEASE_MINUTES` | `120` | How long a claim survives without agent activity |
 | `AGFLOW_REMINDER_MINUTES` | `30` | Minimum time between "you hold a task" reminders |
 | `AGFLOW_MAX_OPEN_TASKS` | `200` | Guard: refuse new tasks beyond this many open tasks |
