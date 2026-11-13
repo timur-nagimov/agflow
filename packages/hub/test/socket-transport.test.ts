@@ -935,6 +935,13 @@ describe('through fetchPublicUrl', () => {
     expect(declared.handed).toBeLessThan(4 * MB);
   }, 10_000);
 
+  test('an encoding the hub does not read ends the download before the body', async () => {
+    // The cap is far away: the body would be downloaded up to it before the encoding were looked at.
+    const encoded = await flooded('HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\n\r\n', { maxBytes: 32 * MB });
+    expect(encoded.code).toBe('bad_response');
+    expect(encoded.handed).toBeLessThan(4 * MB);
+  }, 10_000);
+
   test('a refused redirect, and one redirect too many, end the download of the redirect that brought them', async () => {
     const elsewhere = await flooded('HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/admin\r\n\r\n');
     expect(elsewhere.code).toBe('url_refused');
@@ -1005,6 +1012,19 @@ describe('through fetchPublicUrl', () => {
     const [code, message] = await failure(fetchPublicUrl({ resolve: resolverOf(['example.com']), transport }, 'http://example.com/'));
     expect(code).toBe('connect_failed');
     expect(message).toContain('example.com');
+  });
+
+  test('an answer that is not HTTP is a bad response, and a refused connection a failed one', async () => {
+    const site = await answering('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nokk', 'stay');
+    const { transport } = routed({ 'example.com': site.port });
+    const resolve = resolverOf(['example.com']);
+    const [code, message] = await failure(fetchPublicUrl({ resolve, transport }, 'http://example.com/'));
+    expect(code).toBe('bad_response');
+    expect(message).toContain('example.com');
+    const nowhere = routed({ 'example.com': await unusedPort() });
+    const [refusedCode, refusedMessage] = await failure(fetchPublicUrl({ resolve, transport: nowhere.transport }, 'http://example.com/'));
+    expect(refusedCode).toBe('connect_failed');
+    expect(refusedMessage).toContain('ECONNREFUSED');
   });
 
   test.skipIf(certificates === null)('a certificate is verified against the name of each hop, not the address connected to', async () => {

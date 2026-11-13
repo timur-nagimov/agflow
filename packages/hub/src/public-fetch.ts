@@ -208,6 +208,8 @@ export async function fetchPublicUrl(
         response = await within(deps.transport(request, deadline.signal));
       } catch (error) {
         if (deadline.signal.aborted) throw timedOut();
+        // A failure the transport named itself says more: an answer that is not HTTP is no failure to connect.
+        if (error instanceof PublicFetchError) throw error;
         throw new PublicFetchError('connect_failed', `could not connect to ${url.hostname}: ${reasonOf(error)}`);
       }
       const location = REDIRECTS.has(response.status) ? response.headers.get('location') : null;
@@ -298,6 +300,12 @@ async function readBody(
     void response.body?.cancel().catch(() => {});
     throw tooLarge();
   }
+  const encoding = (response.headers.get('content-encoding') ?? '').trim().toLowerCase();
+  if (encoding !== '' && encoding !== 'identity' && encoding !== 'gzip' && encoding !== 'x-gzip' && encoding !== 'br') {
+    // Refused before its body is downloaded: megabytes the hub could only throw away.
+    void response.body?.cancel().catch(() => {});
+    throw new PublicFetchError('bad_response', `${url.hostname} answered in an encoding the hub does not read (${encoding.slice(0, 40)})`);
+  }
   const chunks: Uint8Array[] = [];
   let total = 0;
   const reader = response.body?.getReader();
@@ -320,11 +328,7 @@ async function readBody(
     }
   }
   const raw = Buffer.concat(chunks, total);
-  const encoding = (response.headers.get('content-encoding') ?? '').trim().toLowerCase();
   if (raw.length === 0 || encoding === '' || encoding === 'identity') return raw;
-  if (encoding !== 'gzip' && encoding !== 'x-gzip' && encoding !== 'br') {
-    throw new PublicFetchError('bad_response', `${url.hostname} answered in an encoding the hub does not read (${encoding.slice(0, 40)})`);
-  }
   try {
     return encoding === 'br' ? brotliDecompressSync(raw, { maxOutputLength: maxBytes }) : gunzipSync(raw, { maxOutputLength: maxBytes });
   } catch (error) {
