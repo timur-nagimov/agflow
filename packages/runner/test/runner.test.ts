@@ -33,7 +33,7 @@ afterEach(cleanupRunnerSetups);
 // Every test here runs git or agent processes, which take several times as long on a machine loaded by other suites.
 setDefaultTimeout(30_000);
 
-/** A runner.settings that names a field: an edit, not a probe. */
+/** A runner.settings that carries a local edit. */
 const isEdit = (event: { type: string; [key: string]: unknown }) =>
   event.type === 'runner.settings' && Object.keys((event.data as { settings: object }).settings).length > 0;
 
@@ -53,6 +53,24 @@ async function runnerJson(s: { paths: { config: string } }) {
 }
 
 describe('createRunner', () => {
+  test.each([false, true])('hello reports retained sparse answers and bounds the pruned prefix (pruned=%s)', async (pruned) => {
+    const s = await setup();
+    let now = 1000;
+    const outbox = new Outbox(s.db, { now: () => now, confirmedVersion: () => 4 });
+    if (pruned) outbox.append({ type: 'runner.state', data: { state: 'ok', detail: null } });
+    else outbox.append({ type: 'runner.settings', data: { settings: { capacity: 3 }, baseVersion: 4 } });
+    now = 500;
+    const answered = outbox.append({ type: 'runner.settings', data: { settings: { draining: true }, baseVersion: 3 } });
+    outbox.markSettingsEcho({ seq: answered.seq, outboxEpoch: outbox.epoch }, 4);
+    outbox.settingsSaved(4);
+    if (pruned) expect(outbox.pruneBefore(750)).toBe(1);
+    await s.start({ config: { confirmedSettings: SNAPSHOT } });
+    const hello = await s.hub.waitFor(() => hellos(s.hub)[0]);
+    expect(RunnerMessageSchema.safeParse(hello).success).toBe(true);
+    expect(hello).toMatchObject({ settingsAnsweredSeq: pruned ? 1 : 0,
+      settingsAnsweredSparse: pruned ? [] : [answered.seq], lastSeq: pruned ? 1 : answered.seq });
+  });
+
   test('hello carries the identity, the confirmed settings, the vendors, git, the outbox and the recovered attempts', async () => {
     const s = await setup();
     const store = new AttemptStore(s.db);
@@ -328,7 +346,7 @@ describe('createRunner', () => {
     });
   }
 
-  for (const key of ['restoredThrough', 'lastHubEpoch'] as const) {
+  for (const key of ['lastHubEpoch'] as const) {
     test(`a restored hub retries a failed ${key} write with normal link backoff before replay`, async () => {
       const s = await setup({ welcome: false, autoAck: false });
       s.db.setMeta('lastHubEpoch', 1);
@@ -349,7 +367,6 @@ describe('createRunner', () => {
       (await s.hub.connection(1)).send(testWelcome(0, { hubEpoch: 2 }));
       await s.hub.waitFor(() => hellos(s.hub).length === 3);
       expect(s.db.meta('lastHubEpoch')).toBe(2);
-      expect(s.db.meta('restoredThrough')).toBeGreaterThanOrEqual(1);
       (await s.hub.connection(2)).send(testWelcome(0, { hubEpoch: 2 }));
       await s.hub.waitFor(() => s.hub.events().length > 0);
       expect(await run(s.hub, { kind: 'preflight', vendor: 'claude' })).toMatchObject({ ok: true });
@@ -512,7 +529,7 @@ describe('createRunner', () => {
         welcome: (_hello, connection) => (connection.index === 0 ? {} : { wipRefPrefix: 'refs/agflow-2/' }),
       });
       await s.start({ config: { draining: true, confirmedSettings: snapshot } });
-      // Probes aside: this hub acknowledges the drain and never echoes it, as a hub that refused it would.
+      // This fixture acknowledges without sending the edit's answer.
       const settings = () => s.hub.events().filter(isEdit);
       const [sent] = await s.hub.waitFor(() => settings().length > 0 && settings());
       expect(sent?.data).toEqual({ settings: { draining: true }, baseVersion: 4 });
@@ -538,7 +555,7 @@ describe('createRunner', () => {
       welcome: (_hello, connection) => (connection.index === 0 ? {} : { wipRefPrefix: 'refs/agflow-2/' }),
     });
     await s.start({ config: { draining: true, confirmedSettings: snapshot } });
-    // Probes aside: this hub acknowledges the drain before its echo, which M2a never does.
+    // This fixture acknowledges before its echo.
     const settings = () => s.hub.events().filter(isEdit);
     const [sent] = await s.hub.waitFor(() => settings().length > 0 && settings());
     const outbox = new Outbox(s.db);
@@ -551,7 +568,7 @@ describe('createRunner', () => {
     await waitFor(() => s.db.meta('wipRefPrefix') === 'refs/agflow-2/');
     expect(outbox.eventsAfter(0).filter(isEdit)).toHaveLength(1);
     // Its own echo: in flight no longer, and nothing to send after the next welcome either.
-    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 6 })).toMatchObject({
+    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 6, answers: { seq: sent!.seq, outboxEpoch: outbox.epoch } })).toMatchObject({
       ok: true,
     });
     expect(outbox.settingsInFlight().filter(isEdit)).toEqual([]);
@@ -570,7 +587,7 @@ describe('createRunner', () => {
     await s.start({ config: { confirmedSettings: SNAPSHOT } });
     await waitFor(() => outbox.ackedSeq() >= 2);
     // The hub applied both, and the drain's echo comes first.
-    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5 })).toMatchObject({
+    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5, answers: { seq: 1, outboxEpoch: outbox.epoch } })).toMatchObject({
       ok: true,
     });
     expect(await runnerJson(s)).toMatchObject({ draining: false, confirmedSettings: { draining: true, version: 5 } });
@@ -581,26 +598,25 @@ describe('createRunner', () => {
       { draining: true },
       { draining: false },
     ]);
-    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: false }, version: 6 })).toMatchObject({
+    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: false }, version: 6, answers: { seq: 2, outboxEpoch: outbox.epoch } })).toMatchObject({
       ok: true,
     });
     expect(await runnerJson(s)).toMatchObject({ draining: false, confirmedSettings: { draining: false, version: 6 } });
     expect(outbox.settingsInFlight().filter(isEdit)).toEqual([]);
   });
 
-  test("a refused edit: a probe follows its acknowledgement, and at the probe's echo runner.json takes the hub's value", async () => {
+  test("an explicitly refused edit takes the hub value without appending a probe", async () => {
     const s = await setup({
       welcome: (_hello, connection) => (connection.index === 0 ? {} : { wipRefPrefix: 'refs/agflow-2/' }),
     });
     // A capacity edit made while the runner was down.
     await s.start({ config: { capacity: 3, confirmedSettings: SNAPSHOT } });
     const settings = () => s.hub.events().filter((event) => event.type === 'runner.settings');
-    const [edit, probe] = await s.hub.waitFor(() => settings().length === 2 && settings());
+    const [edit] = await s.hub.waitFor(() => settings().length === 1 && settings());
     expect(edit?.data).toEqual({ settings: { capacity: 3 }, baseVersion: 4 });
-    expect(probe?.data).toEqual({ settings: {}, baseVersion: 4 });
-    // The hub acknowledged the edit and never echoed it: it refused it. The probe's echo says so.
-    expect(await run(s.hub, { kind: 'update_settings', settings: {}, version: 5 })).toMatchObject({ ok: true });
-    expect(await runnerJson(s)).toMatchObject({ capacity: 2, confirmedSettings: { capacity: 2, version: 5 } });
+    // The hub explicitly refuses this edit at its current version.
+    expect(await run(s.hub, { kind: 'update_settings', settings: {}, version: 4, answers: { seq: edit!.seq, outboxEpoch: new Outbox(s.db).epoch, refused: true } })).toMatchObject({ ok: true });
+    expect(await runnerJson(s)).toMatchObject({ capacity: 2, confirmedSettings: { capacity: 2, version: 4 } });
     expect(s.logger.entries).toContainEqual({
       level: 'warn',
       message: "the hub refused a settings edit; runner.json takes the hub's settings",
@@ -610,53 +626,31 @@ describe('createRunner', () => {
     // Nothing goes again, after the next welcome either.
     (await s.hub.connection(0)).close(1012, 'the hub restarts');
     await waitFor(() => s.db.meta('wipRefPrefix') === 'refs/agflow-2/');
-    expect(new Outbox(s.db).eventsAfter(0).filter((event) => event.type === 'runner.settings')).toHaveLength(2);
+    expect(new Outbox(s.db).eventsAfter(0).filter((event) => event.type === 'runner.settings')).toHaveLength(1);
   });
 
-  test("after a hub restore, the replay leaves out the edits whose echo the snapshot holds, and a probe ends it", async () => {
-    // The welcomes after the first are a restored hub's, of a new hub epoch: its backup acknowledged nothing.
-    const s = await setup({
-      autoAck: false,
-      welcome: (_hello, connection) =>
-        connection.index === 0 ? {} : { ackedSeq: 0, hubEpoch: 2, wipRefPrefix: 'refs/agflow-2/' },
-    });
+  test('after restore hello carries the exact answer watermark and replay sends the answered tail without a probe', async () => {
+    const s = await setup({ autoAck: false, welcome: (_hello, connection) =>
+      connection.index === 0 ? {} : { ackedSeq: 0, hubEpoch: 2 } });
     const runner = await s.start({ config: { draining: true, confirmedSettings: SNAPSHOT } });
     const outbox = new Outbox(s.db);
-    const settings = (index: number) =>
-      (s.hub.connections[index]?.messages ?? [])
-        .flatMap((message) => (message.t === 'events' ? message.events : []))
-        .filter((event) => event.type === 'runner.settings');
-    // The drain, and the probe this hub's ack without an echo brings; both echoed and acknowledged.
+    const settings = (index: number) => (s.hub.connections[index]?.messages ?? [])
+      .flatMap(message => message.t === 'events' ? message.events : []).filter(isEdit);
     const [drain] = await s.hub.waitFor(() => settings(0).length === 1 && settings(0));
+    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5,
+      answers: { seq: drain!.seq, outboxEpoch: outbox.epoch } })).toMatchObject({ ok: true });
     const first = await s.hub.connection(0);
     first.send({ t: 'ack', outboxEpoch: outbox.epoch, seq: drain!.seq });
-    const [, probe] = await s.hub.waitFor(() => settings(0).length === 2 && settings(0));
-    expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5 })).toMatchObject({
-      ok: true,
-    });
-    expect(await run(s.hub, { kind: 'update_settings', settings: {}, version: 6 })).toMatchObject({ ok: true });
-    const probeAcked = runner.waitAcked(probe!.seq, 5_000);
-    first.send({ t: 'ack', outboxEpoch: outbox.epoch, seq: probe!.seq });
-    expect(await probeAcked).toBe(true);
-    expect(outbox.settingsInFlight()).toEqual([]);
-    // The hub is restored. At its first welcome the runner records what it holds and says hello again at once, sending
-    // nothing first. That hello reports version 6, which the hub adopts, and the replay starts from 0. Applying the
-    // drain again would undo whatever came after it; so would the probe, were it an edit. A new probe goes instead, so
-    // the hub's acknowledgement reaches hello.lastSeq.
-    (await s.hub.connection(0)).close(1012, 'the hub restarts');
+    expect(await runner.waitAcked(drain!.seq, 5_000)).toBe(true);
+    first.close(1012, 'hub restored');
     const [replayed] = await s.hub.waitFor(() => settings(2).length > 0 && settings(2));
-    expect(s.hub.connections[1]?.messages.map((message) => message.t)).toEqual(['hello']);
-    expect(hellos(s.hub)[2]).toMatchObject({ settings: { draining: true, version: 6 }, lastHubEpoch: 2 });
-    expect(replayed?.data).toEqual({ settings: {}, baseVersion: 6 });
-    expect(replayed?.seq).toBeGreaterThan(probe?.seq as number);
-    expect(settings(2).map((event) => event.seq)).not.toContain(drain?.seq);
-    expect(outbox.ackedSeq()).toBeLessThan(replayed!.seq);
-    // Subscribe through the runtime's Outbox, then release the ack; a separately constructed Outbox has no
-    // runtime ack callbacks. This exercises the ordering that used to fail when the ack arrived after the wait.
-    const replayAcked = runner.waitAcked(replayed!.seq, 5_000);
+    expect(s.hub.connections[1]?.messages.map(message => message.t)).toEqual(['hello']);
+    expect(hellos(s.hub)[2]).toMatchObject({ settingsAnsweredSeq: drain!.seq,
+      settings: { draining: true, version: 5 }, lastHubEpoch: 2 });
+    expect(replayed!.seq).toBe(drain!.seq);
+    expect(outbox.eventsAfter(0).filter(e => e.type === 'runner.settings')).toHaveLength(1);
     (await s.hub.connection(2)).send({ t: 'ack', outboxEpoch: outbox.epoch, seq: replayed!.seq });
-    expect(await replayAcked).toBe(true);
-    // The welcomes of that hub that follow do not count as a restore.
+    expect(await runner.waitAcked(replayed!.seq, 5_000)).toBe(true);
     expect(s.hub.connections).toHaveLength(3);
   });
 
@@ -691,7 +685,6 @@ describe('createRunner', () => {
     // Nothing ran or went out on the restored hub's first connection: no result, no event, no journal row.
     expect(s.hub.connections[1]?.messages.map((message) => message.t)).toEqual(['hello']);
     expect(new Journal(s.db).get('2-R-1001-1')).toBeNull();
-    expect(s.db.meta('restoredThrough')).toBeGreaterThanOrEqual(drain?.seq as number);
     // The drain is still in flight: the replay to the restored hub delivers it, and runner.json keeps it.
     const [replayed] = await s.hub.waitFor(() => edits(2).length > 0 && edits(2));
     expect(replayed?.seq).toBe(drain?.seq);
@@ -700,25 +693,8 @@ describe('createRunner', () => {
     expect(s.hub.connections).toHaveLength(3);
   });
 
-  test("a restored hub's epoch is recorded after what the runner held at its welcome, so a death between the two records that again", async () => {
-    const s = await setup({
-      welcome: (_hello, connection) => (connection.index === 0 ? {} : { ackedSeq: 0, hubEpoch: 2 }),
-    });
-    // What runner.db holds as the restored hub's epoch is written: a death right after that write leaves this.
-    const restoredThrough: (number | null)[] = [];
-    const setMeta = s.db.setMeta.bind(s.db);
-    s.db.setMeta = ((key: string, value: unknown) => {
-      if (key === 'lastHubEpoch' && value === 2) restoredThrough.push(s.db.meta('restoredThrough'));
-      (setMeta as (key: string, value: unknown) => void)(key, value);
-    }) as typeof s.db.setMeta;
-    await s.start({ config: { draining: true, confirmedSettings: SNAPSHOT } });
-    await waitFor(() => new Outbox(s.db).ackedSeq() > 0);
-    (await s.hub.connection(0)).close(1012, 'the hub was restored');
-    await waitFor(() => restoredThrough.length > 0);
-    expect(restoredThrough[0]).toBeGreaterThan(0);
-  });
 
-  test('any replay but one to a restored hub sends every edit the hub has not acknowledged, one an equal echo answered included', async () => {
+  test('replay sends an undelivered edit even after an equal owner echo', async () => {
     // This hub acknowledges nothing; the second welcome names another prefix, so the test knows when it was handled.
     const s = await setup({
       autoAck: false,
@@ -731,11 +707,11 @@ describe('createRunner', () => {
         .flatMap((message) => (message.t === 'events' ? message.events : []))
         .filter(isEdit);
     const [drain] = await s.hub.waitFor(() => edits(0).length > 0 && edits(0));
-    // The owner drained in the browser before the hub read the runner's drain: that echo answers the drain.
+    // The owner drained in the browser before the hub read the runner's drain: that echo does not answer the drain.
     expect(await run(s.hub, { kind: 'update_settings', settings: { draining: true }, version: 5 })).toMatchObject({
       ok: true,
     });
-    expect(new Outbox(s.db).settingsInFlight().filter(isEdit)).toEqual([]);
+    expect(new Outbox(s.db).settingsInFlight().map(e => e.seq)).toEqual([drain!.seq]);
     // The link drops before the hub applied the drain: the same hub's replay sends it, as nothing has applied it.
     (await s.hub.connection(0)).close(1012, 'the hub restarts');
     const [replayed] = await s.hub.waitFor(() => edits(1).length > 0 && edits(1));

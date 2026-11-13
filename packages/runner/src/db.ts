@@ -77,7 +77,7 @@ export interface RunnerMigration {
 
 /**
  * A runner.settings event an update_settings echo answered, with the echo's version: it counts once runner.json's
- * confirmed snapshot has that version (Outbox.settingsInFlight). refused: a probe's echo showed the hub refused it.
+ * confirmed snapshot has that version (Outbox.settingsInFlight). refused: the hub explicitly refused this edit.
  */
 export interface SettingsMark {
   seq: number;
@@ -102,8 +102,8 @@ export interface RunnerMeta {
   project: { hubUrl: string; name: string; repo: string } | null;
   /** The repository's main branch as the hub's last start named it (AttemptSpec.repo.mainBranch). */
   mainBranch: string | null;
-  /** The newest outbox seq held at the last welcome of a restored hub (Outbox.hubRestored). */
-  restoredThrough: number | null;
+  /** Contiguous settings answers retained after outbox pruning, at the persisted snapshot version. */
+  settingsAnswered: { seq: number; version: number } | null;
 }
 
 const OUTBOX_EPOCH = 'outboxEpoch';

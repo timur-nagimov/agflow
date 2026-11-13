@@ -466,7 +466,7 @@ describe('runner events', () => {
     apply(ctx, [{ seq: 1, at: 0, type: 'runner.settings', data: { settings: { draining: true }, baseVersion: 0 } }]);
     expect(getRunner(ctx, 'R-1')).toMatchObject({ draining: true, settingsVersion: before + 1 });
     const echo = pendingCommands(ctx, 'R-1', 1).at(-1);
-    expect(echo?.command).toEqual({ kind: 'update_settings', settings: { draining: true }, version: before + 1 });
+    expect(echo?.command).toEqual({ kind: 'update_settings', settings: { draining: true }, version: before + 1, answers: { seq: 1, outboxEpoch: 'outbox-1' } });
     expect(findCommand(ctx, echo?.id as string)?.status).toBe('pending');
   });
 

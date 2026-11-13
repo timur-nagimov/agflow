@@ -285,7 +285,7 @@ export class Gateway implements RunnerLink {
         afterCommit(ctx, () => this.attach(connection, runnerId, hello, welcome.message as Welcome, welcome.refence));
         recordHelloInfo(ctx, runnerId, hello);
         recordQuotaReports(ctx, emit, runnerId, hello.quota);
-        reconcileHelloSettings(ctx, runnerId, hello.settings);
+        reconcileHelloSettings(ctx, runnerId, hello.settings, hello.protocol >= 2 ? hello : undefined);
         // Facts count only from the runner's current link.
         markFactsStale(ctx, runnerId);
         const ackedSeq = acknowledgePosition(ctx, runnerId, hello.outboxEpoch, hello.firstSeq);
@@ -396,7 +396,13 @@ export class Gateway implements RunnerLink {
     });
     // Only after the commit: a rolled-back flush must leave its commands to the next one.
     for (const message of messages) connection.sent.add(message.id);
-    for (const message of messages) this.send(connection, message);
+    for (const message of messages) {
+      // Protocol 1 schemas reject unknown keys. Keep the hub-first upgrade window usable.
+      if (connection.protocol < 2 && message.command.kind === 'update_settings') {
+        const { answers: _answers, ...command } = message.command;
+        this.send(connection, { ...message, command });
+      } else this.send(connection, message);
+    }
   }
 
   /** Ends the runner's current link from the hub's side, as retiring the runner does. */
