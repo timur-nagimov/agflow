@@ -121,6 +121,13 @@ export interface HubConfig extends HubRunnerSettings {
   maxTasksPerHour: number;
   secureCookies: boolean;
   webDist?: string | undefined;
+  /**
+   * AGFLOW_OPERATOR_TOKEN: a token kept on the hub's server only, for /api/operator (mark merged, unblock, message),
+   * so an operator script can act for operatorUser without a browser. Null or absent: those routes do not exist.
+   */
+  operatorToken?: string | null | undefined;
+  /** AGFLOW_OPERATOR_USER: the allowed person the operator acts as, in lower case. */
+  operatorUser?: string | null | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */

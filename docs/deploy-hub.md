@@ -105,6 +105,23 @@ sudo systemctl restart agflow-hub
 
 The allowlist is checked whenever a session verifies; removing a login invalidates its web/CLI use. Restart closes existing runner and SSE connections, so the removed user cannot retain an old stream. The colleague signs in via GitHub in the browser and via `agflow login` on their Mac. They do not need the OAuth app secret, a cloud account or SSH access. Allowlisting does not grant repository access, and repository access alone does not grant hub access.
 
+## Operator access
+
+M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. To run a
+project unattended, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
+for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login the script acts as) in
+`/etc/agflow/hub.env` and restart. Three routes then accept the header `X-Agflow-Operator: <token>`:
+
+| Route | Does |
+|---|---|
+| `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
+| `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
+| `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
+
+Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it. Without the token the routes
+do not exist. A person's CLI token, which runners hold, still cannot use people's controls. The events record the
+operator's person as the actor.
+
 ## Joining from a Mac
 
 Requires Apple silicon macOS (`darwin-arm64`), Bun 1.3.11, git and working access to the project repo. Each person needs their own supported Claude/Codex subscription/login; authenticate git separately so fetches and pushes work. Vendor policy (including managed Codex policy) must permit the runner; agflow does not bypass it. These setup commands intentionally install a real per-user LaunchAgent and prompt for vendor login: the human runs them on their own Mac.

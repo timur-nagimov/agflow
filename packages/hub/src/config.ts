@@ -164,6 +164,16 @@ export function loadConfig(env: Env): LoadedConfig {
     throw new Error('AGFLOW_PUBLIC_URL must not contain credentials, a query or a fragment');
   }
   const publicUrl = `${url.origin}${url.pathname}`.replace(/\/+$/, '');
+  const operatorToken = env.AGFLOW_OPERATOR_TOKEN || null;
+  let operatorUser: string | null = null;
+  if (operatorToken !== null) {
+    if (operatorToken.length < 32) throw new Error('AGFLOW_OPERATOR_TOKEN must be at least 32 characters');
+    if (!env.AGFLOW_OPERATOR_USER) throw new Error('AGFLOW_OPERATOR_TOKEN needs AGFLOW_OPERATOR_USER, the person it acts as');
+    operatorUser = env.AGFLOW_OPERATOR_USER.trim().toLowerCase();
+    if (!allowedUsers.some((user) => user.toLowerCase() === operatorUser)) {
+      throw new Error('AGFLOW_OPERATOR_USER must be one of AGFLOW_ALLOWED_USERS');
+    }
+  }
   const testMode = env.AGFLOW_TEST === '1';
   if (env.AGFLOW_TEST_CONFIG && !testMode) throw new Error('AGFLOW_TEST_CONFIG is honoured only with AGFLOW_TEST=1');
   const config: HubConfig = {
@@ -181,6 +191,8 @@ export function loadConfig(env: Env): LoadedConfig {
     maxTasksPerHour: positiveInt(env, 'AGFLOW_MAX_TASKS_PER_HOUR', 60),
     secureCookies: url.protocol === 'https:',
     webDist: env.AGFLOW_WEB_DIST,
+    operatorToken,
+    operatorUser,
   };
   const overrides = env.AGFLOW_TEST_CONFIG ? testOverrides(env.AGFLOW_TEST_CONFIG) : {};
   Object.assign(config, overrides);

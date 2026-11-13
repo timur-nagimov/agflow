@@ -15,6 +15,7 @@ import { mountEventRoutes } from './event-routes';
 import { mountGithubRoutes } from './github-routes';
 import { mountLeadRoutes } from './lead-routes';
 import { mountMessageRoutes } from './message-routes';
+import { mountOperatorRoutes } from './operator-routes';
 import { mountProjectRoutes } from './project-routes';
 import { type RunnerLinkUpgrade, mountRunnerRoutes } from './runner-routes';
 import { mountStatic } from './static';
@@ -145,6 +146,7 @@ export function createApp(ctx: HubContext, options: AppOptions = {}): App {
   mountApprovalRoutes(app, ctx);
   mountLeadRoutes(app, ctx);
   mountMessageRoutes(app, ctx);
+  mountOperatorRoutes(app, ctx);
   mountEventRoutes(app, ctx);
   mountRunnerRoutes(app, ctx, options.upgradeRunnerLink);
   mountCliLoginPage(app, ctx);
