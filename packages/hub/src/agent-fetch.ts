@@ -3,8 +3,9 @@
 // bytes back. The lead may always ask; a worker may once the lead, or a person, granted its task. This module holds
 // the grants and POST /api/fetch: who may ask, the rate limits (fetch-limits.ts) and the audit trail. The request itself
 // is public-fetch.ts.
+import { createHash } from 'node:crypto';
 import { type FetchedUrl, type Task, isClosed, quoteLines } from '@agflow/core';
-import { appendAttemptLog } from './attempt-store';
+import { LOG_SUMMARY_MAX, appendAttemptLog } from './attempt-store';
 import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
 import { HubError, conflict } from './errors';
@@ -150,13 +151,37 @@ const answerFor = (error: PublicFetchError): HubError =>
     error.message,
   );
 
-/** A URL as the attempt log shows it: one line, clipped, whatever the agent sent. */
-const shownUrl = (url: string): string => clip(url.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, '?'), 500);
+/** Text an agent or a site wrote, on one line of the log: line breaks and other control characters become "?". */
+const oneLine = (text: string): string => text.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, '?');
 
-/** The audit trail (design 5): one line in the attempt's log for every request the hub made or refused to make. */
+/** Where the redirects ended. The site chose it, so only its start is shown: it says where the hub went. */
+const shownUrl = (url: string): string => clip(oneLine(url), 500);
+
+/** The outcome never grows past this, so the line that carries it is never clipped by the log. */
+const OUTCOME_MAX = 1500;
+
+/**
+ * The audit trail (design 5): every request the hub made or refused to make is on the attempt's log, with the whole
+ * URL the agent sent, since the URL is what an agent could carry data out in, at its end as well as at its start. The
+ * URL shares a line with the outcome when both fit the log's line. A longer one follows on a line of its own, and the
+ * first line gives its length and SHA-256: they tell a reader that nothing is missing, and name a URL the log had to
+ * cut (one past the route's bound of 2000 characters).
+ */
 function audit(ctx: HubContext, attemptId: string, url: string, outcome: string): void {
+  const shown = oneLine(url);
+  const result = clip(outcome, OUTCOME_MAX);
+  const line = `fetch GET ${shown}: ${result}`;
   try {
-    tx(ctx, () => appendAttemptLog(ctx, attemptId, 'note', `fetch GET ${shownUrl(url)}: ${outcome}`));
+    tx(ctx, () => {
+      if (line.length <= LOG_SUMMARY_MAX) {
+        appendAttemptLog(ctx, attemptId, 'note', line);
+        return;
+      }
+      const digest = createHash('sha256').update(url).digest('hex');
+      const where = `a URL of ${url.length} characters, SHA-256 ${digest}, on the next line`;
+      appendAttemptLog(ctx, attemptId, 'note', `fetch GET (${where}): ${result}`);
+      appendAttemptLog(ctx, attemptId, 'note', shown);
+    });
   } catch (error) {
     // The answer does not depend on the log.
     console.error(`logging a fetch of attempt ${attemptId} failed`, error);

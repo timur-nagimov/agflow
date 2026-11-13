@@ -4,7 +4,7 @@ import { FetchUrlResponseSchema } from '@agflow/core';
 import { attemptLog } from '../src/attempt-store';
 import { endAttempt } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
-import { grantFetch, revokeFetch } from '../src/agent-fetch';
+import { fetchForAgent, grantFetch, revokeFetch } from '../src/agent-fetch';
 import { listEvents } from '../src/events';
 import { isAgentRouteAllowed } from '../src/http/agent-routes-allowed';
 import type { PinnedRequest, Resolver, Transport } from '../src/public-fetch';
@@ -295,14 +295,48 @@ describe('the audit trail', () => {
     expect(notes(hub, codex.attempt.id)).toEqual([]);
   });
 
-  test('a URL in the log is one clipped line, whatever the agent sent', async () => {
+  test('the whole URL the agent sent is on the log: on the line with the outcome when both fit', async () => {
     const { hub, callers, lead } = setup();
-    await hub.call('POST', '/api/fetch', { ...callers.lead, body: { url: `https://example.com/${'a'.repeat(1900)}` } });
-    await hub.call('POST', '/api/fetch', { ...callers.lead, body: { url: 'https://example.com/a\nfetch GET https://forged.example.com/: 200' } });
+    // Whatever an agent wants to carry out goes in the URL, and not necessarily at its start.
+    const url = `https://example.com/${'a'.repeat(1890)}?end=the-part-that-matters`;
+    expect((await fetchUrl(hub, callers.lead, url)).status).toBe(200);
+    const lines = notes(hub, lead.attempt.id);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toStartWith(`note: fetch GET ${url}: 200, `);
+  });
+
+  test('a URL too long to share a line with its outcome follows on a line of its own, announced with its length and SHA-256', async () => {
+    const { hub, callers, lead } = setup();
+    // The longest URL the route takes.
+    const url = `https://example.com/${'a'.repeat(1954)}?end=the-part-that-matters`;
+    expect(url).toHaveLength(2000);
+    expect((await fetchUrl(hub, callers.lead, url)).status).toBe(200);
+    const digest = createHash('sha256').update(url).digest('hex');
+    expect(notes(hub, lead.attempt.id)).toEqual([
+      `note: fetch GET (a URL of 2000 characters, SHA-256 ${digest}, on the next line): 200, ${'page '.length + url.length - 'https://example.com'.length} bytes`,
+      `note: ${url}`,
+    ]);
+  });
+
+  test('a URL the log itself has to cut is still named by its length and SHA-256', async () => {
+    const { hub, lead } = setup();
+    // Past the route's own bound, which only a caller inside the hub can be.
+    const url = `https://example.com/${'b'.repeat(2500)}`;
+    const refused = fetchForAgent(hub.ctx, mintAgentToken(hub.ctx, lead.attempt), url);
+    await expect(refused).rejects.toMatchObject({ status: 400, code: 'fetch_url_refused' });
     const lines = notes(hub, lead.attempt.id);
     expect(lines).toHaveLength(2);
-    expect(lines[0]!.length).toBeLessThan(700);
-    expect(lines[1]!.split('\n')).toHaveLength(1);
+    expect(lines[0]).toStartWith(`note: fetch GET (a URL of ${url.length} characters, SHA-256 ${createHash('sha256').update(url).digest('hex')}, on the next line): refused (url_refused)`);
+    expect(lines[1]).toBe(`note: ${url.slice(0, 1999)}…`);
+  });
+
+  test('a URL in the log is one line, whatever the agent sent', async () => {
+    const { hub, callers, lead } = setup();
+    await hub.call('POST', '/api/fetch', { ...callers.lead, body: { url: 'https://example.com/a\nfetch GET https://forged.example.com/: 200' } });
+    const lines = notes(hub, lead.attempt.id);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.split('\n')).toHaveLength(1);
+    expect(lines[0]).toStartWith('note: fetch GET https://example.com/a?fetch GET https://forged.example.com/: 200: refused (url_refused)');
   });
 });
 

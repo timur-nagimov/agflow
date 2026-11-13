@@ -321,7 +321,8 @@ export function updateAttempt(ctx: HubContext, id: string, changes: AttemptChang
 
 /** Each attempt keeps its newest entries; older ones go as new ones come (design 6.18). */
 const LOG_ENTRIES_KEPT = 500;
-const LOG_SUMMARY_MAX = 2_000;
+/** The longest summary an entry keeps; a longer one is clipped. */
+export const LOG_SUMMARY_MAX = 2_000;
 
 export function appendAttemptLog(
   ctx: HubContext,
