@@ -187,6 +187,13 @@ export interface ContextOptions {
   agentFetch?: Partial<AgentFetchRuntime> | undefined;
 }
 
+/**
+ * The fetch limiter's clock when the context is given none: one that only moves forward. The limiter remembers when
+ * hosts are free and when requests were counted, so on the wall clock a step back (a time sync) would leave hosts
+ * busy and requests counted until the clock had caught up. A context given a clock, as tests give one, limits by it.
+ */
+const steadyNow = (): number => Math.floor(performance.now());
+
 export function createContext(options: ContextOptions): HubContext {
   const now = options.now ?? (() => Date.now());
   const db = openDb(options.dbPath, now());
@@ -205,7 +212,7 @@ export function createContext(options: ContextOptions): HubContext {
       resolve: systemResolver,
       transport: createPinnedTransport(),
       sleep: (ms) => Bun.sleep(ms),
-      limiter: new FetchLimiter(now),
+      limiter: new FetchLimiter(options.now ?? steadyNow),
       limits: {},
       ...options.agentFetch,
     },

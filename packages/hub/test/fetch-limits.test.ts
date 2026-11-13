@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { createContext } from '../src/context';
 import { FETCH_LIMITS, FetchLimiter } from '../src/fetch-limits';
+import { makeConfig } from './helpers';
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -108,5 +110,46 @@ describe('the fetch limits', () => {
     limiter.admit('T-99-a1');
     limiter.reserveHost('example.com');
     expect(limiter.tracked()).toEqual({ attempts: 1, hosts: 1, inFlight: 0 });
+  });
+});
+
+describe("the hub's own limiter", () => {
+  test('a hub given a clock limits by that clock', () => {
+    const clock = { t: 5_000_000 };
+    const ctx = createContext({ dbPath: ':memory:', config: makeConfig(), now: () => clock.t });
+    try {
+      const { limiter } = ctx.agentFetch;
+      expect(limiter.reserveHost('example.com')).toBe(0);
+      expect(limiter.reserveHost('example.com')).toBe(SECOND);
+      clock.t += 10 * SECOND;
+      expect(limiter.reserveHost('example.com')).toBe(0);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('a hub given none counts on a clock that never steps back: setting the wall clock back an hour holds no host back', () => {
+    // As main.ts builds it. On the wall clock, the slot reserved below would stay an hour away after the step.
+    const ctx = createContext({ dbPath: ':memory:', config: makeConfig() });
+    const wallClock = Date.now;
+    try {
+      const { limiter } = ctx.agentFetch;
+      expect(limiter.reserveHost('example.com')).toBe(0);
+      Date.now = () => wallClock() - 60 * MINUTE;
+      const wait = limiter.reserveHost('example.com');
+      // The usual second, less the moment that passed since the first request.
+      expect(wait).not.toBeNull();
+      expect(wait as number).toBeGreaterThan(SECOND / 2);
+      expect(wait as number).toBeLessThanOrEqual(SECOND);
+      // The count of an attempt's requests ages the same way.
+      for (let n = 0; n < FETCH_LIMITS.attemptRequests; n += 1) limiter.admit('T-1-a1');
+      Date.now = () => wallClock() - 120 * MINUTE;
+      const retryIn = limiter.admit('T-1-a1');
+      expect(retryIn as number).toBeGreaterThan(9 * MINUTE);
+      expect(retryIn as number).toBeLessThanOrEqual(FETCH_LIMITS.attemptWindowMs);
+    } finally {
+      Date.now = wallClock;
+      ctx.db.close();
+    }
   });
 });
