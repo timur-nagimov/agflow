@@ -136,7 +136,7 @@ Both sandboxes also let agent commands read the argv and environment of every pr
 
 ### Unattended options
 
-Two hub settings let a project run with no person in the loop. Both are off by default, and with both off everything above holds as written. Neither changes the runner or the protocol between hub and runner: what a runner allows and sends stays the same.
+Two hub settings let a project run with no person in the loop. Both are off by default, and with both off everything above holds as written. Neither changes the protocol between hub and runner or what a runner allows its agents. The runner's only part is to name the lead's four new tools to a Codex lead (section 10).
 
 **Internet through the hub (`AGFLOW_AGENT_FETCH=1`).**
 - **What it is for.** Some tasks need outside data: a specification, an API's documentation, a public data file. Without the setting a person has to bring it into the repository.
@@ -162,7 +162,7 @@ Two hub settings let a project run with no person in the loop. Both are off by d
 - **What stays.**
   - The runner still answers no approval itself, and the owner may still answer in the browser; the first answer wins.
   - A worker can never answer an approval, and the lead never answers its own requests.
-  - A managed device stays owner-approved: there the device's administrator requires the owner's own approval, so the lead may only decline. A runner or vendor the hub cannot find counts as managed.
+  - A managed device stays owner-approved: there the device's administrator requires the owner's own approval, so the lead may only decline. A runner or vendor the hub cannot find counts as managed, and so does a vendor the runner reports not ready: its policy was not read.
   - Only an owner's decision clears an owner-away mark.
 - **What it weakens.** The lead's judgement stands in for the owner's. An approved command runs outside the sandbox with the owner's network and write access (Approvals, above), and now an agent can allow that on an unmanaged device.
 - **Residual risks.** A lead can be misled by the text of a worker's request. So the hub quotes the request as data, never as instructions, and tells the lead to decline anything that touches secrets or files outside the clone. That lowers the risk; it does not remove it. Turn the setting on only for runners whose owners accept an agent's decision in place of their own.
@@ -2038,15 +2038,19 @@ query({
 - It uses the token as its bearer, sends no `X-Agflow-Agent`, and reads no credentials file. It does not call the hub at startup.
 - `hello` answers "already connected".
 - **Tools follow `AGFLOW_ROLE`:**
-  - **workers:** the shared tools, `report_progress`, `write_handoff`, `declare_blocked`, `declare_impossible`, `release_task`, `submit` (section 6.13) and `prepare_dependencies` (section 7.7). Not `claim_task` or `resume_claim`: the task is assigned.
+  - **workers:** the shared tools, `report_progress`, `write_handoff`, `declare_blocked`, `declare_impossible`, `release_task`, `submit` (section 6.13) and `prepare_dependencies` (section 7.7). Not `claim_task` or `resume_claim`: the task is assigned. Also `fetch_url(url, save_as)` (section 5, Unattended options): it asks the hub to download one public URL and saves the answer into the agent's clone (`AGFLOW_CLONE`, never the bridge's own working directory).
   - **leads:** the shared tools and the M1 lead tools, plus:
     - `request_agents(count, vendor?, reason)`;
     - `replace_agent(agent_id, reason)` and `stop_agent(agent_id, reason, hold?)`, for runner agents only;
     - `write_handoff` with an optional task id (none: a lead handoff);
     - `get_lead_notes()`;
     - `fetch_submission(task_id)` (section 6.13): wait for the submitted branch in the runner vault, then fetch from `origin` and review `FETCH_HEAD`.
+    - `grant_internet(task_id, reason)` and `revoke_internet(task_id)` (section 5, Unattended options), which the live bridge serves too;
+    - `list_approvals()` and `decide_approval(id, decision, reason?)` (section 6.10), for a runner lead only;
+    - `fetch_url(url, save_as)`, as for workers; the lead needs no grant.
 
     No claim, resume-claim or submit.
+- **Names.** The runner names each role's tools to its agents (`BRIDGE_TOOL_NAMES`), which a Codex thread needs because it loads MCP tools on demand. `fetch_url` is served but named to nobody (`BRIDGE_UNNAMED_TOOLS`): it works for Claude agents only, and Claude lists its bridge's tools itself, so a Codex agent is not told about a tool that refuses it.
 - **Answers:**
   - **401 `attempt_ended`:** every tool answers "Your agflow attempt has ended (<reason>). Stop working; do not commit further."
   - **401 `attempt_refenced`:** "agflow is restarting your session; stop and wait."
