@@ -323,7 +323,9 @@ async function readBody(
   const encoding = (response.headers.get('content-encoding') ?? '').trim().toLowerCase();
   if (raw.length === 0 || encoding === '' || encoding === 'identity') return raw;
   if (encoding !== 'gzip' && encoding !== 'x-gzip' && encoding !== 'br') {
-    throw new PublicFetchError('bad_response', `${url.hostname} answered in an encoding the hub does not read (${encoding.slice(0, 40)})`);
+    // The header is the site's own text, and the message goes to the agent and the log: only a plain token is named.
+    const named = /^[a-z0-9_-]{1,20}$/.test(encoding) ? encoding : 'an unknown encoding';
+    throw new PublicFetchError('bad_response', `${url.hostname} answered in an encoding the hub does not read (${named})`);
   }
   try {
     return encoding === 'br' ? brotliDecompressSync(raw, { maxOutputLength: maxBytes }) : gunzipSync(raw, { maxOutputLength: maxBytes });

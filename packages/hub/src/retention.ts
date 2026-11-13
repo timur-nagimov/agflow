@@ -6,6 +6,7 @@ import { backupAndLog, dailyBackupDue } from './backup';
 import { type CommandRow, RESULT_HANDLERS, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
+import { trimFetchRecord } from './fetch-record';
 import { findRunnerRows } from './runners';
 
 const HOUR = 60 * 60_000;
@@ -28,6 +29,8 @@ export interface RetentionReport {
   tokensDeleted: number;
   approvalsDeleted: number;
   rejectsDeleted: number;
+  /** Rows of the record of fetches past its age bound (fetch-record.ts). */
+  fetchesDeleted: number;
   refCleanups: number;
 }
 
@@ -36,8 +39,9 @@ const FINAL_STATUSES = ['merged', 'cancelled', 'failed'] as const;
 
 /**
  * The daily retention run (design 6.18): commands lose their payload (a bare { kind } stays, so rows still read),
- * revoked agent tokens, decided approvals and event rejects go, and the tasks due for ref cleanup get their
- * delete_refs. The attempt log needs nothing here: every append keeps its attempt to the newest 500 rows.
+ * revoked agent tokens, decided approvals, event rejects and old rows of the record of fetches go, and the tasks due
+ * for ref cleanup get their delete_refs. The attempt log needs nothing here: every append keeps its attempt to the
+ * newest 500 rows. Nor does the fetch record's row bound: every insert keeps it.
  */
 export function runRetention(ctx: HubContext): RetentionReport {
   const now = ctx.now();
@@ -57,6 +61,7 @@ export function runRetention(ctx: HubContext): RetentionReport {
     rejectsDeleted: ctx.db
       .query('DELETE FROM runner_event_rejects WHERE at <= $cutoff')
       .run({ cutoff: now - RETENTION.eventRejectMs }).changes,
+    fetchesDeleted: trimFetchRecord(ctx),
   }));
   return { ...removed, refCleanups: scheduleRefCleanup(ctx) };
 }

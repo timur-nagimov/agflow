@@ -140,19 +140,26 @@ Two hub settings let a project run with no person in the loop. Both are off by d
 
 **Internet through the hub (`AGFLOW_AGENT_FETCH=1`).**
 - **What it is for.** Some tasks need outside data: a specification, an API's documentation, a public data file. Without the setting a person has to bring it into the repository.
-- **What it changes.** The hub downloads one public URL at a time for a Claude agent (`POST /api/fetch`), and the bridge writes the bytes into the agent's clone. The lead's own attempt may ask; a worker's attempt may ask only after the lead seat holder, or a person, granted its task (`POST /api/tasks/:id/fetch-grant`, with a reason). `DELETE` on the same route takes the grant back. There is no list of allowed sites and no person in between: the lead decides which task needs it.
+- **What it changes.** The hub downloads one public URL at a time for a Claude agent (`POST /api/fetch`), and the bridge writes the bytes into the agent's clone. The lead's own attempt may ask; a worker's attempt may ask only after the lead seat holder, or a person, granted its task (`POST /api/tasks/:id/fetch-grant`, with a reason). There is no list of allowed sites and no person in between: the lead decides which task needs it.
+- **How long a grant lasts.** A grant belongs to the task, not to an attempt: the task's next attempt fetches on it, and a second grant of a granted task changes nothing. It ends in one of three ways, each recorded as `task.fetch_revoked`:
+  - the lead or a person takes it back (`DELETE` on the grant's route), which works whatever the setting says;
+  - the task closes (accepted, merged, cancelled or failed): the hub ends the grant in the same transaction, so no closed task holds one, and a task that opens again starts without;
+  - the hub starts with the setting off: it ends every grant it finds and names their tasks in its log, so nothing comes back to life when the setting is turned on again. While the setting is off no task reads as granted.
+- **How the agent learns of it.** The agent assigned at the moment of the grant gets a message with the reason. The task pack says that the task has internet access, in agflow's own words and with the same rules, and it is composed for every start and resume. So a task granted before it was dispatched, and every successor, read it there.
 - **What stays.**
   - Agents still have no network of their own. Boundary 1 is unchanged; the request travels over the bridge's existing connection to the hub.
   - Only runner agent tokens can fetch, and only for an open attempt. People's tokens cannot, and a worker cannot grant itself anything: granting needs the lead seat.
+  - A stop request ends an attempt's fetching at once, as it ends its submissions and preparation requests: the next fetch answers 409 `fetch_attempt_stopping`, though the attempt stays open until its agent exits or the stop times out. A cancel of the task and the agent's own release are stop requests too, and the rule holds for the lead's attempt as for a worker's. A fetch already under way finishes, within the fetch's own time limit.
+  - A worker's grant counts only while its task is open and names this attempt as its current one.
   - Codex agents get no fetch, with or without a grant. Their sandbox does not keep them from reading the owner's files (Reads, above), so an outbound channel would let them leak those files.
   - The hub fetches public addresses only. It refuses loopback, private, link-local and other non-public addresses in every spelling, in every DNS answer and after every redirect, and it connects to the address it checked, so a second DNS answer cannot redirect the request.
   - It follows at most 5 redirects, takes at most 20 s, refuses bodies over 10 MB and limits the rate of requests (429: the agent retries a little later).
-  - Every request is logged on the attempt.
+  - Every request the hub made, or refused by its URL and address rules, is recorded in the hub's `agent_fetches` table: the time, the attempt, task and agent, the whole URL the agent sent, where the redirects ended, the HTTP status or the error, and the size. The row is written before anything of the request leaves the hub, and a request the hub cannot record is not made. The attempt's log shows the same requests, but it keeps only an attempt's newest 500 entries, so the table is the record that lasts (section 6.18 bounds it). No route reads the table, so no agent can: people query it on the hub ([the hub runbook, Unattended operation](../../deploy-hub.md#unattended-operation)).
   - The bridge writes only inside the clone, never into `.git` or `.agflow`, and never through a symlink.
   - Dependency preparation stays registries-only (section 7.7).
 - **What it weakens.** A granted Claude agent has a way to send data out, one URL at a time.
 - **Residual risks.**
-  - **Leaks.** A prompt-injected Claude agent with a grant can leak whatever its sandbox lets it read, through the URLs it asks for. So grant only the tasks that need outside data, and revoke the grant afterwards.
+  - **Leaks.** A prompt-injected Claude agent with a grant can leak whatever its sandbox lets it read, through the URLs it asks for. So grant only the tasks that need outside data, and take a grant back once its task no longer needs it; at the latest it ends when the task closes. The lead's own attempt needs no grant, so the same holds for a prompt-injected lead for as long as the setting is on.
   - **Untrusted pages.** A downloaded page is untrusted input to the agent that reads it. It can carry instructions written for agents.
   - **The hub's address.** The hub makes the requests, so other sites see the hub's address, and limits or blocks they apply fall on the hub.
 
@@ -1020,8 +1027,8 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 | `POST /api/fetch-submission`, `GET /api/fetch-submission/:id` | lead only: the caller must hold the seat; polling is restricted to the lead attempt that requested the fetch (section 6.13) |
 | `POST /api/inbox`, `POST /api/inbox/ack`, `POST /api/messages` | |
 | lead routes: `POST /api/tasks`, `PATCH /api/tasks/:id`, `POST /api/tasks/:id/{cancel,accept,reject,unblock,merged}`, `POST /api/goal/notes`, `POST /api/staffing`, `POST /api/agents/:id/{stop,replace}`, `POST /api/lead/handoff`, `GET /api/lead/notes` | only while the agent holds the lead seat (section 6.11). Stop and replace apply only to runner agents. |
-| `POST /api/fetch` | every runner agent, for its own attempt: the hub downloads one public URL. Refused unless `AGFLOW_AGENT_FETCH=1`, for Codex attempts, and for a worker whose task holds no grant (section 5, Unattended options) |
-| `POST /api/tasks/:id/fetch-grant`, `DELETE /api/tasks/:id/fetch-grant` | lead only: grants a task internet access and takes it back; 403 `fetch_disabled` unless `AGFLOW_AGENT_FETCH=1` (section 5, Unattended options) |
+| `POST /api/fetch` | every runner agent, for its own attempt: the hub downloads one public URL. Refused unless `AGFLOW_AGENT_FETCH=1`, for an attempt that was asked to stop (409 `fetch_attempt_stopping`), for Codex attempts, and for a worker whose open task holds no grant or names another attempt (section 5, Unattended options) |
+| `POST /api/tasks/:id/fetch-grant`, `DELETE /api/tasks/:id/fetch-grant` | lead only: grants a task internet access and takes it back. Granting answers 403 `fetch_disabled` unless `AGFLOW_AGENT_FETCH=1`; taking back works whatever the setting (section 5, Unattended options) |
 | `GET /api/approvals`, `POST /api/approvals/:id` | lead only, and only with `AGFLOW_LEAD_APPROVALS=1`: lists the pending approvals of other attempts and answers one; without the setting, 403 `agent_not_allowed` as on a route this table does not list (section 5, Unattended options) |
 
 `leadOrHuman` changes for every agent principal, live or runner: the agent must hold the seat (`hub_state.lead_agent_id`). For `fetch_submission`, a runner lead uses its ordinary agent token; there is no separate lead token. A live lead uses the M1 CLI token plus `X-Agflow-Agent` and gets the branch and head immediately. A person without an agent identity cannot call either fetch route.
@@ -1482,7 +1489,7 @@ The types:
 - **approvals:** `approval.requested`, `approval.decided`, `approval.expired`, `approval.voided`;
 - **lead:** `lead.seat_changed`, `lead.rotated`;
 - **submissions:** `submission.pending`, `submission.recorded`, `submission.failed`;
-- **tasks:** `task.taken_over`, `task.handed_back`, `task.refs_deleted`, `task.fetch_granted`, `task.fetch_revoked` (the last two name the task and who decided; no attempt or runner applies);
+- **tasks:** `task.taken_over`, `task.handed_back`, `task.refs_deleted`, `task.fetch_granted`, `task.fetch_revoked` (the last two name the task and who decided; no attempt or runner applies. `task.fetch_revoked` is by `system` when the grant ended with its task, or at a start with `AGFLOW_AGENT_FETCH` off);
 - **guards:** `guard.plan_change`, `guard.dispatch_paused`;
 - **hub:** `system.recovery_started`, `system.recovery_ended`, `system.restored`.
 
@@ -1497,6 +1504,7 @@ Each removal runs on a daily timer outside the tick:
 | decided approvals | deleted after 90 days |
 | `runner_event_rejects` | deleted after 30 days |
 | `attempt_log` | at most 500 rows per attempt |
+| `agent_fetches` (section 5, Unattended options) | rows deleted after 90 days; at most 250,000 rows, the oldest going as each new one is written (this one on every insert, not on the timer). Each request is one row and an attempt gets 120 requests in 10 minutes, so one agent fetching at its limit without a pause needs 14 days to push a row out |
 | remote refs | 7 days after a task is merged, cancelled or failed, an online runner of the task's last attempt (or any runner) gets `delete_refs` for the refs under `<wipRefPrefix><task>/` whose sha the hub recorded (WIP, late work, hand-back), with fenced deletes. A successful result records `task.refs_deleted`; until then the daily run retries. Refs with no recorded sha (a take-over ref never handed back) stay. |
 
 ## 7. Runner

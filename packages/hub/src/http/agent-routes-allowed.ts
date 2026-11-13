@@ -47,7 +47,8 @@ export const AGENT_ROUTES: readonly AgentRoute[] = [
   { method: 'POST', path: '/api/agents/:id/replace', access: 'lead' },
   { method: 'POST', path: '/api/lead/handoff', access: 'lead' },
   { method: 'GET', path: '/api/lead/notes', access: 'lead' },
-  // Internet through the hub (design 5, Unattended options); the routes refuse while AGFLOW_AGENT_FETCH is off.
+  // Internet through the hub (design 5, Unattended options); fetching and granting refuse while AGFLOW_AGENT_FETCH is
+  // off.
   { method: 'POST', path: '/api/fetch', access: 'own' },
   { method: 'POST', path: '/api/tasks/:id/fetch-grant', access: 'lead' },
   { method: 'DELETE', path: '/api/tasks/:id/fetch-grant', access: 'lead' },
