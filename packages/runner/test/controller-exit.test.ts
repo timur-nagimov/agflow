@@ -307,6 +307,8 @@ describe('AttemptController: exits', () => {
   test('canPushWip is asked before every final push try: a gap between tries sends the work to a late-work ref', async () => {
     const f = await createRunnerFixture({
       script: { turns: [[{ do: 'write', path: 'work.txt', content: 'work\n' }, { do: 'sleep', ms: 20_000 }]] },
+      // The first late-work try can run before the origin is restored below; the next one must come well within the wait.
+      config: { timings: { lateRetry: { base: 200, cap: 1_000 } } },
     });
     let pushes = 0;
     const remote = async (): Promise<GitEnvironment> => {
