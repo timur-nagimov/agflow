@@ -520,26 +520,6 @@ export const leadTools: ToolDef[] = [
     },
   ),
   defineTool(
-    'grant_internet',
-    'Lead: let one task fetch public web pages through the agflow hub (its Claude agent then has fetch_url; Codex agents never do). ' +
-      'Grant only a task that needs outside data, and say why: the reason is recorded and shown to people. ' +
-      'An agent with internet access can leak what it reads through the addresses it asks for, so grant no more tasks than need it, and revoke the grant with revoke_internet once the data is in.',
-    { task_id: TaskIdSchema, reason: z.string().min(1).max(500) },
-    async ({ task_id, reason }, ctx) => {
-      const { task } = await asAgent(ctx).grantInternet(task_id, reason);
-      return `${task.id} has internet access: its Claude agent can use fetch_url. Revoke it with revoke_internet when the task no longer needs it.`;
-    },
-  ),
-  defineTool(
-    'revoke_internet',
-    'Lead: take back the internet access you granted a task with grant_internet.',
-    { task_id: TaskIdSchema },
-    async ({ task_id }, ctx) => {
-      const { task } = await asAgent(ctx).revokeInternet(task_id);
-      return `${task.id} has no internet access any more.`;
-    },
-  ),
-  defineTool(
     'add_goal_note',
     'Lead: record how you interpret the goal. People see the note next to the goal.',
     { text: z.string().min(1).max(4000) },

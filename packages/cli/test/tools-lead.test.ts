@@ -75,10 +75,10 @@ describe('lead tools', () => {
     );
   });
 
-  test('all 30 tools are registered with unique names', () => {
+  test('all 28 tools are registered with unique names', () => {
     const names = allTools.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
-    expect(names).toHaveLength(30);
+    expect(names).toHaveLength(28);
     expect(names).toContain('fetch_submission');
   });
 });
