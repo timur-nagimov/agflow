@@ -21,6 +21,9 @@ import {
   BRIDGE_HEADER,
   BRIDGE_VERSION,
   HUB_EVENT_TYPES,
+  FetchGrantInputSchema,
+  FetchUrlInputSchema,
+  FetchUrlResponseSchema,
   HandbackInputSchema,
   type HubEventCategory,
   type HubEventSubject,
@@ -313,6 +316,8 @@ describe('request bodies', () => {
     ['PrepareInputSchema', PrepareInputSchema, {}],
     ['LeadHandoffInputSchema', LeadHandoffInputSchema, { note: 'T-42 waits for review.' }],
     ['ProjectPatchInputSchema', ProjectPatchInputSchema, { runnerLeads: false }],
+    ['FetchGrantInputSchema', FetchGrantInputSchema, { reason: 'the task compares public price lists' }],
+    ['FetchUrlInputSchema', FetchUrlInputSchema, { url: 'https://example.com/data.csv' }],
   ];
 
   for (const [name, schema, body] of bodies) {
@@ -321,6 +326,32 @@ describe('request bodies', () => {
       expect(parses(schema, { ...body, bogus: 1 })).toBe(false);
     });
   }
+
+  test('an internet grant needs a reason of 1 to 500 characters, and a fetch a URL of at most 2000', () => {
+    expect(parses(FetchGrantInputSchema, { reason: '' })).toBe(false);
+    expect(parses(FetchGrantInputSchema, {})).toBe(false);
+    expect(parses(FetchGrantInputSchema, { reason: 'r'.repeat(500) })).toBe(true);
+    expect(parses(FetchGrantInputSchema, { reason: 'r'.repeat(501) })).toBe(false);
+    expect(parses(FetchUrlInputSchema, { url: '' })).toBe(false);
+    expect(parses(FetchUrlInputSchema, { url: `https://example.com/${'a'.repeat(1980)}` })).toBe(true);
+    expect(parses(FetchUrlInputSchema, { url: `https://example.com/${'a'.repeat(1981)}` })).toBe(false);
+    expect(parses(FetchUrlInputSchema, { url: 7 })).toBe(false);
+  });
+
+  test('a fetch answers the status, where it ended, the content type, the size, the digest and the body, and nothing else', () => {
+    const answer = {
+      status: 200,
+      finalUrl: 'https://example.com/data.csv',
+      contentType: 'text/csv',
+      bytes: 3,
+      sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      bodyBase64: 'YWJj',
+    };
+    expect(FetchUrlResponseSchema.parse(answer)).toEqual(answer);
+    expect(parses(FetchUrlResponseSchema, { ...answer, contentType: null })).toBe(true);
+    expect(parses(FetchUrlResponseSchema, { ...answer, headers: { 'set-cookie': 'a=b' } })).toBe(false);
+    expect(parses(FetchUrlResponseSchema, { ...answer, sha256: 'abc' })).toBe(false);
+  });
 
   test("a runner agent's submit body is { summary, evidence } only: the runner pushes, so a branch or headSha is refused", () => {
     expect(RunnerSubmitInputSchema.parse({ summary: 's', evidence: ['bun test: 42 pass'] })).toEqual({
@@ -635,6 +666,8 @@ describe('the event catalogue', () => {
       'task.taken_over',
       'task.handed_back',
       'task.refs_deleted',
+      'task.fetch_granted',
+      'task.fetch_revoked',
       'guard.plan_change',
       'guard.dispatch_paused',
       'system.recovery_started',
@@ -691,7 +724,8 @@ describe('the event catalogue', () => {
       approval: ['approvalId', 'attemptId', 'taskId', 'agentId', 'runnerId'],
       lead: ['agentId', 'attemptId', 'runnerId'],
       submission: ['submissionId', 'attemptId', 'taskId', 'agentId', 'runnerId'],
-      task: ['taskId', 'runnerId'],
+      // A task event names its task; the ones a runner or an attempt caused name those too (checked below).
+      task: ['taskId'],
       guard: [],
       system: [],
     };
@@ -722,6 +756,10 @@ describe('the event catalogue', () => {
     expect(HUB_EVENT_TYPES['attempt.late_work'].optionalData).toEqual(['submittedHead']);
     expect(data('task.handed_back')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'source', 'ref', 'sha']);
     expect(data('task.refs_deleted')).toEqual(['taskId', 'runnerId', 'refs']);
+    // An internet grant is the lead's or a person's decision about a task: no attempt or runner applies.
+    expect(data('task.fetch_granted')).toEqual(['taskId', 'by', 'reason']);
+    expect(data('task.fetch_revoked')).toEqual(['taskId', 'by']);
+    expect(data('task.taken_over')).toContain('runnerId');
     expect(data('agent.stalled')).toEqual(['attemptId', 'taskId', 'agentId', 'runnerId', 'cause', 'reason']);
     expect(data('approval.decided')).toEqual(['approvalId', 'attemptId', 'taskId', 'agentId', 'runnerId', 'summary', 'decision']);
     expect(data('guard.plan_change')).toEqual(['agentId', 'call', 'taskIds', 'count']);

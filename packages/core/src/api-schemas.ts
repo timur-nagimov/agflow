@@ -49,6 +49,7 @@ import type {
   AttemptLogEntry,
   AttemptStatus,
   FailureClass,
+  FetchedUrl,
   LeadNote,
   LeadSeat,
   PrepareRequest,
@@ -435,6 +436,15 @@ export const LeadHandoffInputSchema = HandoffInputSchema;
 /** PATCH /api/project: may the scheduler start leads on runners. */
 export const ProjectPatchInputSchema = z.strictObject({ runnerLeads: z.boolean() });
 
+/** POST /api/tasks/:id/fetch-grant: why the task needs data from outside; its event and the assignee's message quote it. */
+export const FetchGrantInputSchema = z.strictObject({ reason: z.string().min(1).max(500) });
+
+/** The longest URL the hub fetches for an agent, on the first hop and on every redirect. */
+export const FETCH_URL_MAX = 2000;
+
+/** POST /api/fetch: the hub applies its own rules to the URL (design 5); the schema only bounds it. */
+export const FetchUrlInputSchema = z.strictObject({ url: z.string().min(1).max(FETCH_URL_MAX) });
+
 // ---------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------
@@ -480,6 +490,18 @@ export const TakeoverResponseSchema = z.strictObject({ attemptId: AttemptIdSchem
 
 /** GET /api/lead/notes. */
 export const LeadNotesResponseSchema = z.strictObject({ notes: z.array(LeadNoteSchema) });
+
+/** POST /api/fetch. */
+export const FetchUrlResponseSchema = schemaFor<FetchedUrl>()(
+  z.strictObject({
+    status: z.number().int().min(100).max(599),
+    finalUrl: z.string(),
+    contentType: z.string().nullable(),
+    bytes: NonNegativeInt,
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    bodyBase64: z.string(),
+  }),
+);
 
 /** GET /api/runner/whoami: the CLI token's user. */
 export const WhoamiResponseSchema = z.strictObject({ user: Name });
@@ -587,6 +609,9 @@ export const HUB_EVENT_TYPES = {
   'task.handed_back': { category: 'tasks', subject: 'task', data: [...OF_ATTEMPT, 'source', 'ref', 'sha'] },
   // refs: the remote refs the runner deleted.
   'task.refs_deleted': { category: 'tasks', subject: 'task', data: ['taskId', 'runnerId', 'refs'] },
+  // by: the lead or the person who decided; reason: why the task needs data from outside, in their words.
+  'task.fetch_granted': { category: 'tasks', subject: 'task', data: ['taskId', 'by', 'reason'] },
+  'task.fetch_revoked': { category: 'tasks', subject: 'task', data: ['taskId', 'by'] },
   // call: create_tasks, update_task or cancel_task; count: the calls counted in the sliding hour, this one included.
   'guard.plan_change': { category: 'guards', subject: null, data: ['agentId', 'call', 'taskIds', 'count'] },
   // until: when worker dispatch resumes; agentId: the agent whose call reached the budget.

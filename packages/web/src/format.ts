@@ -560,6 +560,9 @@ const M2_SENTENCES: Record<HubEventType, Sentence> = {
       d.sha ? ` at ${sha7(d.sha)}` : ''
     }`,
   'task.refs_deleted': (d, _by, on) => `${text(d.runnerId)} deleted ${count(d.refs, 'ref')} of ${text(d.taskId) || on}`,
+  // The reason is the lead's or a person's own words; the timeline shows it as text.
+  'task.fetch_granted': (d, by, on) => `${by} granted ${text(d.taskId) || on} internet access${d.reason ? `: ${text(d.reason)}` : ''}`,
+  'task.fetch_revoked': (d, by, on) => `${by} revoked ${text(d.taskId) || on}'s internet access`,
   'guard.plan_change': (d) =>
     `${text(d.agentId)} called ${text(d.call)} on ${list(d.taskIds)}: ${String(d.count)} plan changes in the last hour`,
   'guard.dispatch_paused': (d, _by, _on, event) => {
@@ -684,6 +687,7 @@ export function eventTone(type: string, data: Record<string, unknown> = {}): Ton
     case 'submission.recorded':
     case 'attempt.holding':
     case 'approval.requested':
+    case 'task.fetch_granted':
       return 'review';
     case 'task.claimed':
     case 'task.working':
@@ -720,6 +724,7 @@ export function eventTone(type: string, data: Record<string, unknown> = {}): Ton
     case 'agent.stopped':
     case 'approval.voided':
     case 'task.refs_deleted':
+    case 'task.fetch_revoked':
       return 'closed';
     default:
       return 'wait';

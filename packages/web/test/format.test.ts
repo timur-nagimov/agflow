@@ -87,6 +87,7 @@ function task(overrides: Partial<Task> = {}): Task {
     workRef: null,
     workSha: null,
     nextDispatchAt: null,
+    fetchGranted: false,
     ...overrides,
   };
 }
@@ -576,6 +577,8 @@ const M2_EVENTS: Record<HubEventType, { data: Record<string, unknown>; subject: 
     'task.taken_over': task({ ...ofAttempt, person: 'alice', ref: 'refs/agflow/T-8/takeover-alice' }, 'user:alice'),
     'task.handed_back': task({ ...ofAttempt, source: 'ref', ref: 'refs/agflow/T-8/takeover-alice', sha: SHA }, 'user:alice'),
     'task.refs_deleted': task({ taskId: 'T-8', runnerId: 'R-1', refs: ['refs/agflow/T-8/a1', 'refs/agflow/T-8/a2'] }),
+    'task.fetch_granted': task({ taskId: 'T-8', by: 'agent:A-5', reason: 'compare the public price lists' }, 'agent:A-5'),
+    'task.fetch_revoked': task({ taskId: 'T-8', by: 'user:alice' }, 'user:alice'),
     'guard.plan_change': none({ agentId: 'A-5', call: 'update_task', taskIds: ['T-3', 'T-4'], count: 12 }, 'agent:A-5'),
     'guard.dispatch_paused': none({ agentId: 'A-5', until: 1_800_000, count: 20 }),
     'system.recovery_started': none({ gapMs: 3 * 3_600_000, until: 60_000 }),
@@ -708,6 +711,12 @@ describe('M2 events', () => {
       "alice handed T-8 back from the runner's clone",
     );
     expect(describeEvent(m2Event('task.refs_deleted'))).toBe('R-1 deleted 2 refs of T-8');
+    expect(describeEvent(m2Event('task.fetch_granted'))).toBe('A-5 granted T-8 internet access: compare the public price lists');
+    expect(describeEvent(m2Event('task.fetch_revoked'))).toBe("alice revoked T-8's internet access");
+    // An event stored without its data (an older hub, a hand-made row) still reads as a sentence.
+    expect(describeEvent({ id: 1, ts: 0, type: 'task.fetch_granted', actor: 'system', subject: 'T-8', data: {} })).toBe(
+      'agflow granted T-8 internet access',
+    );
     expect(describeEvent(m2Event('guard.plan_change'))).toBe('A-5 called update_task on T-3, T-4: 12 plan changes in the last hour');
     expect(describeEvent(m2Event('guard.dispatch_paused'))).toBe(
       'Worker dispatch paused for 30 min after 20 plan changes in an hour by A-5',
@@ -799,6 +808,8 @@ describe('M2 events', () => {
       'task.taken_over': 'active',
       'task.handed_back': 'done',
       'task.refs_deleted': 'closed',
+      'task.fetch_granted': 'review',
+      'task.fetch_revoked': 'closed',
       'guard.plan_change': 'wait',
       'guard.dispatch_paused': 'trouble',
       'system.recovery_started': 'wait',
