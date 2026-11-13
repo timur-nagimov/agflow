@@ -4,7 +4,7 @@
 // the grants and POST /api/fetch: who may ask, the rate limits (fetch-limits.ts) and the audit trail. The request itself
 // is public-fetch.ts.
 import { createHash } from 'node:crypto';
-import { type FetchedUrl, type Task, isClosed, quoteLines } from '@agflow/core';
+import { type Attempt, type FetchedUrl, type Task, isClosed, quoteLines } from '@agflow/core';
 import { LOG_SUMMARY_MAX, appendAttemptLog } from './attempt-store';
 import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
@@ -14,7 +14,7 @@ import { holdsSeat } from './hub-state';
 import { insertMessage } from './messages';
 import { FetchRefusal, parseFetchUrl } from './public-address';
 import { type PublicFetchFailure, PublicFetchError, fetchPublicUrl } from './public-fetch';
-import { getTask } from './task-store';
+import { findTask, getTask } from './task-store';
 import { clip } from './text';
 
 /** 403 while AGFLOW_AGENT_FETCH is off: the grant routes and POST /api/fetch all answer it. */
@@ -107,15 +107,45 @@ const vendorRefused = () =>
       'and why; the lead can fetch it or give the work to a Claude agent.',
   );
 
-const notGranted = (taskId: string | null) =>
+/**
+ * A stop request ends the fetching at once (design 5, Unattended options), as it ends the agent's other requests
+ * (prepare.ts, tasks.ts requireHolder): the attempt itself stays open until its agent exits or the stop times out,
+ * and an agent told to stop has no more use for outside data. A cancel of its task and its own release are stops too.
+ */
+const attemptStopping = (attemptId: string) =>
   new HubError(
-    403,
-    'fetch_not_granted',
-    taskId === null
-      ? 'only the lead, or the agent of a task the lead granted internet access, can fetch.'
-      : `${taskId} has no internet access. Ask the lead with send_message (to "lead"): say which sites you need ` +
-        'and why. fetch_url works once the lead grants it; you get a message when it does.',
+    409,
+    'fetch_attempt_stopping',
+    `your attempt ${attemptId} is being stopped, so nothing more is fetched for it. Write a handoff note if you have ` +
+      'not, and stop.',
   );
+
+const notGranted = (message: string) => new HubError(403, 'fetch_not_granted', message);
+
+/** What an agent does once the work is no longer its own. */
+const STOP_ADVICE = 'Write a handoff note if you have not, and stop.';
+
+/**
+ * A worker fetches on its task's grant, and only while the work is its own: the task is open and this attempt is the
+ * one the task names. A grant made for a task is no licence for an attempt the task has left behind, nor for work
+ * that is over.
+ */
+function requireGrant(ctx: HubContext, attempt: Attempt): void {
+  const task = attempt.taskId === null ? null : findTask(ctx, attempt.taskId);
+  if (!task) throw notGranted('only the lead, or the agent of a task the lead granted internet access, can fetch.');
+  if (isClosed(task.status)) {
+    throw notGranted(`${task.id} is ${task.status}, so nothing more is fetched for it. ${STOP_ADVICE}`);
+  }
+  if (task.currentAttempt !== attempt.id) {
+    throw notGranted(`your attempt ${attempt.id} no longer holds ${task.id}, so nothing is fetched for it. ${STOP_ADVICE}`);
+  }
+  if (!findFetchGrant(ctx, task.id)) {
+    throw notGranted(
+      `${task.id} has no internet access. Ask the lead with send_message (to "lead"): say which sites you need ` +
+        'and why. fetch_url works once the lead grants it; you get a message when it does.',
+    );
+  }
+}
 
 const rateLimited = (retryInMs: number) =>
   new HubError(
@@ -196,16 +226,16 @@ const failed = (error: PublicFetchError): string =>
 /**
  * POST /api/fetch: the hub downloads one public URL for the runner agent the token names. Checked in this order, each
  * with its own answer: the setting is on; the attempt is open (the token is resolved again, as the body arrived after
- * the route resolved it); the attempt is Claude's; the agent holds the lead seat or its task holds a grant; the rate
- * limits. Then one GET (public-fetch.ts), a line in the attempt's log, and the bytes.
+ * the route resolved it); nobody asked it to stop; the attempt is Claude's; the agent holds the lead seat, or its open
+ * task names this attempt and holds a grant; the rate limits. Then one GET (public-fetch.ts), a line in the attempt's
+ * log, and the bytes. A fetch under way when a stop is asked for runs to its end, within the fetch's own time limit.
  */
 export async function fetchForAgent(ctx: HubContext, token: string, rawUrl: string): Promise<FetchedUrl> {
   requireAgentFetch(ctx);
   const { agent, attempt } = resolveAgentToken(ctx, token);
+  if (attempt.stopRequested) throw attemptStopping(attempt.id);
   if (attempt.vendor !== 'claude') throw vendorRefused();
-  if (!holdsSeat(ctx, agent.id) && (attempt.taskId === null || !findFetchGrant(ctx, attempt.taskId))) {
-    throw notGranted(attempt.taskId);
-  }
+  if (!holdsSeat(ctx, agent.id)) requireGrant(ctx, attempt);
   const { limiter, sleep, resolve, transport, limits } = ctx.agentFetch;
   if (!limiter.enter(attempt.id)) throw busy();
   try {

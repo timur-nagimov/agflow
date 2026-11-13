@@ -1,12 +1,13 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { FetchUrlResponseSchema } from '@agflow/core';
-import { attemptLog } from '../src/attempt-store';
-import { endAttempt } from '../src/attempts';
+import { attemptLog, getAttempt } from '../src/attempt-store';
+import { endAttempt, stopAgent } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
-import { fetchForAgent, grantFetch, revokeFetch } from '../src/agent-fetch';
+import { fetchForAgent, findFetchGrant, grantFetch, revokeFetch } from '../src/agent-fetch';
 import { listEvents } from '../src/events';
 import { isAgentRouteAllowed } from '../src/http/agent-routes-allowed';
+import { holdsSeat } from '../src/hub-state';
 import type { PinnedRequest, Resolver, Transport } from '../src/public-fetch';
 import { addRunnerAttempt, addRunnerLead } from './helpers';
 import { createTestHub } from './http-helpers';
@@ -125,11 +126,14 @@ describe('who may fetch', () => {
     expect([requests, resolved]).toEqual([[], []]);
   });
 
-  test('the checks come in order: the setting, the attempt, the vendor, the grant', async () => {
+  test('the checks come in order: the setting, the attempt, the stop, the vendor, the grant', async () => {
     const { hub, callers, codex, granted, lead, requests } = setup();
     // A Codex worker without a grant hears about its vendor, not about the grant.
     revokeFetch(hub.ctx, codex.task.id, 'user:alice');
     expect((await fetchUrl(hub, callers.codex)).json.error).toBe('fetch_vendor_refused');
+    // Once it is being stopped it hears that, whatever its vendor.
+    stopAgent(hub.ctx, { agentId: codex.agent.id, reason: 'wrong vendor for this', by: 'user:alice', hold: false });
+    expect((await fetchUrl(hub, callers.codex)).json.error).toBe('fetch_attempt_stopping');
     // A revoke takes effect on the next request.
     expect((await fetchUrl(hub, callers.granted)).status).toBe(200);
     revokeFetch(hub.ctx, granted.task.id, `agent:${lead.agent.id}`);
@@ -139,6 +143,72 @@ describe('who may fetch', () => {
     const ended = await fetchUrl(hub, callers.granted);
     expect([ended.status, ended.json.error]).toEqual([401, 'attempt_ended']);
     expect(requests).toHaveLength(1);
+  });
+
+  test("a stop, a cancel of the task or the worker's own release ends its fetching at once, with a code of its own", async () => {
+    type Setup = ReturnType<typeof setup>;
+    const reason = { reason: 'no longer needed' };
+    // Each only asks the agent to stop: its attempt stays open until the agent exits, or the stop times out.
+    const requests: [string, (s: Setup) => Promise<{ status: number }>][] = [
+      ['a stop by the lead', (s) => s.hub.call('POST', `/api/agents/${s.granted.agent.id}/stop`, { ...s.callers.lead, body: reason })],
+      ['a stop and hold by a person', (s) => s.hub.call('POST', `/api/agents/${s.granted.agent.id}/stop`, { ...s.callers.web, body: { ...reason, hold: true } })],
+      ['a replace', (s) => s.hub.call('POST', `/api/agents/${s.granted.agent.id}/replace`, { ...s.callers.lead, body: reason })],
+      ['a cancel of the task', (s) => s.hub.call('POST', `/api/tasks/${s.granted.task.id}/cancel`, { ...s.callers.lead, body: reason })],
+      ["the worker's own release", (s) => s.hub.call('POST', `/api/tasks/${s.granted.task.id}/release`, { ...s.callers.granted, body: reason })],
+    ];
+    for (const [what, request] of requests) {
+      const s = setup();
+      expect([what, (await fetchUrl(s.hub, s.callers.granted)).status]).toEqual([what, 200]);
+      expect([what, (await request(s)).status]).toEqual([what, 200]);
+      const attempt = getAttempt(s.hub.ctx, s.granted.attempt.id);
+      expect([what, attempt.status, attempt.stopRequested !== null]).toEqual([what, 'running', true]);
+      const answer = await fetchUrl(s.hub, s.callers.granted, 'https://example.com/after');
+      expect([what, answer.status, answer.json.error]).toEqual([what, 409, 'fetch_attempt_stopping']);
+      // It tells the agent what to do instead.
+      expect(answer.json.message).toContain(s.granted.attempt.id);
+      expect(answer.json.message).toContain('handoff note');
+      // Nothing left the hub for it, and a request the hub did not make leaves no line.
+      expect([what, s.requests.map((made) => made.path)]).toEqual([what, ['/data']]);
+      expect([what, notes(s.hub, s.granted.attempt.id)]).toEqual([what, ['note: fetch GET https://example.com/data: 200, 10 bytes']]);
+      // Another attempt goes on.
+      expect([what, (await fetchUrl(s.hub, s.callers.lead, 'https://lead.example.com/')).status]).toEqual([what, 200]);
+    }
+  });
+
+  test('a lead that is being stopped fetches no more, though it holds the seat until it exits', async () => {
+    const { hub, callers, lead, requests } = setup();
+    expect((await fetchUrl(hub, callers.lead)).status).toBe(200);
+    const stopped = await hub.call('POST', `/api/agents/${lead.agent.id}/stop`, { ...callers.web, body: { reason: 'a person takes over the planning' } });
+    expect(stopped.status).toBe(200);
+    expect([getAttempt(hub.ctx, lead.attempt.id).status, holdsSeat(hub.ctx, lead.agent.id)]).toEqual(['running', true]);
+    const answer = await fetchUrl(hub, callers.lead, 'https://example.com/after');
+    expect([answer.status, answer.json.error]).toEqual([409, 'fetch_attempt_stopping']);
+    expect(answer.json.message).toContain(lead.attempt.id);
+    expect(requests).toHaveLength(1);
+  });
+
+  test("a grant counts only while its task is open and the attempt is the task's current one", async () => {
+    // A close ends the grant and stops the attempt, and a task gets a new attempt only once the last one ended. So
+    // these two states are written here by hand: the rule is the fetch's own, whatever leads to them.
+    const { hub, callers, granted, requests } = setup();
+    const set = (changes: string) => hub.ctx.db.query(`UPDATE tasks SET ${changes} WHERE id = $id`).run({ id: granted.task.id });
+    set("status = 'cancelled'");
+    expect(findFetchGrant(hub.ctx, granted.task.id)).not.toBeNull();
+    const closed = await fetchUrl(hub, callers.granted);
+    expect([closed.status, closed.json.error]).toEqual([403, 'fetch_not_granted']);
+    expect(closed.json.message).toContain(`${granted.task.id} is cancelled`);
+    for (const status of ['accepted', 'merged', 'failed']) {
+      set(`status = '${status}'`);
+      expect([status, (await fetchUrl(hub, callers.granted)).json.error]).toEqual([status, 'fetch_not_granted']);
+    }
+    set("status = 'working', current_attempt = 'T-900-a2'");
+    const superseded = await fetchUrl(hub, callers.granted);
+    expect([superseded.status, superseded.json.error]).toEqual([403, 'fetch_not_granted']);
+    expect(superseded.json.message).toContain(granted.attempt.id);
+    expect(requests).toEqual([]);
+    // The task's own attempt, once the task is open again, fetches on the same grant.
+    set(`current_attempt = '${granted.attempt.id}'`);
+    expect((await fetchUrl(hub, callers.granted)).status).toBe(200);
   });
 
   test('a Codex lead may grant but not fetch', async () => {
