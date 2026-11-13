@@ -82,7 +82,7 @@ const LINE_BREAKS = /[\p{Cc}\p{Zl}\p{Zp}]+/gu;
 const SPANS_LINES = /[\p{Cc}\p{Zl}\p{Zp}]/u;
 
 /** At most `max` characters of `text` on a single line. Line breaks and other control characters become spaces. */
-function oneLine(text: string, max: number): string {
+export function oneLine(text: string, max: number): string {
   const flat = text.replace(LINE_BREAKS, ' ').trim();
   const chars = Array.from(flat);
   return chars.length <= max ? flat : `${chars.slice(0, max - 1).join('')}…`;

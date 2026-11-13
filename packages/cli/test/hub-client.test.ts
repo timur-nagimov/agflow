@@ -34,6 +34,19 @@ describe('HubClient', () => {
     expect(error).toMatchObject({ status: 401, code: 'unauthorized' });
   });
 
+  test("a request's own timeout replaces the client's", async () => {
+    // A hub that never answers: only the request's signal ends the wait.
+    const hanging: FetchFn = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')));
+      });
+    const client = new HubClient({ baseUrl: HUB_URL, fetch: hanging, timeoutMs: 60_000 });
+    const started = performance.now();
+    const error = await client.request('GET', '/api/status', undefined, { timeoutMs: 20 }).catch((e: unknown) => e);
+    expect(error).toMatchObject({ status: 0, code: 'unreachable' });
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
+
   test('an unreachable hub is reported clearly', async () => {
     const broken = new HubClient({
       baseUrl: 'http://hub.test',

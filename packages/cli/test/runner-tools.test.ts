@@ -114,6 +114,13 @@ function prepared(hub: HubFixture, agent: RunnerAgent, outcome: { ok: boolean; e
   tx(hub.ctx, (emit) => onPrepared(hub.ctx, emit, agent.attempt, { requestId: row.id, ...outcome }));
 }
 
+/**
+ * The unattended options' tools (design 5, 6.10), which the bridge serves and the runner's list does not name: those
+ * options leave the runner as it is. A Codex thread needs every name of the runner's list from its bridge and only
+ * warns about others, so these are the whole difference between the two, and any other is a drift.
+ */
+const UNATTENDED_TOOLS = { worker: ['fetch_url'], lead: ['fetch_url'] } as const;
+
 const SHARED = ['hello', 'get_brief', 'get_goal', 'list_tasks', 'get_task', 'check_inbox', 'ack_messages', 'send_message', 'search'];
 
 describe('the runner tool sets', () => {
@@ -127,6 +134,7 @@ describe('the runner tool sets', () => {
       'release_task',
       'submit',
       'prepare_dependencies',
+      'fetch_url',
     ]);
     // A runner attempt's release stops the attempt: M1's answer, that the task is ready again, would be wrong.
     expect(runnerWorkerTools.find((tool) => tool.name === 'release_task')).not.toBe(workerTools.find((tool) => tool.name === 'release_task'));
@@ -148,6 +156,7 @@ describe('the runner tool sets', () => {
       'write_handoff',
       'get_lead_notes',
       'fetch_submission',
+      'fetch_url',
     ]);
     for (const tools of [runnerWorkerTools, runnerLeadTools]) {
       const names = tools.map((tool) => tool.name);
@@ -160,10 +169,10 @@ describe('the runner tool sets', () => {
     expect(runnerToolsFor('lead')).toBe(runnerLeadTools);
   });
 
-  test("the runner's BRIDGE_TOOL_NAMES name exactly the tools each role's bridge serves", () => {
+  test("the runner's BRIDGE_TOOL_NAMES are all served, and the bridge serves nothing more than them and the unattended options' tools", () => {
     for (const role of ['worker', 'lead'] as const) {
       const served = runnerToolsFor(role).map((tool) => tool.name);
-      expect([...BRIDGE_TOOL_NAMES[role]].sort()).toEqual(served.sort());
+      expect([...BRIDGE_TOOL_NAMES[role], ...UNATTENDED_TOOLS[role]].sort()).toEqual(served.sort());
     }
   });
 });
