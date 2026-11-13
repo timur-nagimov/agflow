@@ -47,6 +47,35 @@ describe('HubClient', () => {
     expect(performance.now() - started).toBeLessThan(5_000);
   });
 
+  test('an answer whose body stops arriving is the hub unreachable too, once the timeout ends the wait', async () => {
+    // The headers and the start of a body, then nothing: the timeout ends the reading of the body, not the request.
+    const stalled = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"bodyBase64":"AAAA'));
+            },
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+    });
+    try {
+      const baseUrl = `http://127.0.0.1:${stalled.port}`;
+      const client = new HubClient({ baseUrl, token: 'agt_token', timeoutMs: 60_000 });
+      const started = performance.now();
+      const error = await client.request('POST', '/api/fetch', { url: 'https://example.com/' }, { timeoutMs: 300 }).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(HubClientError);
+      expect(error).toMatchObject({ status: 0, code: 'unreachable' });
+      expect((error as HubClientError).message).toStartWith(`cannot reach the agflow hub at ${baseUrl}: `);
+      expect(performance.now() - started).toBeLessThan(5_000);
+    } finally {
+      await stalled.stop(true);
+    }
+  });
+
   test('an unreachable hub is reported clearly', async () => {
     const broken = new HubClient({
       baseUrl: 'http://hub.test',

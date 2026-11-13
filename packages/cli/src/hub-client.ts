@@ -131,6 +131,7 @@ export class HubClient {
     if (this.agentId && !this.viaAgentToken) headers['x-agflow-agent'] = this.agentId;
     if (body !== undefined) headers['content-type'] = 'application/json';
     let response: Response;
+    let text: string;
     try {
       response = await this.fetchFn(`${this.baseUrl}${path}`, {
         method,
@@ -138,11 +139,13 @@ export class HubClient {
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(options?.timeoutMs ?? this.timeoutMs),
       });
+      // The timeout covers the body as well: an answer that stops arriving, or a connection lost half way, is the hub
+      // unreachable like one that never started, and no part of such an answer is used.
+      text = await response.text();
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       throw new HubClientError(0, 'unreachable', `cannot reach the agflow hub at ${this.baseUrl}: ${reason}`);
     }
-    const text = await response.text();
     let json: unknown = null;
     try {
       json = text ? JSON.parse(text) : null;

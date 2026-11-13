@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { BRIDGE_ANSWERS } from '@agflow/core';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { FETCH_URL_TIMEOUT_MS, type FetchFn, HubClient } from '../src/hub-client';
@@ -228,8 +229,8 @@ function fetched(text: string, overrides: Record<string, unknown> = {}): Record<
   };
 }
 
-/** A runner agent's bridge over MCP whose hub is `answer`: a JSON body, or a refusal with its status. */
-async function fakeBridge(answer: () => { status?: number; json: unknown }, options: { role?: 'worker' | 'lead'; clone?: string | null } = {}): Promise<FakeBridge> {
+/** A runner agent's bridge over MCP whose hub is `answer`: a JSON body, a refusal with its status, or a response of the test's own. */
+async function fakeBridge(answer: () => { status?: number; json?: unknown; response?: Response }, options: { role?: 'worker' | 'lead'; clone?: string | null } = {}): Promise<FakeBridge> {
   const { dir, clone, outside } = workspace();
   const cwd = join(dir, 'agflow-empty');
   mkdirSync(cwd);
@@ -241,8 +242,8 @@ async function fakeBridge(answer: () => { status?: number; json: unknown }, opti
       body: init?.body ? JSON.parse(String(init.body)) : null,
       authorization: new Headers(init?.headers).get('authorization'),
     });
-    const { status = 200, json } = answer();
-    return Response.json(json, { status });
+    const { status = 200, json, response } = answer();
+    return response ?? Response.json(json, { status });
   };
   const client = new HubClient({ baseUrl: HUB_URL, token: 'agt_test-token', fetch: fetchFn });
   const requests: unknown[][] = [];
@@ -358,6 +359,23 @@ describe('fetch_url', () => {
       expect(answer).toEqual({ text: `agflow hub: ${refusal.json.message}`, isError: true });
       expect(filesIn(bridge.clone)).toEqual([]);
     }
+  });
+
+  test('an answer that breaks off half way saves nothing and is the hub unreachable', async () => {
+    const half = JSON.stringify(fetched('{"a":1}')).slice(0, 40);
+    const broken = () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(half));
+            controller.error(new DOMException('The operation timed out.', 'TimeoutError'));
+          },
+        }),
+      );
+    const bridge = await fakeBridge(() => ({ response: broken() }));
+    const answer = await bridge.call('fetch_url', { url: 'https://example.com/a', save_as: 'a.txt' });
+    expect(answer).toEqual({ text: BRIDGE_ANSWERS.hubUnreachable, isError: true });
+    expect(filesIn(bridge.clone)).toEqual([]);
   });
 
   test('a refused save_as is an error before the hub is asked', async () => {
