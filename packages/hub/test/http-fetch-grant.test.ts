@@ -1,9 +1,13 @@
 import { describe, expect, spyOn, test } from 'bun:test';
+import { TASK_TRANSITIONS, type TaskStatus, isClosed } from '@agflow/core';
+import { endAttempt } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
 import { endGrantsWhileOff, findFetchGrant, grantFetch } from '../src/agent-fetch';
+import { tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { listMessages } from '../src/messages';
 import { startHub } from '../src/server';
+import { getTask, move } from '../src/task-store';
 import { cancelTask, createTasks } from '../src/tasks';
 import { addRunnerAttempt, addRunnerLead, newTask } from './helpers';
 import { createTestHub } from './http-helpers';
@@ -250,5 +254,102 @@ describe('granting and revoking', () => {
     cancelTask(hub.ctx, closed!.id, 'not needed', 'user:alice');
     const late = await post({ reason: 'ok' }, closed!.id);
     expect([late.status, late.json.error]).toEqual([409, 'conflict']);
+  });
+});
+
+describe('a grant ends with the work', () => {
+  test('every move to a closed status ends the grant, as a revoke by the system; every other move leaves it', async () => {
+    const { hub } = await setup();
+    const moves = (Object.entries(TASK_TRANSITIONS) as [TaskStatus, readonly TaskStatus[]][]).flatMap(([from, tos]) =>
+      tos.map((to): [TaskStatus, TaskStatus] => [from, to]),
+    );
+    // Every way a task closes is among them: accepted, merging, merged, cancelled and failed, from wherever.
+    expect([...new Set(moves.filter(([, to]) => isClosed(to)).map(([, to]) => to))].sort()).toEqual(['accepted', 'cancelled', 'failed', 'merged', 'merging']);
+    for (const [from, to] of moves) {
+      const [task] = createTasks(hub.ctx, [newTask()], 'user:alice');
+      if (!task) throw new Error('no task');
+      // The task as it stands before the move, with a grant.
+      hub.ctx.db.query('UPDATE tasks SET status = $from WHERE id = $id').run({ from, id: task.id });
+      leftGrant(hub, task.id);
+      const before = listEvents(hub.ctx.db).length;
+      const moved = tx(hub.ctx, (emit) => move(hub.ctx, emit, getTask(hub.ctx, task.id), to, 'user:alice'));
+      const events = listEvents(hub.ctx.db).slice(before).map((event) => [event.type, event.actor, event.subject]);
+      const label = `${from} to ${to}`;
+      if (isClosed(to)) {
+        expect([label, findFetchGrant(hub.ctx, task.id), moved.fetchGranted]).toEqual([label, null, false]);
+        // The close first, then what it ended.
+        expect([label, events]).toEqual([label, [[`task.${to}`, 'user:alice', task.id], ['task.fetch_revoked', 'system', task.id]]]);
+      } else {
+        expect([label, findFetchGrant(hub.ctx, task.id) !== null, moved.fetchGranted]).toEqual([label, true, true]);
+        expect([label, events]).toEqual([label, [[`task.${to}`, 'user:alice', task.id]]]);
+      }
+    }
+  });
+
+  test('a cancel and an acceptance end it through their routes, and a task without a grant closes as before', async () => {
+    const { hub, worker, other, callers } = await setup();
+    await grant(hub, worker.task.id, callers.lead);
+    const cancelled = await hub.call('POST', `/api/tasks/${worker.task.id}/cancel`, { ...callers.lead, body: { reason: 'not needed' } });
+    expect([cancelled.status, cancelled.json.task.status, cancelled.json.task.fetchGranted]).toEqual([200, 'cancelled', false]);
+    expect(findFetchGrant(hub.ctx, worker.task.id)).toBeNull();
+    expect(eventsOf(hub, 'task.fetch_revoked').map((event) => [event.subject, event.actor, event.data])).toEqual([
+      [worker.task.id, 'system', { taskId: worker.task.id, by: 'system' }],
+    ]);
+    // A closed task takes no new grant, so nothing brings it back.
+    expect((await grant(hub, worker.task.id, callers.lead)).status).toBe(409);
+    await grant(hub, other.task.id, callers.web);
+    // As its submission leaves a task: waiting for review, the grant still its own.
+    hub.ctx.db.query("UPDATE tasks SET status = 'submitted' WHERE id = $id").run({ id: other.task.id });
+    expect(findFetchGrant(hub.ctx, other.task.id)).not.toBeNull();
+    const accepted = await hub.call('POST', `/api/tasks/${other.task.id}/accept`, { ...callers.web, body: {} });
+    expect([accepted.status, accepted.json.task.status, accepted.json.task.fetchGranted]).toEqual([200, 'accepted', false]);
+    expect(eventsOf(hub, 'task.fetch_revoked').map((event) => [event.subject, event.actor])).toEqual([
+      [worker.task.id, 'system'],
+      [other.task.id, 'system'],
+    ]);
+    const [plain] = createTasks(hub.ctx, [newTask()], 'user:alice');
+    cancelTask(hub.ctx, plain!.id, 'not needed', 'user:alice');
+    expect(eventsOf(hub, 'task.fetch_revoked')).toHaveLength(2);
+  });
+
+  test('the grant goes in the transaction that closes the task: a close that does not happen leaves it', async () => {
+    const { hub, worker, callers } = await setup();
+    await grant(hub, worker.task.id, callers.lead);
+    const failing = () =>
+      tx(hub.ctx, (emit) => {
+        move(hub.ctx, emit, getTask(hub.ctx, worker.task.id), 'cancelled', 'user:alice');
+        throw new Error('the close failed after its move');
+      });
+    expect(failing).toThrow('the close failed after its move');
+    expect([getTask(hub.ctx, worker.task.id).status, findFetchGrant(hub.ctx, worker.task.id) !== null]).toEqual(['claimed', true]);
+    expect(eventsOf(hub, 'task.fetch_revoked')).toEqual([]);
+  });
+
+  test("it outlives an attempt: the task's next attempt fetches on it, with no new grant, event or message", async () => {
+    const { hub, worker, lead, callers } = await setup();
+    await grant(hub, worker.task.id, callers.lead);
+    // The first attempt gives the task back and ends; the task is open, so its grant stands.
+    await hub.call('POST', `/api/tasks/${worker.task.id}/release`, { ...callers.worker, body: { reason: 'out of quota' } });
+    endAttempt(hub.ctx, { attemptId: worker.attempt.id, trigger: 'released', actor: `agent:${worker.agent.id}` });
+    expect([getTask(hub.ctx, worker.task.id).status, findFetchGrant(hub.ctx, worker.task.id) !== null]).toEqual(['ready', true]);
+    const notices = () =>
+      listMessages(hub.ctx, { taskId: worker.task.id })
+        .filter((message) => message.from === 'system' && message.body.includes('fetch_url'))
+        .map((message) => message.to);
+    // The grant's one message, and its copy on the task's thread, since the first assignee ended without reading it.
+    expect(notices()).toEqual([`task:${worker.task.id}`, `agent:${worker.agent.id}`]);
+    const next = addRunnerAttempt(hub.ctx, { taskId: worker.task.id });
+    expect(next.attempt.number).toBe(2);
+    hub.ctx.agentFetch.resolve = async () => [{ address: '93.184.216.34', family: 4 }];
+    hub.ctx.agentFetch.transport = async () => new Response('data');
+    const bearer = { headers: { authorization: `Bearer ${mintAgentToken(hub.ctx, next.attempt)}` } };
+    expect((await hub.call('POST', '/api/fetch', { ...bearer, body: { url: 'https://example.com/data' } })).status).toBe(200);
+    // The attempt that ended fetches no more.
+    expect((await hub.call('POST', '/api/fetch', { ...callers.worker, body: { url: 'https://example.com/data' } })).status).toBe(401);
+    expect(findFetchGrant(hub.ctx, worker.task.id)?.grantedBy).toBe(`agent:${lead.agent.id}`);
+    expect(eventsOf(hub, 'task.fetch_granted')).toHaveLength(1);
+    expect(eventsOf(hub, 'task.fetch_revoked')).toEqual([]);
+    // The new attempt got no message of its own: a successor reads of the grant in its task pack.
+    expect(notices()).toHaveLength(2);
   });
 });
