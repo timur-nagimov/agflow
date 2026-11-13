@@ -7,6 +7,8 @@ import { createHash } from 'node:crypto';
 import {
   AgentIdSchema,
   type AgentRole,
+  ApprovalDetailSchema,
+  ApprovalKindSchema,
   FETCH_URL_MAX,
   FIXABLE_SUBMIT_ERRORS,
   FetchUrlResponseSchema,
@@ -20,7 +22,7 @@ import {
   splitSubmitError,
 } from '@agflow/core';
 import { z } from 'zod';
-import { HubClientError, type LeadApproval } from '../hub-client';
+import { HubClientError } from '../hub-client';
 import { saveInside, savePathSegments } from './save-file';
 import { type ToolContext, type ToolDef, ToolError, asAgent, defineTool, leadTools, lines, oneLine, sharedTools, workerTools } from './tools';
 
@@ -351,6 +353,31 @@ const fetchUrl = defineTool(
 /** The reason a lead gives with a decision: the hub's limit (design 6.10). */
 const APPROVAL_REASON_MAX = 500;
 
+/**
+ * What the bridge reads of an approval in the hub's answers (design 6.10). The answers are checked, not trusted: the
+ * hub's side is another module's, and a missing part must reach the lead as words it can act on. Fields the bridge
+ * does not read may come and go. The detail is the runner protocol's, part for part: a part the bridge would not print
+ * is refused, so the lead never judges a request it sees half of.
+ */
+const ListedApprovalSchema = z.object({
+  id: z.string().min(1).max(200),
+  taskId: TaskIdSchema.nullable(),
+  agentId: AgentIdSchema,
+  kind: ApprovalKindSchema,
+  summary: z.string(),
+  detail: ApprovalDetailSchema,
+  expiresAt: z.number(),
+  // Absent or null is false: decline only.
+  leadMayApprove: z.boolean().nullish(),
+});
+type ListedApproval = z.output<typeof ListedApprovalSchema>;
+
+const ApprovalsAnswerSchema = z.object({ approvals: z.array(ListedApprovalSchema) });
+
+const DecidedAnswerSchema = z.object({
+  approval: z.object({ id: z.string().min(1).max(200), status: z.enum(['pending', 'approved', 'declined', 'expired', 'void']) }),
+});
+
 /** A request's parts in the order they are printed: the short ones first, the diffs last. */
 const APPROVAL_DETAIL_FIELDS = ['command', 'cwd', 'reason', 'grantRoot', 'diff', 'manifestDiff'] as const;
 
@@ -383,7 +410,7 @@ function clipBytes(text: string, maxBytes: number): { shown: string; hidden: num
  * and the detail are the asking agent's words, passed on by its runner: every line of them is quoted under a label
  * that says so, so none of it can pose as a line of agflow's or read as agflow's own sentence.
  */
-function approvalBlock(approval: LeadApproval, now: number, detailBytes: number): string {
+function approvalBlock(approval: ListedApproval, now: number, detailBytes: number): string {
   const fields = APPROVAL_DETAIL_FIELDS.flatMap((field) => {
     const value = approval.detail[field];
     return typeof value === 'string' && value !== '' ? [{ field, value }] : [];
@@ -422,7 +449,9 @@ const listApprovals = defineTool(
   {},
   async (_args, ctx) => {
     runnerContext(ctx);
-    const { approvals } = await asAgent(ctx).approvals();
+    const answer = ApprovalsAnswerSchema.safeParse(await asAgent(ctx).approvals());
+    if (!answer.success) throw new ToolError("The hub's answer about approvals is not in the form agflow expects. Nothing was decided; try again later.");
+    const { approvals } = answer.data;
     if (approvals.length === 0) return 'No approvals wait for your answer.';
     const listed = approvals.slice(0, APPROVALS_LISTED_MAX);
     const count =
@@ -453,7 +482,15 @@ const decideApproval = defineTool(
     if (decision === 'decline' && !why) {
       throw new ToolError('A decline needs a reason, which the asking agent reads: say what it should do instead. Nothing was decided; call decide_approval again with a reason.');
     }
-    const { approval } = await client.decideApproval(id, { decision, ...(why ? { reason: why } : {}) });
+    const answer = DecidedAnswerSchema.safeParse(await client.decideApproval(id, { decision, ...(why ? { reason: why } : {}) }));
+    if (!answer.success) {
+      // The hub answered 2xx, so the decision most likely stands: saying that nothing was decided would be a guess.
+      throw new ToolError(
+        'The hub took your answer, but what it sent back is not in the form agflow expects, so agflow cannot say how the approval stands. ' +
+          'Call list_approvals: an approval still listed there still waits for an answer.',
+      );
+    }
+    const { approval } = answer.data;
     const which = oneLine(approval.id, 100);
     if (approval.status === 'approved') return `Approved ${which}: what the agent asked for goes ahead.`;
     if (approval.status === 'declined') return `Declined ${which}: nothing runs, and the asking agent reads your reason.`;

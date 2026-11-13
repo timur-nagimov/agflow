@@ -330,11 +330,14 @@ export class HubClient {
   revokeFetch(taskId: string) {
     return this.request<{ task: Task }>('DELETE', `/api/tasks/${q(taskId)}/fetch-grant`);
   }
-  /** The pending approvals the lead may answer (design 6.10), oldest first; a person's token lists that person's own. */
+  /**
+   * The pending approvals the lead may answer (design 6.10), oldest first, each a LeadApproval; a person's token lists
+   * that person's own. Unchecked, like the answer to a decision: the caller checks what it reads.
+   */
   approvals() {
-    return this.request<{ approvals: LeadApproval[] }>('GET', '/api/approvals');
+    return this.request<unknown>('GET', '/api/approvals');
   }
   decideApproval(id: string, body: ApprovalDecisionBody) {
-    return this.request<{ approval: Approval }>('POST', `/api/approvals/${q(id)}`, body);
+    return this.request<unknown>('POST', `/api/approvals/${q(id)}`, body);
   }
 }

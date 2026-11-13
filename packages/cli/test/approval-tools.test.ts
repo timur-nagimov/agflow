@@ -245,6 +245,36 @@ describe('list_approvals', () => {
     const bridge = await fakeBridge(() => ({ status: 403, json: { error: 'forbidden', message: 'only people answer approvals on this hub' } }));
     expect(await bridge.call('list_approvals')).toEqual({ text: 'agflow hub: only people answer approvals on this hub', isError: true });
   });
+
+  test('an answer that is not in the stated form is an error the lead can act on, never a listing with a part left out', async () => {
+    const { detail: _detail, ...withoutDetail } = approval();
+    const malformed: unknown[] = [
+      { approvals: [withoutDetail] },
+      { approvals: [{ ...approval(), detail: null }] },
+      { approvals: 'x' },
+      { approvals: [approval(), { ...approval({ id: OTHER }), kind: 'network' }] },
+      { approvals: [{ ...approval(), expiresAt: 'soon' }] },
+      { approvals: [{ ...approval(), leadMayApprove: 'yes' }] },
+      // A part of a request the bridge would not print: the lead must not judge a request it sees half of.
+      { approvals: [{ ...approval(), detail: { command: 'ls', env: 'TOKEN=1' } }] },
+      {},
+      null,
+    ];
+    for (const json of malformed) {
+      const bridge = await fakeBridge(() => ({ json }));
+      expect({ json, answer: await bridge.call('list_approvals') }).toEqual({
+        json,
+        answer: { text: "The hub's answer about approvals is not in the form agflow expects. Nothing was decided; try again later.", isError: true },
+      });
+    }
+  });
+
+  test('fields the bridge does not read may come with an approval', async () => {
+    const bridge = await fakeBridge(() => ({ json: { approvals: [{ ...approval({ leadMayApprove: true }), reason: null, vendor: 'codex' }], next: null } }));
+    const { text, isError } = await bridge.call('list_approvals');
+    expect(isError).toBe(false);
+    expect(text).toContain('you may: approve or decline it');
+  });
 });
 
 describe('decide_approval', () => {
@@ -303,6 +333,22 @@ describe('decide_approval', () => {
   test("a status the decision did not ask for is reported as the hub's", async () => {
     const bridge = await fakeBridge(() => ({ json: { approval: approval({ status: 'expired' }) } }));
     expect(await bridge.call('decide_approval', { id: ID, decision: 'approve' })).toEqual({ text: `Approval ${ID} is expired.`, isError: false });
+  });
+
+  test('an answer to a decision that is not in the stated form does not claim that nothing was decided', async () => {
+    for (const json of [{}, null, { approval: null }, { approval: { id: ID } }, { approval: { id: ID, status: 'done' } }, { approval: 'approved' }]) {
+      const bridge = await fakeBridge(() => ({ json }));
+      expect({ json, answer: await bridge.call('decide_approval', { id: ID, decision: 'approve' }) }).toEqual({
+        json,
+        answer: {
+          text:
+            "The hub took your answer, but what it sent back is not in the form agflow expects, so agflow cannot say how the approval stands. " +
+            'Call list_approvals: an approval still listed there still waits for an answer.',
+          isError: true,
+        },
+      });
+      expect(bridge.hubCalls).toHaveLength(1);
+    }
   });
 
   test('an id is one path segment, whatever it holds', async () => {
