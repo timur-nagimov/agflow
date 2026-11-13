@@ -16,7 +16,7 @@ export function search(ctx: HubContext, query: string): SearchResult {
          ORDER BY id = $exact DESC, seq DESC LIMIT 20`,
       )
       .all({ exact: needle.toUpperCase(), like }) as TaskRow[]
-  ).map(rowToTask);
+  ).map((row) => rowToTask(ctx, row));
   const messages = (
     ctx.db
       .query("SELECT * FROM messages WHERE body LIKE $like ESCAPE '\\' ORDER BY id DESC LIMIT 20")

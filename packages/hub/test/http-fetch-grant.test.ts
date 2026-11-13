@@ -1,8 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mintAgentToken } from '../src/auth';
-import { findFetchGrant } from '../src/agent-fetch';
+import { endGrantsWhileOff, findFetchGrant, grantFetch } from '../src/agent-fetch';
 import { listEvents } from '../src/events';
 import { listMessages } from '../src/messages';
+import { startHub } from '../src/server';
 import { cancelTask, createTasks } from '../src/tasks';
 import { addRunnerAttempt, addRunnerLead, newTask } from './helpers';
 import { createTestHub } from './http-helpers';
@@ -36,6 +37,11 @@ const grant = (hub: Hub, taskId: string, auth: Auth, reason = 'compare the publi
   hub.call('POST', `/api/tasks/${taskId}/fetch-grant`, { ...auth, body: { reason } });
 const revoke = (hub: Hub, taskId: string, auth: Auth) => hub.call('DELETE', `/api/tasks/${taskId}/fetch-grant`, auth);
 const eventsOf = (hub: Hub, type: string) => listEvents(hub.ctx.db).filter((event) => event.type === type);
+/** A grant as a hub that ran with the setting on left it in the database. */
+const leftGrant = (hub: Hub, taskId: string) =>
+  hub.ctx.db
+    .query("INSERT INTO task_fetch_grants (task_id, granted_by, reason, granted_at) VALUES ($taskId, 'user:alice', 'earlier', 0)")
+    .run({ taskId });
 
 describe('who may grant and revoke internet access', () => {
   test('the seated lead and a person in the web UI may; workers, Codex workers, CLI tokens and strangers may not', async () => {
@@ -82,20 +88,80 @@ describe('who may grant and revoke internet access', () => {
     expect(findFetchGrant(hub.ctx, task!.id)?.grantedBy).toBe(`agent:${lead}`);
   });
 
-  test('with AGFLOW_AGENT_FETCH off nobody grants or revokes, and the answer says why', async () => {
-    const { hub, worker, callers } = await setup(false);
+  test('with AGFLOW_AGENT_FETCH off nobody grants, and the answer says why; taking a grant away still works', async () => {
+    const { hub, worker, lead, callers } = await setup(false);
+    leftGrant(hub, worker.task.id);
     for (const who of ['lead', 'web'] as const) {
-      for (const answer of [await grant(hub, worker.task.id, callers[who]), await revoke(hub, worker.task.id, callers[who])]) {
-        expect([who, answer.status, answer.json.error]).toEqual([who, 403, 'fetch_disabled']);
-        expect(answer.json.message).toContain('AGFLOW_AGENT_FETCH');
-      }
+      const answer = await grant(hub, worker.task.id, callers[who]);
+      expect([who, answer.status, answer.json.error]).toEqual([who, 403, 'fetch_disabled']);
+      expect(answer.json.message).toContain('AGFLOW_AGENT_FETCH');
     }
     for (const who of ['worker', 'codexWorker', 'cli', 'liveWorker'] as const) {
       expect([who, (await grant(hub, worker.task.id, callers[who])).status]).toEqual([who, 403]);
       expect([who, (await revoke(hub, worker.task.id, callers[who])).status]).toEqual([who, 403]);
     }
+    expect(findFetchGrant(hub.ctx, worker.task.id)).not.toBeNull();
+    // Taking access away is safe whatever the setting, so the lead and people always can.
+    const revoked = await revoke(hub, worker.task.id, callers.lead);
+    expect([revoked.status, revoked.json.task.fetchGranted]).toEqual([200, false]);
     expect(findFetchGrant(hub.ctx, worker.task.id)).toBeNull();
-    expect((await hub.call('GET', `/api/tasks/${worker.task.id}`, callers.web)).json.task.fetchGranted).toBe(false);
+    expect(eventsOf(hub, 'task.fetch_revoked').map((event) => [event.subject, event.actor])).toEqual([
+      [worker.task.id, `agent:${lead.agent.id}`],
+    ]);
+    expect((await revoke(hub, worker.task.id, callers.web)).status).toBe(200);
+    expect(eventsOf(hub, 'task.fetch_revoked')).toHaveLength(1);
+  });
+
+  test('while the setting is off no task reads as granted, whatever the database still holds', async () => {
+    const { hub, worker, callers } = await setup(false);
+    leftGrant(hub, worker.task.id);
+    const reads = async (): Promise<boolean[]> => {
+      const one = (await hub.call('GET', `/api/tasks/${worker.task.id}`, callers.web)).json.task as { fetchGranted: boolean };
+      const listed = (await hub.call('GET', '/api/tasks', callers.worker)).json.tasks as { id: string; fetchGranted: boolean }[];
+      const found = (await hub.call('GET', `/api/search?q=${worker.task.id}`, callers.web)).json.tasks as { id: string; fetchGranted: boolean }[];
+      return [one, ...listed.filter((task) => task.id === worker.task.id), ...found.filter((task) => task.id === worker.task.id)].map(
+        (task) => task.fetchGranted,
+      );
+    };
+    expect(await reads()).toEqual([false, false, false]);
+    // The same rows under a hub that runs with the setting on.
+    hub.ctx.config.agentFetch = true;
+    expect(await reads()).toEqual([true, true, true]);
+  });
+
+  test('a hub that starts with the setting off ends the grants it finds, and says once which', async () => {
+    const { hub, worker, other, lead } = await setup();
+    grantFetch(hub.ctx, worker.task.id, `agent:${lead.agent.id}`, 'needs the price list');
+    hub.clock.advance(1_000);
+    grantFetch(hub.ctx, other.task.id, 'user:alice', 'needs the schema');
+    const granted = () => [worker, other].map((held) => findFetchGrant(hub.ctx, held.task.id) !== null);
+    const logged = spyOn(console, 'log').mockImplementation(() => {});
+    const said = () => logged.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('AGFLOW_AGENT_FETCH'));
+    try {
+      // A start with the setting on leaves them.
+      await startHub(hub.ctx, { timers: false }).stop();
+      expect([granted(), said()]).toEqual([[true, true], []]);
+      hub.ctx.config.agentFetch = false;
+      await startHub(hub.ctx, { timers: false }).stop();
+      expect(granted()).toEqual([false, false]);
+      expect(said()).toEqual([`AGFLOW_AGENT_FETCH is off: ended the internet access of ${worker.task.id}, ${other.task.id}`]);
+      // Each ended as a revoke by the system does, so the timeline shows where the grant went.
+      expect(eventsOf(hub, 'task.fetch_revoked').map((event) => [event.subject, event.actor, event.data])).toEqual([
+        [worker.task.id, 'system', { taskId: worker.task.id, by: 'system' }],
+        [other.task.id, 'system', { taskId: other.task.id, by: 'system' }],
+      ]);
+      // A later start with it off finds nothing and says nothing.
+      await startHub(hub.ctx, { timers: false }).stop();
+      expect(said()).toHaveLength(1);
+      // Turned on again, nothing has come back to life.
+      hub.ctx.config.agentFetch = true;
+      await startHub(hub.ctx, { timers: false }).stop();
+      expect(granted()).toEqual([false, false]);
+      expect((await hub.call('GET', `/api/tasks/${worker.task.id}`, { user: 'alice', via: 'web' })).json.task.fetchGranted).toBe(false);
+      expect(endGrantsWhileOff(hub.ctx)).toEqual([]);
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 

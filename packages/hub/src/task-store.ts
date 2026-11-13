@@ -46,6 +46,9 @@ export interface TaskRow {
   fetch_granted: number;
 }
 
+/** What a task's reading needs of the hub: whether AGFLOW_AGENT_FETCH is on. */
+type TaskReader = Pick<HubContext, 'config'>;
+
 /** Selects task rows with their attempt count and whether they hold an internet grant; add WHERE and ORDER BY clauses. */
 export const TASK_SELECT =
   'SELECT tasks.*, (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id) AS attempt_count,' +
@@ -54,7 +57,11 @@ export const TASK_SELECT =
 /** Submissions recorded before M2 carry no attempt or submission id. */
 type StoredSubmission = Omit<Submission, 'attemptId' | 'submissionId'> & Partial<Submission>;
 
-export function rowToTask(row: TaskRow): Task {
+/**
+ * The task of a row. Its fetchGranted is false while AGFLOW_AGENT_FETCH is off, whatever the database holds: nothing
+ * fetches then, so nothing reads as able to.
+ */
+export function rowToTask(ctx: TaskReader, row: TaskRow): Task {
   const contract = JSON.parse(row.contract) as TaskContract;
   return {
     ...contract,
@@ -79,13 +86,13 @@ export function rowToTask(row: TaskRow): Task {
     workRef: row.work_ref,
     workSha: row.work_sha,
     nextDispatchAt: row.next_dispatch_at,
-    fetchGranted: row.fetch_granted === 1,
+    fetchGranted: ctx.config.agentFetch === true && row.fetch_granted === 1,
   };
 }
 
 export function findTask(ctx: HubContext, id: string): Task | null {
   const row = ctx.db.query(`${TASK_SELECT} WHERE id = $id`).get({ id }) as TaskRow | null;
-  return row ? rowToTask(row) : null;
+  return row ? rowToTask(ctx, row) : null;
 }
 
 export function getTask(ctx: HubContext, id: string): Task {
@@ -102,7 +109,7 @@ export interface TaskFilter {
 export function listTasks(ctx: HubContext, filter: TaskFilter = {}): Task[] {
   const rows = ctx.db.query(`${TASK_SELECT} ORDER BY seq`).all() as TaskRow[];
   return rows
-    .map(rowToTask)
+    .map((row) => rowToTask(ctx, row))
     .filter(
       (task) =>
         (!filter.status || filter.status.includes(task.status)) && (!filter.assignee || task.assignee === filter.assignee),
@@ -184,6 +191,18 @@ export function writeTask(ctx: HubContext, id: string, changes: TaskChanges): vo
     params[key] = isJson ? (value === null ? null : JSON.stringify(value)) : (value as string | number | null);
   }
   ctx.db.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = $id`).run(params);
+}
+
+/**
+ * Ends the task's internet grant (design 5, Unattended options): the row goes, and task.fetch_revoked names who ended
+ * it. False, and no event, when the task held none. It lives here because every way a grant ends needs it: a revoke
+ * and a start with the setting off (agent-fetch.ts).
+ */
+export function endFetchGrant(ctx: HubContext, emit: Emit, taskId: string, actor: string): boolean {
+  const removed = ctx.db.query('DELETE FROM task_fetch_grants WHERE task_id = $taskId').run({ taskId });
+  if (removed.changes === 0) return false;
+  emit({ type: 'task.fetch_revoked', actor, subject: taskId, data: { taskId, by: actor } });
+  return true;
 }
 
 export interface MoveOptions {

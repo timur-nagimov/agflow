@@ -15,10 +15,10 @@ import { holdsSeat } from './hub-state';
 import { insertMessage } from './messages';
 import { FetchRefusal, parseFetchUrl } from './public-address';
 import { type PublicFetchFailure, PublicFetchError, type PublicFetchResult, fetchPublicUrl } from './public-fetch';
-import { findTask, getTask } from './task-store';
+import { endFetchGrant, findTask, getTask } from './task-store';
 import { clip, oneLine } from './text';
 
-/** 403 while AGFLOW_AGENT_FETCH is off: the grant routes and POST /api/fetch all answer it. */
+/** 403 while AGFLOW_AGENT_FETCH is off: granting and POST /api/fetch answer it. Taking a grant back still works. */
 export const fetchDisabled = () =>
   new HubError(
     403,
@@ -80,15 +80,31 @@ export function grantFetch(ctx: HubContext, taskId: string, actor: string, reaso
   });
 }
 
-/** DELETE /api/tasks/:id/fetch-grant: the next fetch for the task is refused. Nothing to revoke changes nothing. */
+/**
+ * DELETE /api/tasks/:id/fetch-grant: the next fetch for the task is refused. Nothing to revoke changes nothing. It
+ * works whatever AGFLOW_AGENT_FETCH says: taking access away is always safe.
+ */
 export function revokeFetch(ctx: HubContext, taskId: string, actor: string): Task {
-  requireAgentFetch(ctx);
   return tx(ctx, (emit) => {
     getTask(ctx, taskId);
-    const removed = ctx.db.query('DELETE FROM task_fetch_grants WHERE task_id = $taskId').run({ taskId });
-    if (removed.changes > 0) emit({ type: 'task.fetch_revoked', actor, subject: taskId, data: { taskId, by: actor } });
+    endFetchGrant(ctx, emit, taskId, actor);
     return getTask(ctx, taskId);
   });
+}
+
+/**
+ * A hub that starts with AGFLOW_AGENT_FETCH off ends the grants it finds, each as a revoke by the system, and names
+ * their tasks in one log line. A grant that slept through the off period would let its task fetch again the moment
+ * the setting came back, with nobody having decided so. Returns the tasks whose grants ended.
+ */
+export function endGrantsWhileOff(ctx: HubContext): string[] {
+  if (ctx.config.agentFetch) return [];
+  const ended = tx(ctx, (emit) => {
+    const rows = ctx.db.query('SELECT task_id FROM task_fetch_grants ORDER BY granted_at, task_id').all() as { task_id: string }[];
+    return rows.map((row) => row.task_id).filter((taskId) => endFetchGrant(ctx, emit, taskId, 'system'));
+  });
+  if (ended.length > 0) console.log(`AGFLOW_AGENT_FETCH is off: ended the internet access of ${ended.join(', ')}`);
+  return ended;
 }
 
 // ---------------------------------------------------------------------------

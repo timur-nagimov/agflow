@@ -1,6 +1,6 @@
 // Internet for runner agents (design 5, Unattended options): the lead, or a person in the web UI, grants a task
-// internet access and takes it back, and a runner agent asks the hub to download one public URL. All three routes
-// answer 403 fetch_disabled while AGFLOW_AGENT_FETCH is off.
+// internet access and takes it back, and a runner agent asks the hub to download one public URL. Granting and fetching
+// answer 403 fetch_disabled while AGFLOW_AGENT_FETCH is off; taking a grant back works whatever the setting.
 import { FetchGrantInputSchema, FetchUrlInputSchema } from '@agflow/core';
 import { fetchForAgent, grantFetch, requireAgentFetch, revokeFetch } from '../agent-fetch';
 import type { HubContext } from '../context';

@@ -3,6 +3,7 @@
 // at start, as a tick does (design 6.14), and with dbLock keeps <db>.pid while it runs.
 import type { Attempt, Message } from '@agflow/core';
 import type { Server, ServerWebSocket } from 'bun';
+import { endGrantsWhileOff } from './agent-fetch';
 import { sweepAuth } from './auth';
 import { type HubContext, NO_RUNNER_LINK } from './context';
 import { flushDeliveries, watchDeliveries } from './delivery';
@@ -128,6 +129,8 @@ function serveHub(ctx: HubContext, options: StartHubOptions): HubServer {
   const dbPath = ctx.db.filename;
   // Downtime before this start extends the leases and opens the recovery window before any runner can say hello.
   checkClock(ctx);
+  // With AGFLOW_AGENT_FETCH off, the grants of an earlier run end here, before any request is answered.
+  endGrantsWhileOff(ctx);
   const gateway = new Gateway(ctx);
   // The app is made before the server it upgrades links on, so it reaches the server through this binding.
   let upgrader: Server<LinkData> | undefined;

@@ -393,7 +393,7 @@ function heldTaskOf(ctx: HubContext, agentId: string): Task | null {
   const row = ctx.db
     .query(`${TASK_SELECT} WHERE assignee = $agentId AND status IN ('claimed', 'working') LIMIT 1`)
     .get({ agentId }) as TaskRow | null;
-  return row ? rowToTask(row) : null;
+  return row ? rowToTask(ctx, row) : null;
 }
 
 /** Names the task that holds overlapping paths, for a refusal. */
@@ -617,7 +617,7 @@ export function sweepLeases(ctx: HubContext): string[] {
       )
       .all({ now: ctx.now() }) as TaskRow[];
     for (const row of rows) {
-      const task = rowToTask(row);
+      const task = rowToTask(ctx, row);
       const stale = move(ctx, emit, task, 'stale', 'system', {
         changes: { leaseExpiresAt: null },
         data: { holder: task.assignee },
@@ -877,7 +877,7 @@ export function markMerged(ctx: HubContext, id: string, actor: string, sha?: str
 function refreshDependents(ctx: HubContext, emit: Emit): void {
   const rows = ctx.db.query(`${TASK_SELECT} WHERE status = 'blocked' AND blocked_kind = 'deps'`).all() as TaskRow[];
   for (const row of rows) {
-    const task = rowToTask(row);
+    const task = rowToTask(ctx, row);
     const waiting = unmetDependencies(ctx, task.dependsOn);
     if (waiting.length === 0) {
       move(ctx, emit, task, 'ready', 'system', { changes: { blockedKind: null, blockedReason: null } });
