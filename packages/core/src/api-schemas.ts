@@ -50,6 +50,7 @@ import type {
   AttemptStatus,
   FailureClass,
   FetchedUrl,
+  LeadApproval,
   LeadNote,
   LeadSeat,
   PrepareRequest,
@@ -245,30 +246,40 @@ export const AttemptLogEntrySchema = schemaFor<AttemptLogEntry>()(
   }),
 );
 
+const ApprovalFields = z.strictObject({
+  // Minted by the runner as a UUID (design 6.10).
+  id: z.uuid(),
+  attemptId: AttemptIdSchema,
+  fence: FenceSchema,
+  runnerId: RunnerIdSchema,
+  owner: Name,
+  taskId: TaskIdSchema.nullable(),
+  agentId: AgentIdSchema,
+  kind: ApprovalKindSchema,
+  summary: z.string(),
+  detail: ApprovalDetailSchema,
+  status: ApprovalStatusSchema,
+  decidedBy: Name.nullable(),
+  createdAt: NonNegativeInt,
+  expiresAt: NonNegativeInt,
+  decidedAt: NonNegativeInt.nullable(),
+});
+
+const APPROVAL_TASK = {
+  error: 'expected the task its attempt id names; a lead attempt has none',
+  path: ['taskId'],
+};
+
 export const ApprovalSchema = schemaFor<Approval>()(
-  z
-    .strictObject({
-      // Minted by the runner as a UUID (design 6.10).
-      id: z.uuid(),
-      attemptId: AttemptIdSchema,
-      fence: FenceSchema,
-      runnerId: RunnerIdSchema,
-      owner: Name,
-      taskId: TaskIdSchema.nullable(),
-      agentId: AgentIdSchema,
-      kind: ApprovalKindSchema,
-      summary: z.string(),
-      detail: ApprovalDetailSchema,
-      status: ApprovalStatusSchema,
-      decidedBy: Name.nullable(),
-      createdAt: NonNegativeInt,
-      expiresAt: NonNegativeInt,
-      decidedAt: NonNegativeInt.nullable(),
-    })
-    .refine((approval) => namesTask(approval.attemptId, approval.taskId), {
-      error: 'expected the task its attempt id names; a lead attempt has none',
-      path: ['taskId'],
-    }),
+  ApprovalFields.refine((approval) => namesTask(approval.attemptId, approval.taskId), APPROVAL_TASK),
+);
+
+/** An approval in the lead's listing (design 6.10, Who may answer): the approval, and whether the lead may approve it. */
+export const LeadApprovalSchema = schemaFor<LeadApproval>()(
+  ApprovalFields.extend({ leadMayApprove: z.boolean() }).refine(
+    (approval) => namesTask(approval.attemptId, approval.taskId),
+    APPROVAL_TASK,
+  ),
 );
 
 export const SubmissionRecordSchema = schemaFor<SubmissionRecord>()(
@@ -411,8 +422,14 @@ export const HandbackInputSchema = z.strictObject({
 /** GET /api/approvals?status=, the caller's own approvals. */
 export const ApprovalsQuerySchema = z.object({ status: param(commaList(ApprovalStatusSchema)) });
 
-/** POST /api/approvals/:id. Approve maps only to the vendor's one-time accept (design 6.10). */
-export const ApprovalDecisionInputSchema = z.strictObject({ decision: z.enum(['approve', 'decline']) });
+/**
+ * POST /api/approvals/:id. Approve maps only to the vendor's one-time accept (design 6.10). The reason is the lead's
+ * (AGFLOW_LEAD_APPROVALS): the asking agent reads it, and a lead's decline must carry one. A person's body has none.
+ */
+export const ApprovalDecisionInputSchema = z.strictObject({
+  decision: z.enum(['approve', 'decline']),
+  reason: z.string().min(1).max(500).optional(),
+});
 
 /** POST /api/staffing (request_agents): the hub clamps count to [0, cap]; a vendor sets the project's preference. */
 export const StaffingInputSchema = z.strictObject({
@@ -472,6 +489,9 @@ export const AttemptResponseSchema = z.strictObject({ attempt: AttemptSchema });
 
 /** GET /api/approvals. */
 export const ApprovalsResponseSchema = z.strictObject({ approvals: z.array(ApprovalSchema) });
+
+/** GET /api/approvals with the lead's agent token: the pending approvals it may answer, oldest first. */
+export const LeadApprovalsResponseSchema = z.strictObject({ approvals: z.array(LeadApprovalSchema) });
 
 /** POST /api/approvals/:id. */
 export const ApprovalResponseSchema = z.strictObject({ approval: ApprovalSchema });
@@ -593,7 +613,13 @@ export const HUB_EVENT_TYPES = {
   'agent.stopped': { category: 'agents', subject: 'task', data: [...OF_ATTEMPT, 'cause', 'reason'] },
   'agent.replaced': { category: 'agents', subject: 'task', data: [...OF_ATTEMPT, 'cause', 'reason'] },
   'approval.requested': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL, 'kind'] },
-  'approval.decided': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL, 'decision'] },
+  // reason: what the one who decided told the asking agent; the owner gives none.
+  'approval.decided': {
+    category: 'approvals',
+    subject: 'task',
+    data: [...OF_APPROVAL, 'decision'],
+    optionalData: ['reason'],
+  },
   'approval.expired': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL] },
   'approval.voided': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL] },
   // The seat after the change; kind none leaves the ids null.
