@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as tls from 'node:tls';
 import { gzipSync } from 'node:zlib';
+import { createContext } from '../src/context';
 import {
   type PinnedRequest,
   PublicFetchError,
@@ -13,8 +14,10 @@ import {
   type Resolver,
   type Transport,
   fetchPublicUrl,
+  systemResolver,
 } from '../src/public-fetch';
 import { type SocketTransportOptions, createSocketTransport } from '../src/socket-transport';
+import { makeConfig } from './helpers';
 
 const MB = 1024 * 1024;
 const KB = 1024;
@@ -1060,5 +1063,23 @@ describe('through fetchPublicUrl', () => {
     // Without the authority the same site is not trusted.
     const untrusting = routed({ 'pinned.example.test': site.port });
     expect((await failure(fetchPublicUrl({ resolve, transport: untrusting.transport }, 'https://pinned.example.test/')))[0]).toBe('connect_failed');
+  });
+});
+
+describe('the hub by default', () => {
+  test('resolves with the system resolver and fetches with the socket transport', async () => {
+    const ctx = createContext({ dbPath: ':memory:', config: makeConfig({ agentFetch: true }) });
+    try {
+      expect(ctx.agentFetch.resolve).toBe(systemResolver);
+      const site = await answering('HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n');
+      const response = await ctx.agentFetch.transport(pinned(site, { hostname: 'default.example.org', path: '/start' }), new AbortController().signal);
+      // The 302 comes back as it is, and what went out are the socket transport's bytes: the Host of the name, the
+      // fixed User-Agent, and a connection that is not kept.
+      expect([response.status, response.headers.get('location')]).toEqual([302, '/next']);
+      await Bun.sleep(30);
+      expect(site.connections.map((connection) => connection.received())).toEqual([wire('default.example.org', '/start')]);
+    } finally {
+      ctx.db.close();
+    }
   });
 });
