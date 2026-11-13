@@ -126,6 +126,43 @@ operator's person as the actor.
 With an operator that merges, also set `AGFLOW_DEPENDENCIES_NEED_MERGE=1`: a dependency then counts as done only once
 it is marked merged, so the hub releases dependent tasks after their dependencies are in `main`, not at acceptance.
 
+## Unattended operation
+
+By default a person merges accepted work, brings outside data into the repository and answers every approval request.
+Four opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
+after a change. The rules behind the last two are in the
+[M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
+
+- **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal, marking tasks
+  merged, unblocking and messaging the lead by hand. Risk: whoever reads the token acts as the operator's person on
+  those routes, so keep it on the server only.
+- **`AGFLOW_DEPENDENCIES_NEED_MERGE=1`.** Removes: checking that a dependency reached `main` before dependent work
+  starts. Risk: if nothing marks accepted tasks merged, dependent tasks wait forever. Set it only together with an
+  operator that merges.
+- **`AGFLOW_AGENT_FETCH=1`.** Removes: fetching outside data for agents. The hub downloads one public URL at a time
+  for a Claude agent, for the lead and for the tasks the lead granted internet access, and the agent's bridge saves
+  the file inside its clone. Agents still have no network of their own. Risk: an agent that reads hostile text can
+  leak whatever its sandbox lets it read, through the addresses it asks for; downloaded pages are untrusted input to
+  the agent; the requests come from this server's address. The hub refuses non-public addresses, caps time, size and
+  rate, and logs every request on the attempt. Grants belong on tasks that need outside data and should be revoked
+  afterwards.
+- **`AGFLOW_LEAD_APPROVALS=1`.** Removes: the runner owner answering each Codex approval request in a browser. The
+  agent holding the lead seat may decline other agents' requests, with a reason, and approve them when the device's
+  Codex policy is not managed. A request nobody answered in time is then declined without marking the owner away. The
+  owner can still answer first. Risk: an approved command runs outside the sandbox, with network access and write
+  access to all the owner's files, on the lead's judgement instead of the owner's, and a lead can be misled by the
+  text of a request.
+
+What still needs a person:
+
+- **Approvals on a managed device.** Where the device's administrator manages the Codex policy, the lead can only
+  decline. Approving stays with the owner, in the browser.
+- **Internet for Codex agents.** They never fetch, with or without a grant. Give outside-data tasks to Claude agents,
+  or commit the data.
+- **Runner sign-in.** A person runs `agflow login` on each Mac and completes the Claude and Codex logins that
+  `agflow runner setup` opens ([Joining from a Mac](#joining-from-a-mac)).
+- **Secrets.** API keys and other secrets are never handed out by the hub or by the lead. A person provides them.
+
 ## Joining from a Mac
 
 Requires Apple silicon macOS (`darwin-arm64`), Bun 1.3.11, git and working access to the project repo. Each person needs their own supported Claude/Codex subscription/login; authenticate git separately so fetches and pushes work. Vendor policy (including managed Codex policy) must permit the runner; agflow does not bypass it. These setup commands intentionally install a real per-user LaunchAgent and prompt for vendor login: the human runs them on their own Mac.
