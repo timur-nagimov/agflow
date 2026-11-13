@@ -127,9 +127,10 @@ const vendorRefused = () =>
   );
 
 /**
- * A stop request ends the fetching at once (design 5, Unattended options), as it ends the agent's other requests
- * (prepare.ts, tasks.ts requireHolder): the attempt itself stays open until its agent exits or the stop times out,
- * and an agent told to stop has no more use for outside data. A cancel of its task and its own release are stops too.
+ * A stop request ends the fetching at once (design 5, Unattended options), as it ends the agent's submissions and
+ * preparation requests (tasks.ts requireHolder, prepare.ts): the attempt itself stays open until its agent exits or
+ * the stop times out, and an agent told to stop has no more use for outside data. A cancel of its task and its own
+ * release are stops too.
  */
 const attemptStopping = (attemptId: string) =>
   new HubError(
