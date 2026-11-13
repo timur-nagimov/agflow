@@ -130,6 +130,14 @@ describe('the record of fetches', () => {
       },
       { utc: '2026-10-26 12:00:00', attempt_id: 'T-1-a1', outcome: 200, bytes: 10, url: 'https://example.com/a', final_url: 'https://example.com/', detail: null },
     ]);
+    // The runbook's list of grants, for the check after a restore, reads the grants table the same way.
+    const grants = /"(SELECT [^"]*FROM task_fetch_grants[^"]*)"/.exec(runbook)?.[1];
+    if (!grants) throw new Error('the runbook shows no query on task_fetch_grants');
+    ctx.db.run("INSERT INTO tasks (id, seq, status, contract, goal_version, created_by, created_at, updated_at) VALUES ('T-1', 1, 'ready', '{}', 0, 'user:alice', 1, 1)");
+    ctx.db
+      .query("INSERT INTO task_fetch_grants (task_id, granted_by, reason, granted_at) VALUES ('T-1', 'agent:A-3', 'why', $at)")
+      .run({ at: clock.now() });
+    expect(ctx.db.query(grants).all()).toEqual([{ task_id: 'T-1', granted_by: 'agent:A-3', utc: '2026-10-26 12:00:01' }]);
     // The filters it names are columns of the table.
     const filters = [...runbook.matchAll(/`WHERE ([a-z_]+) = '[^'`]*'`/g)].map((match) => match[1] as string);
     expect(filters).toEqual(['task_id', 'agent_id', 'error']);

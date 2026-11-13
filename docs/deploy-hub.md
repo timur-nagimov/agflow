@@ -94,6 +94,46 @@ If activation or server readiness fails, the script restores the previous symlin
 
 After deployment open the UI, sign in as each allowed user, check live Timeline updates, and connect one Mac runner. Check the Caddy certificate and runner reconnect after a hub restart. These are deployment acceptance checks, separate from the local regression suite.
 
+### Upgrading to schema version 3
+
+This release moves the database from schema version 2 to 3. Version 3 adds two tables: the internet grants
+(`task_fetch_grants`) and the record of what agents fetched (`agent_fetches`). Both stay empty unless
+`AGFLOW_AGENT_FETCH=1`. The hub migrates the database in place the first time it starts.
+
+The previous release cannot open a version 3 database: it stops at start with "database schema version 3 is newer
+than this hub supports (2)", and it cannot restore a backup written after the upgrade either. So a deployment that
+fails after the migration and rolls back leaves the previous hub unable to start.
+
+Before deploying, copy the newest backup aside, under a name the backup rotation does not remove:
+
+```bash
+sudo -u agflow sh -c 'cp -p "$(ls -t /var/lib/agflow/backups/agflow-*.db | head -n 1)" /var/lib/agflow/backups/before-schema-3.db'
+sudo ls -l /var/lib/agflow/backups/before-schema-3.db
+```
+
+The way back to the previous release does not need that backup, and keeps everything done since the upgrade except
+the grants and the record of fetches. Stop the hub and take out what version 3 added:
+
+```bash
+sudo systemctl stop agflow-hub
+sudo systemctl is-active agflow-hub    # should report inactive
+sudo apt-get install -y sqlite3        # once: the host template does not install it
+sudo -u agflow sqlite3 /var/lib/agflow/data/agflow.db <<'SQL'
+BEGIN;
+DROP TABLE agent_fetches;
+DROP TABLE task_fetch_grants;
+DELETE FROM schema_migrations WHERE version = 3;
+COMMIT;
+SQL
+```
+
+Then deploy the previous release with the usual command. It ignores `AGFLOW_AGENT_FETCH` and `AGFLOW_LEAD_APPROVALS`
+in `hub.env`. To keep the record of fetches, save it before the statements above:
+`sudo -u agflow sqlite3 /var/lib/agflow/data/agflow.db ".dump agent_fetches" > agent_fetches.sql`. Deploying this
+release again later migrates the database to version 3 again, with both tables empty. Restore
+`before-schema-3.db` only if the database itself is damaged: it brings back the state of that backup and loses
+what happened since.
+
 ## Add or remove a person
 
 Grant the colleague read/write access to the project repository on GitHub and add their GitHub login (not display name/email) to the comma-separated `AGFLOW_ALLOWED_USERS`. Then:
@@ -173,7 +213,7 @@ sudo -u agflow sqlite3 -readonly -header -column /var/lib/agflow/data/agflow.db 
 Narrow it with `WHERE task_id = 'T-12'` or `WHERE agent_id = 'A-7'`. `WHERE error = 'fetch_address_refused'` finds
 requests for names that resolve inside your network; `detail` then holds the address, which the agent was not told.
 A row with no outcome is a request that was under way when the hub stopped. Requests made after a backup was taken
-are on record only in the database a restore puts aside (`agflow.db.replaced-*`).
+are on record only in the database a restore puts aside (`agflow.db.replaced-*`): run the same query on that file.
 
 What still needs a person:
 
@@ -229,7 +269,16 @@ sudo systemctl start agflow-hub
 sudo journalctl -u agflow-hub -n 100 --no-pager
 ```
 
-Restore refuses while the DB lock names a live process, validates/migrates the backup, keeps the replaced DB/WAL/SHM as `agflow.db.replaced-*`, advances epoch/counters and checkpoints the restored database. Keep those replaced files until recovery is verified. Never copy a backup over a running database or delete the lock to force a restore. After restart the recovery window (default 120 seconds) pauses dispatch/lease expiry/stall decisions while runners reconnect and replay retained work. Check task positions, the lead, both runners, capacity/drain settings and approvals before resuming. The README's [settings-sync restore limits](../README.md#backups-restore-and-known-limits) still apply.
+Restore refuses while the DB lock names a live process, validates/migrates the backup, keeps the replaced DB/WAL/SHM as `agflow.db.replaced-*`, advances epoch/counters and checkpoints the restored database. Keep those replaced files until recovery is verified. Never copy a backup over a running database or delete the lock to force a restore. After restart the recovery window (default 120 seconds) pauses dispatch/lease expiry/stall decisions while runners reconnect and replay retained work. Check task positions, the lead, both runners, capacity/drain settings, approvals and internet grants before resuming. The README's [settings-sync restore limits](../README.md#backups-restore-and-known-limits) still apply.
+
+A restore brings back the internet grants as the backup had them, so a grant that was taken back after the backup is in force again. List them before starting the hub:
+
+```bash
+sudo -u agflow sqlite3 -readonly -header -column /var/lib/agflow/data/agflow.db \
+  "SELECT task_id, granted_by, datetime(granted_at / 1000, 'unixepoch') AS utc FROM task_fetch_grants ORDER BY granted_at"
+```
+
+To end them all, start the hub once with `AGFLOW_AGENT_FETCH` unset: it ends every grant and names the tasks in its journal. Then set it again and restart; the lead grants anew where a task still needs outside data. To end single grants, tell the lead which tasks should lose theirs. The requests the hub made after the backup are on record only in the replaced database ([What agents fetched](#what-agents-fetched)).
 
 For VM loss, stop/fence the old VM before bringing up any replacement (never run two hubs against one project's runners). In the cloud console create a boot disk from the selected snapshot and a replacement VM in the same subnet/security group, then move the reserved public IP. Alternatively use `yc compute disk create --source-snapshot-id SNAPSHOT_ID --name RESTORED_DISK --zone ZONE`, followed by `yc compute instance create ... --use-boot-disk disk-id=RESTORED_DISK,auto-delete=false` with the same CPU/memory/network settings as the recipe. Disable automatic hub startup on the recovery VM while verifying files; keep public 80/443 closed until ready. Use serial console or an isolated recovery VM to do this before attaching the public IP.
 
