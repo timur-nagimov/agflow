@@ -127,6 +127,7 @@ describe('the runner tool sets', () => {
       'release_task',
       'submit',
       'prepare_dependencies',
+      'fetch_url',
     ]);
     // A runner attempt's release stops the attempt: M1's answer, that the task is ready again, would be wrong.
     expect(runnerWorkerTools.find((tool) => tool.name === 'release_task')).not.toBe(workerTools.find((tool) => tool.name === 'release_task'));
@@ -140,6 +141,8 @@ describe('the runner tool sets', () => {
       'reject_task',
       'unblock_task',
       'mark_merged',
+      'grant_internet',
+      'revoke_internet',
       'add_goal_note',
       'get_events',
       'request_agents',
@@ -148,6 +151,7 @@ describe('the runner tool sets', () => {
       'write_handoff',
       'get_lead_notes',
       'fetch_submission',
+      'fetch_url',
     ]);
     for (const tools of [runnerWorkerTools, runnerLeadTools]) {
       const names = tools.map((tool) => tool.name);
@@ -160,10 +164,15 @@ describe('the runner tool sets', () => {
     expect(runnerToolsFor('lead')).toBe(runnerLeadTools);
   });
 
-  test("the runner's BRIDGE_TOOL_NAMES name exactly the tools each role's bridge serves", () => {
+  test("the runner's BRIDGE_TOOL_NAMES and the unattended tools name exactly the tools each role's bridge serves", () => {
+    // The tools of the unattended options (design 5, 10) came after the runner's list and leave the runner as it was:
+    // the bridge serves them, Claude lists them from the server, and Codex reports them as extra tools at a start.
+    // Written out here, so a tool that is in neither list fails.
+    const unattended = { worker: ['fetch_url'], lead: ['fetch_url', 'grant_internet', 'revoke_internet'] };
     for (const role of ['worker', 'lead'] as const) {
       const served = runnerToolsFor(role).map((tool) => tool.name);
-      expect([...BRIDGE_TOOL_NAMES[role]].sort()).toEqual(served.sort());
+      expect([...BRIDGE_TOOL_NAMES[role], ...unattended[role]].sort()).toEqual(served.sort());
+      expect(BRIDGE_TOOL_NAMES[role].filter((name) => unattended[role].includes(name))).toEqual([]);
     }
   });
 });

@@ -12,6 +12,7 @@ import type {
   AgentRole,
   Attempt,
   FetchSubmissionRequest,
+  FetchedUrl,
   GoalNote,
   GoalVersion,
   HubEvent,
@@ -79,6 +80,12 @@ export interface MessageBody {
 
 const q = encodeURIComponent;
 
+/**
+ * How long the bridge waits for POST /api/fetch: the hub may wait a few seconds for the site's turn and then gives the
+ * site 20 seconds, and a large body takes its time on the way back.
+ */
+const FETCH_URL_TIMEOUT_MS = 40_000;
+
 /** The hub takes every bearer with this prefix for a runner agent's token (design 6.5). */
 const AGENT_TOKEN_PREFIX = 'agt_';
 
@@ -102,7 +109,7 @@ export class HubClient {
     return this.token?.startsWith(AGENT_TOKEN_PREFIX) ?? false;
   }
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number } = {}): Promise<T> {
     // The bridge header tells the hub this client can start a live claim from a WIP ref (design 10).
     const headers: Record<string, string> = { accept: 'application/json', [BRIDGE_HEADER]: String(BRIDGE_VERSION) };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
@@ -115,7 +122,7 @@ export class HubClient {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(options.timeoutMs ?? this.timeoutMs),
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -252,6 +259,11 @@ export class HubClient {
     return this.request<{ request: PrepareRequest }>('GET', `/api/prepare/${q(id)}`);
   }
 
+  /** The hub downloads one public URL for this runner agent (design 5, Unattended options). */
+  fetchUrl(url: string) {
+    return this.request<FetchedUrl>('POST', '/api/fetch', { url }, { timeoutMs: FETCH_URL_TIMEOUT_MS });
+  }
+
   requestSubmissionFetch(taskId: string) {
     return this.request<{ request: FetchSubmissionRequest }>('POST', '/api/fetch-submission', { task_id: taskId });
   }
@@ -283,6 +295,12 @@ export class HubClient {
   }
   addGoalNote(text: string) {
     return this.request<GoalNote>('POST', '/api/goal/notes', { text });
+  }
+  grantInternet(taskId: string, reason: string) {
+    return this.request<{ task: Task }>('POST', `/api/tasks/${q(taskId)}/fetch-grant`, { reason });
+  }
+  revokeInternet(taskId: string) {
+    return this.request<{ task: Task }>('DELETE', `/api/tasks/${q(taskId)}/fetch-grant`);
   }
   staffing(body: StaffingBody) {
     return this.request<{ running: number; target: number }>('POST', '/api/staffing', body);

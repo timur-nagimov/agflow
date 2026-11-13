@@ -28,7 +28,7 @@ test('agflow mcp speaks MCP over stdio and binds the chat with hello', async () 
   try {
     await client.connect(transport);
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(28);
+    expect(tools).toHaveLength(30);
     expect(tools.find((t) => t.name === 'fetch_submission')?.inputSchema.properties).toHaveProperty('task_id');
     expect(tools.find((t) => t.name === 'claim_task')?.inputSchema.properties).toHaveProperty('id');
     const before = await client.callTool({ name: 'check_inbox', arguments: {} });
