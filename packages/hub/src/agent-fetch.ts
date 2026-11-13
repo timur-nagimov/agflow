@@ -193,11 +193,16 @@ const hostBusy = (host: string) =>
 /** The failures that are the hub's refusal; the rest are the site's or the network's. */
 const REFUSALS: readonly PublicFetchFailure[] = ['url_refused', 'address_refused'];
 
+/**
+ * The agent's answer to a fetch that gave none. A failure's words may hold text of the site's or the network's (an
+ * error of the connection), so they reach the agent on one line, as they reach the log and the record: nothing in
+ * them can pose as a line of the hub's.
+ */
 const answerFor = (error: PublicFetchError): HubError =>
   new HubError(
     REFUSALS.includes(error.code) ? 400 : error.code === 'timeout' ? 504 : 502,
     `fetch_${error.code}`,
-    error.message,
+    oneLine(error.message),
   );
 
 /** Where the redirects ended. The site chose it, so only its start is shown: it says where the hub went. */
@@ -217,7 +222,8 @@ const OUTCOME_MAX = 1500;
  */
 function logFetch(ctx: HubContext, attemptId: string, url: string, outcome: string): void {
   const shown = oneLine(url);
-  const result = clip(outcome, OUTCOME_MAX);
+  // The outcome holds a site's and the network's words as well as the hub's, so it is one line like the URL.
+  const result = clip(oneLine(outcome), OUTCOME_MAX);
   const line = `fetch GET ${shown}: ${result}`;
   try {
     tx(ctx, () => {
