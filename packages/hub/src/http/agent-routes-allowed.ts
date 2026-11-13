@@ -12,7 +12,7 @@
 export type AgentRouteAccess = 'read' | 'self' | 'holder' | 'own' | 'lead';
 
 export interface AgentRoute {
-  method: 'GET' | 'POST' | 'PATCH';
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   /** A Hono pattern; a ':name' parameter matches exactly one path segment. */
   path: string;
   access: AgentRouteAccess;
@@ -47,6 +47,9 @@ export const AGENT_ROUTES: readonly AgentRoute[] = [
   { method: 'POST', path: '/api/agents/:id/replace', access: 'lead' },
   { method: 'POST', path: '/api/lead/handoff', access: 'lead' },
   { method: 'GET', path: '/api/lead/notes', access: 'lead' },
+  // Internet grants (design 5, Unattended options); the routes refuse while AGFLOW_AGENT_FETCH is off.
+  { method: 'POST', path: '/api/tasks/:id/fetch-grant', access: 'lead' },
+  { method: 'DELETE', path: '/api/tasks/:id/fetch-grant', access: 'lead' },
 ];
 
 const segments = (path: string): string[] => path.split('/');

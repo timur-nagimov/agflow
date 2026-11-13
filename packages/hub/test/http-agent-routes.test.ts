@@ -40,6 +40,8 @@ const DESIGN_TABLE = [
   'POST /api/agents/:id/replace',
   'POST /api/lead/handoff',
   'GET /api/lead/notes',
+  'POST /api/tasks/:id/fetch-grant',
+  'DELETE /api/tasks/:id/fetch-grant',
 ];
 
 /** A path that the route pattern matches: each parameter becomes a sample segment, a wildcard a sample page. */
@@ -49,7 +51,7 @@ function concrete(pattern: string): string {
 
 describe('the agent-token route allowlist', () => {
   test("the allowlist is exactly design 6.5's table", () => {
-    expect(DESIGN_TABLE).toHaveLength(34);
+    expect(DESIGN_TABLE).toHaveLength(36);
     expect(AGENT_ROUTES.map((route) => `${route.method} ${route.path}`).sort()).toEqual([...DESIGN_TABLE].sort());
   });
 
@@ -153,6 +155,8 @@ describe('the agent-token route allowlist', () => {
       ['POST', '/api/agents/:id/replace'],
       ['POST', '/api/lead/handoff'],
       ['GET', '/api/lead/notes'],
+      ['POST', '/api/tasks/:id/fetch-grant'],
+      ['DELETE', '/api/tasks/:id/fetch-grant'],
     ];
     for (const [method, path] of lead) expect([method, path, access(method, path)]).toEqual([method, path, 'lead']);
     expect(access('GET', '/api/tasks')).toBe('read');
