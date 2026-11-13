@@ -2,10 +2,11 @@
 // exist only when AGFLOW_OPERATOR_TOKEN is set, and that token lives only in the hub's server environment, never on a
 // laptop where agents run: a person's CLI token, which runners hold, still cannot do any of this.
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { MarkMergedInputSchema, NoteInputSchema, SendMessageInputSchema } from '@agflow/core';
+import { MarkMergedInputSchema, NoteInputSchema, SendMessageInputSchema, UpdateGoalInputSchema } from '@agflow/core';
 import type { Context } from 'hono';
 import type { HubContext } from '../context';
 import { unauthorized } from '../errors';
+import { updateGoal } from '../goal';
 import { sendMessage } from '../messages';
 import { markMerged, unblockTask } from '../tasks';
 import type { App, AppEnv } from './app';
@@ -26,6 +27,12 @@ export function mountOperatorRoutes(app: App, ctx: HubContext): void {
     if (!given || !timingSafeEqual(digest(given), expected)) throw unauthorized('the operator token is missing or wrong');
     return `user:${operatorUser}`;
   };
+
+  app.put('/api/operator/goal', async (c) => {
+    const who = operator(c);
+    const input = await readBody(c, UpdateGoalInputSchema);
+    return c.json(updateGoal(ctx, input, who));
+  });
 
   app.post('/api/operator/tasks/:id/merged', async (c) => {
     const who = operator(c);

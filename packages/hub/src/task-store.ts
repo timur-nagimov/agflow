@@ -233,10 +233,12 @@ export function addNote(
     .run({ taskId, kind, body, author, now: ctx.now(), attemptId });
 }
 
+/** The dependencies not done yet: accepted counts, unless the hub is set to wait for the merge (dependenciesNeedMerge). */
 export function unmetDependencies(ctx: HubContext, dependsOn: string[]): string[] {
+  const done = ctx.config.dependenciesNeedMerge ? (status: TaskStatus) => status === 'merged' : isDone;
   return dependsOn.filter((id) => {
     const dependency = findTask(ctx, id);
-    return !dependency || !isDone(dependency.status);
+    return !dependency || !done(dependency.status);
   });
 }
 

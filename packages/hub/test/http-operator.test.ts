@@ -63,6 +63,18 @@ describe('operator routes', () => {
     expect(sent.json.message).toMatchObject({ from: 'user:alice', body: 'T-1 is in main' });
   });
 
+  test('the operator sets the goal as its person, with the usual version check', async () => {
+    const hub = createTestHub({ operatorToken: TOKEN, operatorUser: 'alice' });
+    const set = await hub.call('PUT', '/api/operator/goal', { ...op(), body: { text: 'Ship the afisha', baseVersion: 0 } });
+    expect(set.status).toBe(200);
+    expect(set.json).toMatchObject({ version: 1, text: 'Ship the afisha' });
+    const goal = await hub.call('GET', '/api/goal', { user: 'alice', via: 'web' });
+    expect(goal.json.current).toMatchObject({ version: 1, text: 'Ship the afisha' });
+    const stale = await hub.call('PUT', '/api/operator/goal', { ...op(), body: { text: 'Another', baseVersion: 0 } });
+    expect(stale.status).toBe(409);
+    expect((await hub.call('PUT', '/api/operator/goal', { ...op(`${TOKEN}x`), body: { text: 'x', baseVersion: 1 } })).status).toBe(401);
+  });
+
   test('the config asks for a long token and an allowed operator', () => {
     const base = {
       AGFLOW_AUTH: 'dev',

@@ -867,7 +867,10 @@ export function markMerged(ctx: HubContext, id: string, actor: string, sha?: str
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
     if (task.status !== 'accepted') throw conflict(`${id} is ${task.status}; only accepted tasks can be marked merged`);
-    return move(ctx, emit, task, 'merged', actor, { changes: { mergedSha: sha ?? null }, data: { sha: sha ?? null } });
+    const merged = move(ctx, emit, task, 'merged', actor, { changes: { mergedSha: sha ?? null }, data: { sha: sha ?? null } });
+    // With dependenciesNeedMerge, this is what releases the tasks that waited for it.
+    refreshDependents(ctx, emit);
+    return merged;
   });
 }
 

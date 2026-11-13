@@ -171,7 +171,8 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_DB` | `data/agflow.db` | SQLite database file |
 | `AGFLOW_BACKUP_DIR` | `data/backups` | Hourly snapshots (24 hours), daily snapshots (newest 7) and start snapshots (newest 3) |
 | `AGFLOW_WEB_DIST` | (unset) | Folder with the built web UI |
-| `AGFLOW_OPERATOR_TOKEN`, `AGFLOW_OPERATOR_USER` | (unset) | Server-only token for the operator routes (mark merged, unblock, message) and the allowed login they act as; see [docs/deploy-hub.md](docs/deploy-hub.md#operator-access) |
+| `AGFLOW_OPERATOR_TOKEN`, `AGFLOW_OPERATOR_USER` | (unset) | Server-only token for the operator routes (goal, mark merged, unblock, message) and the allowed login they act as; see [docs/deploy-hub.md](docs/deploy-hub.md#operator-access) |
+| `AGFLOW_DEPENDENCIES_NEED_MERGE` | `0` | `1`: a dependency is done only once it is merged, not when it is accepted, so dependents start from a main branch that holds it |
 | `AGFLOW_LEASE_MINUTES` | `120` | How long a claim survives without agent activity |
 | `AGFLOW_REMINDER_MINUTES` | `30` | Minimum time between "you hold a task" reminders |
 | `AGFLOW_MAX_OPEN_TASKS` | `200` | Guard: refuse new tasks beyond this many open tasks |

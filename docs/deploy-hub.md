@@ -110,10 +110,11 @@ The allowlist is checked whenever a session verifies; removing a login invalidat
 M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. To run a
 project unattended, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
 for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login the script acts as) in
-`/etc/agflow/hub.env` and restart. Three routes then accept the header `X-Agflow-Operator: <token>`:
+`/etc/agflow/hub.env` and restart. Four routes then accept the header `X-Agflow-Operator: <token>`:
 
 | Route | Does |
 |---|---|
+| `PUT /api/operator/goal` `{ "text": string, "baseVersion": number }` | sets the project goal (the usual version check applies) |
 | `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
 | `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
 | `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
@@ -121,6 +122,9 @@ for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login
 Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it. Without the token the routes
 do not exist. A person's CLI token, which runners hold, still cannot use people's controls. The events record the
 operator's person as the actor.
+
+With an operator that merges, also set `AGFLOW_DEPENDENCIES_NEED_MERGE=1`: a dependency then counts as done only once
+it is marked merged, so the hub releases dependent tasks after their dependencies are in `main`, not at acceptance.
 
 ## Joining from a Mac
 

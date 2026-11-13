@@ -175,6 +175,10 @@ export function loadConfig(env: Env): LoadedConfig {
       throw new Error('AGFLOW_OPERATOR_USER must be one of AGFLOW_ALLOWED_USERS');
     }
   }
+  const needMerge = env.AGFLOW_DEPENDENCIES_NEED_MERGE ?? '';
+  if (needMerge !== '' && needMerge !== '0' && needMerge !== '1') {
+    throw new Error('AGFLOW_DEPENDENCIES_NEED_MERGE must be 0 or 1');
+  }
   const testMode = env.AGFLOW_TEST === '1';
   if (env.AGFLOW_TEST_CONFIG && !testMode) throw new Error('AGFLOW_TEST_CONFIG is honoured only with AGFLOW_TEST=1');
   const config: HubConfig = {
@@ -194,6 +198,7 @@ export function loadConfig(env: Env): LoadedConfig {
     webDist: env.AGFLOW_WEB_DIST,
     operatorToken,
     operatorUser,
+    dependenciesNeedMerge: needMerge === '1',
   };
   const overrides = env.AGFLOW_TEST_CONFIG ? testOverrides(env.AGFLOW_TEST_CONFIG) : {};
   Object.assign(config, overrides);
