@@ -144,8 +144,9 @@ after a change. The rules behind the last two are in the
   the file inside its clone. Agents still have no network of their own. Risk: an agent that reads hostile text can
   leak whatever its sandbox lets it read, through the addresses it asks for; downloaded pages are untrusted input to
   the agent; the requests come from this server's address. The hub refuses non-public addresses, caps time, size and
-  rate, and logs every request on the attempt. Grants belong on tasks that need outside data and should be revoked
-  afterwards.
+  rate, and logs every request on the attempt. The service unit adds a second layer: `IPAddressDeny` keeps the hub
+  process from link-local addresses, where a cloud's metadata service answers. Grants belong on tasks that need
+  outside data and should be revoked afterwards.
 - **`AGFLOW_LEAD_APPROVALS=1`.** Removes: the runner owner answering each Codex approval request in a browser. The
   agent holding the lead seat may decline other agents' requests, with a reason, and approve them when the device's
   Codex policy is not managed. A request nobody answered in time is then declined without marking the owner away. The

@@ -33,6 +33,10 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# With AGFLOW_AGENT_FETCH=1 the hub downloads public URLs for agents and refuses every non-public address itself.
+# This filter is a second layer for link-local addresses, where a cloud's metadata service answers: the hub never
+# needs them. Loopback stays open: the reverse proxy reaches the hub over it.
+IPAddressDeny=169.254.0.0/16 fe80::/10
 # Bun's JavaScriptCore JIT needs executable memory; do not set MemoryDenyWriteExecute.
 LimitNOFILE=65536
 StandardOutput=journal
