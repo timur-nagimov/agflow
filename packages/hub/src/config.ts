@@ -165,11 +165,12 @@ export function loadConfig(env: Env): LoadedConfig {
   }
   const publicUrl = `${url.origin}${url.pathname}`.replace(/\/+$/, '');
   const operatorToken = env.AGFLOW_OPERATOR_TOKEN || null;
+  const operatorLogin = env.AGFLOW_OPERATOR_USER?.trim().toLowerCase() || null;
   let operatorUser: string | null = null;
   if (operatorToken !== null) {
     if (operatorToken.length < 32) throw new Error('AGFLOW_OPERATOR_TOKEN must be at least 32 characters');
-    if (!env.AGFLOW_OPERATOR_USER) throw new Error('AGFLOW_OPERATOR_TOKEN needs AGFLOW_OPERATOR_USER, the person it acts as');
-    operatorUser = env.AGFLOW_OPERATOR_USER.trim().toLowerCase();
+    if (!operatorLogin) throw new Error('AGFLOW_OPERATOR_TOKEN needs AGFLOW_OPERATOR_USER, the person it acts as');
+    operatorUser = operatorLogin;
     if (!allowedUsers.some((user) => user.toLowerCase() === operatorUser)) {
       throw new Error('AGFLOW_OPERATOR_USER must be one of AGFLOW_ALLOWED_USERS');
     }
