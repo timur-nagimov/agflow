@@ -3,7 +3,8 @@ import { DEFAULT_INFRA_BACKOFF_MS, DEFAULT_WIP_REF_PREFIX } from '@agflow/core';
 import { openDb } from './db';
 import { type Emit, EventBus, insertEvent } from './events';
 import { FetchLimiter } from './fetch-limits';
-import { type PublicFetchLimits, type Resolver, type Transport, createPinnedTransport, systemResolver } from './public-fetch';
+import { type PublicFetchLimits, type Resolver, type Transport, systemResolver } from './public-fetch';
+import { createSocketTransport } from './socket-transport';
 
 export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -216,7 +217,7 @@ export function createContext(options: ContextOptions): HubContext {
     link: options.link ?? NO_RUNNER_LINK,
     agentFetch: {
       resolve: systemResolver,
-      transport: createPinnedTransport(),
+      transport: createSocketTransport(),
       sleep: (ms) => Bun.sleep(ms),
       limiter: new FetchLimiter(options.now ?? steadyNow),
       limits: {},

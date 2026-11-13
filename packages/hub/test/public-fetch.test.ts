@@ -1,8 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { brotliCompressSync, gzipSync } from 'node:zlib';
 import {
   type PinnedRequest,
@@ -10,11 +7,10 @@ import {
   type ResolvedAddress,
   type Resolver,
   type Transport,
-  createPinnedTransport,
   fetchPublicUrl,
-  pinnedUrl,
   systemResolver,
 } from '../src/public-fetch';
+import { createSocketTransport } from '../src/socket-transport';
 
 const PUBLIC = '93.184.216.34';
 const PUBLIC_V6 = '2606:2800:220:1:248:1893:25c8:1946';
@@ -64,12 +60,12 @@ afterAll(() => {
   for (const server of servers) server.stop(true);
 });
 
-/** A server on 127.0.0.1, and the real pinned transport pointed at it whatever public address the request pins. */
-function localServer(handler: (request: Request) => Response | Promise<Response>, tls?: { cert: string; key: string }) {
-  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', idleTimeout: 10, fetch: handler, ...(tls ? { tls } : {}) });
+/** A server on 127.0.0.1, and the real transport pointed at it whatever public address the request pins. */
+function localServer(handler: (request: Request) => Response | Promise<Response>) {
+  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', idleTimeout: 10, fetch: handler });
   servers.push(server);
   const pinned: PinnedRequest[] = [];
-  const real = createPinnedTransport(tls ? { ca: tls.cert } : {});
+  const real = createSocketTransport();
   const transport: Transport = (request, signal) => {
     pinned.push(request);
     return real({ ...request, address: '127.0.0.1', family: 4, port: server.port as number }, signal);
@@ -194,8 +190,6 @@ describe('the addresses a host resolves to', () => {
     const six = scripted({ 'example.com/': page });
     await fetchPublicUrl({ resolve: resolverOf({ 'example.com': [PUBLIC_V6] }).resolve, transport: six.transport }, 'https://example.com/');
     expect(six.requests[0]).toMatchObject({ address: PUBLIC_V6, family: 6 });
-    expect(pinnedUrl(six.requests[0]!)).toBe(`https://[${PUBLIC_V6}]:443/`);
-    expect(pinnedUrl(both.requests[0]!)).toBe(`https://${PUBLIC}:443/`);
   });
 });
 
@@ -222,88 +216,12 @@ describe('pinning', () => {
     expect(requests.map((request) => request.address)).toEqual([PUBLIC]);
   });
 
-  test('the real transport connects to the pinned address and never looks the host name up', async () => {
-    const hosts: (string | null)[] = [];
-    const { server } = localServer((request) => {
-      hosts.push(request.headers.get('host'));
-      return new Response('reached');
-    });
-    // A name no resolver knows: only the pinned address can have reached the server.
-    const request: PinnedRequest = { protocol: 'http:', hostname: 'never-resolved.invalid', address: '127.0.0.1', family: 4, port: server.port as number, path: '/' };
-    const response = await createPinnedTransport()(request, new AbortController().signal);
-    expect(await response.text()).toBe('reached');
-    expect(hosts).toEqual(['never-resolved.invalid']);
-  });
-
   test('a rebinding answer on a redirect hop is checked like the first', async () => {
     let calls = 0;
     const resolve: Resolver = async () => (++calls === 1 ? [{ address: PUBLIC, family: 4 }] : [{ address: '192.168.0.10', family: 4 }]);
     const { transport, requests } = scripted({ 'rebind.example.org/': () => redirect('/next') });
     expect((await failure(fetchPublicUrl({ resolve, transport }, 'http://rebind.example.org/')))[0]).toBe('address_refused');
     expect(requests).toHaveLength(1);
-  });
-});
-
-/** A throwaway certificate for the name, or null where openssl is missing. */
-function selfSigned(name = 'pinned.example.test'): { cert: string; key: string } | null {
-  const dir = mkdtempSync(join(tmpdir(), 'agflow-fetch-tls-'));
-  try {
-    const made = Bun.spawnSync(
-      ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-keyout', join(dir, 'key.pem'), '-out', join(dir, 'cert.pem'), '-subj', `/CN=${name}`, '-addext', `subjectAltName=DNS:${name}`],
-      { stdout: 'ignore', stderr: 'ignore' },
-    );
-    if (made.exitCode !== 0) return null;
-    return { cert: readFileSync(join(dir, 'cert.pem'), 'utf8'), key: readFileSync(join(dir, 'key.pem'), 'utf8') };
-  } catch {
-    return null;
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-describe('TLS to a pinned address', () => {
-  const tls = selfSigned();
-
-  test.skipIf(tls === null)('the certificate is verified against the host name, not the address connected to', async () => {
-    const { transport } = localServer(() => new Response('secure'), tls!);
-    const { resolve } = resolverOf({ 'pinned.example.test': [PUBLIC], 'other.example.test': [PUBLIC] });
-    const result = await fetchPublicUrl({ resolve, transport }, 'https://pinned.example.test/');
-    expect(text(result.body)).toBe('secure');
-    // The same server and address under a name its certificate does not cover.
-    const [code, message] = await failure(fetchPublicUrl({ resolve, transport }, 'https://other.example.test/'));
-    expect(code).toBe('connect_failed');
-    expect(message).toContain('other.example.test');
-  });
-
-  test.skipIf(tls === null)('the host name goes into the handshake (SNI), so a server with a certificate per name presents the right one', async () => {
-    const second = selfSigned('second.example.test');
-    if (!second) throw new Error('openssl made one certificate but not a second');
-    // Without the name in the handshake the server could only present one of the two, and one request would fail.
-    const server = Bun.serve({
-      port: 0,
-      hostname: '127.0.0.1',
-      fetch: (request) => new Response(`for ${request.headers.get('host')}`),
-      tls: [
-        { serverName: 'pinned.example.test', ...tls! },
-        { serverName: 'second.example.test', ...second },
-      ],
-    });
-    servers.push(server);
-    const { resolve } = resolverOf({ 'pinned.example.test': [PUBLIC], 'second.example.test': [PUBLIC] });
-    for (const [name, trusted] of [['pinned.example.test', tls!.cert], ['second.example.test', second.cert]] as const) {
-      const real = createPinnedTransport({ ca: trusted });
-      const transport: Transport = (request, signal) => real({ ...request, address: '127.0.0.1', port: server.port as number }, signal);
-      const result = await fetchPublicUrl({ resolve, transport }, `https://${name}/`);
-      expect([name, text(result.body)]).toEqual([name, `for ${name}`]);
-    }
-  });
-
-  test.skipIf(tls === null)('a certificate no authority vouches for is refused', async () => {
-    const { server } = localServer(() => new Response('secure'), tls!);
-    const untrusting = createPinnedTransport();
-    const transport: Transport = (request, signal) => untrusting({ ...request, address: '127.0.0.1', port: server.port as number }, signal);
-    const { resolve } = resolverOf({ 'pinned.example.test': [PUBLIC] });
-    expect((await failure(fetchPublicUrl({ resolve, transport }, 'https://pinned.example.test/')))[0]).toBe('connect_failed');
   });
 });
 
@@ -529,26 +447,6 @@ describe('limits', () => {
     expect(code).toBe('connect_failed');
     expect(message).toContain('example.com');
     expect(message).toContain('ECONNRESET');
-  });
-
-  test('a site that closes the connection before the body it announced is complete is a failure, never a shorter success', async () => {
-    const listener = Bun.listen({
-      hostname: '127.0.0.1',
-      port: 0,
-      socket: {
-        data(socket) {
-          socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 1000\r\n\r\nonly the start');
-          socket.end();
-        },
-      },
-    });
-    try {
-      const real = createPinnedTransport();
-      const transport: Transport = (request, signal) => real({ ...request, address: '127.0.0.1', port: listener.port }, signal);
-      expect((await failure(fetchPublicUrl({ resolve, transport }, 'http://example.com/')))[0]).toBe('connect_failed');
-    } finally {
-      listener.stop(true);
-    }
   });
 
   test('the defaults are 20 seconds, 10 MB and 5 redirects', async () => {

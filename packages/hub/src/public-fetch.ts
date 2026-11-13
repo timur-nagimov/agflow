@@ -1,7 +1,7 @@
 // One GET to a public site, made by the hub for an agent (design 5, Unattended options). The rules are in
 // public-address.ts; this module applies them to every hop. A host is resolved once per hop, every address it resolves
-// to must be public, and the connection goes to one of the addresses that were checked: the URL the transport requests
-// names that address, with the host name only in the Host header and as the TLS server name. So nothing resolves the
+// to must be public, and the connection goes to one of the addresses that were checked: the transport connects to that
+// address itself, with the host name only in the Host header and as the TLS server name. So nothing resolves the
 // name a second time, and a resolver that answers differently later (DNS rebinding) cannot move the connection.
 // Redirects are followed by hand, each target checked like the first URL. The resolver and the transport are passed
 // in, so tests use tables and local servers.
@@ -104,49 +104,6 @@ export const systemResolver: Resolver = async (hostname) => {
   return answers.map(({ address, family }) => ({ address, family: family === 6 ? 6 : 4 }));
 };
 
-/** The URL of one hop: the pinned address stands where the host name was. */
-export function pinnedUrl(request: PinnedRequest): string {
-  const host = request.family === 6 ? `[${request.address}]` : request.address;
-  return `${request.protocol}//${host}:${request.port}${request.path}`;
-}
-
-/** The encodings the hub asks for and can undo within the size cap. */
-const ACCEPT_ENCODING = 'gzip, br';
-
-export interface PinnedTransportOptions {
-  /** A certificate authority to trust besides the system's; tests pass their own. */
-  ca?: string | undefined;
-}
-
-/**
- * The transport the hub uses. The request URL holds the address, so no name is looked up; the certificate is still
- * verified against the host name (Bun's tls.serverName). Nothing of the caller's is sent: no cookies, no
- * authorization, a fixed User-Agent. The connection is not reused, so a later request for another name on the same
- * address never rides on this one's handshake.
- */
-export function createPinnedTransport(options: PinnedTransportOptions = {}): Transport {
-  return (request, signal) => {
-    const init: RequestInit & Record<string, unknown> = {
-      method: 'GET',
-      redirect: 'manual',
-      signal,
-      headers: {
-        host: request.hostname,
-        'user-agent': 'agflow-fetch/1.0',
-        accept: '*/*',
-        'accept-encoding': ACCEPT_ENCODING,
-      },
-      // The body is decompressed by hand, under the size cap.
-      decompress: false,
-      keepalive: false,
-    };
-    if (request.protocol === 'https:') {
-      init.tls = { serverName: request.hostname, rejectUnauthorized: true, ...(options.ca ? { ca: options.ca } : {}) };
-    }
-    return fetch(pinnedUrl(request), init);
-  };
-}
-
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
 const sizeText = (bytes: number): string =>
@@ -208,6 +165,8 @@ export async function fetchPublicUrl(
         response = await within(deps.transport(request, deadline.signal));
       } catch (error) {
         if (deadline.signal.aborted) throw timedOut();
+        // A failure the transport named itself says more: an answer that is not HTTP is no failure to connect.
+        if (error instanceof PublicFetchError) throw error;
         throw new PublicFetchError('connect_failed', `could not connect to ${url.hostname}: ${reasonOf(error)}`);
       }
       const location = REDIRECTS.has(response.status) ? response.headers.get('location') : null;
@@ -298,6 +257,14 @@ async function readBody(
     void response.body?.cancel().catch(() => {});
     throw tooLarge();
   }
+  const encoding = (response.headers.get('content-encoding') ?? '').trim().toLowerCase();
+  if (encoding !== '' && encoding !== 'identity' && encoding !== 'gzip' && encoding !== 'x-gzip' && encoding !== 'br') {
+    // Refused before its body is downloaded: megabytes the hub could only throw away.
+    void response.body?.cancel().catch(() => {});
+    // The header is the site's own text, and the message goes to the agent and the log: only a plain token is named.
+    const named = /^[a-z0-9_-]{1,20}$/.test(encoding) ? encoding : 'an unknown encoding';
+    throw new PublicFetchError('bad_response', `${url.hostname} answered in an encoding the hub does not read (${named})`);
+  }
   const chunks: Uint8Array[] = [];
   let total = 0;
   const reader = response.body?.getReader();
@@ -320,13 +287,7 @@ async function readBody(
     }
   }
   const raw = Buffer.concat(chunks, total);
-  const encoding = (response.headers.get('content-encoding') ?? '').trim().toLowerCase();
   if (raw.length === 0 || encoding === '' || encoding === 'identity') return raw;
-  if (encoding !== 'gzip' && encoding !== 'x-gzip' && encoding !== 'br') {
-    // The header is the site's own text, and the message goes to the agent and the log: only a plain token is named.
-    const named = /^[a-z0-9_-]{1,20}$/.test(encoding) ? encoding : 'an unknown encoding';
-    throw new PublicFetchError('bad_response', `${url.hostname} answered in an encoding the hub does not read (${named})`);
-  }
   try {
     return encoding === 'br' ? brotliDecompressSync(raw, { maxOutputLength: maxBytes }) : gunzipSync(raw, { maxOutputLength: maxBytes });
   } catch (error) {
