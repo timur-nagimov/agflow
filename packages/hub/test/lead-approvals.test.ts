@@ -90,6 +90,24 @@ function setVendors(hub: Hub, runnerId: string, change: (vendors: Record<string,
 const managed = (hub: Hub, runnerId: string, value: unknown = true) =>
   setVendors(hub, runnerId, (vendors) => vendors.map((vendor) => ({ ...vendor, managedPolicy: value })));
 
+/**
+ * What the runner reports for a vendor whose preflight threw (preflightOf in the runner): not ready, and managedPolicy
+ * false although the policy was never read.
+ */
+const preflightThrew = (hub: Hub, runnerId: string) =>
+  setVendors(hub, runnerId, (vendors) =>
+    vendors.map((vendor) => ({
+      ...vendor,
+      cliVersion: null,
+      ownerCliVersion: null,
+      ready: false,
+      problem: 'the preflight failed: boom',
+      accountId: null,
+      plan: null,
+      managedPolicy: false,
+    })),
+  );
+
 const decide = (hub: Hub, id: string, auth: Auth, body: unknown = { decision: 'approve' }) =>
   hub.call('POST', `/api/approvals/${id}`, { ...auth, body });
 const list = (hub: Hub, auth: Auth, query = '') => hub.call('GET', `/api/approvals${query}`, auth);
@@ -331,6 +349,9 @@ describe('the lead approves', () => {
     ['reports no managedPolicy field', (hub, runnerId) => managed(hub, runnerId, undefined)],
     ['reports managedPolicy as something that is not false', (hub, runnerId) => managed(hub, runnerId, 'false')],
     ['reports managedPolicy as null', (hub, runnerId) => managed(hub, runnerId, null)],
+    ['reports the vendor not ready and managedPolicy false, as after a preflight that threw', preflightThrew],
+    ['reports no ready field', (hub, runnerId) => setVendors(hub, runnerId, (vendors) => vendors.map((vendor) => ({ ...vendor, ready: undefined })))],
+    ['reports ready as something that is not true', (hub, runnerId) => setVendors(hub, runnerId, (vendors) => vendors.map((vendor) => ({ ...vendor, ready: 'true' })))],
     ['has no entry for the vendor', (hub, runnerId) => setVendors(hub, runnerId, () => [])],
     ['has an entry for another vendor only', (hub, runnerId) => setVendors(hub, runnerId, (vendors) => vendors.map((vendor) => ({ ...vendor, vendor: 'claude' })))],
     ['has two entries for the vendor, one of them managed', (hub, runnerId) => setVendors(hub, runnerId, (vendors) => [...vendors, { ...vendors[0], managedPolicy: true }])],
@@ -534,6 +555,17 @@ describe('the notice to the lead', () => {
   test('on a managed runner it says the lead may only decline, and names no way to approve', () => {
     const { hub, codex, lead } = setup();
     managed(hub, codex.runner.id);
+    const id = requested(hub, codex);
+    const [message] = toldLead(hub, lead.agent.id);
+    const body = message?.body ?? '';
+    expect(body).toContain('only decline');
+    expect(body).toContain(`decide_approval("${id}", "decline", reason)`);
+    expect(body).not.toContain('"approve"');
+  });
+
+  test('on a runner whose vendor is not ready it says the lead may only decline: the policy was not read', () => {
+    const { hub, codex, lead } = setup();
+    preflightThrew(hub, codex.runner.id);
     const id = requested(hub, codex);
     const [message] = toldLead(hub, lead.agent.id);
     const body = message?.body ?? '';

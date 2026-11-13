@@ -107,7 +107,9 @@ function leadFor(ctx: HubContext, asking: Pick<Approval, 'agentId' | 'attemptId'
  * Whether the lead may approve the request, read from the runner's row now (design 6.10, Managed devices). A managed
  * device policy means the device's administrator requires the owner's own approval, so the lead never approves there.
  * It fails closed: only a runner the hub knows, not retired, still running the attempt, whose one entry for the
- * attempt's vendor says managedPolicy false, allows it.
+ * attempt's vendor is ready and says managedPolicy false, allows it. Ready is the runner's own report, without the
+ * hub's marks: a runner whose preflight threw reports the vendor not ready with managedPolicy false, having read no
+ * policy, so a false beside a vendor that is not ready confirms nothing.
  */
 function leadMayApprove(ctx: HubContext, approval: Approval): boolean {
   const attempt = findAttempt(ctx, approval.attemptId);
@@ -120,10 +122,10 @@ function leadMayApprove(ctx: HubContext, approval: Approval): boolean {
     return false;
   }
   if (!Array.isArray(vendors)) return false;
-  const entries = (vendors as ({ vendor?: unknown; managedPolicy?: unknown } | null)[]).filter(
+  const entries = (vendors as ({ vendor?: unknown; ready?: unknown; managedPolicy?: unknown } | null)[]).filter(
     (entry) => entry?.vendor === attempt.vendor,
   );
-  return entries.length === 1 && entries[0]?.managedPolicy === false;
+  return entries.length === 1 && entries[0]?.ready === true && entries[0].managedPolicy === false;
 }
 
 /** The data every approval event carries (design 6.17), on the subject of its attempt's events. */
@@ -253,9 +255,10 @@ function leadNotice(approval: Approval, attempt: Attempt, mayApprove: boolean): 
       `then runs outside the sandbox on ${approval.owner}'s machine, with network access and write access to their ` +
       `files, so approve only what the task needs and you understand. decide_approval("${id}", "decline", reason) ` +
       'refuses it; the reason goes to the asking agent, so say what to do instead.'
-    : `You may only decline it: this runner's device is managed, and its administrator requires the owner's own ` +
-      `approval. decide_approval("${id}", "decline", reason) refuses it; the reason goes to the asking agent, so say ` +
-      `what to do instead. Or leave it to ${approval.owner}, who answers in the browser.`;
+    : 'You may only decline it: the hub cannot confirm that this runner is free of a managed device policy, and on ' +
+      `a managed device the administrator requires the owner's own approval. decide_approval("${id}", "decline", ` +
+      'reason) refuses it; the reason goes to the asking agent, so say what to do instead. Or leave it to ' +
+      `${approval.owner}, who answers in the browser.`;
   return (
     `Approval ${id}: ${approval.agentId} (${attempt.vendor}), ${where} on ${approval.owner}'s runner ` +
     `${approval.runnerId}, asks for an approval of kind ${approval.kind}.\n` +
