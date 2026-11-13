@@ -140,6 +140,58 @@ describe('the method map', () => {
 });
 
 describe('gen-codex-protocol', () => {
+  for (const discovery of [false, true]) {
+    test(`SIGTERM during ${discovery ? 'binary discovery' : 'the explicit version check'} cleans up the probe`, async () => {
+      const dir = tempDir();
+      const bin = join(dir, 'codex');
+      const ready = join(dir, 'ready.json');
+      const out = join(dir, 'out');
+      writeFileSync(bin, `#!${process.execPath}
+        import { writeFileSync } from 'node:fs';
+        if (process.argv[2] !== '--version') process.exit(1);
+        writeFileSync(process.env.PROBE_READY, JSON.stringify({ pid: process.pid, home: process.env.HOME }));
+        setInterval(() => {}, 1000);
+      `);
+      chmodSync(bin, 0o755);
+      const proc = Bun.spawn([
+        process.execPath, generator, '--out', out, ...(discovery ? [] : ['--bin', bin]),
+      ], {
+        env: {
+          PATH: '/usr/bin:/bin', HOME: dir, TMPDIR: dir, CODEX_HOME: join(dir, 'codex-home'),
+          AGFLOW_CODEX_BIN: bin, PROBE_READY: ready,
+        },
+        stdout: 'ignore', stderr: 'pipe',
+      });
+      let probe: { pid: number; home: string } | undefined;
+      try {
+        const deadline = Date.now() + 5_000;
+        while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
+        expect(existsSync(ready)).toBe(true);
+        probe = JSON.parse(readFileSync(ready, 'utf8')) as { pid: number; home: string };
+        expect(existsSync(probe.home)).toBe(true);
+        proc.kill('SIGTERM');
+        const code = await proc.exited;
+        expect(existsSync(probe.home)).toBe(false);
+        const childGone = () => {
+          try { process.kill(probe!.pid, 0); return false; } catch { return true; }
+        };
+        const stoppedDeadline = Date.now() + 2_000;
+        while (!childGone() && Date.now() < stoppedDeadline) await Bun.sleep(10);
+        expect(childGone()).toBe(true);
+        expect(code).toBe(143);
+        expect(existsSync(out)).toBe(false);
+      } finally {
+        proc.kill('SIGKILL');
+        await proc.exited;
+        // Also clean up on the pre-fix failure, when the detached probe outlives the generator.
+        if (!probe && existsSync(ready)) probe = JSON.parse(readFileSync(ready, 'utf8'));
+        if (probe) {
+          try { process.kill(-probe.pid, 'SIGKILL'); } catch { /* Already stopped. */ }
+        }
+      }
+    }, 20_000);
+  }
+
   /**
    * A stand-in codex that prints a version and, for generate-ts, writes what it was given into its output. Each
    * --version run appends its HOME and CODEX_HOME to <dir>/version-env.txt.

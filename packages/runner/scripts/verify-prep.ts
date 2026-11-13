@@ -1,7 +1,8 @@
 // Design 15's real registry check: fresh caches, sandboxed installs, and no cache inode shared with a clone.
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ScriptResources } from '../../../scripts/resources';
 import { DEFAULT_TIMINGS } from '../src/config';
 import { runnerPaths } from '../src/paths';
 import { prepEnv, prepLayout, prepPolicy, writePrepToolConfig } from '../src/prep/plan';
@@ -27,16 +28,16 @@ function regularFiles(root: string): { path: string; identity: string }[] {
   return files;
 }
 
-async function pythonExecutable(env: Env): Promise<string> {
+async function pythonExecutable(env: Env, resources: ScriptResources): Promise<string> {
   const python = Bun.which('python3', { PATH: env.PATH });
   if (!python) throw new Error('verify-prep needs python3 with pip on PATH');
   // Resolve a pyenv shim before replacing HOME; -I ignores Python's user site and environment configuration.
-  const proc = Bun.spawn([python, '-I', '-c', 'import sys; print(sys.executable)'], {
+  const proc = resources.child(Bun.spawn([python, '-I', '-c', 'import sys; print(sys.executable)'], {
     env,
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
-  });
+  }));
   const [code, stdout, stderr] = await Promise.all([
     proc.exited,
     new Response(proc.stdout).text(),
@@ -51,17 +52,18 @@ export async function verifyPrepMain(
   env: Env = process.env,
   options: VerifyPrepOptions = {},
 ): Promise<number> {
+  await using resources = new ScriptResources();
   const log = options.log ?? console.log;
   let root: string | undefined;
   try {
     if (argv.length) throw new Error('usage: bun run verify:prep');
     if (process.platform !== 'darwin') throw new Error('verify-prep requires macOS');
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-verify-prep-')));
+    root = resources.directory(join(tmpdir(), 'agflow-verify-prep-'));
     const paths = runnerPaths(root);
     const sandbox = new PrepSandbox({ allowedDomains: standardProfile.network.allowedDomains });
-    const checked = await checkPrepSandbox({ sandbox });
+    const checked = await resources.waitFor(checkPrepSandbox({ sandbox }));
     if (!checked.works) throw new Error(`preparation sandbox unavailable: ${checked.reason}`);
-    const python = await pythonExecutable(env);
+    const python = await pythonExecutable(env, resources);
     const fixtures = [
       {
         name: 'bun',
@@ -107,7 +109,7 @@ export async function verifyPrepMain(
           `${JSON.stringify({ name: 'prep-fixture', private: true, dependencies: { 'is-number': '7.0.0' } })}\n`,
         );
       }
-      const tmpDir = mkdtempSync(join(layout.tmp, 'install-'));
+      const tmpDir = resources.directory(join(layout.tmp, 'install-'));
       // Only the executable search path and system CA setting cross from the calling environment.
       const runEnv = prepEnv({
         agentEnv: { PATH: env.PATH ?? '/usr/bin:/bin', NODE_USE_SYSTEM_CA: '1' },
@@ -120,7 +122,9 @@ export async function verifyPrepMain(
       const cache = fixture.name === 'bun' ? runEnv.BUN_INSTALL_CACHE_DIR! : runEnv.PIP_CACHE_DIR!;
       for (const path of [runEnv.HOME!, cache]) mkdirSync(path, { recursive: true, mode: 0o700 });
       if (readdirSync(cache).length) throw new Error(`${fixture.name}: cache was not empty`);
-      const result = await sandbox.run({
+      const abort = new AbortController();
+      const result = await resources.waitFor(sandbox.run({
+        signal: abort.signal,
         // pip runs with the preparation's environment, as a project's entry would: its cache and no config.
         argv: fixture.argv,
         cwd: clone,
@@ -136,7 +140,7 @@ export async function verifyPrepMain(
           vendorHomes: { claude: paths.homes.claude, codex: paths.homes.codex },
         }),
         timeoutMs: DEFAULT_TIMINGS.prep,
-      });
+      }), () => abort.abort());
       if (result.code !== 0 || result.signal || result.timedOut) {
         throw new Error(
           `${fixture.name} install failed (exit ${result.code}, signal ${result.signal}, timedOut ${result.timedOut}): ${result.logTail}`,
@@ -162,7 +166,7 @@ export async function verifyPrepMain(
     (options.error ?? console.error)(error instanceof Error ? error.message : String(error));
     return 1;
   } finally {
-    if (root) rmSync(root, { recursive: true, force: true });
+    await resources.close();
   }
 }
 

@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { ScriptResources } from '../../../scripts/resources';
 import { CREDENTIALS_FILE } from '@agflow/core';
 import { findRunnerByKey } from '@agflow/hub/src/runners';
 import { originRepo } from '@agflow/testkit';
@@ -53,12 +54,39 @@ export async function verifyServiceMain(
   let origin: Awaited<ReturnType<typeof originRepo>> | undefined;
   let uid: number | undefined;
   let code = 0;
+  await using resources = new ScriptResources();
+  resources.defer(async () => {
+    const cleanup = async (action: () => unknown) => {
+      try {
+        await action();
+      } catch (caught) {
+        error(`cleanup: ${caught instanceof Error ? caught.message : String(caught)}`);
+        code = 1;
+      }
+    };
+    if (root !== undefined && uid !== undefined) {
+      log('cleanup: removing the scratch LaunchAgent and temporary homes');
+      await cleanup(() => bootoutService({ label, uid }));
+      // stop's disable persists in launchd's disabled-services database; leave the scratch label enabled there.
+      await cleanup(async () => {
+        const enabled = await defaultExec(['launchctl', 'enable', serviceTarget(label, uid)], { timeoutMs: 30_000 });
+        if (enabled.exitCode !== 0 || enabled.timedOut) throw new Error(`launchctl enable failed: ${enabled.stderr}`);
+      });
+      await cleanup(() =>
+        until(() => readLockOwner(runnerPaths(join(root!, 'agflow'))) === null, 'cleanup lock release', 90_000),
+      );
+      await cleanup(() => rmSync(plistPath({ home: join(root!, 'home'), label }), { force: true }));
+    }
+    await cleanup(() => hub?.stop());
+    await cleanup(() => origin?.remove());
+    if (root) await cleanup(() => rmSync(root!, { recursive: true, force: true }));
+  });
   try {
     if (argv.length) throw new Error('usage: bun run verify:service');
     if (process.platform !== 'darwin') throw new Error('verify-service requires a macOS desktop (Aqua) session');
     uid = process.getuid!();
-    const session = await defaultExec(['launchctl', 'managername'], { timeoutMs: 5_000 });
-    const domain = await defaultExec(['launchctl', 'print', `gui/${uid}`], { timeoutMs: 5_000 });
+    const session = await resources.waitFor(defaultExec(['launchctl', 'managername'], { timeoutMs: 5_000 }));
+    const domain = await resources.waitFor(defaultExec(['launchctl', 'print', `gui/${uid}`], { timeoutMs: 5_000 }));
     if (
       session.exitCode !== 0 ||
       session.timedOut ||
@@ -88,11 +116,11 @@ export async function verifyServiceMain(
     );
     const binary = join(root, 'agflow-bin');
     log('build: compiling the CLI into the temporary directory');
-    await compileServiceCli(binary);
+    await resources.waitFor(compileServiceCli(binary));
 
     log('hub: starting an isolated hub over a local bare origin');
-    origin = await originRepo({ 'README.md': '# service verification\n' });
-    hub = startTestHub({ config: { projectName: 'verify-service', projectRepo: origin.path } });
+    await resources.waitFor(originRepo({ 'README.md': '# service verification\n' }).then((value) => { origin = value; }));
+    hub = startTestHub({ config: { projectName: 'verify-service', projectRepo: origin!.path } });
     writeFileSync(join(configDir, CREDENTIALS_FILE), `${JSON.stringify(hub.credentials)}\n`, { mode: 0o600 });
     const config = createRunnerConfig(
       {
@@ -111,7 +139,7 @@ export async function verifyServiceMain(
     const operations = { ...launchd, paths, home, log, env: scratchEnv };
 
     log('install: bootstrapping the scratch LaunchAgent without vendor downloads');
-    await installService({
+    await resources.waitFor(installService({
       ...launchd,
       paths,
       home,
@@ -125,58 +153,36 @@ export async function verifyServiceMain(
           codex: join(paths.runner, vendorBinary('codex', pins.codex.version)),
         };
       },
-    });
-    await until(() => row()?.state === 'online', 'the runner to come online');
+    }));
+    await until(() => { resources.checkOpen(); return row()?.state === 'online'; }, 'the runner to come online');
     const firstPid = readLockOwner(paths)?.pid;
     if (!firstPid) throw new Error('online runner has no lock owner');
 
     log('status: checking the compiled CLI reports a running runner');
-    const status = await defaultExec([binary, 'runner', 'status', '--json'], { env: scratchEnv, timeoutMs: 10_000 });
+    const status = await resources.waitFor(defaultExec([binary, 'runner', 'status', '--json'], { env: scratchEnv, timeoutMs: 10_000 }));
     if (status.exitCode !== 0 || status.timedOut || JSON.parse(status.stdout).running !== true) {
       throw new Error(`runner status failed: ${status.stderr || status.stdout}`);
     }
 
     log('restart: suspending and waiting for a new runner pid online');
-    await restartRunner(operations);
+    await resources.waitFor(restartRunner(operations));
     await until(() => {
+      resources.checkOpen();
       const pid = readLockOwner(paths)?.pid;
       return pid != null && pid !== firstPid && row()?.state === 'online';
     }, 'a new runner pid online');
 
     log('stop: draining, stopping and disabling the scratch LaunchAgent');
-    await stopRunner(operations);
+    await resources.waitFor(stopRunner(operations));
     if (readLockOwner(paths) !== null) throw new Error('stop left runner.lock held');
-    if (await serviceLoaded(launchd)) throw new Error('stop left the scratch LaunchAgent loaded');
-    await until(() => row()?.state === 'offline', 'the hub to mark the runner offline');
+    if (await resources.waitFor(serviceLoaded(launchd))) throw new Error('stop left the scratch LaunchAgent loaded');
+    await until(() => { resources.checkOpen(); return row()?.state === 'offline'; }, 'the hub to mark the runner offline');
     log('verify-service passed');
   } catch (caught) {
     error(caught instanceof Error ? caught.message : String(caught));
     code = 1;
   } finally {
-    const cleanup = async (action: () => unknown) => {
-      try {
-        await action();
-      } catch (caught) {
-        error(`cleanup: ${caught instanceof Error ? caught.message : String(caught)}`);
-        code = 1;
-      }
-    };
-    if (root !== undefined && uid !== undefined) {
-      log('cleanup: removing the scratch LaunchAgent and temporary homes');
-      await bootoutService({ label, uid });
-      // stop's disable persists in launchd's disabled-services database; leave the scratch label enabled there.
-      await cleanup(async () => {
-        const enabled = await defaultExec(['launchctl', 'enable', serviceTarget(label, uid)], { timeoutMs: 30_000 });
-        if (enabled.exitCode !== 0 || enabled.timedOut) throw new Error(`launchctl enable failed: ${enabled.stderr}`);
-      });
-      await cleanup(() =>
-        until(() => readLockOwner(runnerPaths(join(root!, 'agflow'))) === null, 'cleanup lock release', 90_000),
-      );
-      await cleanup(() => rmSync(plistPath({ home: join(root!, 'home'), label }), { force: true }));
-      await cleanup(() => rmSync(root!, { recursive: true, force: true }));
-    }
-    await cleanup(() => hub?.stop());
-    await cleanup(() => origin?.remove());
+    await resources.close();
   }
   return code;
 }
