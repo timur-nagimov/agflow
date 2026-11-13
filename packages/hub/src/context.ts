@@ -133,6 +133,11 @@ export interface HubConfig extends HubRunnerSettings {
    * dependent's work starts from a main branch that holds it. Off by default (M2: acceptance counts).
    */
   dependenciesNeedMerge?: boolean | undefined;
+  /**
+   * AGFLOW_AGENT_FETCH: the hub downloads public URLs for Claude runner agents (POST /api/fetch), for the lead and for
+   * the tasks the lead granted (design 5, Unattended options). Off by default: agents then reach nothing outside.
+   */
+  agentFetch?: boolean | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */
