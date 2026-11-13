@@ -36,7 +36,14 @@ import type { Emit } from './events';
 import { onPrepared } from './prepare';
 import { recordQuotaReports } from './quota';
 import { resumeDeferred } from './recovery';
-import { applyRunnerSettings, applyVendorReport, markGitPushed, setReportedState } from './runners';
+import {
+  applyRunnerSettings,
+  applyVendorReport,
+  markGitPushed,
+  refuseRunnerSettings,
+  setReportedState,
+  settingsReplayCovered,
+} from './runners';
 import { onSubmitted } from './submissions';
 import { onVendorOutcome } from './supervisor';
 import { onHandedBack, onTakenOver } from './takeover';
@@ -57,6 +64,7 @@ export interface EventContext {
   standing: EventStanding;
   /** The highest seq the link's hello reported: events up to it were emitted before that hello (ApplyOptions). */
   helloLastSeq: number;
+  outboxEpoch: string;
 }
 
 export type EventHandler<T extends RunnerEventType = RunnerEventType> = (
@@ -144,8 +152,8 @@ export const EVENT_HANDLERS: { [T in RunnerEventType]?: EventHandler<T> } = {
     setReportedState(ctx, runnerId, event.data.state, event.data.detail);
     if (event.data.state === 'ok') resumeDeferred(ctx, runnerId);
   },
-  'runner.settings': (ctx, event, { runnerId, emit }) => {
-    applyRunnerSettings(ctx, emit, runnerId, event.data.settings);
+  'runner.settings': (ctx, event, { runnerId, emit, outboxEpoch }) => {
+    applyRunnerSettings(ctx, emit, runnerId, event.data.settings, { seq: event.seq, outboxEpoch });
   },
   'runner.vendors': (ctx, event, { runnerId, emit }) => {
     applyVendorReport(ctx, runnerId, event.data.vendors);
@@ -241,11 +249,12 @@ function dispatch(
   runnerId: string,
   event: RunnerEvent,
   options: ApplyOptions,
+  outboxEpoch: string,
 ): string | null {
   const handler = EVENT_HANDLERS[event.type] as EventHandler | undefined;
   const helloLastSeq = options.helloLastSeq ?? 0;
   if (!('attemptId' in event)) {
-    handler?.(ctx, event, { runnerId, emit, attempt: null, standing: 'current', helloLastSeq });
+    handler?.(ctx, event, { runnerId, emit, attempt: null, standing: 'current', helloLastSeq, outboxEpoch });
     return null;
   }
   const attempt = findAttempt(ctx, event.attemptId);
@@ -263,7 +272,7 @@ function dispatch(
     appendAttemptLog(ctx, attempt.id, 'rejected', `${event.type} at fence ${formatFence(event.fence)} ignored: ${why}`);
     return null;
   }
-  handler?.(ctx, event, { runnerId, emit, attempt, standing, helloLastSeq });
+  handler?.(ctx, event, { runnerId, emit, attempt, standing, helloLastSeq, outboxEpoch });
   return null;
 }
 
@@ -275,19 +284,24 @@ function applyOne(
   raw: RawRunnerEvent,
   options: ApplyOptions,
 ): void {
+  if (raw.type === 'runner.settings' && settingsReplayCovered(ctx, runnerId, outboxEpoch, raw.seq)) return;
   const parsed = parseRunnerEvent(raw);
   if (!parsed.ok) {
     reject(ctx, emit, runnerId, outboxEpoch, raw, parsed.error);
+    if (raw.type === 'runner.settings') refuseRunnerSettings(ctx, runnerId, outboxEpoch, raw.seq);
     return;
   }
   let refusal: string | null;
   try {
     // A savepoint: whatever a throwing handler wrote is undone, and the rest of the batch goes on.
-    refusal = tx(ctx, (inner) => dispatch(ctx, inner, runnerId, parsed.value, options));
+    refusal = tx(ctx, (inner) => dispatch(ctx, inner, runnerId, parsed.value, options, outboxEpoch));
   } catch (error) {
     refusal = `the hub failed to apply it: ${error instanceof Error ? error.message : String(error)}`;
   }
-  if (refusal !== null) reject(ctx, emit, runnerId, outboxEpoch, raw, refusal);
+  if (refusal !== null) {
+    reject(ctx, emit, runnerId, outboxEpoch, raw, refusal);
+    if (raw.type === 'runner.settings') refuseRunnerSettings(ctx, runnerId, outboxEpoch, raw.seq);
+  }
 }
 
 /**

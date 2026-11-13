@@ -1,0 +1,9 @@
+# deploy-hub replaces this hostname with the validated public URL's hostname.
+__AGFLOW_DOMAIN__ {
+    header Strict-Transport-Security "max-age=31536000"
+    reverse_proxy 127.0.0.1:8787 {
+        # SSE (text/event-stream) is flushed immediately by Caddy 2.6 by default.
+        # Keep default cancellation on disconnect; WebSocket upgrades are automatic.
+        # Do not add response_buffers, a stream timeout, or a path prefix.
+    }
+}

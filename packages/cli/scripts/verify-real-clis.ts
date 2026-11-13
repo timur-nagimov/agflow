@@ -1,10 +1,12 @@
-import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ScriptResources } from '../../../scripts/resources';
 import { saveCredentials } from '../src/credentials';
 import { codexTrustOverride } from './codex-trust';
 
-const base = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-real-')));
+await using resources = new ScriptResources();
+const base = resources.directory(join(tmpdir(), 'agflow-real-'));
 const port = 8796;
 const hubUrl = `http://localhost:${port}`;
 const cli = join(import.meta.dir, '..', 'src', 'main.ts');
@@ -25,7 +27,7 @@ function sh(cmd: string[], cwd: string, timeout = 60_000): { code: number; out: 
   return { code: result.exitCode ?? 1, out: `${result.stdout.toString()}\n${result.stderr.toString()}` };
 }
 
-const hub = Bun.spawn(['bun', hubMain], {
+const hub = resources.child(Bun.spawn(['bun', hubMain], {
   env: {
     ...env,
     AGFLOW_AUTH: 'dev',
@@ -38,7 +40,7 @@ const hub = Bun.spawn(['bun', hubMain], {
   },
   stdout: 'ignore',
   stderr: 'inherit',
-});
+}));
 
 const results: string[] = [];
 const work = join(base, 'work');
@@ -93,6 +95,6 @@ try {
   if (codex.code !== 0) results.push(`codex output (first 2000 chars):\n${codex.out.slice(0, 2000)}`);
 } finally {
   sh(['bun', cli, 'leave'], work);
-  hub.kill();
+  await resources.close();
   console.log(results.join('\n'));
 }

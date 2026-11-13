@@ -1,20 +1,5 @@
-// Settings sync on the runner (design 6.3, "Settings sync"; X-12). runner.json holds the settings and the snapshot
-// the hub confirmed last; local edits go out as runner.settings, which the hub applies in seq order whatever their
-// base, each at a new version, and echoes verbatim with update_settings, as it echoes the owner's edits.
-// - In flight: a runner.settings is in flight until an echo answers it (Outbox.markSettingsEcho) and runner.json's
-//   snapshot has that echo's version. runner.json holds the snapshot with the edits in flight laid over it (the
-//   view), so a local edit back to an earlier value differs from it and is sent.
-// - An echo becomes the snapshot. runner.json takes the new view, but where it differs from the view before the echo
-//   (an edit made by other means), which is kept and sent again. An echo answers only edits made before it came.
-// - Versions: the snapshot moves one version at a time, or to the hub's whole settings; an echo that would skip a
-//   version waits for the ones before it (CommandExecutor), and one the snapshot already covers only marks. A failed
-//   write of runner.json leaves the echo in the settings the runner holds.
-// - Refusals: the hub acknowledges an edit it refuses and never echoes it. A probe (isSettingsProbe) settles which
-//   acknowledged edits will get no echo: at its echo, every older edit still unanswered was refused, and runner.json
-//   falls back to the hub's value for it. Nothing is ever sent again for a refused edit.
-// - A replay to a restored hub leaves out the edits held at its welcome whose answer the snapshot holds (resent): it
-//   would apply them twice. Any other replay sends all the hub has not acknowledged.
-import { RunnerSettingsChangesSchema, type RunnerSettings } from '@agflow/core';
+// Exact settings answers (design 6.3). Marks precede runner.json writes; local edits overlay the snapshot.
+import { RunnerSettingsChangesSchema, type RunnerSettings, type SettingsAnswer } from '@agflow/core';
 import {
   applySettingsEcho,
   editLocalSettings,
@@ -25,7 +10,7 @@ import {
   settingsAfterEdits,
 } from './config';
 import type { Logger } from './log';
-import { isSettingsProbe, type Outbox, type SettingsEvent, type StoredEvent } from './outbox';
+import type { Outbox, SettingsEvent } from './outbox';
 
 export interface SettingsSyncOptions {
   config(): RunnerConfig;
@@ -67,12 +52,16 @@ export class SettingsSync {
    *   should it stop before a write succeeds, its next hello reports the older version and the hub sends its whole
    *   settings.
    */
-  echo(update: { settings: SettingsEdits; version: number }, arrivedAfter = Number.MAX_SAFE_INTEGER): boolean {
+  echo(
+    update: { settings: SettingsEdits; version: number; answers?: SettingsAnswer },
+    arrivedAfter = Number.MAX_SAFE_INTEGER,
+  ): boolean {
     const { outbox, logger } = this.options;
     const config = this.options.config();
     const current = config.confirmedSettings.version;
     const whole = isWholeSettings(update.settings, config.confirmedSettings);
-    if (!whole && update.version > current + 1) {
+    // An empty refusal confirms no settings values: it cannot fill even a single missing snapshot version.
+    if (!whole && update.version > current + (update.answers?.refused ? 0 : 1)) {
       logger.warn('an update_settings skips a version; it waits for the ones before it', {
         version: update.version,
         snapshot: current,
@@ -81,7 +70,7 @@ export class SettingsSync {
     }
     const stale = whole ? update.version < current : update.version <= current;
     const before = settingsOfEvents(outbox.settingsInFlight(current));
-    const { refused } = outbox.markSettingsEcho(update.settings, update.version, arrivedAfter);
+    const { refused } = outbox.markSettingsEcho(update.answers, update.version, arrivedAfter);
     const echo = stale ? { settings: {}, version: current } : update;
     const after = settingsOfEvents(outbox.settingsInFlight(echo.version));
     const { config: next, pending } = applySettingsEcho(config, echo, { before, after });
@@ -111,61 +100,13 @@ export class SettingsSync {
     this.options.outbox.settingsSaved(config.confirmedSettings.version);
   }
 
-  /**
-   * Sends a probe when the hub has acknowledged a settings edit no echo has answered, once the commands that came
-   * before the acknowledgement have run (CommandExecutor.settingsAcknowledged). The hub had applied or refused it,
-   * and M2a sends an applied edit's echo before the ack of the events message that carried it, so after an ack only a
-   * refused edit is left; at a welcome the echoes the hub still holds come after it, and a probe for one of those
-   * costs one version. None goes while a probe newer than the edits still waits for its acknowledgement; nor while
-   * one the hub acknowledged waits for its echo, except at a welcome, so a refused probe is followed by one probe per
-   * welcome at most.
-   */
-  probeUnanswered(options: { welcome: boolean }): void {
-    const { outbox } = this.options;
-    const acked = outbox.ackedSeq();
-    const unanswered = outbox.settingsUnanswered();
-    const waiting = unanswered.filter((event) => !isSettingsProbe(event) && event.seq <= acked).at(-1);
-    if (waiting === undefined) return;
-    const probes = unanswered.filter((event) => isSettingsProbe(event) && event.seq > waiting.seq);
-    if (probes.some((probe) => probe.seq > acked)) return;
-    if (probes.length > 0 && !options.welcome) return;
-    const baseVersion = this.options.config().confirmedSettings.version;
-    outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion } });
-  }
-
-  /**
-   * Whether the replay leaves an event out: a runner.settings whose answer the snapshot holds (its echo, or its
-   * refusal) and that the hub a restore replaced may have had, one held at the restored hub's welcome
-   * (Outbox.restoredThrough). That replay starts below what the old hub processed, and the restored hub adopted the
-   * snapshot hello reported, so applying such an edit again would revert whatever came after it. Every other event
-   * goes: M2a acknowledges an event in the transaction that applies it, so no hub has applied those, and an edit that
-   * an equal echo answered before the hub had it is still a change to deliver.
-   */
-  resent(event: StoredEvent): boolean {
-    const { outbox } = this.options;
-    if (event.type !== 'runner.settings' || event.seq > outbox.restoredThrough()) return false;
-    return !outbox.settingsInFlight().some((open) => open.seq === event.seq);
-  }
-
-  /**
-   * After each welcome (the runtime records a restored hub's first, Outbox.hubRestored, and says hello again): every
-   * field runner.json changed while the runner was down (a hand edit) goes out as runner.settings, less what the edits
-   * in flight carry: the replay delivers those, or the hub applied them and their echo is to come, and an edit sent
-   * twice would apply twice. When the newest event the outbox holds is in the replay and one it leaves out (resent), a
-   * probe follows it, so the hub's acknowledgement reaches hello.lastSeq and its replay completes (X-1).
-   */
-  welcomed(welcome: { ackedSeq: number }): void {
+  /** Send hand edits after welcome; every retained event is replayed and the hub decides what its snapshot covers. */
+  welcomed(): void {
     const { outbox } = this.options;
     const config = this.options.config();
-    const view = this.view(config);
-    const settings = localSettingsEdits({ ...config, confirmedSettings: view });
+    const settings = localSettingsEdits({ ...config, confirmedSettings: this.view(config) });
     if (Object.keys(settings).length > 0) {
       outbox.append({ type: 'runner.settings', data: { settings, baseVersion: config.confirmedSettings.version } });
-      return;
-    }
-    const newest = outbox.eventsAfter(outbox.lastSeq() - 1, 1)[0];
-    if (newest !== undefined && newest.seq > welcome.ackedSeq && this.resent(newest)) {
-      outbox.append({ type: 'runner.settings', data: { settings: {}, baseVersion: config.confirmedSettings.version } });
     }
   }
 

@@ -73,11 +73,6 @@ export interface LinkOptions {
   hello: () => HelloMessage | Promise<HelloMessage>;
   /** The content of each heartbeat: every live attempt's facts, power, disk and acceptingUntil. */
   heartbeat: () => HeartbeatContent;
-  /**
-   * Whether the hub has had an event already and must not apply it again: the replay leaves it out, as if sent. The
-   * runtime names the settings edits a restored hub would apply twice (X-12). None when absent.
-   */
-  resent?: (event: StoredEvent) => boolean;
   handlers: LinkHandlers;
   /** The whoami probe; one over `credentials` by default. */
   http?: Pick<RunnerHubHttp, 'whoami'>;
@@ -552,13 +547,12 @@ export class LinkClient {
 
   /**
    * Sends every event after the last one sent, in seq order, while the link is online: at most EVENT_BATCH events
-   * and MAX_EVENTS_MESSAGE_BYTES per message, and always at least one event. Events the hub has had (resent) are left
-   * out; the cumulative ack of a later one covers them.
+   * and MAX_EVENTS_MESSAGE_BYTES per message, and always at least one event. The hub skips settings already
+   * covered by an adopted snapshot, while acknowledging every replayed event.
    */
   private pump(): void {
     const socket = this.socket;
     if (!socket || this.currentState !== 'online') return;
-    const resent = this.options.resent;
     for (;;) {
       const candidates = this.options.outbox.eventsAfter(this.sentSeq, EVENT_BATCH);
       if (candidates.length === 0) return;
@@ -568,10 +562,6 @@ export class LinkClient {
       // The array's brackets, then each event's JSON and its separating comma.
       let bytes = 2;
       for (const event of candidates) {
-        if (resent?.(event)) {
-          through = event.seq;
-          continue;
-        }
         const size = Buffer.byteLength(JSON.stringify(event)) + 1;
         if (events.length > 0 && bytes + size > MAX_EVENTS_MESSAGE_BYTES) break;
         events.push(event);

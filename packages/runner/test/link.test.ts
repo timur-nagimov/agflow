@@ -445,26 +445,6 @@ describe('LinkClient', () => {
     expect(eventsMessages(hub, 0).map((message) => message.events.length)).toEqual([100, 100, 43]);
   });
 
-  test('leaves out of the replay the events resent names, as if sent, so the ack of a later one covers them', async () => {
-    const welcomes = [{ ackedSeq: 1 }, { ackedSeq: 3 }];
-    const { hub, outbox } = setup(
-      { welcome: (_hello, connection) => welcomes[connection.index] ?? {} },
-      {
-        before: (box) => ['one', 'two', 'three', 'four'].forEach((summary) => box.append(note(summary))),
-        resent: (event) => event.seq === 2 || event.seq === 4,
-      },
-    );
-    expect(await outbox.waitAcked(3, 2_000)).toBe(true);
-    expect(seqs(hub.events())).toEqual([3]);
-    // A replay of nothing but events it leaves out sends nothing, and goes on after them.
-    (await hub.connection(0)).terminate();
-    await hub.connection(1);
-    outbox.append(note('five'));
-    expect(await outbox.waitAcked(5, 2_000)).toBe(true);
-    expect(seqs(eventsMessages(hub, 1).flatMap((message) => message.events))).toEqual([5]);
-    expect(seqs(hub.events())).toEqual([3, 5]);
-  });
-
   test('fills each events message only up to its byte budget, one event at least', async () => {
     const big = 'x'.repeat(Math.floor(MAX_EVENTS_MESSAGE_BYTES / 3));
     const { hub, link, outbox } = setup(

@@ -10,6 +10,8 @@ M1's hub, web UI and live-chat bridge are built. M2 adds runners that start and 
 
 M2 runners support **macOS on Apple silicon (`darwin-arm64`) only**. The hub and ordinary unit tests also run on Linux. The lead still accepts or rejects submissions, and people mark tasks merged. Verification clones, reviewers, PRs and the merge queue belong to M3; usage dashboards and repository-derived context belong to M4.
 
+For a shared Linux hub with HTTPS, GitHub sign-in, backups and two Mac runners, follow the [hub deployment runbook](docs/deploy-hub.md).
+
 ## Run the hub locally
 
 Requires [Bun](https://bun.sh) 1.3.11 or newer.
@@ -212,7 +214,7 @@ AGFLOW_DB=data/agflow.db bun run restore data/backups/<backup-file>
 
 The restore command validates the backup, keeps the replaced database aside and advances the hub epoch/counters. Restart the hub with its normal configuration; runners reconnect and replay retained events. The recovery window pauses dispatch, lease expiry and stall judgments while they reconcile.
 
-**Known limits — settings sync after a restore.** M2 keeps the runner-only, content-matched echo rule. A local edit can be lost if an equal owner echo answered it before it reached the old hub, or if the restored hub's newer settings prevent adoption of the runner's snapshot. Equal versions from different histories can also leave settings divergent; old pending echoes/probes can temporarily apply or revert settings during recovery. After restoring, check drain, capacity and other settings on both sides and reapply intended changes. Exact echo identity and restore replay selection need a protocol change in a later milestone.
+**Settings sync after a restore.** Protocol 2 names each answered edit and each refusal exactly. A runner replays all retained edits; the hub skips answered edits only when it adopted the snapshot that includes them. Equal owner echoes cannot settle local edits early, and a restored hub ahead of the snapshot still receives post-backup edits. Upgrade the hub first; it supports protocol-1 runners during the transition. **Known limits:** settings versions still do not identify their history, so equal versions from different restores can diverge and pending echoes from an older history can temporarily apply until the full snapshot arrives. Pruned events and protocol-1 history cannot be reconstructed. Check intended settings after those cases.
 
 ## Development
 

@@ -1,0 +1,65 @@
+#cloud-config
+# Render __AGFLOW_ADMIN_SSH_KEY_JSON__ with a JSON-quoted PUBLIC SSH key (yc-create.sh does this).
+# No GitHub/OAuth credentials belong in instance metadata.
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - unzip
+  - caddy
+  - python3
+  - sudo
+  - util-linux
+users:
+  - name: agflow
+    system: true
+    homedir: /var/lib/agflow
+    no_create_home: true
+    shell: /usr/sbin/nologin
+    lock_passwd: true
+  - name: agflow-admin
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh_authorized_keys:
+      - __AGFLOW_ADMIN_SSH_KEY_JSON__
+ssh_pwauth: false
+disable_root: true
+write_files:
+  - path: /usr/local/sbin/agflow-install-bun
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      [[ $(uname -m) == x86_64 ]]
+      scratch=$(mktemp -d)
+      trap 'rm -rf "$scratch"' EXIT
+      cd "$scratch"
+      base=https://github.com/oven-sh/bun/releases/download/bun-v1.3.11
+      curl --fail --location --retry 3 --output bun-linux-x64.zip "$base/bun-linux-x64.zip"
+      curl --fail --location --retry 3 --output SHASUMS256.txt "$base/SHASUMS256.txt"
+      # Check the downloaded archive against the release's checksum BEFORE extracting/running it.
+      awk '$2 == "bun-linux-x64.zip" || $2 == "*bun-linux-x64.zip" { print }' SHASUMS256.txt > bun.sha256
+      [[ $(wc -l < bun.sha256) == 1 ]]
+      sha256sum --check --strict bun.sha256
+      unzip -q bun-linux-x64.zip
+      install -o root -g root -m 0755 bun-linux-x64/bun /usr/local/bin/bun
+      [[ $(/usr/local/bin/bun --version) == 1.3.11 ]]
+  - path: /etc/systemd/journald.conf.d/agflow.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Journal]
+      SystemMaxUse=200M
+      RuntimeMaxUse=50M
+runcmd:
+  - [install, -d, -o, root, -g, root, -m, '0755', /opt/agflow, /opt/agflow/releases]
+  - [install, -d, -o, agflow, -g, agflow, -m, '0750', /var/lib/agflow, /var/lib/agflow/data, /var/lib/agflow/backups]
+  - [install, -d, -o, root, -g, root, -m, '0700', /etc/agflow]
+  - [/usr/local/sbin/agflow-install-bun]
+  - [systemctl, restart, systemd-journald]
+  - [apt-get, clean]
+  # deploy-hub installs/enables the hub unit and replaces Ubuntu's default Caddyfile after env setup.
+final_message: 'agflow host provisioned; fill /etc/agflow/hub.env and deploy a release. Check cloud-init status --long.'

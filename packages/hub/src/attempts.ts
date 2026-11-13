@@ -1518,7 +1518,7 @@ export interface LateWork {
 }
 
 /** attempt.late_work of a pushed ref, which keeps the ref, at its sha, for its cleanup (design 6.18). */
-function emitLateWork(emit: Emit, attempt: Attempt | null, work: LateWork): void {
+function emitLateWork(emit: Emit, attempt: Attempt | null, work: LateWork, submittedHead = false): void {
   emit({
     type: 'attempt.late_work',
     actor: `runner:${work.runnerId}`,
@@ -1530,6 +1530,7 @@ function emitLateWork(emit: Emit, attempt: Attempt | null, work: LateWork): void
       runnerId: work.runnerId,
       ref: work.ref,
       sha: work.sha,
+      ...(submittedHead ? { submittedHead: true } : {}),
     },
   });
 }
@@ -1543,7 +1544,7 @@ function emitLateWork(emit: Emit, attempt: Attempt | null, work: LateWork): void
  */
 function recordSubmittedHeadPush(ctx: HubContext, emit: Emit, attempt: Attempt, work: LateWork): void {
   if (work.ref === attempt.wipRef) updateAttempt(ctx, attempt.id, { wipSha: work.sha });
-  else emitLateWork(emit, attempt, work);
+  else emitLateWork(emit, attempt, work, true);
   const pushed = `runner ${work.runnerId} pushed the submitted head ${work.sha} to ${work.ref}`;
   appendAttemptLog(ctx, attempt.id, 'note', `${pushed}: it is on the task branch, not late work`);
 }

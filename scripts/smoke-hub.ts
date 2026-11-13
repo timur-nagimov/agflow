@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ScriptResources } from './resources';
 import { connectFakeRunnerWs } from '../packages/hub/test/fake-runner';
 
-const dir = mkdtempSync(join(tmpdir(), 'agflow-smoke-'));
+await using resources = new ScriptResources();
+const dir = resources.directory(join(tmpdir(), 'agflow-smoke-'));
 const port = 8799;
 const base = `http://localhost:${port}`;
-const hub = Bun.spawn(['bun', 'packages/hub/src/main.ts'], {
+const hub = resources.child(Bun.spawn(['bun', 'packages/hub/src/main.ts'], {
   env: {
     ...process.env,
     AGFLOW_AUTH: 'dev',
@@ -20,7 +22,7 @@ const hub = Bun.spawn(['bun', 'packages/hub/src/main.ts'], {
   },
   stdout: 'inherit',
   stderr: 'inherit',
-});
+}));
 
 async function waitForHub(): Promise<void> {
   for (let attempt = 0; attempt < 50; attempt++) {
@@ -91,5 +93,5 @@ try {
   const passed = 'smoke test passed: hub started, snapshots written, dev sign-in worked, goal v1 saved';
   console.log(`${passed}, runner ${welcome.runnerId} linked`);
 } finally {
-  hub.kill();
+  await resources.close();
 }

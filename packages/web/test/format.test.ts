@@ -608,7 +608,8 @@ describe('M2 events', () => {
         },
       });
       const sentence = describeEvent({ ...event, data });
-      expect([type, [...read].filter((key) => !(spec.data as readonly string[]).includes(key))]).toEqual([type, []]);
+      const allowed = [...spec.data, ...('optionalData' in spec ? spec.optionalData : [])] as readonly string[];
+      expect([type, [...read].filter((key) => !allowed.includes(key))]).toEqual([type, []]);
       expect([type, sentence.includes(type) || /undefined|null|NaN|\[object/.test(sentence)]).toEqual([type, false]);
     }
   });
@@ -673,6 +674,15 @@ describe('M2 events', () => {
       'alice stopped and held A-9 on T-8-a1: wrong approach',
     );
     expect(describeEvent(m2Event('agent.replaced'))).toBe('alice replaced A-9 on T-8-a1: looping');
+  });
+
+  test('submitted-head late refs are neutral and explain that there is nothing new', () => {
+    const event = m2Event('attempt.late_work', { submittedHead: true });
+    expect(describeEvent(event)).toBe('T-8-a1 pushed its submitted head to refs/agflow/T-8/late-a1 (nothing new)');
+    expect(eventTone(event.type, event.data)).toBe('wait');
+    const ordinary = m2Event('attempt.late_work');
+    expect(describeEvent(ordinary)).toBe('T-8-a1 pushed late work at 0123456');
+    expect(eventTone(ordinary.type, ordinary.data)).toBe('trouble');
   });
 
   test('approval, lead, submission, task, guard and hub events', () => {
