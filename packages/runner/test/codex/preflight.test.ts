@@ -1,3 +1,4 @@
+import { withoutTestProcessEnv } from '@agflow/testkit/src/process-cleanup';
 // Zero-model preflight through the scripted app-server, including isolation and cleanup on failures.
 import { afterEach, describe, expect, test } from 'bun:test';
 import { TEST_ACCOUNT_ID, VendorQuotaSchema } from '@agflow/core';
@@ -228,7 +229,7 @@ describe('runCodexPreflight', () => {
     };
     Object.assign(fixture.options, codexProcessOptions({ config, paths: fixture.options.paths, env }));
     expect((await probe(fixture)).facts.ready).toBe(true);
-    expect(readCodexRecord(fixture.bin)[0]?.env).toEqual({
+    expect(withoutTestProcessEnv(readCodexRecord(fixture.bin)[0]!.env)).toEqual({
       PATH: '/usr/bin:/bin',
       HTTPS_PROXY: 'http://127.0.0.1:9',
       SSL_CERT_FILE: '/tmp/ca',

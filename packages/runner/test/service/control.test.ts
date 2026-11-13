@@ -147,14 +147,24 @@ writeFileSync(${JSON.stringify(ready)}, 'ready');
 
   test('missing listeners and a request deadline are ControlUnavailableError', async () => {
     await expect(controlRequest<unknown>(scratch(), 'GET', '/status')).rejects.toBeInstanceOf(ControlUnavailableError);
-    const { paths } = await serve({ 'GET /status': () => new Promise(() => {}) });
-    const started = Date.now();
-    const error = await controlRequest<unknown>(paths, 'GET', '/status', undefined, { timeoutMs: 40 }).catch(
-      (error: unknown) => error,
-    );
-    expect(error).toBeInstanceOf(ControlUnavailableError);
-    expect((error as Error).message).toContain('40 ms');
-    expect(Date.now() - started).toBeLessThan(1_000);
+    const pending = Promise.withResolvers<void>();
+    try {
+      const { paths, server } = await serve({ 'GET /status': () => pending.promise });
+      const started = Date.now();
+      const error = await controlRequest<unknown>(paths, 'GET', '/status', undefined, { timeoutMs: 40 }).catch(
+        (error: unknown) => error,
+      );
+      expect(error).toBeInstanceOf(ControlUnavailableError);
+      expect((error as Error).message).toContain('40 ms');
+      expect(Date.now() - started).toBeLessThan(1_000);
+      // Shutdown must close the listener while the handler is still unresponsive.
+      server.stop();
+      await expect(controlRequest<unknown>(paths, 'GET', '/status')).rejects.toBeInstanceOf(ControlUnavailableError);
+    } finally {
+      // Bun's stop(true) promise waits for handlers even after closing their connections. Release this test
+      // fixture only after proving the deadline and forced shutdown, so the cleanup hook can await the server.
+      pending.resolve();
+    }
   });
 
   test('refuses paths over 103 bytes on both sides and names AGFLOW_HOME', async () => {

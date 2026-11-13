@@ -1,3 +1,4 @@
+import { withoutTestProcessEnv } from '@agflow/testkit/src/process-cleanup';
 // App-server startup, handshake and bounded group shutdown against the scripted peer.
 import { afterEach, describe, expect, test } from 'bun:test';
 import { AGFLOW_VERSION } from '@agflow/core';
@@ -89,7 +90,7 @@ describe('openAppServer', () => {
     expect(run?.pid).toBe(spawned!);
     expect(server.pid).toBe(spawned!);
     expect(run?.argv).toEqual(options.args);
-    expect(run?.env).toEqual(options.env);
+    expect(withoutTestProcessEnv(run!.env)).toEqual(options.env);
     expect(run?.cwd).toBe(realpathSync(options.cwd));
     expect(process.kill(-server.pid, 0)).toBe(true);
     await server.end(fastEnd);
