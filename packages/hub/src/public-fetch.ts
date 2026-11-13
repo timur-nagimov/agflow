@@ -1,7 +1,7 @@
 // One GET to a public site, made by the hub for an agent (design 5, Unattended options). The rules are in
 // public-address.ts; this module applies them to every hop. A host is resolved once per hop, every address it resolves
-// to must be public, and the connection goes to one of the addresses that were checked: the URL the transport requests
-// names that address, with the host name only in the Host header and as the TLS server name. So nothing resolves the
+// to must be public, and the connection goes to one of the addresses that were checked: the transport connects to that
+// address itself, with the host name only in the Host header and as the TLS server name. So nothing resolves the
 // name a second time, and a resolver that answers differently later (DNS rebinding) cannot move the connection.
 // Redirects are followed by hand, each target checked like the first URL. The resolver and the transport are passed
 // in, so tests use tables and local servers.
@@ -103,49 +103,6 @@ export const systemResolver: Resolver = async (hostname) => {
   const answers = await lookup(hostname, { all: true, verbatim: true });
   return answers.map(({ address, family }) => ({ address, family: family === 6 ? 6 : 4 }));
 };
-
-/** The URL of one hop: the pinned address stands where the host name was. */
-export function pinnedUrl(request: PinnedRequest): string {
-  const host = request.family === 6 ? `[${request.address}]` : request.address;
-  return `${request.protocol}//${host}:${request.port}${request.path}`;
-}
-
-/** The encodings the hub asks for and can undo within the size cap. */
-const ACCEPT_ENCODING = 'gzip, br';
-
-export interface PinnedTransportOptions {
-  /** A certificate authority to trust besides the system's; tests pass their own. */
-  ca?: string | undefined;
-}
-
-/**
- * The transport the hub uses. The request URL holds the address, so no name is looked up; the certificate is still
- * verified against the host name (Bun's tls.serverName). Nothing of the caller's is sent: no cookies, no
- * authorization, a fixed User-Agent. The connection is not reused, so a later request for another name on the same
- * address never rides on this one's handshake.
- */
-export function createPinnedTransport(options: PinnedTransportOptions = {}): Transport {
-  return (request, signal) => {
-    const init: RequestInit & Record<string, unknown> = {
-      method: 'GET',
-      redirect: 'manual',
-      signal,
-      headers: {
-        host: request.hostname,
-        'user-agent': 'agflow-fetch/1.0',
-        accept: '*/*',
-        'accept-encoding': ACCEPT_ENCODING,
-      },
-      // The body is decompressed by hand, under the size cap.
-      decompress: false,
-      keepalive: false,
-    };
-    if (request.protocol === 'https:') {
-      init.tls = { serverName: request.hostname, rejectUnauthorized: true, ...(options.ca ? { ca: options.ca } : {}) };
-    }
-    return fetch(pinnedUrl(request), init);
-  };
-}
 
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
