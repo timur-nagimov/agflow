@@ -16,7 +16,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 // The runner's own list of these names, which its launches give the adapters; the CLI does not depend on the runner
 // package, so the test reads its source.
-import { BRIDGE_TOOL_NAMES } from '../../runner/src/adapters/bridge-tools';
+import { BRIDGE_TOOL_NAMES, BRIDGE_UNNAMED_TOOLS } from '../../runner/src/adapters/bridge-tools';
 import { type FetchFn, HubClient } from '../src/hub-client';
 import { type RunnerToolContext, runnerLeadTools, runnerToolsFor, runnerWorkerTools } from '../src/mcp/runner-tools';
 import { leadTools, workerTools } from '../src/mcp/tools';
@@ -118,13 +118,6 @@ function prepared(hub: HubFixture, agent: RunnerAgent, outcome: { ok: boolean; e
   tx(hub.ctx, (emit) => onPrepared(hub.ctx, emit, agent.attempt, { requestId: row.id, ...outcome }));
 }
 
-/**
- * The unattended options' tools (design 5, 6.10), which the bridge serves and the runner's list does not name: those
- * options leave the runner as it is. A Codex thread needs every name of the runner's list from its bridge and only
- * warns about others, so these are the whole difference between the two, and any other is a drift.
- */
-const UNATTENDED_TOOLS = { worker: ['fetch_url'], lead: ['grant_internet', 'revoke_internet', 'list_approvals', 'decide_approval', 'fetch_url'] } as const;
-
 const SHARED = ['hello', 'get_brief', 'get_goal', 'list_tasks', 'get_task', 'check_inbox', 'ack_messages', 'send_message', 'search'];
 
 describe('the runner tool sets', () => {
@@ -177,11 +170,14 @@ describe('the runner tool sets', () => {
     expect(runnerToolsFor('lead')).toBe(runnerLeadTools);
   });
 
-  test("the runner's BRIDGE_TOOL_NAMES are all served, and the bridge serves nothing more than them and the unattended options' tools", () => {
+  test("the runner's BRIDGE_TOOL_NAMES and BRIDGE_UNNAMED_TOOLS are exactly the tools each role's bridge serves", () => {
     for (const role of ['worker', 'lead'] as const) {
       const served = runnerToolsFor(role).map((tool) => tool.name);
-      expect([...BRIDGE_TOOL_NAMES[role], ...UNATTENDED_TOOLS[role]].sort()).toEqual(served.sort());
+      expect([...BRIDGE_TOOL_NAMES[role], ...BRIDGE_UNNAMED_TOOLS].sort()).toEqual(served.sort());
     }
+    // The lead's four tools of the unattended options are named to it; fetch_url is named to nobody (Claude only).
+    expect(BRIDGE_TOOL_NAMES.lead).toEqual(expect.arrayContaining(['grant_internet', 'revoke_internet', 'list_approvals', 'decide_approval']));
+    expect(BRIDGE_TOOL_NAMES.worker.filter((name) => ['grant_internet', 'revoke_internet', 'list_approvals', 'decide_approval'].includes(name))).toEqual([]);
   });
 });
 
