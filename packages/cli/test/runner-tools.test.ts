@@ -119,7 +119,7 @@ function prepared(hub: HubFixture, agent: RunnerAgent, outcome: { ok: boolean; e
  * options leave the runner as it is. A Codex thread needs every name of the runner's list from its bridge and only
  * warns about others, so these are the whole difference between the two, and any other is a drift.
  */
-const UNATTENDED_TOOLS = { worker: ['fetch_url'], lead: ['fetch_url'] } as const;
+const UNATTENDED_TOOLS = { worker: ['fetch_url'], lead: ['grant_internet', 'revoke_internet', 'fetch_url'] } as const;
 
 const SHARED = ['hello', 'get_brief', 'get_goal', 'list_tasks', 'get_task', 'check_inbox', 'ack_messages', 'send_message', 'search'];
 
@@ -150,6 +150,8 @@ describe('the runner tool sets', () => {
       'mark_merged',
       'add_goal_note',
       'get_events',
+      'grant_internet',
+      'revoke_internet',
       'request_agents',
       'replace_agent',
       'stop_agent',
