@@ -127,8 +127,9 @@ COMMIT;
 SQL
 ```
 
-Then deploy the previous release with the usual command. It ignores `AGFLOW_AGENT_FETCH` and `AGFLOW_LEAD_APPROVALS`
-in `hub.env`. To keep the record of fetches, save it before the statements above:
+Then start the previous release. After a deployment that rolled back by itself it is already in place:
+`sudo systemctl start agflow-hub`. Otherwise deploy it with the usual command. It ignores `AGFLOW_AGENT_FETCH` and
+`AGFLOW_LEAD_APPROVALS` in `hub.env`. To keep the record of fetches, save it before the statements above:
 `sudo -u agflow sqlite3 /var/lib/agflow/data/agflow.db ".dump agent_fetches" > agent_fetches.sql`. Deploying this
 release again later migrates the database to version 3 again, with both tables empty. Restore
 `before-schema-3.db` only if the database itself is damaged: it brings back the state of that backup and loses
