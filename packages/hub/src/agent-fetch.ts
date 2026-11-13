@@ -1,8 +1,8 @@
 // Internet for runner agents, through the hub (design 5, Unattended options). Agents have no network of their own, and
 // that stays: with AGFLOW_AGENT_FETCH on, the hub downloads one public URL at a time for a Claude agent and hands the
 // bytes back. The lead may always ask; a worker may once the lead, or a person, granted its task. This module holds
-// the grants and POST /api/fetch: who may ask, the rate limits (fetch-limits.ts) and the audit trail. The request itself
-// is public-fetch.ts.
+// the grants and POST /api/fetch: who may ask, the rate limits (fetch-limits.ts) and the audit trail (the record of
+// fetch-record.ts, and the attempt's log). The request itself is public-fetch.ts.
 import { createHash } from 'node:crypto';
 import { type Attempt, type FetchedUrl, type Task, isClosed, quoteLines } from '@agflow/core';
 import { LOG_SUMMARY_MAX, appendAttemptLog } from './attempt-store';
@@ -10,12 +10,13 @@ import { resolveAgentToken } from './auth';
 import { type HubContext, tx } from './context';
 import { HubError, conflict } from './errors';
 import { FETCH_LIMITS } from './fetch-limits';
+import { type FetchOutcome, type FetchRequest, finishFetch, recordFetch } from './fetch-record';
 import { holdsSeat } from './hub-state';
 import { insertMessage } from './messages';
 import { FetchRefusal, parseFetchUrl } from './public-address';
-import { type PublicFetchFailure, PublicFetchError, fetchPublicUrl } from './public-fetch';
+import { type PublicFetchFailure, PublicFetchError, type PublicFetchResult, fetchPublicUrl } from './public-fetch';
 import { findTask, getTask } from './task-store';
-import { clip } from './text';
+import { clip, oneLine } from './text';
 
 /** 403 while AGFLOW_AGENT_FETCH is off: the grant routes and POST /api/fetch all answer it. */
 export const fetchDisabled = () =>
@@ -181,9 +182,6 @@ const answerFor = (error: PublicFetchError): HubError =>
     error.message,
   );
 
-/** Text an agent or a site wrote, on one line of the log: line breaks and other control characters become "?". */
-const oneLine = (text: string): string => text.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, '?');
-
 /** Where the redirects ended. The site chose it, so only its start is shown: it says where the hub went. */
 const shownUrl = (url: string): string => clip(oneLine(url), 500);
 
@@ -191,13 +189,15 @@ const shownUrl = (url: string): string => clip(oneLine(url), 500);
 const OUTCOME_MAX = 1500;
 
 /**
- * The audit trail (design 5): every request the hub made or refused to make is on the attempt's log, with the whole
- * URL the agent sent, since the URL is what an agent could carry data out in, at its end as well as at its start. The
- * URL shares a line with the outcome when both fit the log's line. A longer one follows on a line of its own, and the
- * first line gives its length and SHA-256: they tell a reader that nothing is missing, and name a URL the log had to
- * cut (one past the route's bound of 2000 characters).
+ * The audit trail where people look at an attempt (design 5): every request the hub made or refused to make is on the
+ * attempt's log, with the whole URL the agent sent, since the URL is what an agent could carry data out in, at its end
+ * as well as at its start. The URL shares a line with the outcome when both fit the log's line. A longer one follows
+ * on a line of its own, and the first line gives its length and SHA-256: they tell a reader that nothing is missing,
+ * and name a URL the log had to cut (one past the route's bound of 2000 characters). The log keeps only an attempt's
+ * newest entries, so the trail that lasts is the record (fetch-record.ts); a line that cannot be written costs the
+ * agent nothing, since the record holds the request.
  */
-function audit(ctx: HubContext, attemptId: string, url: string, outcome: string): void {
+function logFetch(ctx: HubContext, attemptId: string, url: string, outcome: string): void {
   const shown = oneLine(url);
   const result = clip(outcome, OUTCOME_MAX);
   const line = `fetch GET ${shown}: ${result}`;
@@ -213,22 +213,40 @@ function audit(ctx: HubContext, attemptId: string, url: string, outcome: string)
       appendAttemptLog(ctx, attemptId, 'note', shown);
     });
   } catch (error) {
-    // The answer does not depend on the log.
     console.error(`logging a fetch of attempt ${attemptId} failed`, error);
   }
 }
 
-/** A failure as the log shows it: what the agent was told and, in brackets, what only the log may hold. */
-const failed = (error: PublicFetchError): string =>
-  `${REFUSALS.includes(error.code) ? 'refused' : 'failed'} (${error.code}), 0 bytes: ${error.message}` +
-  `${error.detail === null ? '' : ` [${error.detail}]`}`;
+/** A request that got no answer: its words in the attempt's log, and its outcome on the record. */
+interface FetchFailure {
+  line: string;
+  outcome: FetchOutcome;
+}
+
+function failureOf(error: unknown): FetchFailure {
+  /** code: as the log names the failure; answered: the error code the agent got, which the record keeps. */
+  const told = (verdict: 'refused' | 'failed', code: string, answered: string, words: string): FetchFailure => ({
+    line: `${verdict} (${code}), 0 bytes: ${words}`,
+    outcome: { finalUrl: null, status: null, error: answered, bytes: 0, detail: words },
+  });
+  if (error instanceof PublicFetchError) {
+    // What the agent was told and, in brackets, what only people may read.
+    const words = `${error.message}${error.detail === null ? '' : ` [${error.detail}]`}`;
+    return told(REFUSALS.includes(error.code) ? 'refused' : 'failed', error.code, `fetch_${error.code}`, words);
+  }
+  // A redirect led to a host whose slot is too far away: the first hop was made by then.
+  if (error instanceof HubError) return told('failed', error.code, error.code, error.message);
+  // A fault of the hub's own: the site may have the URL, whatever the hub made of its answer.
+  return told('failed', 'internal', 'internal', 'the hub could not finish the request');
+}
 
 /**
  * POST /api/fetch: the hub downloads one public URL for the runner agent the token names. Checked in this order, each
  * with its own answer: the setting is on; the attempt is open (the token is resolved again, as the body arrived after
  * the route resolved it); nobody asked it to stop; the attempt is Claude's; the agent holds the lead seat, or its open
- * task names this attempt and holds a grant; the rate limits. Then one GET (public-fetch.ts), a line in the attempt's
- * log, and the bytes. A fetch under way when a stop is asked for runs to its end, within the fetch's own time limit.
+ * task names this attempt and holds a grant; the rate limits. Then one GET (public-fetch.ts), on record from before it
+ * leaves (fetch-record.ts) and on the attempt's log once it ended, and the bytes. A fetch under way when a stop is
+ * asked for runs to its end, within the fetch's own time limit.
  */
 export async function fetchForAgent(ctx: HubContext, token: string, rawUrl: string): Promise<FetchedUrl> {
   requireAgentFetch(ctx);
@@ -247,42 +265,55 @@ export async function fetchForAgent(ctx: HubContext, token: string, rawUrl: stri
       if (wait === null) throw hostBusy(host);
       await sleep(wait);
     };
+    const asked: FetchRequest = { attemptId: attempt.id, taskId: attempt.taskId, agentId: agent.id, url: rawUrl };
     let url: URL;
     try {
       url = parseFetchUrl(rawUrl);
     } catch (error) {
       if (!(error instanceof FetchRefusal)) throw error;
       const refusal = new PublicFetchError('url_refused', error.message);
-      audit(ctx, attempt.id, rawUrl, failed(refusal));
+      const failure = failureOf(refusal);
+      recordFetch(ctx, { ...asked, ...failure.outcome });
+      logFetch(ctx, attempt.id, rawUrl, failure.line);
       throw answerFor(refusal);
     }
     await takeSlot(url.hostname);
+    // The request is on record before anything of it leaves the hub, its host name to the resolver included, and it
+    // does not leave when the record cannot be written. A hub stopped in the middle still names what went out.
+    const recordId = recordFetch(ctx, asked);
+    /** The request's end, on the record and in the attempt's log. A failure here never costs the agent its answer. */
+    const settle = (outcome: FetchOutcome, line: string): void => {
+      try {
+        finishFetch(ctx, recordId, outcome);
+      } catch (error) {
+        console.error(`recording how fetch ${recordId} of attempt ${attempt.id} ended failed`, error);
+      }
+      logFetch(ctx, attempt.id, rawUrl, line);
+    };
+    let result: PublicFetchResult;
     try {
-      const result = await fetchPublicUrl({ resolve, transport }, url.href, {
+      result = await fetchPublicUrl({ resolve, transport }, url.href, {
         ...limits,
         beforeHop: (next) => takeSlot(next.hostname),
       });
-      const from = result.finalUrl === url.href ? '' : `, from ${shownUrl(result.finalUrl)}`;
-      audit(ctx, attempt.id, rawUrl, `${result.status}, ${result.bytes} bytes${from}`);
-      return {
-        status: result.status,
-        finalUrl: result.finalUrl,
-        contentType: result.contentType,
-        bytes: result.bytes,
-        sha256: result.sha256,
-        bodyBase64: Buffer.from(result.body.buffer, result.body.byteOffset, result.body.byteLength).toString('base64'),
-      };
     } catch (error) {
-      if (error instanceof PublicFetchError) {
-        audit(ctx, attempt.id, rawUrl, failed(error));
-        throw answerFor(error);
-      }
-      // A redirect led to a host whose slot is too far away: the first hop was made, so it is on the log too. So is
-      // a fault of the hub's own: the site may have the URL by then, whatever the hub made of the answer.
-      if (error instanceof HubError) audit(ctx, attempt.id, rawUrl, `failed (${error.code}), 0 bytes: ${error.message}`);
-      else audit(ctx, attempt.id, rawUrl, 'failed (internal), 0 bytes: the hub could not finish the request');
-      throw error;
+      const failure = failureOf(error);
+      settle(failure.outcome, failure.line);
+      throw error instanceof PublicFetchError ? answerFor(error) : error;
     }
+    const from = result.finalUrl === url.href ? '' : `, from ${shownUrl(result.finalUrl)}`;
+    settle(
+      { finalUrl: result.finalUrl, status: result.status, error: null, bytes: result.bytes, detail: null },
+      `${result.status}, ${result.bytes} bytes${from}`,
+    );
+    return {
+      status: result.status,
+      finalUrl: result.finalUrl,
+      contentType: result.contentType,
+      bytes: result.bytes,
+      sha256: result.sha256,
+      bodyBase64: Buffer.from(result.body.buffer, result.body.byteOffset, result.body.byteLength).toString('base64'),
+    };
   } finally {
     limiter.leave(attempt.id);
   }

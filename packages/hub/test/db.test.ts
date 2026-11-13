@@ -75,6 +75,7 @@ describe('openDb', () => {
       'approvals',
       'lead_notes',
       'task_fetch_grants',
+      'agent_fetches',
     ]) {
       expect(tables).toContain(name);
     }
@@ -95,8 +96,22 @@ describe('openDb', () => {
     );
     expect(columns(db, 'task_notes')).toContain('attempt_id');
     expect(columns(db, 'task_fetch_grants')).toEqual(['task_id', 'granted_by', 'reason', 'granted_at']);
+    expect(columns(db, 'agent_fetches')).toEqual([
+      'id',
+      'at',
+      'attempt_id',
+      'task_id',
+      'agent_id',
+      'url',
+      'final_url',
+      'status',
+      'error',
+      'bytes',
+      'detail',
+    ]);
     expect(names(db, 'index')).toEqual(
       expect.arrayContaining([
+        'agent_fetches_attempt',
         'attempts_task_number',
         'attempts_one_open',
         'attempts_status',
@@ -116,10 +131,11 @@ describe('openDb', () => {
     ]);
   });
 
-  test('a schema version 2 database gains the internet grants and keeps its rows', () => {
+  test('a schema version 2 database gains the internet grants and the record of fetches, and keeps its rows', () => {
     const db = openDb(':memory:', NOW);
-    // As a hub before the grants left it.
+    // As a hub before version 3 left it.
     db.run('DROP TABLE task_fetch_grants');
+    db.run('DROP TABLE agent_fetches');
     db.run('DELETE FROM schema_migrations WHERE version = 3');
     db.run("INSERT INTO goal_versions (version, text, author, created_at) VALUES (1, 'goal', 'user:alice', 0)");
     migrate(db, NOW + MINUTE);
@@ -128,6 +144,7 @@ describe('openDb', () => {
       applied_at: NOW + MINUTE,
     });
     expect(db.query('SELECT COUNT(*) AS n FROM task_fetch_grants').get()).toEqual({ n: 0 });
+    expect(db.query('SELECT COUNT(*) AS n FROM agent_fetches').get()).toEqual({ n: 0 });
     expect(db.query('SELECT COUNT(*) AS n FROM goal_versions').get()).toEqual({ n: 1 });
   });
 

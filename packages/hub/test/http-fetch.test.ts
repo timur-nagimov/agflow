@@ -1,11 +1,13 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { FetchUrlResponseSchema } from '@agflow/core';
-import { attemptLog, getAttempt } from '../src/attempt-store';
+import { appendAttemptLog, attemptLog, getAttempt } from '../src/attempt-store';
 import { endAttempt, stopAgent } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
 import { fetchForAgent, findFetchGrant, grantFetch, revokeFetch } from '../src/agent-fetch';
+import { tx } from '../src/context';
 import { listEvents } from '../src/events';
+import { type FetchRecord, listFetches } from '../src/fetch-record';
 import { isAgentRouteAllowed } from '../src/http/agent-routes-allowed';
 import { holdsSeat } from '../src/hub-state';
 import type { PinnedRequest, Resolver, Transport } from '../src/public-fetch';
@@ -425,6 +427,171 @@ describe('the audit trail', () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]!.split('\n')).toHaveLength(1);
     expect(lines[0]).toStartWith('note: fetch GET https://example.com/a?fetch GET https://forged.example.com/: 200: refused (url_refused)');
+  });
+});
+
+/** The record's rows without their ids and times, oldest first. */
+const recorded = (hub: Hub): Omit<FetchRecord, 'id' | 'at'>[] => listFetches(hub.ctx).map(({ id: _id, at: _at, ...row }) => row);
+
+describe('the record of fetches', () => {
+  test("a fetch stays on record once the attempt's later activity has pushed its line out of the attempt log", async () => {
+    const { hub, callers, granted } = setup({
+      script: {
+        'example.com/start?said=what-the-agent-carried-out': () =>
+          new Response(null, { status: 302, headers: { location: 'https://cdn.example.com/file?token=t' } }),
+      },
+    });
+    const url = 'https://example.com/start?said=what-the-agent-carried-out';
+    const at = hub.ctx.now();
+    expect((await fetchUrl(hub, callers.granted, url)).status).toBe(200);
+    expect(notes(hub, granted.attempt.id)).toHaveLength(1);
+    // As many later entries as an attempt's log keeps: an agent makes that many with its own tool calls.
+    hub.clock.advance(60_000);
+    tx(hub.ctx, () => {
+      for (let n = 0; n < 500; n += 1) appendAttemptLog(hub.ctx, granted.attempt.id, 'tool', `Bash: step ${n}`);
+    });
+    expect(notes(hub, granted.attempt.id).filter((line) => line.includes('fetch GET'))).toEqual([]);
+    expect(listFetches(hub.ctx)).toEqual([
+      {
+        id: 1,
+        at,
+        attemptId: granted.attempt.id,
+        taskId: granted.task.id,
+        agentId: granted.agent.id,
+        url,
+        finalUrl: 'https://cdn.example.com/file?token=t',
+        status: 200,
+        error: null,
+        bytes: 'page /file?token=t'.length,
+        detail: null,
+      },
+    ]);
+  });
+
+  test('every request the hub made or refused by its URL and address rules is one row, with who asked and how it ended', async () => {
+    const { hub, callers, granted, lead } = setup({
+      script: {
+        'example.com/start': () => new Response(null, { status: 301, headers: { location: 'https://www.example.com/page' } }),
+        'www.example.com/page': () => new Response('hello'),
+        'example.com/missing': () => new Response('nope', { status: 404 }),
+      },
+    });
+    await fetchUrl(hub, callers.granted, 'http://example.com/start');
+    hub.clock.advance(5_000);
+    await fetchUrl(hub, callers.granted, 'https://example.com/missing');
+    await fetchUrl(hub, callers.granted, 'http://10.0.0.1/admin');
+    await fetchUrl(hub, callers.granted, 'https://inside.example.com/');
+    await fetchUrl(hub, callers.lead, 'https://nowhere.example.org/x');
+    const worker = { attemptId: granted.attempt.id, taskId: granted.task.id, agentId: granted.agent.id };
+    const none = { finalUrl: null, status: null, bytes: 0 };
+    expect(recorded(hub)).toEqual([
+      { ...worker, url: 'http://example.com/start', finalUrl: 'https://www.example.com/page', status: 200, error: null, bytes: 5, detail: null },
+      { ...worker, url: 'https://example.com/missing', finalUrl: 'https://example.com/missing', status: 404, error: null, bytes: 4, detail: null },
+      {
+        ...worker,
+        ...none,
+        url: 'http://10.0.0.1/admin',
+        error: 'fetch_url_refused',
+        detail: 'the URL names an IP address; name the site by its DNS host name',
+      },
+      {
+        ...worker,
+        ...none,
+        url: 'https://inside.example.com/',
+        error: 'fetch_address_refused',
+        // What the agent was told and, in brackets, what only people may read.
+        detail:
+          'inside.example.com resolves to an address that is not public (private); the hub fetches only from public internet addresses [inside.example.com resolves to 10.0.0.5 (private)]',
+      },
+      {
+        // A lead's attempt has no task.
+        attemptId: lead.attempt.id,
+        taskId: null,
+        agentId: lead.agent.id,
+        ...none,
+        url: 'https://nowhere.example.org/x',
+        error: 'fetch_dns_failed',
+        detail: 'nowhere.example.org could not be resolved: ENOTFOUND',
+      },
+    ]);
+  });
+
+  test('a request the hub refused before it would make one leaves no row: the stop, the vendor, the grant, the rate', async () => {
+    const { hub, callers, granted } = setup();
+    await fetchUrl(hub, callers.ungranted);
+    await fetchUrl(hub, callers.codex);
+    for (let n = 0; n < 121; n += 1) await fetchUrl(hub, callers.lead, `https://site${n}.example.com/`);
+    stopAgent(hub.ctx, { agentId: granted.agent.id, reason: 'enough', by: 'user:alice', hold: false });
+    await fetchUrl(hub, callers.granted);
+    // The lead's 120 requests within its limit, and nothing else.
+    expect(recorded(hub).map((row) => row.url)).toEqual(Array.from({ length: 120 }, (_, n) => `https://site${n}.example.com/`));
+  });
+
+  test('the request is on record before anything of it leaves the hub', async () => {
+    const { hub, callers, lead } = setup();
+    // The first thing to leave is the host name, to the resolver: the row is there by then.
+    const rowsWhenResolved: number[] = [];
+    const scripted = hub.ctx.agentFetch.resolve;
+    hub.ctx.agentFetch.resolve = (hostname) => {
+      rowsWhenResolved.push(listFetches(hub.ctx).length);
+      return scripted(hostname);
+    };
+    const release: (() => void)[] = [];
+    hub.ctx.agentFetch.transport = () => new Promise<Response>((resolve) => release.push(() => resolve(new Response('late'))));
+    const answer = fetchUrl(hub, callers.lead, 'https://example.com/slow');
+    while (release.length < 1) await Bun.sleep(1);
+    expect(rowsWhenResolved).toEqual([1]);
+    // The site has the URL and has not answered: a hub stopped now leaves this row, which names no outcome.
+    expect(recorded(hub)).toEqual([
+      { attemptId: lead.attempt.id, taskId: null, agentId: lead.agent.id, url: 'https://example.com/slow', finalUrl: null, status: null, error: null, bytes: 0, detail: null },
+    ]);
+    release[0]!();
+    expect((await answer).status).toBe(200);
+    expect(recorded(hub).map((row) => [row.status, row.finalUrl, row.bytes])).toEqual([[200, 'https://example.com/slow', 4]]);
+  });
+
+  test('a request the hub cannot record is not made', async () => {
+    const { hub, callers, lead, resolved, requests } = setup();
+    hub.ctx.db.run('ALTER TABLE agent_fetches RENAME TO agent_fetches_away');
+    const logged = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const url of ['https://example.com/unrecorded', 'http://10.0.0.1/unrecorded']) {
+        const answer = await fetchUrl(hub, callers.lead, url);
+        expect([url, answer.status, answer.json.error]).toEqual([url, 500, 'internal']);
+      }
+      expect(logged).toHaveBeenCalled();
+    } finally {
+      logged.mockRestore();
+    }
+    // No name was resolved and no site was asked.
+    expect([resolved, requests]).toEqual([[], []]);
+    expect(notes(hub, lead.attempt.id)).toEqual([]);
+    hub.ctx.db.run('ALTER TABLE agent_fetches_away RENAME TO agent_fetches');
+    expect((await fetchUrl(hub, callers.lead, 'https://example.com/recorded')).status).toBe(200);
+    expect(recorded(hub).map((row) => row.url)).toEqual(['https://example.com/recorded']);
+  });
+
+  test('a fetch that failed once the request was out names its failure on the record', async () => {
+    const { hub, callers } = setup({
+      script: {
+        'example.com/start': () => new Response(null, { status: 302, headers: { location: 'https://busy.example.com/' } }),
+      },
+    });
+    // The redirect leads to a host whose next slots are all taken.
+    for (let n = 0; n < 5; n += 1) hub.ctx.agentFetch.limiter.reserveHost('busy.example.com');
+    const busy = await fetchUrl(hub, callers.lead, 'https://example.com/start');
+    expect([busy.status, busy.json.error]).toEqual([429, 'fetch_host_busy']);
+    hub.ctx.agentFetch.transport = async () => ({ status: 200 }) as unknown as Response;
+    const logged = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect((await fetchUrl(hub, callers.lead, 'https://example.com/odd')).status).toBe(500);
+    } finally {
+      logged.mockRestore();
+    }
+    expect(recorded(hub).map((row) => [row.url, row.status, row.error, row.detail])).toEqual([
+      ['https://example.com/start', null, 'fetch_host_busy', expect.stringContaining('busy.example.com already has requests waiting')],
+      ['https://example.com/odd', null, 'internal', 'the hub could not finish the request'],
+    ]);
   });
 });
 

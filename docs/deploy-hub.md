@@ -144,15 +144,36 @@ after a change. The rules behind the last two are in the
   the file inside its clone. Agents still have no network of their own. Risk: an agent that reads hostile text can
   leak whatever its sandbox lets it read, through the addresses it asks for; downloaded pages are untrusted input to
   the agent; the requests come from this server's address. The hub refuses non-public addresses, caps time, size and
-  rate, and logs every request on the attempt. The service unit adds a second layer: `IPAddressDeny` keeps the hub
-  process from link-local addresses, where a cloud's metadata service answers. Grants belong on tasks that need
-  outside data and should be revoked afterwards.
+  rate, and records every request ([What agents fetched](#what-agents-fetched)). The service unit adds a second
+  layer: `IPAddressDeny` keeps the hub process from link-local addresses, where a cloud's metadata service answers.
+  Grants belong on tasks that need outside data and should be revoked afterwards.
 - **`AGFLOW_LEAD_APPROVALS=1`.** Removes: the runner owner answering each Codex approval request in a browser. The
   agent holding the lead seat may decline other agents' requests, with a reason, and approve them when the device's
   Codex policy is not managed. A request nobody answered in time is then declined without marking the owner away. The
   owner can still answer first. Risk: an approved command runs outside the sandbox, with network access and write
   access to all the owner's files, on the lead's judgement instead of the owner's, and a lead can be misled by the
   text of a request.
+
+### What agents fetched
+
+With `AGFLOW_AGENT_FETCH=1` the hub records every request it made for an agent, or refused by its URL and address
+rules, in the `agent_fetches` table of its database: the time, the attempt, task and agent, the whole URL the agent
+sent, where the redirects ended, the HTTP status or the error, and the size. The row is written before the request
+leaves the server. An attempt's log in the UI shows the same requests, but only among the attempt's newest 500
+entries. The table keeps 90 days and at most 250,000 rows, and no page shows it yet. Read it on the server:
+
+```bash
+sudo apt-get install -y sqlite3     # once: the host template does not install it
+sudo -u agflow sqlite3 -readonly -header -column /var/lib/agflow/data/agflow.db \
+  "SELECT datetime(at / 1000, 'unixepoch') AS utc, attempt_id, coalesce(status, error, 'no outcome') AS outcome,
+          bytes, url, final_url, detail
+   FROM agent_fetches ORDER BY id DESC LIMIT 50"
+```
+
+Narrow it with `WHERE task_id = 'T-12'` or `WHERE agent_id = 'A-7'`. `WHERE error = 'fetch_address_refused'` finds
+requests for names that resolve inside your network; `detail` then holds the address, which the agent was not told.
+A row with no outcome is a request that was under way when the hub stopped. Requests made after a backup was taken
+are on record only in the database a restore puts aside (`agflow.db.replaced-*`).
 
 What still needs a person:
 

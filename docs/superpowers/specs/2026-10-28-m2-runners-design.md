@@ -147,7 +147,7 @@ Two hub settings let a project run with no person in the loop. Both are off by d
   - Codex agents get no fetch, with or without a grant. Their sandbox does not keep them from reading the owner's files (Reads, above), so an outbound channel would let them leak those files.
   - The hub fetches public addresses only. It refuses loopback, private, link-local and other non-public addresses in every spelling, in every DNS answer and after every redirect, and it connects to the address it checked, so a second DNS answer cannot redirect the request.
   - It follows at most 5 redirects, takes at most 20 s, refuses bodies over 10 MB and limits the rate of requests (429: the agent retries a little later).
-  - Every request is logged on the attempt.
+  - Every request the hub made, or refused by its URL and address rules, is recorded in the hub's `agent_fetches` table: the time, the attempt, task and agent, the whole URL the agent sent, where the redirects ended, the HTTP status or the error, and the size. The row is written before anything of the request leaves the hub, and a request the hub cannot record is not made. The attempt's log shows the same requests, but it keeps only an attempt's newest 500 entries, so the table is the record that lasts (section 6.18 bounds it). No route reads the table, so no agent can: people query it on the hub ([the hub runbook, Unattended operation](../../deploy-hub.md#unattended-operation)).
   - The bridge writes only inside the clone, never into `.git` or `.agflow`, and never through a symlink.
   - Dependency preparation stays registries-only (section 7.7).
 - **What it weakens.** A granted Claude agent has a way to send data out, one URL at a time.
@@ -1497,6 +1497,7 @@ Each removal runs on a daily timer outside the tick:
 | decided approvals | deleted after 90 days |
 | `runner_event_rejects` | deleted after 30 days |
 | `attempt_log` | at most 500 rows per attempt |
+| `agent_fetches` (section 5, Unattended options) | rows deleted after 90 days; at most 250,000 rows, the oldest going as each new one is written (this one on every insert, not on the timer). Each request is one row and an attempt gets 120 requests in 10 minutes, so one agent fetching at its limit without a pause needs 14 days to push a row out |
 | remote refs | 7 days after a task is merged, cancelled or failed, an online runner of the task's last attempt (or any runner) gets `delete_refs` for the refs under `<wipRefPrefix><task>/` whose sha the hub recorded (WIP, late work, hand-back), with fenced deletes. A successful result records `task.refs_deleted`; until then the daily run retries. Refs with no recorded sha (a take-over ref never handed back) stay. |
 
 ## 7. Runner
