@@ -353,6 +353,17 @@ CREATE TABLE lead_notes (
 );
 `;
 
+// Design 5, Unattended options: the tasks whose Claude agents may ask the hub to download public URLs. One row per
+// granted task; revoking deletes it, and the grant and revoke events keep the history.
+const SCHEMA_V3 = `
+CREATE TABLE task_fetch_grants (
+  task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+  granted_by TEXT NOT NULL,          -- agent:<id> or user:<login>
+  reason TEXT NOT NULL,
+  granted_at INTEGER NOT NULL
+);
+`;
+
 /** M1's lead seat: the lead chat seen within the last 15 minutes. Only the migration to schema version 2 reads it. */
 export const M1_LEAD_STALE_MS = 15 * 60_000;
 
@@ -374,6 +385,7 @@ const MIGRATIONS: readonly ((db: Database, now: number) => void)[] = [
     db.run(SCHEMA_V2);
     seedHubState(db, now);
   },
+  (db) => db.run(SCHEMA_V3),
 ];
 
 export function openDb(path: string, now: number): Database {

@@ -42,11 +42,14 @@ export interface TaskRow {
   dispatch_hold_until: number | null;
   /** Not a column: TASK_SELECT counts the task's attempts. */
   attempt_count: number;
+  /** Not a column: 1 when the task holds an internet grant (task_fetch_grants). */
+  fetch_granted: number;
 }
 
-/** Selects task rows with their attempt count; add WHERE and ORDER BY clauses. */
+/** Selects task rows with their attempt count and whether they hold an internet grant; add WHERE and ORDER BY clauses. */
 export const TASK_SELECT =
-  'SELECT tasks.*, (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id) AS attempt_count FROM tasks';
+  'SELECT tasks.*, (SELECT COUNT(*) FROM attempts WHERE attempts.task_id = tasks.id) AS attempt_count,' +
+  ' EXISTS (SELECT 1 FROM task_fetch_grants WHERE task_fetch_grants.task_id = tasks.id) AS fetch_granted FROM tasks';
 
 /** Submissions recorded before M2 carry no attempt or submission id. */
 type StoredSubmission = Omit<Submission, 'attemptId' | 'submissionId'> & Partial<Submission>;
@@ -76,6 +79,7 @@ export function rowToTask(row: TaskRow): Task {
     workRef: row.work_ref,
     workSha: row.work_sha,
     nextDispatchAt: row.next_dispatch_at,
+    fetchGranted: row.fetch_granted === 1,
   };
 }
 

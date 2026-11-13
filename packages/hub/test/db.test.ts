@@ -49,7 +49,7 @@ function v1Database(path: string, leadSeenAt: number): void {
 }
 
 describe('openDb', () => {
-  test('creates every table, column and index of schema version 2', () => {
+  test('creates every table, column and index of schema versions 2 and 3', () => {
     const db = openDb(':memory:', NOW);
     const tables = names(db, 'table');
     for (const name of [
@@ -74,6 +74,7 @@ describe('openDb', () => {
       'runner_event_rejects',
       'approvals',
       'lead_notes',
+      'task_fetch_grants',
     ]) {
       expect(tables).toContain(name);
     }
@@ -93,6 +94,7 @@ describe('openDb', () => {
       ]),
     );
     expect(columns(db, 'task_notes')).toContain('attempt_id');
+    expect(columns(db, 'task_fetch_grants')).toEqual(['task_id', 'granted_by', 'reason', 'granted_at']);
     expect(names(db, 'index')).toEqual(
       expect.arrayContaining([
         'attempts_task_number',
@@ -110,14 +112,30 @@ describe('openDb', () => {
     expect(versions).toEqual([
       { version: 1, applied_at: NOW },
       { version: 2, applied_at: NOW },
+      { version: 3, applied_at: NOW },
     ]);
+  });
+
+  test('a schema version 2 database gains the internet grants and keeps its rows', () => {
+    const db = openDb(':memory:', NOW);
+    // As a hub before the grants left it.
+    db.run('DROP TABLE task_fetch_grants');
+    db.run('DELETE FROM schema_migrations WHERE version = 3');
+    db.run("INSERT INTO goal_versions (version, text, author, created_at) VALUES (1, 'goal', 'user:alice', 0)");
+    migrate(db, NOW + MINUTE);
+    expect(db.query('SELECT version, applied_at FROM schema_migrations WHERE version = 3').get()).toEqual({
+      version: 3,
+      applied_at: NOW + MINUTE,
+    });
+    expect(db.query('SELECT COUNT(*) AS n FROM task_fetch_grants').get()).toEqual({ n: 0 });
+    expect(db.query('SELECT COUNT(*) AS n FROM goal_versions').get()).toEqual({ n: 1 });
   });
 
   test('migrating twice is a no-op', () => {
     const db = openDb(':memory:', NOW);
     migrate(db, NOW + MINUTE);
     const row = db.query('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number };
-    expect(row.n).toBe(2);
+    expect(row.n).toBe(3);
     expect((db.query('SELECT COUNT(*) AS n FROM hub_state').get() as { n: number }).n).toBe(1);
   });
 
@@ -126,7 +144,7 @@ describe('openDb', () => {
     const db = openDb(path, NOW);
     db.run('INSERT INTO schema_migrations (version, applied_at) VALUES (1000, 0)');
     db.close();
-    expect(() => openDb(path, NOW)).toThrow('database schema version 1000 is newer than this hub supports (2)');
+    expect(() => openDb(path, NOW)).toThrow('database schema version 1000 is newer than this hub supports (3)');
   });
 
   test('a version 1 database keeps its data and gets the defaults', () => {
