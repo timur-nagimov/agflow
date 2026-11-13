@@ -245,8 +245,9 @@ const system: CleanupHost = {
   forgetGroup(id) { rmSync(join(registry!, id), { force: true }); },
   snapshot() {
     // Never print this output: `ps e` contains environments. A clean ps environment keeps the scanner unmarked.
+    // BSD-style options only: Linux procps refuses BSD 'eww' mixed with UNIX '-ax' ("must set personality").
     return identifyProcesses(() => {
-      const result = rawSpawnSync(['ps', 'eww', '-axo', PS_COLUMNS], {
+      const result = rawSpawnSync(['ps', 'axeww', '-o', PS_COLUMNS], {
         env: { PATH: process.env.PATH, ...PS_ENV }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
       });
       if (result.exitCode !== 0) throw new Error(`test process cleanup: ps exited ${result.exitCode}`);
