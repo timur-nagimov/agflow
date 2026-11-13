@@ -220,8 +220,10 @@ export async function fetchForAgent(ctx: HubContext, token: string, rawUrl: stri
         audit(ctx, attempt.id, rawUrl, failed(error));
         throw answerFor(error);
       }
-      // A redirect led to a host whose slot is too far away: the first hop was made, so it is on the log too.
+      // A redirect led to a host whose slot is too far away: the first hop was made, so it is on the log too. So is
+      // a fault of the hub's own: the site may have the URL by then, whatever the hub made of the answer.
       if (error instanceof HubError) audit(ctx, attempt.id, rawUrl, `failed (${error.code}), 0 bytes: ${error.message}`);
+      else audit(ctx, attempt.id, rawUrl, 'failed (internal), 0 bytes: the hub could not finish the request');
       throw error;
     }
   } finally {

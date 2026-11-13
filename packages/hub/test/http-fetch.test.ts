@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { FetchUrlResponseSchema } from '@agflow/core';
 import { attemptLog } from '../src/attempt-store';
@@ -249,6 +249,42 @@ describe('the audit trail', () => {
       'note: fetch GET https://nowhere.example.org/x: failed (dns_failed), 0 bytes: nowhere.example.org could not be resolved: ENOTFOUND',
     ]);
     expect(listEvents(hub.ctx.db).length).toBe(before);
+  });
+
+  test('a connection that breaks under the body is 502 fetch_connect_failed, and the request is on the log', async () => {
+    const { hub, callers, lead } = setup({
+      script: {
+        'example.com/cut?said=something': () =>
+          new Response(
+            new ReadableStream({
+              start: (controller) => controller.enqueue(new TextEncoder().encode('begin')),
+              pull: (controller) => controller.error(Object.assign(new Error('socket closed'), { code: 'ECONNRESET' })),
+            }),
+          ),
+      },
+    });
+    // The site has the URL by now, whatever became of its answer.
+    const answer = await fetchUrl(hub, callers.lead, 'https://example.com/cut?said=something');
+    expect([answer.status, answer.json.error]).toEqual([502, 'fetch_connect_failed']);
+    expect(answer.json.bodyBase64).toBeUndefined();
+    const lines = notes(hub, lead.attempt.id);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toStartWith('note: fetch GET https://example.com/cut?said=something: failed (connect_failed), 0 bytes');
+  });
+
+  test('whatever goes wrong once the request went out, the log still holds it', async () => {
+    const { hub, callers, lead } = setup();
+    // An answer the hub cannot even read: a fault of the hub's own, which must not cost the audit line.
+    hub.ctx.agentFetch.transport = async () => ({ status: 200 }) as unknown as Response;
+    const logged = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const answer = await fetchUrl(hub, callers.lead, 'https://example.com/odd');
+      expect([answer.status, answer.json.error]).toEqual([500, 'internal']);
+      expect(logged).toHaveBeenCalled();
+    } finally {
+      logged.mockRestore();
+    }
+    expect(notes(hub, lead.attempt.id)).toEqual(['note: fetch GET https://example.com/odd: failed (internal), 0 bytes: the hub could not finish the request']);
   });
 
   test('a request refused before any fetch leaves no line: the setting, the vendor, the grant', async () => {

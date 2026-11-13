@@ -297,7 +297,13 @@ async function readBody(
   const reader = response.body?.getReader();
   if (reader) {
     for (;;) {
-      const { done, value } = await within(reader.read());
+      const { done, value } = await within(reader.read()).catch((error: unknown) => {
+        void reader.cancel().catch(() => {});
+        // The deadline passes through for the caller to word. Anything else is the connection breaking under the
+        // body: the site has the request by then, so it is a failure of the fetch, never an unknown error.
+        if (error instanceof PublicFetchError) throw error;
+        throw new PublicFetchError('connect_failed', `the connection to ${url.hostname} broke while its answer was read: ${reasonOf(error)}`);
+      });
       if (done) break;
       total += value.length;
       if (total > maxBytes) {

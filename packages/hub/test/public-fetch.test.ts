@@ -489,6 +489,43 @@ describe('limits', () => {
     expect(message).toContain('example.com');
   });
 
+  test('a connection that breaks while the body is read is a failure of the fetch, with its code', async () => {
+    // The site sent its headers and the start of the body; then the stream failed.
+    const { transport } = scripted({
+      'example.com/': () =>
+        new Response(
+          new ReadableStream({
+            start: (controller) => controller.enqueue(new TextEncoder().encode('begin')),
+            pull: (controller) => controller.error(Object.assign(new Error('socket closed'), { code: 'ECONNRESET' })),
+          }),
+        ),
+    });
+    const [code, message] = await failure(fetchPublicUrl({ resolve, transport }, 'https://example.com/'));
+    expect(code).toBe('connect_failed');
+    expect(message).toContain('example.com');
+    expect(message).toContain('ECONNRESET');
+  });
+
+  test('a site that closes the connection before the body it announced is complete is a failure, never a shorter success', async () => {
+    const listener = Bun.listen({
+      hostname: '127.0.0.1',
+      port: 0,
+      socket: {
+        data(socket) {
+          socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 1000\r\n\r\nonly the start');
+          socket.end();
+        },
+      },
+    });
+    try {
+      const real = createPinnedTransport();
+      const transport: Transport = (request, signal) => real({ ...request, address: '127.0.0.1', port: listener.port }, signal);
+      expect((await failure(fetchPublicUrl({ resolve, transport }, 'http://example.com/')))[0]).toBe('connect_failed');
+    } finally {
+      listener.stop(true);
+    }
+  });
+
   test('the defaults are 20 seconds, 10 MB and 5 redirects', async () => {
     const { PUBLIC_FETCH_LIMITS } = await import('../src/public-fetch');
     expect(PUBLIC_FETCH_LIMITS).toEqual({ timeoutMs: 20_000, maxBytes: 10 * 1024 * 1024, maxRedirects: 5 });
