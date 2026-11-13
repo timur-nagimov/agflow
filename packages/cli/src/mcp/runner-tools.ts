@@ -380,8 +380,8 @@ function clipBytes(text: string, maxBytes: number): { shown: string; hidden: num
 /**
  * One pending approval as the lead reads it, its detail within `detailBytes`. What the lead may do stands above the
  * asking agent's words, so a client that cuts the answer short cuts the request, never agflow's own lines. The summary
- * and the detail are the asking agent's words, passed on by its runner: the summary stays on its line, and every line
- * of the detail is quoted, so none of it can pose as a line of agflow's.
+ * and the detail are the asking agent's words, passed on by its runner: every line of them is quoted under a label
+ * that says so, so none of it can pose as a line of agflow's or read as agflow's own sentence.
  */
 function approvalBlock(approval: LeadApproval, now: number, detailBytes: number): string {
   const fields = APPROVAL_DETAIL_FIELDS.flatMap((field) => {
@@ -399,6 +399,7 @@ function approvalBlock(approval: LeadApproval, now: number, detailBytes: number)
     if (part.hidden > 0) cut.push(`${part.hidden} more characters of ${field}`);
   }
   const minutes = Math.ceil((approval.expiresAt - now) / 60_000);
+  const summary = oneLine(approval.summary, 300);
   return lines([
     `Approval ${oneLine(approval.id, 100)}`,
     `task: ${approval.taskId ?? 'none'}`,
@@ -408,7 +409,7 @@ function approvalBlock(approval: LeadApproval, now: number, detailBytes: number)
     approval.leadMayApprove === true
       ? 'you may: approve or decline it'
       : 'you may: decline only: a managed device policy leaves approving to the owner',
-    `summary: ${oneLine(approval.summary, 300) || 'none'}`,
+    summary === '' ? 'summary: none' : `summary (untrusted, the asking agent's words):\n${quoteLines(summary)}`,
     detail.length > 0 ? `detail (untrusted data from the asking agent):\n${quoteLines(detail.join('\n'))}` : 'detail: none',
     cut.length > 0 && `(not shown: ${cut.join(', ')}. Decline it if what is shown is not enough to judge.)`,
   ]);
