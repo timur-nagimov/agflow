@@ -2,6 +2,8 @@ import type { Database } from 'bun:sqlite';
 import { DEFAULT_INFRA_BACKOFF_MS, DEFAULT_WIP_REF_PREFIX } from '@agflow/core';
 import { openDb } from './db';
 import { type Emit, EventBus, insertEvent } from './events';
+import { FetchLimiter } from './fetch-limits';
+import { type PublicFetchLimits, type Resolver, type Transport, createPinnedTransport, systemResolver } from './public-fetch';
 
 export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -151,6 +153,21 @@ export interface RunnerLink {
 /** The link until the gateway installs itself: commands wait in runner_commands for the runner's next hello. */
 export const NO_RUNNER_LINK: RunnerLink = Object.freeze({ flush: () => {}, closeRunner: () => {} });
 
+/**
+ * What the hub fetches public URLs for agents with (design 5, Unattended options; agent-fetch.ts). Tests replace the
+ * resolver and the transport with tables and local servers, and the wait with one that moves their clock.
+ */
+export interface AgentFetchRuntime {
+  resolve: Resolver;
+  transport: Transport;
+  /** Waits for a host's slot. */
+  sleep: (ms: number) => Promise<void>;
+  /** The rate limits, in memory. */
+  limiter: FetchLimiter;
+  /** Overrides of the fetch's own limits (public-fetch.ts); none in production. */
+  limits: Partial<PublicFetchLimits>;
+}
+
 export interface HubContext {
   db: Database;
   bus: EventBus;
@@ -158,6 +175,7 @@ export interface HubContext {
   now: () => number;
   fetch: FetchFn;
   link: RunnerLink;
+  agentFetch: AgentFetchRuntime;
 }
 
 export interface ContextOptions {
@@ -166,6 +184,7 @@ export interface ContextOptions {
   now?: (() => number) | undefined;
   fetch?: FetchFn | undefined;
   link?: RunnerLink | undefined;
+  agentFetch?: Partial<AgentFetchRuntime> | undefined;
 }
 
 export function createContext(options: ContextOptions): HubContext {
@@ -182,6 +201,14 @@ export function createContext(options: ContextOptions): HubContext {
     now,
     fetch: options.fetch ?? ((input, init) => fetch(input, init)),
     link: options.link ?? NO_RUNNER_LINK,
+    agentFetch: {
+      resolve: systemResolver,
+      transport: createPinnedTransport(),
+      sleep: (ms) => Bun.sleep(ms),
+      limiter: new FetchLimiter(now),
+      limits: {},
+      ...options.agentFetch,
+    },
   };
 }
 

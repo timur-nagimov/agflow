@@ -987,6 +987,7 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 | `POST /api/fetch-submission`, `GET /api/fetch-submission/:id` | lead only: the caller must hold the seat; polling is restricted to the lead attempt that requested the fetch (section 6.13) |
 | `POST /api/inbox`, `POST /api/inbox/ack`, `POST /api/messages` | |
 | lead routes: `POST /api/tasks`, `PATCH /api/tasks/:id`, `POST /api/tasks/:id/{cancel,accept,reject,unblock,merged}`, `POST /api/goal/notes`, `POST /api/staffing`, `POST /api/agents/:id/{stop,replace}`, `POST /api/lead/handoff`, `GET /api/lead/notes` | only while the agent holds the lead seat (section 6.11). Stop and replace apply only to runner agents. |
+| `POST /api/fetch` | every runner agent, for its own attempt: the hub downloads one public URL. Refused unless `AGFLOW_AGENT_FETCH=1`, for Codex attempts, and for a worker whose task holds no grant (section 5, Unattended options) |
 | `POST /api/tasks/:id/fetch-grant`, `DELETE /api/tasks/:id/fetch-grant` | lead only: grants a task internet access and takes it back; 403 `fetch_disabled` unless `AGFLOW_AGENT_FETCH=1` (section 5, Unattended options) |
 
 `leadOrHuman` changes for every agent principal, live or runner: the agent must hold the seat (`hub_state.lead_agent_id`). For `fetch_submission`, a runner lead uses its ordinary agent token; there is no separate lead token. A live lead uses the M1 CLI token plus `X-Agflow-Agent` and gets the branch and head immediately. A person without an agent identity cannot call either fetch route.
