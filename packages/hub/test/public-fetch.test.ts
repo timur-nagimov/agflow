@@ -242,12 +242,12 @@ describe('pinning', () => {
   });
 });
 
-/** A throwaway certificate for pinned.example.test, or null where openssl is missing. */
-function selfSigned(): { cert: string; key: string } | null {
+/** A throwaway certificate for the name, or null where openssl is missing. */
+function selfSigned(name = 'pinned.example.test'): { cert: string; key: string } | null {
   const dir = mkdtempSync(join(tmpdir(), 'agflow-fetch-tls-'));
   try {
     const made = Bun.spawnSync(
-      ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-keyout', join(dir, 'key.pem'), '-out', join(dir, 'cert.pem'), '-subj', '/CN=pinned.example.test', '-addext', 'subjectAltName=DNS:pinned.example.test'],
+      ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-keyout', join(dir, 'key.pem'), '-out', join(dir, 'cert.pem'), '-subj', `/CN=${name}`, '-addext', `subjectAltName=DNS:${name}`],
       { stdout: 'ignore', stderr: 'ignore' },
     );
     if (made.exitCode !== 0) return null;
@@ -271,6 +271,29 @@ describe('TLS to a pinned address', () => {
     const [code, message] = await failure(fetchPublicUrl({ resolve, transport }, 'https://other.example.test/'));
     expect(code).toBe('connect_failed');
     expect(message).toContain('other.example.test');
+  });
+
+  test.skipIf(tls === null)('the host name goes into the handshake (SNI), so a server with a certificate per name presents the right one', async () => {
+    const second = selfSigned('second.example.test');
+    if (!second) throw new Error('openssl made one certificate but not a second');
+    // Without the name in the handshake the server could only present one of the two, and one request would fail.
+    const server = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch: (request) => new Response(`for ${request.headers.get('host')}`),
+      tls: [
+        { serverName: 'pinned.example.test', ...tls! },
+        { serverName: 'second.example.test', ...second },
+      ],
+    });
+    servers.push(server);
+    const { resolve } = resolverOf({ 'pinned.example.test': [PUBLIC], 'second.example.test': [PUBLIC] });
+    for (const [name, trusted] of [['pinned.example.test', tls!.cert], ['second.example.test', second.cert]] as const) {
+      const real = createPinnedTransport({ ca: trusted });
+      const transport: Transport = (request, signal) => real({ ...request, address: '127.0.0.1', port: server.port as number }, signal);
+      const result = await fetchPublicUrl({ resolve, transport }, `https://${name}/`);
+      expect([name, text(result.body)]).toEqual([name, `for ${name}`]);
+    }
   });
 
   test.skipIf(tls === null)('a certificate no authority vouches for is refused', async () => {
