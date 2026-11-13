@@ -50,6 +50,10 @@ export const AGENT_ROUTES: readonly AgentRoute[] = [
   // Internet grants (design 5, Unattended options); the routes refuse while AGFLOW_AGENT_FETCH is off.
   { method: 'POST', path: '/api/tasks/:id/fetch-grant', access: 'lead' },
   { method: 'DELETE', path: '/api/tasks/:id/fetch-grant', access: 'lead' },
+  // The lead answers approvals (design 6.10, Who may answer); both refuse as an unlisted route does while
+  // AGFLOW_LEAD_APPROVALS is off.
+  { method: 'GET', path: '/api/approvals', access: 'lead' },
+  { method: 'POST', path: '/api/approvals/:id', access: 'lead' },
 ];
 
 const segments = (path: string): string[] => path.split('/');

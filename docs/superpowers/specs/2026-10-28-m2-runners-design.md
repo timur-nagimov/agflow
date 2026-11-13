@@ -972,7 +972,7 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 - **Route allowlist.** Agent principals are accepted only on the routes the bridge uses. Every other route answers **403 `agent_not_allowed`**, including:
   - `/api/live/*`, `/api/cli-login/*` and `GET /api/agents`;
   - claim and resume-claim;
-  - approvals, runners, attempts, take-over and the runner gateway.
+  - approvals (unless `AGFLOW_LEAD_APPROVALS=1`, in the table below), runners, attempts, take-over and the runner gateway.
 
   The list lives in one table in `packages/hub/src/http/agent-routes-allowed.ts`. A test enumerates every mounted route and checks that each is on the list or refuses an agent token.
 
@@ -988,6 +988,7 @@ Live attempts keep `attempts.lease_expires_at` `NULL`; the M1 task lease stays a
 | `POST /api/inbox`, `POST /api/inbox/ack`, `POST /api/messages` | |
 | lead routes: `POST /api/tasks`, `PATCH /api/tasks/:id`, `POST /api/tasks/:id/{cancel,accept,reject,unblock,merged}`, `POST /api/goal/notes`, `POST /api/staffing`, `POST /api/agents/:id/{stop,replace}`, `POST /api/lead/handoff`, `GET /api/lead/notes` | only while the agent holds the lead seat (section 6.11). Stop and replace apply only to runner agents. |
 | `POST /api/tasks/:id/fetch-grant`, `DELETE /api/tasks/:id/fetch-grant` | lead only: grants a task internet access and takes it back; 403 `fetch_disabled` unless `AGFLOW_AGENT_FETCH=1` (section 5, Unattended options) |
+| `GET /api/approvals`, `POST /api/approvals/:id` | lead only, and only with `AGFLOW_LEAD_APPROVALS=1`: lists the pending approvals of other attempts and answers one; without the setting, 403 `agent_not_allowed` as on a route this table does not list (section 5, Unattended options) |
 
 `leadOrHuman` changes for every agent principal, live or runner: the agent must hold the seat (`hub_state.lead_agent_id`). For `fetch_submission`, a runner lead uses its ordinary agent token; there is no separate lead token. A live lead uses the M1 CLI token plus `X-Agflow-Agent` and gets the branch and head immediately. A person without an agent identity cannot call either fetch route.
 
@@ -1407,8 +1408,8 @@ All request and response bodies have zod schemas in `packages/core/src/api-schem
 | `POST /api/agents/:id/replace` | person (browser), or the lead for runner workers | `{ reason }` → `{ attempt }`; 409 for live chats |
 | `POST /api/tasks/:id/takeover` | person (browser) | → `202 { attemptId }`; 409 `runner_offline`, `not_running` or `submission_pending` |
 | `POST /api/tasks/:id/handback` | person (browser) | `{ source: 'clone' \| { ref, sha } }` (sha: 40 hex) → `202 { attemptId }` |
-| `GET /api/approvals` | signed in | `?status=` (a comma list) → `{ approvals: Approval[] }`, the caller's own |
-| `POST /api/approvals/:id` | owner, browser | `{ decision: 'approve' \| 'decline' }` → `{ approval }` |
+| `GET /api/approvals` | signed in; with `AGFLOW_LEAD_APPROVALS=1`, the lead's agent token | `?status=` (a comma list) → `{ approvals: Approval[] }`, the caller's own. The lead: the pending ones it may answer (every owner's, none of its own attempt), oldest first, each with `leadMayApprove` |
+| `POST /api/approvals/:id` | owner, browser; with `AGFLOW_LEAD_APPROVALS=1`, the lead's agent token | `{ decision: 'approve' \| 'decline' }` → `{ approval }`. The lead adds `reason?` (1..500, required to decline); 403 `approval_not_lead`, `approval_own`, `approval_managed` (approve on a runner whose vendor reports a managed policy, or that the hub cannot find), 400 `approval_reason_required`, 409 when no longer pending |
 | `POST /api/staffing` | seat holder or person | `{ count, vendor?, reason }` → `{ running, target }` |
 | `POST /api/tasks/:id/submit` | agent token (runner agent) | `{ summary, evidence }` only (a `branch` or `headSha` is a 400) → `202 { submission }` (live chats keep M1's `200 { task }`) |
 | `POST /api/agents/:id/interrupt` | person (browser) | → `{ ok }`; sends `interrupt` to a runner agent |
