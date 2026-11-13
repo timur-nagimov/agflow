@@ -632,28 +632,49 @@ describe('stopping', () => {
     await soon(site.connections[0]!.closed);
   });
 
-  test('a reader that does not read stops the server: about a megabyte waits in the hub, never more', async () => {
+  test('a reader that does not read stops the socket: about a megabyte waits in the hub, never more', async () => {
     let sent = { handed: 0 };
     const site = await rawServer((socket) => {
       socket.write('HTTP/1.1 200 OK\r\n\r\n');
       sent = flood(socket, { bytes: 64 * MB, ms: 8_000 });
     });
-    const response = await get(site);
-    await Bun.sleep(400);
-    const stalledAt = sent.handed;
-    // The megabyte the transport holds, and what the two ends' socket buffers took.
-    expect(stalledAt).toBeGreaterThan(MB);
-    expect(stalledAt).toBeLessThan(8 * MB);
-    await Bun.sleep(300);
-    expect(sent.handed).toBe(stalledAt);
-    expect(site.connections[0]!.isClosed()).toBe(false);
-    // Reading lets the server go on.
-    const reader = response.body!.getReader();
-    let read = 0;
-    while (read < 16 * MB) read += (await soon(reader.read())).value!.length;
-    expect(sent.handed).toBeGreaterThan(stalledAt);
-    await reader.cancel();
-    await soon(site.connections[0]!.closed);
+    // What the transport's socket had read each time the transport paused it.
+    const pausedAt: number[] = [];
+    let client: net.Socket | null = null;
+    const pause = net.Socket.prototype.pause;
+    net.Socket.prototype.pause = function (this: net.Socket) {
+      if (this.remotePort === site.port) {
+        client = this;
+        pausedAt.push(this.bytesRead);
+      }
+      return pause.call(this);
+    };
+    try {
+      const response = await get(site);
+      await Bun.sleep(400);
+      // The megabyte that may wait, and the one read that crossed it.
+      expect(pausedAt).toHaveLength(1);
+      expect(pausedAt[0]).toBeGreaterThanOrEqual(MB);
+      expect(pausedAt[0]).toBeLessThan(2.5 * MB);
+      const transportSocket = client as unknown as net.Socket;
+      const [readAtStall, handedAtStall] = [transportSocket.bytesRead, sent.handed];
+      expect(readAtStall).toBeLessThan(2.5 * MB);
+      await Bun.sleep(300);
+      // Nothing more is read, so the server stalls too: its socket and the hub's hold what it had handed over, which
+      // is the operating system's buffers and far from the 64 MB it would send.
+      expect([transportSocket.bytesRead, sent.handed]).toEqual([readAtStall, handedAtStall]);
+      expect(handedAtStall).toBeLessThan(32 * MB);
+      expect(site.connections[0]!.isClosed()).toBe(false);
+      // Reading lets the server go on.
+      const reader = response.body!.getReader();
+      let read = 0;
+      while (read < 36 * MB) read += (await soon(reader.read())).value!.length;
+      expect(sent.handed).toBeGreaterThan(handedAtStall);
+      await reader.cancel();
+      await soon(site.connections[0]!.closed);
+    } finally {
+      net.Socket.prototype.pause = pause;
+    }
   }, 15_000);
 });
 
