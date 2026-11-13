@@ -243,7 +243,7 @@ describe('the audit trail', () => {
       'note: fetch GET http://example.com/start: 200, 5 bytes, from https://www.example.com/page',
       'note: fetch GET https://example.com/missing: 404, 4 bytes',
       'note: fetch GET http://10.0.0.1/admin: refused (url_refused), 0 bytes: the URL names an IP address; name the site by its DNS host name',
-      'note: fetch GET https://inside.example.com/: refused (address_refused), 0 bytes: inside.example.com, which resolves to 10.0.0.5 (private); the hub fetches only from public internet addresses',
+      'note: fetch GET https://inside.example.com/: refused (address_refused), 0 bytes: inside.example.com resolves to an address that is not public (private); the hub fetches only from public internet addresses [inside.example.com resolves to 10.0.0.5 (private)]',
     ]);
     expect(notes(hub, lead.attempt.id)).toEqual([
       'note: fetch GET https://nowhere.example.org/x: failed (dns_failed), 0 bytes: nowhere.example.org could not be resolved: ENOTFOUND',
@@ -285,6 +285,24 @@ describe('the audit trail', () => {
       logged.mockRestore();
     }
     expect(notes(hub, lead.attempt.id)).toEqual(['note: fetch GET https://example.com/odd: failed (internal), 0 bytes: the hub could not finish the request']);
+  });
+
+  test('an address refusal tells the agent the kind of address, and the address itself only the log', async () => {
+    const { hub, callers, lead } = setup({
+      script: { 'example.com/inward': () => new Response(null, { status: 302, headers: { location: 'http://inside.example.com/admin' } }) },
+    });
+    for (const url of ['https://inside.example.com/', 'https://example.com/inward']) {
+      hub.clock.advance(60_000);
+      const answer = await fetchUrl(hub, callers.lead, url);
+      expect([url, answer.status, answer.json.error]).toEqual([url, 400, 'fetch_address_refused']);
+      expect(answer.json.message).toContain('inside.example.com');
+      expect(answer.json.message).toContain('private');
+      // Which internal address a name has is what a hostile page would want to learn through the agent.
+      expect([url, JSON.stringify(answer.json).includes('10.0.0.5')]).toEqual([url, false]);
+    }
+    const lines = notes(hub, lead.attempt.id);
+    expect(lines).toHaveLength(2);
+    for (const line of lines) expect(line).toEndWith('[inside.example.com resolves to 10.0.0.5 (private)]');
   });
 
   test('a request refused before any fetch leaves no line: the setting, the vendor, the grant', async () => {

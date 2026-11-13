@@ -88,6 +88,11 @@ export class PublicFetchError extends Error {
   constructor(
     readonly code: PublicFetchFailure,
     message: string,
+    /**
+     * What only the people who read the hub's log may know, never the agent: the address a refused name resolves to.
+     * An agent told which internal address each name has could map the hub's network for whoever steers it.
+     */
+    readonly detail: string | null = null,
   ) {
     super(message);
   }
@@ -257,8 +262,9 @@ async function pin(resolve: Resolver, url: URL, redirected: boolean): Promise<Pi
     if (kind !== 'public') {
       throw new PublicFetchError(
         'address_refused',
-        `${redirected ? 'a redirect leads to ' : ''}${host}, which resolves to ${address} (${kind}); ` +
-          'the hub fetches only from public internet addresses',
+        `${redirected ? `a redirect leads to ${host}, which resolves` : `${host} resolves`} to an address that is not ` +
+          `public (${kind}); the hub fetches only from public internet addresses`,
+        `${host} resolves to ${address} (${kind})`,
       );
     }
   }

@@ -48,15 +48,15 @@ function scripted(script: Record<string, (request: PinnedRequest) => Response>) 
 
 const redirect = (location: string, status = 302) => new Response('moved', { status, headers: { location } });
 
-/** The failure of a fetch, as [code, message]; 'no failure' when it succeeded. */
-async function failure(run: Promise<unknown>): Promise<[string, string]> {
+/** The failure of a fetch, as [code, message for the agent, detail for the log]; 'no failure' when it succeeded. */
+async function failure(run: Promise<unknown>): Promise<[string, string, string | null]> {
   try {
     await run;
   } catch (error) {
-    if (error instanceof PublicFetchError) return [error.code, error.message];
+    if (error instanceof PublicFetchError) return [error.code, error.message, error.detail];
     throw error;
   }
-  return ['no failure', ''];
+  return ['no failure', '', null];
 }
 
 const servers: { stop: (force: boolean) => unknown }[] = [];
@@ -160,10 +160,12 @@ describe('the addresses a host resolves to', () => {
     for (const [address, kind] of refused) {
       const { resolve } = resolverOf({ 'evil.example.org': [address] });
       const { transport, requests } = scripted({});
-      const [code, message] = await failure(fetchPublicUrl({ resolve, transport }, 'https://evil.example.org/'));
+      const [code, message, detail] = await failure(fetchPublicUrl({ resolve, transport }, 'https://evil.example.org/'));
       expect([address, code]).toEqual([address, 'address_refused']);
-      expect(message).toContain(address);
+      // The agent learns what kind of address the name has, not the address: that would map the hub's network for it.
       expect(message).toContain(kind);
+      expect([address, message.includes(address)]).toEqual([address, false]);
+      expect(detail).toBe(`evil.example.org resolves to ${address} (${kind})`);
       expect(requests).toEqual([]);
     }
   });

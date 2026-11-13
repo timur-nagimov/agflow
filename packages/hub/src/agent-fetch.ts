@@ -188,8 +188,10 @@ function audit(ctx: HubContext, attemptId: string, url: string, outcome: string)
   }
 }
 
+/** A failure as the log shows it: what the agent was told and, in brackets, what only the log may hold. */
 const failed = (error: PublicFetchError): string =>
-  `${REFUSALS.includes(error.code) ? 'refused' : 'failed'} (${error.code}), 0 bytes: ${error.message}`;
+  `${REFUSALS.includes(error.code) ? 'refused' : 'failed'} (${error.code}), 0 bytes: ${error.message}` +
+  `${error.detail === null ? '' : ` [${error.detail}]`}`;
 
 /**
  * POST /api/fetch: the hub downloads one public URL for the runner agent the token names. Checked in this order, each
