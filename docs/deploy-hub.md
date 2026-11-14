@@ -174,18 +174,21 @@ The allowlist is checked whenever a session verifies; removing a login invalidat
 M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. To run a
 project unattended, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
 for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login the script acts as) in
-`/etc/agflow/hub.env` and restart. Four routes then accept the header `X-Agflow-Operator: <token>`:
+`/etc/agflow/hub.env` and restart. Five routes then accept the header `X-Agflow-Operator: <token>`:
 
 | Route | Does |
 |---|---|
 | `PUT /api/operator/goal` `{ "text": string, "baseVersion": number }` | sets the project goal (the usual version check applies) |
+| `PUT /api/operator/deadline` `{ "deadline": string \| null }` | sets when the project must be done, as an ISO 8601 date and time with `Z` or an offset (`2026-11-16T18:00:00+03:00`); `null` takes it away |
 | `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
 | `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
 | `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
 
 Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it. Without the token the routes
 do not exist. A person's CLI token, which runners hold, still cannot use people's controls. The events record the
-operator's person as the actor.
+operator's person as the actor. A person signed in to the web UI can set the deadline too, with the same body on
+`PUT /api/project/deadline`. The lead sees the deadline and the time left in every situation report, and plans only
+fixes in the last hour.
 
 With an operator that merges, also set `AGFLOW_DEPENDENCIES_NEED_MERGE=1`: a dependency then counts as done only once
 it is marked merged, so the hub releases dependent tasks after their dependencies are in `main`, not at acceptance.
@@ -231,6 +234,17 @@ after a change. The details are in the
   every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
   owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
   removing the line and restarting the hub.
+
+One more setting is on by default:
+
+- **The idle nudge, `AGFLOW_IDLE_NUDGE_SECONDS` (60) and `AGFLOW_IDLE_NUDGE_MINUTES` (5).** Removes: a person noticing
+  that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the free worker
+  slots outnumber the ready tasks that can start, for `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub sends the
+  lead one message: the free slots, the ready, blocked, submitted and accepted tasks, each account's quota, the time
+  left to the deadline, and what to plan next (the spec until it is covered, then defects, missing tests, demo polish
+  and new features, and only fixes in the last hour). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
+  `lead.idle_nudged` records each one. `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk: the lead keeps adding work
+  until the deadline, so the subscriptions stay in use; pause the project, or set a lower worker target, to stop it.
 
 ### What agents fetched
 

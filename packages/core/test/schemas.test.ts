@@ -192,6 +192,11 @@ describe('unknown keys', () => {
     ).toBe(false);
   });
 
+  test('a goal holds a whole spec: up to 200,000 characters', () => {
+    expect(UpdateGoalInputSchema.safeParse({ text: 'g'.repeat(200_000), baseVersion: 0 }).success).toBe(true);
+    expect(UpdateGoalInputSchema.safeParse({ text: 'g'.repeat(200_001), baseVersion: 0 }).success).toBe(false);
+  });
+
   test('query schemas stay loose, because proxies and caches add parameters', () => {
     expect(LiveSessionQuerySchema.safeParse({ vendor: 'claude', sessionId: 's', t: '1' }).success).toBe(true);
     expect(GoalDiffQuerySchema.safeParse({ from: '1', to: '2', t: '1' }).success).toBe(true);

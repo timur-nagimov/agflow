@@ -12,6 +12,7 @@ import {
   formatMessages,
   isHeld,
   isTaskBranch,
+  liveChatOnlyReason,
   quoteLines,
   taskBranchName,
 } from '@agflow/core';
@@ -257,16 +258,19 @@ export const sharedTools: ToolDef[] = [
   ),
   defineTool(
     'send_message',
-    'Send a message. "to" is "lead", "humans", "all" (lead only), "agent:A-<n>" or "task:T-<n>".',
+    'Send a message. "to" is "lead", "humans", "all" (lead only), "agent:A-<n>" or "task:T-<n>". ' +
+      'standing_rule (lead only) makes it a standing rule: every agent\'s brief shows it from now on, so use it for the ' +
+      "project's conventions.",
     {
       to: TargetSchema,
       body: z.string().min(1).max(8000),
       task_id: TaskIdSchema.optional(),
       reply_to: z.number().int().positive().optional(),
+      standing_rule: z.boolean().optional(),
     },
-    async ({ to, body, task_id, reply_to }, ctx) => {
-      const { message } = await asAgent(ctx).send({ to, body, taskId: task_id, replyTo: reply_to });
-      return `Sent message #${message.id} to ${message.to}.`;
+    async ({ to, body, task_id, reply_to, standing_rule }, ctx) => {
+      const { message } = await asAgent(ctx).send({ to, body, taskId: task_id, replyTo: reply_to, standingRule: standing_rule });
+      return `Sent ${message.standingRule ? 'standing rule' : 'message'} #${message.id} to ${message.to}.`;
     },
   ),
   defineTool('search', 'Search tasks, messages and the goal by text.', { query: z.string().min(1).max(200) }, async ({ query }, ctx) => {
@@ -447,9 +451,11 @@ export const leadTools: ToolDef[] = [
     async (_args, ctx) => {
       const status = await hub(ctx).status();
       const counts = Object.entries(status.counts).map(([state, n]) => `${state} ${n}`).join(' · ') || 'none';
+      const { deadlineAt } = status.project;
       return lines([
         `Project: ${status.project.name}${status.project.paused ? ' (PAUSED)' : ''}`,
         `Goal: v${status.goalVersion}`,
+        `Deadline: ${typeof deadlineAt === 'number' ? new Date(deadlineAt).toISOString() : 'none'}`,
         `Lead: ${status.lead ? `${status.lead.id} (${status.lead.user})` : 'none'}`,
         `Tasks: ${counts}`,
         `Active agents: ${status.activeAgents}`,
@@ -463,7 +469,16 @@ export const leadTools: ToolDef[] = [
     { tasks: z.array(NewTaskSchema).min(1).max(20) },
     async ({ tasks }, ctx) => {
       const created = await asAgent(ctx).createTasks(tasks);
-      return `Created:\n${created.tasks.map(taskLine).join('\n')}`;
+      // A task that owns a path no runner agent may change waits for a person's live chat (design 7.3).
+      const kept = created.tasks.flatMap((task) => {
+        const why = liveChatOnlyReason(task);
+        return why === null ? [] : [`- ${task.id}: ${why}`];
+      });
+      return lines([
+        `Created:\n${created.tasks.map(taskLine).join('\n')}`,
+        kept.length > 0 &&
+          `No runner agent will run these; they wait for a person's live chat, since they own paths runner agents may not change:\n${kept.join('\n')}`,
+      ]);
     },
   ),
   defineTool(

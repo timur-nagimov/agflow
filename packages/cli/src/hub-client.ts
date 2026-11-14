@@ -96,6 +96,8 @@ export interface MessageBody {
   body: string;
   taskId?: string | undefined;
   replyTo?: number | undefined;
+  /** A standing rule, shown in every brief: people and the lead only. */
+  standingRule?: boolean | undefined;
 }
 
 const q = encodeURIComponent;

@@ -3,7 +3,7 @@ import { type Attempt, attemptId } from '@agflow/core';
 import { getAttempt, insertAttempt, issueFence, nextAttemptNumber, updateAttempt } from '../src/attempt-store';
 import { BRIEF_HANDOFF_LIMIT, buildBrief } from '../src/brief';
 import { type HubContext, tx } from '../src/context';
-import { updateGoal } from '../src/goal';
+import { GOAL_CUT, updateGoal } from '../src/goal';
 import { HANDOFF_NOTE_LIMIT, assembleHandoffNote, assembleLeadHandoff, handoffWritten } from '../src/handoff';
 import { sendMessage } from '../src/messages';
 import { addNote } from '../src/task-store';
@@ -379,7 +379,7 @@ describe('assembled lead handoff', () => {
       '## Earlier messages the lead sent since the newest lead handoff, newest first',
       '## The lead handoff the previous lead started from',
       '## Situation report',
-      '## Goal (v1), as people set it; your brief has all of it',
+      '## Goal (v1), as people set it',
     ]);
     const last = section(body, '## The last 20 messages to and from the lead, newest first');
     expect(found(last, /> talk \d+/g)).toEqual(Array.from({ length: 20 }, (_, n) => `> talk ${20 - n}`));
@@ -389,13 +389,23 @@ describe('assembled lead handoff', () => {
     const started = section(body, '## The lead handoff the previous lead started from');
     expect(started).toContain(`agent:${earlierLead.agent.id} wrote it:\n> an earlier lead handoff`);
     expect(body).toContain('## Situation report\nTasks:');
-    expect(section(body, '## Goal (v1), as people set it; your brief has all of it')).toBe(
-      '## Goal (v1), as people set it; your brief has all of it\nShip the parser',
-    );
+    expect(section(body, '## Goal (v1), as people set it')).toBe('## Goal (v1), as people set it\nShip the parser');
     expect(body).not.toContain('before the handoff');
     expect(body).not.toContain('not for the lead');
     expect(framing(body).filter((line) => line.includes(POSING))).toEqual([]);
     expect(body.endsWith(LEAD_CLOSING)).toBe(true);
+  });
+
+  test('cuts a long goal with the line that names get_goal, which has all of it', () => {
+    const { ctx } = createTestContext();
+    updateGoal(ctx, { text: `${'requirement\n'.repeat(200)}the last requirement`, baseVersion: 0 }, 'user:alice');
+    const lead = addRunnerLead(ctx);
+    const { body } = assembleLeadHandoff(ctx, endAttempt(ctx, lead.attempt, 'lost'));
+    const goal = section(body, '## Goal (v1), as people set it');
+    expect(goal).toEndWith(GOAL_CUT);
+    expect(goal.length).toBeLessThanOrEqual('## Goal (v1), as people set it\n'.length + 800);
+    expect(body).not.toContain('the last requirement');
+    expect(body).not.toContain('your brief has all of it');
   });
 
   test("puts the newest people's messages in the next lead's brief, whatever the goal and the board", () => {

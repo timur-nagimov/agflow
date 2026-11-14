@@ -20,6 +20,10 @@ export interface HubRunnerSettings {
   recoveryMs: number;
   approvalMs: number;
   leadReviewMs: number;
+  /** How long free worker slots must outnumber the dispatchable ready tasks before the runner lead is nudged. */
+  idleNudgeMs: number;
+  /** The least time between two idle nudges; 0 turns them off. */
+  idleNudgeIntervalMs: number;
   liveLeadGraceMs: number;
   quotaWaitMaxMs: number;
   quotaUnknownMs: number;
@@ -69,6 +73,8 @@ export const HUB_RUNNER_DEFAULTS: Readonly<HubRunnerSettings> = Object.freeze({
   recoveryMs: 2 * MINUTE,
   approvalMs: 15 * MINUTE,
   leadReviewMs: 45 * MINUTE,
+  idleNudgeMs: 60 * SECOND,
+  idleNudgeIntervalMs: 5 * MINUTE,
   liveLeadGraceMs: 120 * MINUTE,
   quotaWaitMaxMs: 45 * MINUTE,
   quotaUnknownMs: 30 * MINUTE,

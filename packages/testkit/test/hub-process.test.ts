@@ -59,8 +59,8 @@ describe('E2E_HUB_TIMINGS', () => {
     }
     expect(deadLinkMs).toBeGreaterThanOrEqual(3 * heartbeatMs);
     expect(runnerLeaseMs).toBeGreaterThan(deadLinkMs);
-    const { stallMs, toolCapMs, longToolCapMs, leadReviewMs, activeBudgetMs } = E2E_HUB_TIMINGS;
-    for (const judgement of [stallMs, toolCapMs, longToolCapMs, leadReviewMs, activeBudgetMs]) {
+    const { stallMs, toolCapMs, longToolCapMs, leadReviewMs, idleNudgeMs, activeBudgetMs } = E2E_HUB_TIMINGS;
+    for (const judgement of [stallMs, toolCapMs, longToolCapMs, leadReviewMs, idleNudgeMs, activeBudgetMs]) {
       expect(judgement).toBeGreaterThanOrEqual(60 * 60_000);
     }
   });

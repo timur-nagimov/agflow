@@ -94,6 +94,8 @@ describe('loadConfig: runner settings', () => {
       recoveryMs: 2 * MINUTE,
       approvalMs: 15 * MINUTE,
       leadReviewMs: 45 * MINUTE,
+      idleNudgeMs: 60_000,
+      idleNudgeIntervalMs: 5 * MINUTE,
       liveLeadGraceMs: 120 * MINUTE,
       quotaWaitMaxMs: 45 * MINUTE,
       quotaUnknownMs: 30 * MINUTE,
@@ -139,6 +141,8 @@ describe('loadConfig: runner settings', () => {
       AGFLOW_RECOVERY_SECONDS: '45',
       AGFLOW_APPROVAL_MINUTES: '16',
       AGFLOW_LEAD_REVIEW_MINUTES: '46',
+      AGFLOW_IDLE_NUDGE_SECONDS: '90',
+      AGFLOW_IDLE_NUDGE_MINUTES: '7',
       AGFLOW_LIVE_LEAD_GRACE_MINUTES: '121',
       AGFLOW_QUOTA_WAIT_MINUTES: '47',
       AGFLOW_QUOTA_UNKNOWN_MINUTES: '32',
@@ -160,6 +164,8 @@ describe('loadConfig: runner settings', () => {
       recoveryMs: 45_000,
       approvalMs: 16 * MINUTE,
       leadReviewMs: 46 * MINUTE,
+      idleNudgeMs: 90_000,
+      idleNudgeIntervalMs: 7 * MINUTE,
       liveLeadGraceMs: 121 * MINUTE,
       quotaWaitMaxMs: 47 * MINUTE,
       quotaUnknownMs: 32 * MINUTE,
@@ -174,6 +180,18 @@ describe('loadConfig: runner settings', () => {
       // A longer lease gives WIP pushes a longer grace.
       wipGraceMs: 10 * MINUTE,
     });
+  });
+
+  test('AGFLOW_IDLE_NUDGE_MINUTES 0 turns the idle nudge off; its seconds stay positive', () => {
+    expect(loadConfig({ ...base, AGFLOW_IDLE_NUDGE_MINUTES: '0' }).config.idleNudgeIntervalMs).toBe(0);
+    expect(loadConfig({ ...base, AGFLOW_IDLE_NUDGE_MINUTES: '' }).config.idleNudgeIntervalMs).toBe(5 * MINUTE);
+    for (const value of ['-1', '1.5', 'off']) {
+      expect(() => loadConfig({ ...base, AGFLOW_IDLE_NUDGE_MINUTES: value })).toThrow('AGFLOW_IDLE_NUDGE_MINUTES');
+    }
+    expect(() => loadConfig({ ...base, AGFLOW_IDLE_NUDGE_SECONDS: '0' })).toThrow('AGFLOW_IDLE_NUDGE_SECONDS');
+    // In test mode AGFLOW_TEST_CONFIG may turn it off too.
+    const off = loadConfig({ ...base, AGFLOW_TEST: '1', AGFLOW_TEST_CONFIG: JSON.stringify({ idleNudgeIntervalMs: 0 }) });
+    expect(off.config.idleNudgeIntervalMs).toBe(0);
   });
 
   test('refuses a WIP ref prefix or main branch git would not take', () => {

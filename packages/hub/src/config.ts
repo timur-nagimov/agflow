@@ -45,6 +45,7 @@ const RUNNER_VARIABLES: readonly (readonly [CountField, string, number])[] = [
   ['recoveryMs', 'AGFLOW_RECOVERY_SECONDS', SECOND],
   ['approvalMs', 'AGFLOW_APPROVAL_MINUTES', MINUTE],
   ['leadReviewMs', 'AGFLOW_LEAD_REVIEW_MINUTES', MINUTE],
+  ['idleNudgeMs', 'AGFLOW_IDLE_NUDGE_SECONDS', SECOND],
   ['liveLeadGraceMs', 'AGFLOW_LIVE_LEAD_GRACE_MINUTES', MINUTE],
   ['quotaWaitMaxMs', 'AGFLOW_QUOTA_WAIT_MINUTES', MINUTE],
   ['quotaUnknownMs', 'AGFLOW_QUOTA_UNKNOWN_MINUTES', MINUTE],
@@ -82,6 +83,9 @@ const TestConfigSchema = z.strictObject({
   recoveryMs: Milliseconds.optional(),
   approvalMs: Milliseconds.optional(),
   leadReviewMs: Milliseconds.optional(),
+  idleNudgeMs: Milliseconds.optional(),
+  // 0 turns the idle nudge off.
+  idleNudgeIntervalMs: z.number().int().min(0).optional(),
   liveLeadGraceMs: Milliseconds.optional(),
   quotaWaitMaxMs: Milliseconds.optional(),
   quotaUnknownMs: Milliseconds.optional(),
@@ -127,6 +131,13 @@ function runnerSettings(env: Env, testMode: boolean): HubRunnerSettings {
       throw new Error(`${variable} must be at least ${minimum / unit} outside test mode (AGFLOW_TEST=1)`);
     }
     settings[key] = value;
+  }
+  // Read apart from the counts above, since 0 is allowed: it turns the idle nudge off.
+  const nudgeMinutes = env.AGFLOW_IDLE_NUDGE_MINUTES;
+  if (nudgeMinutes) {
+    const minutes = Number(nudgeMinutes);
+    if (!Number.isInteger(minutes) || minutes < 0) throw new Error('AGFLOW_IDLE_NUDGE_MINUTES must be 0 or a positive integer');
+    settings.idleNudgeIntervalMs = minutes * MINUTE;
   }
   if (env.AGFLOW_WIP_REF_PREFIX) {
     if (!isValidWipRefPrefix(env.AGFLOW_WIP_REF_PREFIX)) {

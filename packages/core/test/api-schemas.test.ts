@@ -22,6 +22,7 @@ import {
   BRIDGE_ANSWERS,
   BRIDGE_HEADER,
   BRIDGE_VERSION,
+  DeadlineInputSchema,
   HUB_EVENT_TYPES,
   FetchGrantInputSchema,
   FetchUrlInputSchema,
@@ -294,7 +295,13 @@ const prepareRequest: PrepareRequest = {
   finishedAt: at + 20_000,
 };
 
-const project: Project = { name: 'demo', repo: 'https://github.com/acme/demo', paused: false, runnerLeads: false };
+const project: Project = {
+  name: 'demo',
+  repo: 'https://github.com/acme/demo',
+  paused: false,
+  runnerLeads: false,
+  deadlineAt: null,
+};
 
 const parses = (schema: z.ZodType, value: unknown) => schema.safeParse(value).success;
 
@@ -319,6 +326,7 @@ describe('request bodies', () => {
     ['PrepareInputSchema', PrepareInputSchema, {}],
     ['LeadHandoffInputSchema', LeadHandoffInputSchema, { note: 'T-42 waits for review.' }],
     ['ProjectPatchInputSchema', ProjectPatchInputSchema, { runnerLeads: false }],
+    ['DeadlineInputSchema', DeadlineInputSchema, { deadline: null }],
     ['FetchGrantInputSchema', FetchGrantInputSchema, { reason: 'the task compares public price lists' }],
     ['FetchUrlInputSchema', FetchUrlInputSchema, { url: 'https://example.com/data.csv' }],
   ];
@@ -329,6 +337,17 @@ describe('request bodies', () => {
       expect(parses(schema, { ...body, bogus: 1 })).toBe(false);
     });
   }
+
+  test('a deadline is an ISO 8601 date and time with Z or an offset, or null to take it away', () => {
+    expect(parses(DeadlineInputSchema, { deadline: '2026-11-16T18:00:00+03:00' })).toBe(true);
+    expect(parses(DeadlineInputSchema, { deadline: '2026-11-16T15:00:00Z' })).toBe(true);
+    expect(parses(DeadlineInputSchema, { deadline: null })).toBe(true);
+    // A time without a zone would mean another hour on each laptop.
+    expect(parses(DeadlineInputSchema, { deadline: '2026-11-16T18:00:00' })).toBe(false);
+    expect(parses(DeadlineInputSchema, { deadline: Date.UTC(2026, 10, 16, 15) })).toBe(false);
+    expect(parses(DeadlineInputSchema, { deadline: 'tomorrow' })).toBe(false);
+    expect(parses(DeadlineInputSchema, {})).toBe(false);
+  });
 
   test('an internet grant needs a reason of 1 to 500 characters, and a fetch a URL of at most 2000', () => {
     expect(parses(FetchGrantInputSchema, { reason: '' })).toBe(false);
@@ -608,6 +627,8 @@ describe('responses', () => {
     // A refusal is an error status with a code, never a 200 that says ok: false.
     expect(parses(OkResponseSchema, { ok: false })).toBe(false);
     expect(parses(ProjectSchema, { ...project, runnerLeads: undefined })).toBe(false);
+    expect(parses(ProjectSchema, { ...project, deadlineAt: Date.UTC(2026, 10, 16, 15) })).toBe(true);
+    expect(parses(ProjectSchema, without(project, 'deadlineAt'))).toBe(false);
     expect(parses(LeadSeatSchema, leadSeat)).toBe(true);
     const empty = { kind: 'none', agentId: null, attemptId: null, runnerId: null, since: null, wakeups: 0, runnerLeads: false };
     expect(parses(LeadSeatSchema, empty)).toBe(true);

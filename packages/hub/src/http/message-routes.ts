@@ -22,7 +22,10 @@ export function mountMessageRoutes(app: App, ctx: HubContext): void {
   app.post('/api/messages', async (c) => {
     const p = agentOrHuman(c);
     const input = await readBody(c, SendMessageInputSchema);
-    if (input.standingRule && p.agent) throw forbidden('only people can set standing rules');
+    // The lead sets the project's conventions; every brief shows its rules apart from people's.
+    if (input.standingRule && p.agent && !holdsSeat(ctx, p.agent.id)) {
+      throw forbidden('only people and the lead can set standing rules');
+    }
     if (input.to === 'all' && p.agent && !holdsSeat(ctx, p.agent.id)) {
       throw forbidden('only the lead or a person can message everyone');
     }
