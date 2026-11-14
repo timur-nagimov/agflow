@@ -113,7 +113,7 @@ function executor(f: RunnerFixture, overrides: Partial<ControllerDeps> = {}) {
       saveRunnerConfig(f.paths.config, config);
     },
     outbox: f.outbox,
-    vault: f.vault,
+    vault: () => f.vault,
     local: f.local,
     remote: deps.remote,
     wipRefPrefix: () => FIXTURE_WIP_PREFIX,

@@ -454,6 +454,14 @@ describe('welcome', () => {
       expect([prefix, fromHub({ ...welcome, wipRefPrefix: prefix }).ok]).toEqual([prefix, false]);
     }
   });
+
+  test("protocol 3 may name the hub's project, with its name and repository and nothing else", () => {
+    const project = { name: 'afisha', repo: 'https://github.com/acme/afisha' };
+    expect(fromHub({ ...welcome, project })).toEqual({ ok: true, value: { ...welcome, project } });
+    expect(fromHub({ ...welcome, project: { name: 'afisha' } }).ok).toBe(false);
+    expect(fromHub({ ...welcome, project: { ...project, deadline: null } }).ok).toBe(false);
+    expect(fromHub({ ...welcome, project: { ...project, name: '' } }).ok).toBe(false);
+  });
 });
 
 describe('the events envelope', () => {
@@ -553,7 +561,7 @@ describe('commands', () => {
   test('COMMAND_MIN_PROTOCOL maps all 17 kinds to 1', () => {
     expect(Object.keys(COMMAND_MIN_PROTOCOL).sort()).toEqual([...RUNNER_COMMAND_KINDS].sort());
     for (const kind of RUNNER_COMMAND_KINDS) expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, 1]);
-    expect(PROTOCOL_VERSION).toBe(2);
+    expect(PROTOCOL_VERSION).toBe(3);
   });
 
   test('start_attempt and resume_attempt carry an agent token', () => {
@@ -1064,7 +1072,7 @@ describe('runner events', () => {
 });
 
 test('protocol 2 names exact settings answers and bounds the hello watermark to its outbox', () => {
-  expect(PROTOCOL_VERSION).toBe(2);
+  expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(2);
   const command = { kind: 'update_settings', settings: {}, version: 4,
     answers: { seq: 42, outboxEpoch: 'epoch', refused: true } } as const;
   expect(RunnerCommandSchema.parse(command)).toEqual(command);

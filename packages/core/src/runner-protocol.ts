@@ -21,7 +21,7 @@ import type {
   VendorQuota,
 } from './types';
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** The WebSocket close codes the hub ends a runner's link with. */
 export const CLOSE_CODES = {
@@ -177,6 +177,11 @@ export type HubMessage =
       stop: { attemptId: string; reason: string }[];
       /** They override runner.json. wipGraceMs, runnerLeaseMs / 3, bounds WIP pushes during a link outage (7.3). */
       timings: { heartbeatMs: number; deadLinkMs: number; handoffMs: number; wipGraceMs: number };
+      /**
+       * Protocol 3: the hub's project. A runner whose vault holds another one opens this project's vault, as after a
+       * project reset; older runners get no project.
+       */
+      project?: { name: string; repo: string };
     }
   | { t: 'ack'; outboxEpoch: string; seq: number } // cumulative
   | { t: 'heartbeat_ack'; at: number; hubTime: number }
@@ -778,6 +783,7 @@ export const HubMessageSchema = schemaFor<HubMessage>()(
         handoffMs: PositiveInt,
         wipGraceMs: PositiveInt,
       }),
+      project: z.strictObject({ name: Name, repo: Name }).optional(),
     }),
     z.strictObject({ t: z.literal('ack'), outboxEpoch: Name, seq: NonNegativeInt }),
     z.strictObject({ t: z.literal('heartbeat_ack'), at: NonNegativeInt, hubTime: NonNegativeInt }),
