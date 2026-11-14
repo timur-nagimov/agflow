@@ -134,6 +134,30 @@ describe('createRunner', () => {
     expect(store.get('T-4-a1')?.state).toBe('stopped');
   });
 
+  test('a preflight that throws reports a vendor that is not ready, and no policy fact it did not read', async () => {
+    const s = await setup();
+    const codex = new FakeAdapter({ vendor: 'codex', skipAuthChecks: true, script: { turns: [[]] } });
+    codex.preflight = async () => {
+      throw new Error('the app-server did not start');
+    };
+    const claude = new FakeAdapter({ vendor: 'claude', skipAuthChecks: true, script: { turns: [[]] } });
+    await s.start({ adapters: [claude, codex] });
+    const [hello] = await s.hub.waitFor(() => hellos(s.hub).length > 0 && hellos(s.hub));
+    expect(s.hub.invalid).toEqual([]);
+    const vendors = Object.fromEntries((hello?.vendors ?? []).map((vendor) => [vendor.vendor, vendor]));
+    // Both policy facts stay closed: managed configuration it never saw is not reported absent.
+    expect(vendors.codex).toMatchObject({
+      ready: false,
+      problem: 'the preflight failed: the app-server did not start',
+      cliVersion: null,
+      accountId: null,
+      plan: null,
+      managedPolicy: true,
+      approvalsReservedToOwner: true,
+    });
+    expect(vendors.claude).toMatchObject({ ready: true, managedPolicy: false, approvalsReservedToOwner: false });
+  });
+
   test("the project's name and repo come from GET /api/status and are cached for the next start", async () => {
     const s = await setup();
     const first = await s.start();
