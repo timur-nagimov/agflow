@@ -944,7 +944,7 @@ export class AttemptController {
     }
     await this.recallPushedWork(workspace.startSha);
     const prep = await this.prepareDependencies(spec, workspace);
-    if (prep.error !== null) throw new Error(`dependency preparation failed: ${prep.error}`);
+    this.checkPreparation(prep.error);
     await startStep('cannot verify the clone', () =>
       finishWorkspace(this.deps, spec, workspace, { prepared: prep.ran }),
     );
@@ -1115,7 +1115,7 @@ export class AttemptController {
       for (const path of fresh) this.reported.add(path);
     }
     const prep = await this.prepareDependencies(spec, workspace);
-    if (prep.error !== null) throw new Error(`dependency preparation failed: ${prep.error}`);
+    this.checkPreparation(prep.error);
     await startStep('cannot verify the clone', () =>
       finishWorkspace(this.deps, spec, workspace, { prepared: prep.ran }),
     );
@@ -2082,6 +2082,16 @@ export class AttemptController {
     const { ok, error, logTail } = outcome;
     this.report(spec.fence, { type: 'attempt.prepared', data: { requestId: null, ok, error, logTail } });
     return { ran: true, error: ok ? null : (error ?? 'the preparation failed') };
+  }
+
+  /**
+   * A failed preparation fails the start or resume. Under the open profile the agent starts anyway: it has the network
+   * and can install for itself, and a config an agent broke on main must not keep every worker from fixing it.
+   */
+  private checkPreparation(error: string | null): void {
+    if (error !== null && this.deps.config().profile !== 'open') {
+      throw new Error(`dependency preparation failed: ${error}`);
+    }
   }
 
   /** attempt.failed_to_start for a start the runner tried: refused null, class infra, the error clipped. */
