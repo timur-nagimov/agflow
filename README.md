@@ -8,7 +8,7 @@ See the [project design](docs/superpowers/specs/2026-10-26-agflow-design.md) and
 
 M1's hub, web UI and live-chat bridge are built. M2 adds runners that start and supervise Claude Code and Codex agents on teammates' laptops: scheduling, WIP recovery, lead failover, approvals, dependency preparation and take-over. Automated tests use scripted model servers; the [live exit run](docs/m2-live-run.md) with real Claude and Codex subscriptions passed on 2026-11-12 (116 of 116 checks).
 
-M2 runners support **macOS on Apple silicon (`darwin-arm64`) only**. The hub and ordinary unit tests also run on Linux. The lead still accepts or rejects submissions, and people mark tasks merged. Verification clones, reviewers, PRs and the merge queue belong to M3; usage dashboards and repository-derived context belong to M4.
+M2 runners run on **macOS on Apple silicon (`darwin-arm64`)**, and on Linux (`linux-x64`, `linux-arm64`) as a [cloud runner](docs/linux-runner.md) that keeps working while the laptops sleep. The hub and ordinary unit tests also run on Linux. The lead still accepts or rejects submissions, and people mark tasks merged. Verification clones, reviewers, PRs and the merge queue belong to M3; usage dashboards and repository-derived context belong to M4.
 
 For a shared Linux hub with HTTPS, GitHub sign-in, backups and two Mac runners, follow the [hub deployment runbook](docs/deploy-hub.md).
 
@@ -93,7 +93,7 @@ agflow runner setup
 agflow runner status
 ```
 
-Setup records the machine identity, login-shell PATH, proxy/certificate settings and git commit identity in `~/.agflow/runner/runner.json` (mode 0600). Defaults include capacity 2, keep-awake on AC and paid usage off. It installs pinned vendor binaries into its own vendor directory, logs in to separate runner vendor homes, and installs the macOS LaunchAgent. It leaves your own vendor installations alone. `--relogin` repeats vendor logins; `--no-service` omits service installation; `--yes` accepts setup defaults.
+Setup records the machine identity, login-shell PATH, proxy/certificate settings and git commit identity in `~/.agflow/runner/runner.json` (mode 0600). Defaults include capacity 2, keep-awake on AC and paid usage off. It installs pinned vendor binaries into its own vendor directory, logs in to separate runner vendor homes, and installs the service: the macOS LaunchAgent, or a systemd user unit on Linux, where Codex signs in with a device code and Claude with a `claude setup-token` token ([Linux runner](docs/linux-runner.md)). It leaves your own vendor installations alone. `--relogin` repeats vendor logins; `--no-service` omits service installation; `--yes` accepts setup defaults.
 
 Checks run **inside the service**: hub identity, repository access (`git ls-remote`), a fenced create/delete push to a probe ref, both vendor preflights (including the expected MCP surface), the dependency sandbox, and sleep settings. The runner needs your git credentials for vault fetches and pushes. It captures connectivity settings because a LaunchAgent does not inherit an interactive shell. A missing pinned binary at start is a preflight failure; start never downloads one.
 
@@ -101,11 +101,11 @@ Checks run **inside the service**: hub identity, repository access (`git ls-remo
 |---|---|
 | `agflow runner setup` | Interactive setup and checks; rerun after moving to another machine or retiring the runner. |
 | `agflow runner start` | Run in the foreground, with terminal and file logs; Ctrl-C suspends attempts and saves WIP. Only one instance runs. |
-| `agflow runner install` | Install/enable/start `~/Library/LaunchAgents/dev.agflow.runner.plist` in the logged-in macOS desktop session; also installs missing pins. |
+| `agflow runner install` | Install/enable/start `~/Library/LaunchAgents/dev.agflow.runner.plist` in the logged-in macOS desktop session, or on Linux `~/.config/systemd/user/agflow-runner.service` with lingering; also installs missing pins. |
 | `agflow runner status` | Query the running runner; without its socket, report best-effort service state, last exit and log tail. `--json` includes attempts and process identities. |
 | `agflow runner drain` | Take no new attempts; current work continues. Offline changes are sent at reconnect. |
 | `agflow runner undrain` | Accept work again and clear the crash-loop guard. |
-| `agflow runner restart` | Suspend attempts, save WIP and restart under launchd. |
+| `agflow runner restart` | Suspend attempts, save WIP and restart the service (launchd, or systemd on Linux). |
 | `agflow runner stop` | Drain, hand off and stop agents, push WIP, then stop and disable the service until install/start. |
 | `agflow runner uninstall` | Stop, log out of runner vendor homes, retire on the hub and remove the service. `--purge` also removes runner data, vaults and work only after checking for unpushed WIP. |
 
@@ -246,7 +246,7 @@ bun run check:codex-sandbox    # AGFLOW_SMOKE=1 + AGFLOW_SANDBOX_CHECKS=1
 bun run e2e                    # AGFLOW_E2E=1; scripted models, both vendors, kept awake
 ```
 
-`bun test` and `bun run typecheck` are the baseline CI gate; UI changes also need `bun run check:ui`. Adapter smoke tests use `AGFLOW_SMOKE=1`; sandbox checks additionally use `AGFLOW_SANDBOX_CHECKS=1`. Run both vendors' smoke and sandbox checks on a supported Mac. Platform-specific tests skip on Linux because **the runner supports darwin-arm64 only; design 7.1**. The E2E gate (`AGFLOW_E2E=1 bun run e2e`) uses a local hub, three scratch runner homes, a bare origin and scripted servers on loopback; once enabled, missing prerequisites fail instead of silently skipping. It covers killed agents, closed laptops, lost leads, runner/hub restarts, hub restore, mid-turn delivery and take-over/hand-back. These scripted checks spend no model quota; vendor processes use isolated homes and a refusing external proxy.
+`bun test` and `bun run typecheck` are the baseline CI gate; UI changes also need `bun run check:ui`. Adapter smoke tests use `AGFLOW_SMOKE=1`; sandbox checks additionally use `AGFLOW_SANDBOX_CHECKS=1`. Run both vendors' smoke and sandbox checks on a supported Mac. Platform-specific tests skip on Linux because they check macOS behaviour (design 7.1); the Linux runner's branches are tested on every platform, with the platform passed in. The E2E gate (`AGFLOW_E2E=1 bun run e2e`) uses a local hub, three scratch runner homes, a bare origin and scripted servers on loopback; once enabled, missing prerequisites fail instead of silently skipping. It covers killed agents, closed laptops, lost leads, runner/hub restarts, hub restore, mid-turn delivery and take-over/hand-back. These scripted checks spend no model quota; vendor processes use isolated homes and a refusing external proxy.
 
 `AGFLOW_TEST=1` enables hub test mode. `AGFLOW_TEST_CONFIG` is a JSON object of recognized `HubConfig` millisecond fields (including `infraBackoffMs`, an array), for example `'{"runnerLeaseMs":30000,"tickMs":100}'`. Unknown fields and non-positive values are refused; setting it without test mode is an error. Runner test mode can redirect vendors to scripted servers, skip auth checks and allow short timings through the `test` block in `runner.json`. It posts no notifications and refuses service installation.
 

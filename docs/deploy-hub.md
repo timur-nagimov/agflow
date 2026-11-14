@@ -267,6 +267,8 @@ What still needs a person:
 
 Requires Apple silicon macOS (`darwin-arm64`), Bun 1.3.11, git and working access to the project repo. Each person needs their own supported Claude/Codex subscription/login; authenticate git separately so fetches and pushes work. Vendor policy (including managed Codex policy) must permit the runner; agflow does not bypass it. These setup commands intentionally install a real per-user LaunchAgent and prompt for vendor login: the human runs them on their own Mac.
 
+A runner on a Linux VM keeps working while the Macs sleep; [linux-runner.md](linux-runner.md) creates and sets one up.
+
 Build from the same release as the hub (a source archive works; no server secrets are needed):
 
 ```bash
