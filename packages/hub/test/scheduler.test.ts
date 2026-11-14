@@ -293,6 +293,9 @@ describe('dispatch', () => {
     const [agents] = tasks(ctx, { title: 'Agent notes', ownedPaths: ['AGENTS.md'] });
     expect(tick(ctx)).toEqual([]);
     expect(statusOf(ctx, agents as string)).toBe('ready');
+    // It is not left to live chats: the first runner with the open profile takes it.
+    const open = addRunner(ctx, { profile: 'open' });
+    expect(tick(ctx)).toEqual([[agents, open, 'claude']]);
   });
 
   test('the ladder requirement and vendorHint steer the vendor', () => {

@@ -1,7 +1,8 @@
 name: release
 
 # Builds the agflow CLI for the machines runners use and attaches the binaries to the GitHub release named after the
-# tag. Pushing a tag v* starts it; so does a run by hand, which names the tag and builds the commit it runs on.
+# tag. Pushing a tag v* starts it; so does a run by hand, which names the tag and builds the commit it runs on. A tag
+# that already exists must be at that commit.
 on:
   push:
     tags: ['v*']
@@ -73,6 +74,10 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           chmod +x dist/agflow-*
+          if tagged=$(gh api "repos/$GH_REPO/commits/tags/$TAG" --jq .sha 2>/dev/null) && [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "$TAG is at $tagged, not at $GITHUB_SHA, the commit this run built" >&2
+            exit 1
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/agflow-* --clobber
           else
