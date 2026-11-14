@@ -12,6 +12,7 @@ import {
   formatMessages,
   isHeld,
   isTaskBranch,
+  liveChatOnlyReason,
   quoteLines,
   taskBranchName,
 } from '@agflow/core';
@@ -112,6 +113,32 @@ export function taskLine(task: Task): string {
 
 export const lines = (parts: Array<string | false | null | undefined | 0>) => parts.filter(Boolean).join('\n');
 
+/**
+ * The most UTF-8 bytes of the goal and its notes that one get_goal answer gives. An agent's client cuts a long tool
+ * result short or refuses it (Claude Code at about 25,000 tokens), and a token is a byte at least, so a part fits
+ * whatever the text is.
+ */
+export const GOAL_PART_BYTES = 20_000;
+
+/**
+ * The part of `text` from `offset` that fits `maxBytes` of UTF-8, and the offset of the next part, or null when this
+ * one reaches the end. A part that stops short ends after a line break when one is in its second half, so a quoted
+ * line of a note is not split between two answers.
+ */
+export function goalPart(text: string, offset: number, maxBytes: number): { part: string; next: number | null } {
+  let bytes = 0;
+  let end = offset;
+  for (const char of text.slice(offset)) {
+    bytes += Buffer.byteLength(char);
+    if (bytes > maxBytes) break;
+    end += char.length;
+  }
+  if (end >= text.length) return { part: text.slice(offset), next: null };
+  const lineEnd = text.lastIndexOf('\n', end - 1) + 1;
+  if (lineEnd - offset > (end - offset) / 2) end = lineEnd;
+  return { part: text.slice(offset, end), next: end };
+}
+
 /** Where a chat that holds a task works. claim_task and resume_claim both end with it. */
 const workInside = (path: string, branch: string) => `Work only inside ${path} (branch ${branch}). Commit there; submit pushes the branch.`;
 
@@ -202,15 +229,27 @@ export const sharedTools: ToolDef[] = [
     {},
     async (_args, ctx) => (await asAgent(ctx).brief()).brief,
   ),
-  defineTool('get_goal', "The project's current goal and the lead's interpretation notes.", {}, async (_args, ctx) => {
-    const { current, notes } = await hub(ctx).goal();
-    if (!current) return 'No goal has been set yet.';
-    return lines([
-      `Goal v${current.version} (by ${current.author}):`,
-      current.text,
-      notes.length > 0 && `\nInterpretation notes:\n${notes.map((note) => labelled(`- Note by ${note.author}:`, note.text)).join('\n')}`,
-    ]);
-  }),
+  defineTool(
+    'get_goal',
+    "The project's current goal and the lead's interpretation notes. A long goal comes in parts: an answer that stops short names the offset to call again with.",
+    { offset: z.number().int().min(0).optional() },
+    async ({ offset = 0 }, ctx) => {
+      const { current, notes } = await hub(ctx).goal();
+      if (!current) return 'No goal has been set yet.';
+      const whole = lines([
+        current.text,
+        notes.length > 0 && `\nInterpretation notes:\n${notes.map((note) => labelled(`- Note by ${note.author}:`, note.text)).join('\n')}`,
+      ]);
+      const by = `Goal v${current.version} (by ${current.author})`;
+      if (offset >= whole.length) return `${by} and its notes have ${whole.length} characters; offset ${offset} is past the end.`;
+      const { part, next } = goalPart(whole, offset, GOAL_PART_BYTES);
+      return lines([
+        offset > 0 ? `${by}, from offset ${offset}:` : `${by}:`,
+        part,
+        next !== null && `… cut here: call get_goal with offset ${next} for the rest (${whole.length} characters in all).`,
+      ]);
+    },
+  ),
   defineTool(
     'list_tasks',
     'List tasks, optionally filtered by status, for example ["ready"].',
@@ -257,16 +296,19 @@ export const sharedTools: ToolDef[] = [
   ),
   defineTool(
     'send_message',
-    'Send a message. "to" is "lead", "humans", "all" (lead only), "agent:A-<n>" or "task:T-<n>".',
+    'Send a message. "to" is "lead", "humans", "all" (lead only), "agent:A-<n>" or "task:T-<n>". ' +
+      'standing_rule (lead only) makes it a standing rule: every agent\'s brief shows it from now on, so use it for the ' +
+      "project's conventions.",
     {
       to: TargetSchema,
       body: z.string().min(1).max(8000),
       task_id: TaskIdSchema.optional(),
       reply_to: z.number().int().positive().optional(),
+      standing_rule: z.boolean().optional(),
     },
-    async ({ to, body, task_id, reply_to }, ctx) => {
-      const { message } = await asAgent(ctx).send({ to, body, taskId: task_id, replyTo: reply_to });
-      return `Sent message #${message.id} to ${message.to}.`;
+    async ({ to, body, task_id, reply_to, standing_rule }, ctx) => {
+      const { message } = await asAgent(ctx).send({ to, body, taskId: task_id, replyTo: reply_to, standingRule: standing_rule });
+      return `Sent ${message.standingRule ? 'standing rule' : 'message'} #${message.id} to ${message.to}.`;
     },
   ),
   defineTool('search', 'Search tasks, messages and the goal by text.', { query: z.string().min(1).max(200) }, async ({ query }, ctx) => {
@@ -447,9 +489,11 @@ export const leadTools: ToolDef[] = [
     async (_args, ctx) => {
       const status = await hub(ctx).status();
       const counts = Object.entries(status.counts).map(([state, n]) => `${state} ${n}`).join(' · ') || 'none';
+      const { deadlineAt } = status.project;
       return lines([
         `Project: ${status.project.name}${status.project.paused ? ' (PAUSED)' : ''}`,
         `Goal: v${status.goalVersion}`,
+        `Deadline: ${typeof deadlineAt === 'number' ? new Date(deadlineAt).toISOString() : 'none'}`,
         `Lead: ${status.lead ? `${status.lead.id} (${status.lead.user})` : 'none'}`,
         `Tasks: ${counts}`,
         `Active agents: ${status.activeAgents}`,
@@ -463,7 +507,16 @@ export const leadTools: ToolDef[] = [
     { tasks: z.array(NewTaskSchema).min(1).max(20) },
     async ({ tasks }, ctx) => {
       const created = await asAgent(ctx).createTasks(tasks);
-      return `Created:\n${created.tasks.map(taskLine).join('\n')}`;
+      // A task that owns a path no runner agent may change waits for a person's live chat (design 7.3).
+      const kept = created.tasks.flatMap((task) => {
+        const why = liveChatOnlyReason(task);
+        return why === null ? [] : [`- ${task.id}: ${why}`];
+      });
+      return lines([
+        `Created:\n${created.tasks.map(taskLine).join('\n')}`,
+        kept.length > 0 &&
+          `No runner agent will run these; they wait for a person's live chat, since they own paths runner agents may not change:\n${kept.join('\n')}`,
+      ]);
     },
   ),
   defineTool(

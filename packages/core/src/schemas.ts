@@ -130,7 +130,8 @@ export const TaskPatchSchema = z
 export type TaskPatch = z.output<typeof TaskPatchSchema>;
 
 export const UpdateGoalInputSchema = z.strictObject({
-  text: z.string().min(1).max(20_000),
+  // A whole hackathon spec fits; agents read it with get_goal, and briefs show its start.
+  text: z.string().min(1).max(200_000),
   baseVersion: z.number().int().min(0),
 });
 export const GoalNoteInputSchema = z.strictObject({ text: z.string().min(1).max(4000) });

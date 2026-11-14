@@ -2,7 +2,6 @@ import { type GoalNote, type GoalVersion, diffGoal, formatChanges } from '@agflo
 import { type HubContext, tx } from './context';
 import { conflict } from './errors';
 import { insertMessage } from './messages';
-import { clip } from './text';
 
 interface GoalRow {
   version: number;
@@ -33,6 +32,14 @@ const toNote = (row: NoteRow): GoalNote => ({
   author: row.author,
   createdAt: row.created_at,
 });
+
+/** How a goal cut short ends: agents see where it stops, and how to read the rest. */
+export const GOAL_CUT = '… cut here: call `get_goal` for the whole goal.';
+
+/** The goal's text in at most max characters, or just GOAL_CUT when max is shorter; a cut one ends with GOAL_CUT. */
+export function clipGoal(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - GOAL_CUT.length))}${GOAL_CUT}`;
+}
 
 export function getCurrentGoal(ctx: HubContext): GoalVersion | null {
   const row = ctx.db.query('SELECT * FROM goal_versions ORDER BY version DESC LIMIT 1').get() as GoalRow | null;
@@ -69,7 +76,8 @@ export function updateGoal(ctx: HubContext, input: { text: string; baseVersion: 
     emit({ type: 'goal.updated', actor, data: { version, previousVersion: currentVersion, changes } });
     const body = current
       ? `The goal changed from v${currentVersion} to v${version}.\nChanges:\n${changes}\n\nRe-plan: for each open task planned against an older goal version, keep it, amend it with update_task, or cancel it with cancel_task.`
-      : `The first goal (v1) was set:\n${clip(input.text, 4000)}\n\nTurn it into tasks with create_tasks.`;
+      : `The first goal (v1) was set:\n${clipGoal(input.text, 4000)}\n\nBefore you plan, read the whole goal with ` +
+        'get_goal, and SPEC.md in the repository if it has one. Then turn it into tasks with create_tasks.';
     insertMessage(ctx, emit, { from: 'system', to: 'lead', body });
     return { version, text: input.text, author: actor, createdAt: now };
   });

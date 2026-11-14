@@ -4,6 +4,7 @@ import {
   type ProtectedClass,
   classifyPath,
   liveChatOnly,
+  liveChatOnlyReason,
   matchesProtectedPattern,
   protectedViolations,
   restoreSet,
@@ -328,6 +329,17 @@ describe('runnerForbiddenPaths and liveChatOnly', () => {
     for (const ownedPaths of [...owners, ['.agflow/run/**']]) {
       expect([ownedPaths, liveChatOnly(task(ownedPaths))]).toEqual([ownedPaths, false]);
     }
+  });
+
+  test("the lead is told which owned path keeps a task from runners, and the rule that does", () => {
+    const owned = ['src/**', 'AGENTS.md', '.github/workflows/ci.yml', '.claude/settings.json'];
+    expect(liveChatOnlyReason(task(owned))).toBe(
+      'AGENTS.md (only a task of kind curation may change it), ' +
+        '.github/workflows/ci.yml (only a task a person created may change it), ' +
+        '.claude/settings.json (agent configuration, which no runner agent may change)',
+    );
+    expect(liveChatOnlyReason(task(['src/**', 'AGENTS.md'], { kind: 'curation' }))).toBeNull();
+    expect(liveChatOnlyReason(task(['src/**']))).toBeNull();
   });
 });
 

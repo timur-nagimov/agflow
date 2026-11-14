@@ -75,6 +75,24 @@ describe('operator routes', () => {
     expect((await hub.call('PUT', '/api/operator/goal', { ...op(`${TOKEN}x`), body: { text: 'x', baseVersion: 1 } })).status).toBe(401);
   });
 
+  test('the operator sets the deadline as its person, and takes it away with null', async () => {
+    const hub = createTestHub({ operatorToken: TOKEN, operatorUser: 'alice' });
+    const path = '/api/operator/deadline';
+    const set = await hub.call('PUT', path, { ...op(), body: { deadline: '2026-11-16T18:00:00+03:00' } });
+    expect(set.status).toBe(200);
+    expect(set.json).toMatchObject({ name: 'demo', deadlineAt: Date.UTC(2026, 10, 16, 15, 0, 0) });
+    const project = await hub.call('GET', '/api/project', { user: 'bob', via: 'web' });
+    expect(project.json.deadlineAt).toBe(Date.UTC(2026, 10, 16, 15, 0, 0));
+    const events = (await hub.call('GET', '/api/events?limit=50', { user: 'bob', via: 'web' })).json.events;
+    expect(events.filter((event: { type: string }) => event.type === 'project.deadline_set')).toMatchObject([
+      { actor: 'user:alice', data: { deadlineAt: Date.UTC(2026, 10, 16, 15, 0, 0) } },
+    ]);
+    // A time without a zone is refused: each laptop would read it in its own.
+    expect((await hub.call('PUT', path, { ...op(), body: { deadline: '2026-11-16T18:00:00' } })).status).toBe(400);
+    expect((await hub.call('PUT', path, { ...op(`${TOKEN}x`), body: { deadline: null } })).status).toBe(401);
+    expect((await hub.call('PUT', path, { ...op(), body: { deadline: null } })).json.deadlineAt).toBeNull();
+  });
+
   test('the config asks for a long token and an allowed operator', () => {
     const base = {
       AGFLOW_AUTH: 'dev',

@@ -4,6 +4,7 @@
 // this.
 import { createHash, timingSafeEqual } from 'node:crypto';
 import {
+  DeadlineInputSchema,
   MarkMergedInputSchema,
   NoteInputSchema,
   type OperatorProject,
@@ -16,7 +17,7 @@ import type { HubContext } from '../context';
 import { unauthorized } from '../errors';
 import { updateGoal } from '../goal';
 import { sendMessage } from '../messages';
-import { getProject } from '../project';
+import { getProject, setDeadline } from '../project';
 import { resetProject } from '../reset';
 import { markMerged, unblockTask } from '../tasks';
 import type { App, AppEnv } from './app';
@@ -42,6 +43,12 @@ export function mountOperatorRoutes(app: App, ctx: HubContext): void {
     const who = operator(c);
     const input = await readBody(c, UpdateGoalInputSchema);
     return c.json(updateGoal(ctx, input, who));
+  });
+
+  app.put('/api/operator/deadline', async (c) => {
+    const who = operator(c);
+    const { deadline } = await readBody(c, DeadlineInputSchema);
+    return c.json(setDeadline(ctx, deadline === null ? null : Date.parse(deadline), who));
   });
 
   app.post('/api/operator/tasks/:id/merged', async (c) => {

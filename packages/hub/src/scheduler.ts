@@ -1,40 +1,47 @@
 // The scheduler (design 6.6). Each tick first checks the clock (step 0: downtime opens a recovery window, in which
 // the tick does nothing more), then reconciles (step 1: leases, approvals, stalls, stop and submission
-// timeouts, holding leads, the Codex reset probe, quota_wait replacements, the lead review and rotation), fills an
-// empty lead seat (step 2, lead.ts), then reads the database into core's terms and leaves the rules to core's
-// scheduling.ts (X-46): which ready tasks qualify and in what order, how many workers may start, and where each one
-// goes. Every claim and start is its own transaction, so one that fails rolls back only itself,
+// timeouts, holding leads, the Codex reset probe, quota_wait replacements, the lead review, the idle nudge and
+// rotation), fills an empty lead seat (step 2, lead.ts), then reads the database into core's terms and leaves the
+// rules to core's scheduling.ts (X-46): which ready tasks qualify and in what order, how many workers may start, and
+// where each one goes. Every claim and start is its own transaction, so one that fails rolls back only itself,
 // and the tick's placement snapshot is updated after each start, so a runner's slots and an account's probing start
 // are not handed out twice. Retention and remote-ref cleanup are not the tick's: they run on a daily timer (X-39).
 import {
+  type AccountQuota,
   type AgentRole,
   type Attempt,
   type EndedAttemptView,
+  type Message,
   type Placement,
   type PlacementSnapshot,
   type RefusedPlacement,
   type Task,
   type TaskCandidate,
+  type TaskStatus,
   type Vendor,
+  candidateRunners,
   countedAttempts,
+  freeSlots,
   isDispatchable,
   orderReady,
   pathsOverlap,
   place,
   placeLead,
   runnerToAvoid,
+  usableVendors,
   workerSlotsFree,
 } from '@agflow/core';
 import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
-import { churnPaused, inRecovery } from './hub-state';
+import { currentGoalVersion } from './goal';
+import { churnPaused, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
-import { markOwnerAwayTold, probeUnknownResets } from './quota';
+import { listAccounts, markOwnerAwayTold, probeUnknownResets } from './quota';
 import { type ClockCheck, checkClock } from './recovery';
 import { TAKES_SLOT_SQL } from './runners';
 import { expireSubmissions } from './submissions';
@@ -335,6 +342,8 @@ export interface ReconcileResult {
   quotaWaits: string[];
   /** Whether a periodic review message went to the lead (periodicLeadReview). */
   leadReview: boolean;
+  /** Whether an idle nudge went to the lead (nudgeIdleLead). */
+  idleNudge: boolean;
   /** The runner lead asked to rotate (rotateLeadIfDue), or null. */
   rotated: string | null;
 }
@@ -367,6 +376,7 @@ export function reconcile(ctx: HubContext): ReconcileResult {
     probes: duty('the Codex reset probe', () => probeUnknownResets(ctx), 0),
     quotaWaits: duty('the quota_wait replacement', () => replaceQuotaWaits(ctx), []),
     leadReview: duty('the lead review', () => periodicLeadReview(ctx) !== null, false),
+    idleNudge: duty('the idle nudge', () => nudgeIdleLead(ctx) !== null, false),
     rotated: duty('the lead rotation', () => rotateLeadIfDue(ctx), null),
   };
 }
@@ -497,5 +507,157 @@ export function requestAgents(ctx: HubContext, request: StaffingRequest): { runn
     const target = setWorkerTarget(ctx, request.count);
     if (request.vendor) setVendorPreference(ctx, request.vendor);
     return { running: runningWorkers(ctx), target };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The worker load and the idle nudge: workers never wait for the plan
+// ---------------------------------------------------------------------------
+
+/** What the lead plans against: the workers, the slots dispatch could fill, and the tasks in each state. */
+export interface WorkerLoad {
+  /** Runner workers starting, running or in quota_wait (runningWorkers). */
+  running: number;
+  /** project.worker_target, which request_agents sets; null leaves the cap. */
+  target: number | null;
+  /** maxWorkers. */
+  cap: number;
+  /**
+   * The workers dispatch could start now: the target or cap less the running workers, bounded by the free slots of the
+   * runners that can place a worker.
+   */
+  freeSlots: number;
+  ready: number;
+  /** The ready tasks dispatch may start now (readySet). */
+  dispatchable: number;
+  blockedOnDependencies: number;
+  /** Submitted and waiting for the lead's verdict. */
+  submitted: number;
+  acceptedNotMerged: number;
+}
+
+/** The free slots of the runners that could take a worker now: candidates with a usable vendor. */
+function placeableSlots(ctx: HubContext): number {
+  const snapshot = placementSnapshot(ctx);
+  return candidateRunners(snapshot)
+    .candidates.filter((runner) => usableVendors(snapshot, runner).usable.length > 0)
+    .reduce((sum, runner) => sum + freeSlots(runner), 0);
+}
+
+/** The worker load now, as dispatch computes it. */
+export function workerLoad(ctx: HubContext): WorkerLoad {
+  const { workerTarget } = getStaffing(ctx);
+  const running = runningWorkers(ctx);
+  const free = workerSlotsFree({ workerTarget, maxWorkers: ctx.config.maxWorkers, runningWorkers: running });
+  const tasks = listTasks(ctx);
+  const count = (statuses: readonly TaskStatus[]): number =>
+    tasks.filter((task) => statuses.includes(task.status)).length;
+  return {
+    running,
+    target: workerTarget,
+    cap: ctx.config.maxWorkers,
+    freeSlots: free === 0 ? 0 : Math.min(free, placeableSlots(ctx)),
+    ready: count(['ready']),
+    dispatchable: readySet(ctx).length,
+    blockedOnDependencies: tasks.filter((task) => task.status === 'blocked' && task.blockedKind === 'deps').length,
+    submitted: count(['submitted', 'checking', 'reviewing']),
+    acceptedNotMerged: count(['accepted', 'merging']),
+  };
+}
+
+const at = (ms: number): string => `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+
+/** A span of time for the lead: minutes, then hours and minutes. */
+function span(ms: number): string {
+  const minutes = Math.round(Math.abs(ms) / 60_000);
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+const share = (value: number | null): string => (value === null ? 'unknown' : `${Math.round(value * 100)}%`);
+
+function quotaLine(account: AccountQuota): string {
+  const { state, windows, resetsAt } = account.quota;
+  const reset = resetsAt === null ? 'reset unknown' : `resets ${at(resetsAt)}`;
+  const use = `5-hour ${share(windows.fiveHour)}, weekly ${share(windows.weekly)}`;
+  return `- ${account.owner} ${account.vendor}: ${state}, ${use}, ${reset}`;
+}
+
+/** The worker load, one quota line per account and the deadline with the time left, as lines for the lead. */
+export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
+  // Without a target of its own, the project's target is the cap.
+  const lines = [
+    `Workers: ${load.running} running (target ${load.target ?? load.cap}, cap ${load.cap}); ${load.freeSlots} free ` +
+      'worker slot(s).',
+    `Ready tasks: ${load.ready}, ${load.dispatchable} of them dispatchable now. Blocked on dependencies: ` +
+      `${load.blockedOnDependencies}. Submitted: ${load.submitted}. Accepted, not merged: ${load.acceptedNotMerged}.`,
+  ];
+  const accounts = listAccounts(ctx);
+  if (accounts.length === 0) lines.push('Quota: no account has reported yet.');
+  else lines.push('Quota:', ...accounts.map(quotaLine));
+  const { deadlineAt } = getProject(ctx);
+  if (deadlineAt === null) lines.push('Deadline: no deadline.');
+  else {
+    const left = deadlineAt - ctx.now();
+    lines.push(`Deadline: ${at(deadlineAt)}, ${left >= 0 ? `${span(left)} left` : `passed ${span(left)} ago`}.`);
+  }
+  return lines;
+}
+
+/** What an idle nudge asks of the lead. */
+const NUDGE_PLAN =
+  'Plan the next batch now, so that ready, independent tasks are at least twice the free worker slots. Tasks blocked ' +
+  'on dependencies count as planned: while they wait for work in progress, such as the skeleton, add only tasks that ' +
+  'need none of it. Work through SPEC.md (or the goal) until every requirement is covered. Once it is, plan in this ' +
+  'order: defects found by the latest demo check or reported by agents, missing tests, demo polish, then new features ' +
+  'a jury would notice. In the last hour before the deadline, plan only fixes.';
+
+/**
+ * When free worker slots began to outnumber the dispatchable ready tasks, per hub context. Kept in memory: a restarted
+ * hub only waits idleNudgeMs again before it nudges.
+ */
+const idleSince = new WeakMap<HubContext, number>();
+
+/** When the newest idle nudge went to the lead, or null. */
+function lastNudgeAt(ctx: HubContext): number | null {
+  const row = ctx.db
+    .query("SELECT MAX(ts) AS ts FROM events WHERE type = 'lead.idle_nudged'")
+    .get() as { ts: number | null };
+  return row.ts;
+}
+
+/**
+ * The idle nudge: while a runner lead holds the seat and free worker slots outnumber the dispatchable ready tasks for
+ * idleNudgeMs without a break, the lead gets one system message with the load, each account's quota, the deadline and
+ * what to plan; then none before idleNudgeIntervalMs has passed since the last (lead.idle_nudged), and none at all
+ * while it is 0. A paused project or a churn pause starts no worker, so neither nudges. Without a goal there is nothing
+ * to plan, and the work is planned until the deadline, so none goes out before the goal is set or once the deadline
+ * has passed. Part of the tick's reconcile step. Returns the message, or null.
+ */
+export function nudgeIdleLead(ctx: HubContext): Message | null {
+  if (ctx.config.idleNudgeIntervalMs === 0) return null;
+  const { paused, deadlineAt } = getProject(ctx);
+  const due =
+    !paused && !churnPaused(ctx) && currentGoalVersion(ctx) > 0 && (deadlineAt === null || ctx.now() < deadlineAt);
+  const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
+  if (load === null || load.freeSlots <= load.dispatchable) {
+    idleSince.delete(ctx);
+    return null;
+  }
+  const now = ctx.now();
+  const since = idleSince.get(ctx) ?? now;
+  idleSince.set(ctx, since);
+  if (now - since < ctx.config.idleNudgeMs) return null;
+  const last = lastNudgeAt(ctx);
+  if (last !== null && now - last < ctx.config.idleNudgeIntervalMs) return null;
+  const lines = loadLines(ctx, load);
+  return tx(ctx, (emit) => {
+    emit({ type: 'lead.idle_nudged', actor: 'system', data: { ...load, deadlineAt } });
+    return insertMessage(ctx, emit, {
+      from: 'system',
+      to: 'lead',
+      body:
+        `${load.freeSlots} worker slot(s) are free, more than the ${load.dispatchable} ready task(s) that can start ` +
+        `now.\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
+    });
   });
 }

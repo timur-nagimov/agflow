@@ -56,6 +56,20 @@ describe('project and status routes', () => {
     expect((await hub.call('GET', '/api/project', { user: 'bob' })).json).toMatchObject({ name: 'demo', paused: true });
   });
 
+  test('the deadline is for people in the web UI; the project and the status show it', async () => {
+    const hub = createTestHub();
+    const lead = addAgent(hub.ctx, 'alice', 'lead');
+    const body = { deadline: '2026-11-16T15:00:00Z' };
+    expect((await hub.call('PUT', '/api/project/deadline', { user: 'alice', via: 'cli', body })).status).toBe(403);
+    expect((await hub.call('PUT', '/api/project/deadline', { user: 'alice', agent: lead.id, body })).status).toBe(403);
+    const set = await hub.call('PUT', '/api/project/deadline', { user: 'alice', via: 'web', body });
+    expect(set.json.deadlineAt).toBe(Date.UTC(2026, 10, 16, 15, 0, 0));
+    expect((await hub.call('GET', '/api/status', { user: 'bob' })).json.project.deadlineAt).toBe(Date.UTC(2026, 10, 16, 15, 0, 0));
+    expect((await hub.call('PUT', '/api/project/deadline', { user: 'alice', via: 'web', body: { deadline: 'soon' } })).status).toBe(400);
+    const cleared = await hub.call('PUT', '/api/project/deadline', { user: 'bob', via: 'web', body: { deadline: null } });
+    expect(cleared.json.deadlineAt).toBeNull();
+  });
+
   test('status summarises the project', async () => {
     const hub = createTestHub();
     const lead = addAgent(hub.ctx, 'alice', 'lead');

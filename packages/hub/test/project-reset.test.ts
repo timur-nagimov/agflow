@@ -154,7 +154,13 @@ describe('the project reset', () => {
     expect(reset.status).toBe(200);
     const archive = join(dir, readdirSync(dir).find((name) => name.startsWith('agflow-archive-demo-')) as string);
     expect(reset.json).toEqual({
-      project: { name: 'afisha', repo: 'https://github.com/acme/afisha', paused: false, runnerLeads: true },
+      project: {
+        name: 'afisha',
+        repo: 'https://github.com/acme/afisha',
+        paused: false,
+        runnerLeads: true,
+        deadlineAt: Date.parse('2026-11-16T15:00:00Z'),
+      },
       archive,
       epoch: epoch + 1,
       goalVersion: 1,

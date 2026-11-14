@@ -347,7 +347,13 @@ export const PrepareRequestSchema = schemaFor<PrepareRequest>()(
 );
 
 export const ProjectSchema = schemaFor<Project>()(
-  z.strictObject({ name: Name, repo: Name, paused: z.boolean(), runnerLeads: z.boolean() }),
+  z.strictObject({
+    name: Name,
+    repo: Name,
+    paused: z.boolean(),
+    runnerLeads: z.boolean(),
+    deadlineAt: NonNegativeInt.nullable(),
+  }),
 );
 
 // ---------------------------------------------------------------------------
@@ -454,6 +460,16 @@ export const LeadHandoffInputSchema = HandoffInputSchema;
 
 /** PATCH /api/project: may the scheduler start leads on runners. */
 export const ProjectPatchInputSchema = z.strictObject({ runnerLeads: z.boolean() });
+
+/**
+ * PUT /api/project/deadline and PUT /api/operator/deadline: when the project must be done, as an ISO 8601 date and time
+ * with Z or an offset, so a laptop's time zone cannot shift it; null takes the deadline away.
+ */
+export const DeadlineInputSchema = z.strictObject({
+  deadline: z.iso
+    .datetime({ offset: true, error: 'expected an ISO 8601 date and time with Z or an offset, such as 2026-11-16T18:00:00+03:00' })
+    .nullable(),
+});
 
 /**
  * POST /api/operator/project/reset (agflow start): the project that takes the place of the hub's current one. The

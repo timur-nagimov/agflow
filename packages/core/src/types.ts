@@ -153,6 +153,8 @@ export interface Project {
   paused: boolean;
   /** May the scheduler start leads on runners. */
   runnerLeads: boolean;
+  /** When the project must be done, in epoch ms, which the lead plans against; null for no deadline. */
+  deadlineAt: number | null;
 }
 
 export interface Agent {

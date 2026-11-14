@@ -443,6 +443,7 @@ describe('the reconcile step', () => {
       probes: 1,
       quotaWaits: [],
       leadReview: false,
+      idleNudge: false,
       rotated: null,
     });
     expect(getAttempt(ctx, lost.attempt.id).endReason).toBe('lost');

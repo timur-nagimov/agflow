@@ -208,6 +208,23 @@ export function liveChatOnly(task: TaskScope): boolean {
   return runnerForbiddenPaths(task).length > 0;
 }
 
+/** Why a class keeps a task from runner agents, in words for the lead. */
+const KEPT_FROM_RUNNERS: Readonly<Record<ProtectedClass, string>> = {
+  agent_config: 'agent configuration, which no runner agent may change',
+  people_only: 'only a task a person created may change it',
+  curators_only: 'only a task of kind curation may change it',
+};
+
+/**
+ * Why the task is left to live chats, for the lead: each owned path that no runner agent may change, with the rule
+ * that keeps it from them. Null when runner agents may take the task.
+ */
+export function liveChatOnlyReason(task: TaskScope): string | null {
+  const paths = runnerForbiddenPaths(task);
+  if (paths.length === 0) return null;
+  return paths.map((one) => `${one.path} (${KEPT_FROM_RUNNERS[one.class]})`).join(', ');
+}
+
 /**
  * The changed paths that the task's restore set covers, each with its strictest class: the changes a runner agent
  * may not make in this task (all protected paths for a lead attempt).

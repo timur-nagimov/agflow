@@ -23,7 +23,7 @@ export type HubTimings = Partial<Pick<HubConfig, MillisecondField>>;
  * The E2E hub timings. Liveness is short, so a fault shows within seconds: the tick, the heartbeat and dead link, the
  * runner lease (whose third is the WIP grace, X-11), the recovery window, the infra backoff, the dispatch hold for late
  * work and delivery batching. Judgement is long, so a scenario trips only the rule it tests: no stall, tool cap, lead
- * review or active budget ends an attempt during a run.
+ * review or active budget ends an attempt during a run, and no idle nudge wakes a scripted lead.
  */
 export const E2E_HUB_TIMINGS = Object.freeze({
   tickMs: SECOND,
@@ -38,6 +38,7 @@ export const E2E_HUB_TIMINGS = Object.freeze({
   toolCapMs: 60 * MINUTE,
   longToolCapMs: 120 * MINUTE,
   leadReviewMs: 60 * MINUTE,
+  idleNudgeMs: 60 * MINUTE,
   activeBudgetMs: 8 * 60 * MINUTE,
 }) satisfies HubTimings;
 

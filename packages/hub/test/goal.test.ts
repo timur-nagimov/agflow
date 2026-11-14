@@ -1,7 +1,16 @@
 import { describe, expect, test } from 'bun:test';
 import { HubError } from '../src/errors';
 import { listEvents } from '../src/events';
-import { addGoalNote, currentGoalVersion, getCurrentGoal, listGoalNotes, listGoalVersions, updateGoal } from '../src/goal';
+import {
+  GOAL_CUT,
+  addGoalNote,
+  clipGoal,
+  currentGoalVersion,
+  getCurrentGoal,
+  listGoalNotes,
+  listGoalVersions,
+  updateGoal,
+} from '../src/goal';
 import { listMessages } from '../src/messages';
 import { createTestContext } from './helpers';
 
@@ -19,6 +28,28 @@ describe('goal', () => {
     const [message] = listMessages(ctx, { target: 'lead' });
     expect(message?.from).toBe('system');
     expect(message?.body).toContain('create_tasks');
+    expect(message?.body).toContain('Before you plan, read the whole goal with get_goal, and SPEC.md in the repository');
+    expect(message?.body).not.toContain(GOAL_CUT);
+  });
+
+  test('a long first goal is cut in the message, which says so and names get_goal', () => {
+    const { ctx } = createTestContext();
+    const text = `${'requirement\n'.repeat(1000)}the last line`;
+    updateGoal(ctx, { text, baseVersion: 0 }, 'user:alice');
+    const [message] = listMessages(ctx, { target: 'lead' });
+    expect(message?.body).toContain(`${clipGoal(text, 4000)}\n\nBefore you plan`);
+    expect(message?.body).toContain(`${GOAL_CUT}\n\nBefore you plan`);
+    expect(message?.body).not.toContain('the last line');
+    expect(getCurrentGoal(ctx)?.text).toBe(text);
+  });
+
+  test('clipGoal keeps a goal that fits and ends a cut one with GOAL_CUT, within the limit', () => {
+    expect(clipGoal('Ship a CLI.', 11)).toBe('Ship a CLI.');
+    const cut = clipGoal('x'.repeat(5000), 2500);
+    expect(cut).toHaveLength(2500);
+    expect(cut).toEndWith('… cut here: call `get_goal` for the whole goal.');
+    // With less room than the cut line takes, the cut line alone remains.
+    expect(clipGoal('x'.repeat(100), 10)).toBe(GOAL_CUT);
   });
 
   test('an edit against an old version is a conflict', () => {

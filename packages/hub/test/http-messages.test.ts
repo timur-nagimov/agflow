@@ -28,11 +28,19 @@ describe('message routes', () => {
     const send = (options: Parameters<typeof hub.call>[2]) => hub.call('POST', '/api/messages', options);
     expect((await send({ user: 'bob', agent: worker.id, body: { to: 'all', body: 'hi' } })).status).toBe(403);
     expect((await send({ user: 'alice', agent: lead.id, body: { to: 'all', body: 'hi' } })).status).toBe(201);
-    expect((await send({ user: 'alice', agent: lead.id, body: { to: 'all', body: 'rule', standingRule: true } })).status).toBe(403);
+    // The lead sets the project's conventions as standing rules; other agents may not.
+    expect((await send({ user: 'bob', agent: worker.id, body: { to: 'all', body: 'rule', standingRule: true } })).status).toBe(403);
+    const convention = await send({ user: 'alice', agent: lead.id, body: { to: 'all', body: 'Use pnpm.', standingRule: true } });
+    expect(convention.status).toBe(201);
+    expect(convention.json.message).toMatchObject({ from: `agent:${lead.id}`, standingRule: true, ruleActive: true });
     expect((await send({ user: 'alice', via: 'cli', body: { to: 'lead', body: 'x' } })).status).toBe(403);
     const rule = await send({ user: 'alice', via: 'web', body: { to: 'all', body: 'Always use pnpm.', standingRule: true } });
-    expect((await hub.call('GET', '/api/rules', { user: 'bob', agent: worker.id })).json.rules).toHaveLength(1);
+    expect((await hub.call('GET', '/api/rules', { user: 'bob', agent: worker.id })).json.rules).toHaveLength(2);
     expect((await hub.call('DELETE', `/api/rules/${rule.json.message.id}`, { user: 'alice', via: 'web' })).json).toEqual({ ok: true });
+    // Only people remove rules, the lead's among them.
+    const leads = `/api/rules/${convention.json.message.id}`;
+    expect((await hub.call('DELETE', leads, { user: 'alice', agent: lead.id })).status).toBe(403);
+    expect((await hub.call('DELETE', leads, { user: 'alice', via: 'web' })).json).toEqual({ ok: true });
     expect((await hub.call('GET', '/api/rules', { user: 'alice', via: 'web' })).json.rules).toEqual([]);
   });
 

@@ -207,7 +207,7 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_DB` | `data/agflow.db` | SQLite database file |
 | `AGFLOW_BACKUP_DIR` | `data/backups` | Hourly snapshots (24 hours), daily snapshots (newest 7) and start snapshots (newest 3), and the archive of each project a reset replaced (never pruned) |
 | `AGFLOW_WEB_DIST` | (unset) | Folder with the built web UI |
-| `AGFLOW_OPERATOR_TOKEN`, `AGFLOW_OPERATOR_USER` | (unset) | Token for the operator routes (goal, mark merged, unblock, message, project reset) and the allowed login they act as; `agflow start` reads it on the owner's laptop. See [docs/deploy-hub.md](docs/deploy-hub.md#operator-access) |
+| `AGFLOW_OPERATOR_TOKEN`, `AGFLOW_OPERATOR_USER` | (unset) | Token for the operator routes (goal, deadline, mark merged, unblock, message, project reset) and the allowed login they act as; `agflow start` reads it on the owner's laptop. See [docs/deploy-hub.md](docs/deploy-hub.md#operator-access) |
 | `AGFLOW_DEPENDENCIES_NEED_MERGE` | `0` | `1`: a dependency is done only once it is merged, not when it is accepted, so dependents start from a main branch that holds it |
 | `AGFLOW_AGENT_FETCH` | `0` | `1`: the hub downloads public web pages for Claude runner agents, for the lead and for the tasks the lead grants internet access; an agent that reads hostile text can then leak what its sandbox lets it read through the addresses it asks for. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
 | `AGFLOW_LEAD_APPROVALS` | `0` | `1`: the agent holding the lead seat may answer the approval requests of other agents' Codex attempts: decline any of them with a reason, and approve them on a runner whose device policy does not reserve approvals to its owner, so a command the lead approves runs outside the sandbox on its owner's laptop without a person looking at it. |
@@ -224,6 +224,8 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_RECOVERY_SECONDS` | `120` | Reconnect/replay window after hub downtime |
 | `AGFLOW_APPROVAL_MINUTES` | `15` | Time to answer an approval |
 | `AGFLOW_LEAD_REVIEW_MINUTES` | `45` | Lead review deadline |
+| `AGFLOW_IDLE_NUDGE_SECONDS` | `60` | How long free worker slots must outnumber the ready tasks that can start before the runner lead is told to plan more; see [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
+| `AGFLOW_IDLE_NUDGE_MINUTES` | `5` | Least time between two of those messages to the lead; `0` turns them off |
 | `AGFLOW_LIVE_LEAD_GRACE_MINUTES` | `120` | Live lead absence grace |
 | `AGFLOW_QUOTA_WAIT_MINUTES` | `45` | Maximum quota wait before a worker is replaced on another account; a lead is replaced at once |
 | `AGFLOW_QUOTA_UNKNOWN_MINUTES` | `30` | Wait when the quota reset time is unknown |

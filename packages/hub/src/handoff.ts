@@ -6,7 +6,7 @@ import { type Attempt, type Message, type TaskNote, formatMessage, quoteLines } 
 import { unpushedHead } from './attempt-store';
 import { BRIEF_HANDOFF_LIMIT, newestLeadHandoff, situationReport } from './brief';
 import type { HubContext } from './context';
-import { getCurrentGoal } from './goal';
+import { clipGoal, getCurrentGoal } from './goal';
 import { insertLeadNote } from './hub-state';
 import { type MessageRow, listMessages, rowToMessage } from './messages';
 import { getTask, listTaskNotes } from './task-store';
@@ -43,7 +43,7 @@ const LIMITS = {
   compaction: 1000,
   /** About the last 3 assistant turns (design 6.8). */
   transcript: 4000,
-  /** The next lead's brief carries the whole goal. */
+  /** The next lead's brief shows the goal's start, and get_goal all of it. */
   goal: 800,
   leadMessage: 180,
 } as const;
@@ -235,9 +235,10 @@ function leadAgents(ctx: HubContext, attempt: Attempt): string[] {
 /**
  * The next lead's note when a lead ended without a lead handoff (design 6.11, failover): the last 20 messages to and
  * from the lead, the lead's earlier messages since the newest lead handoff, that handoff itself, the situation report
- * and the goal. What only this note carries comes first, newest first: the next lead's brief quotes only the newest
- * lead handoff, which this note becomes, and only its start, and also shows the situation report and the whole goal,
- * so a cut falls on the oldest material and then on what the brief has anyway.
+ * and the goal's start. What only this note carries comes first, newest first: the next lead's brief quotes only the
+ * newest lead handoff, which this note becomes, and only its start, and also shows the situation report and the
+ * goal's start, which get_goal gives whole, so a cut falls on the oldest material and then on what the next lead has
+ * anyway.
  */
 export function assembleLeadHandoff(ctx: HubContext, attempt: Attempt): AssembledNote {
   const leads = JSON.stringify(leadAgents(ctx, attempt));
@@ -298,7 +299,7 @@ export function assembleLeadHandoff(ctx: HubContext, attempt: Attempt): Assemble
   const goal = getCurrentGoal(ctx);
   sections.push(
     goal
-      ? `## Goal (v${goal.version}), as people set it; your brief has all of it\n${clip(goal.text, LIMITS.goal)}`
+      ? `## Goal (v${goal.version}), as people set it\n${clipGoal(goal.text, LIMITS.goal)}`
       : '## Goal\nNo goal has been set yet.',
   );
   return closeNote(sections, null, LEAD_CLOSING);
