@@ -2,6 +2,7 @@ import {
   type Agent,
   type Attempt,
   BRIDGE_VERSION,
+  MergeTaskResultSchema,
   type NewTask,
   type Submission,
   type Task,
@@ -30,13 +31,14 @@ import {
   startLiveAttempt,
 } from './attempts';
 import { resolveAgentToken } from './auth';
-import { enqueueCommand } from './commands';
+import { type CommandResult, type CommandRow, RESULT_HANDLERS, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
 import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { getHubState, updateHubState } from './hub-state';
+import { mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
 import { listSubmissions } from './submission-store';
@@ -687,6 +689,14 @@ export function submitTask(
   });
 }
 
+/** Who sends a task back when its merge conflicts (AGFLOW_AUTO_MERGE). */
+const AUTO_MERGE = 'hub:auto-merge';
+
+/**
+ * Accepts a submitted task. With AGFLOW_AUTO_MERGE, a task submitted on its own branch with a head moves on to merging
+ * and its merge is queued; its author's attempt keeps holding until the work is in main, so that a conflict can go
+ * back to it. Otherwise the author's attempt ends now, and people merge the work.
+ */
 export function acceptTask(ctx: HubContext, id: string, actor: string, note?: string): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
@@ -697,30 +707,44 @@ export function acceptTask(ctx: HubContext, id: string, actor: string, note?: st
       throw forbidden(`${id} was submitted by you; an agent cannot accept its own work`);
     }
     const attempt = openRunnerAttempt(ctx, task);
-    move(ctx, emit, task, 'accepted', actor, { changes: { feedback: null }, data: { note: note ?? null } });
+    const accepted = move(ctx, emit, task, 'accepted', actor, { changes: { feedback: null }, data: { note: note ?? null } });
+    if (ctx.config.autoMerge && mergeableHead(accepted) !== null) {
+      move(ctx, emit, accepted, 'merging', 'system');
+      if (!attempt) tellLiveAuthor(ctx, emit, task, actor, note);
+      queueMerges(ctx);
+      return getTask(ctx, id);
+    }
     if (attempt) {
       // The accepted row: the holding attempt ends at once and its cleanup is queued; nobody would read a message.
       endAttempt(ctx, { attemptId: attempt.id, trigger: 'accepted', actor });
     } else {
       endLiveAttempt(ctx, task, 'accepted', actor);
-      if (task.assignee) {
-        insertMessage(ctx, emit, {
-          from: actor,
-          to: `agent:${task.assignee}`,
-          taskId: id,
-          body: `${id} was accepted.${note ? ` ${note}` : ''}`,
-        });
-      }
+      tellLiveAuthor(ctx, emit, task, actor, note);
     }
     refreshDependents(ctx, emit);
     return getTask(ctx, id);
   });
 }
 
+/** A live chat's author hears that its task was accepted. */
+function tellLiveAuthor(ctx: HubContext, emit: Emit, task: Task, actor: string, note: string | undefined): void {
+  if (!task.assignee) return;
+  insertMessage(ctx, emit, {
+    from: actor,
+    to: `agent:${task.assignee}`,
+    taskId: task.id,
+    body: `${task.id} was accepted.${note ? ` ${note}` : ''}`,
+  });
+}
+
 export function rejectTask(ctx: HubContext, id: string, actor: string, feedback: string): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    if (task.status !== 'submitted') throw conflict(`${id} is ${task.status}; only submitted tasks can be rejected`);
+    // A merge conflict sends a merging task back the same way (AGFLOW_AUTO_MERGE, onMergeResult).
+    const conflicted = task.status === 'merging' && actor === AUTO_MERGE;
+    if (task.status !== 'submitted' && !conflicted) {
+      throw conflict(`${id} is ${task.status}; only submitted tasks can be rejected`);
+    }
     const rejected = move(ctx, emit, task, 'rejected', actor, {
       changes: { feedback },
       data: { feedback: clip(feedback, 500) },
@@ -863,16 +887,86 @@ export function unblockTask(ctx: HubContext, id: string, actor: string, note?: s
   });
 }
 
+/** Marks an accepted task merged, or a merging one that a person merged by hand; the next auto merge goes out. */
 export function markMerged(ctx: HubContext, id: string, actor: string, sha?: string): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    if (task.status !== 'accepted') throw conflict(`${id} is ${task.status}; only accepted tasks can be marked merged`);
-    const merged = move(ctx, emit, task, 'merged', actor, { changes: { mergedSha: sha ?? null }, data: { sha: sha ?? null } });
-    // With dependenciesNeedMerge, this is what releases the tasks that waited for it.
-    refreshDependents(ctx, emit);
+    if (task.status !== 'accepted' && task.status !== 'merging') {
+      throw conflict(`${id} is ${task.status}; only accepted tasks can be marked merged`);
+    }
+    const merged = landMerge(ctx, emit, task, actor, sha ?? null);
+    if (task.status === 'merging') queueMerges(ctx);
     return merged;
   });
 }
+
+/**
+ * The task's work is in main: the author's attempt, which auto merge kept holding, ends accepted, and the task moves to
+ * merged. With dependenciesNeedMerge or autoMerge, this is what releases the tasks that waited for it.
+ */
+function landMerge(ctx: HubContext, emit: Emit, task: Task, actor: string, sha: string | null): Task {
+  const attempt = openRunnerAttempt(ctx, task);
+  if (attempt) endAttempt(ctx, { attemptId: attempt.id, trigger: 'accepted', actor });
+  else endLiveAttempt(ctx, task, 'accepted', actor);
+  const merged = move(ctx, emit, task, 'merged', actor, { changes: { mergedSha: sha }, data: { sha } });
+  refreshDependents(ctx, emit);
+  return merged;
+}
+
+/**
+ * merge_task's result (AGFLOW_AUTO_MERGE). merged marks the task merged at main's new sha; a conflict sends it back
+ * to its author through rejected, with the files as feedback; either way the next merge goes out. A failure leaves the
+ * task merging for the tick to try again, records task.merge_failed, and tells people the first time a merge fails.
+ */
+function onMergeResult(ctx: HubContext, emit: Emit, command: CommandRow, result: CommandResult): void {
+  if (command.command.kind !== 'merge_task') return;
+  const task = findTask(ctx, command.command.taskId);
+  if (task?.status !== 'merging') {
+    queueMerges(ctx);
+    return;
+  }
+  const parsed = result.ok ? MergeTaskResultSchema.safeParse(result.data) : null;
+  if (!parsed?.success) {
+    const error = result.ok ? 'the runner gave a result agflow cannot read' : (result.error ?? 'no reason given');
+    mergeFailed(ctx, emit, task, command.runnerId, error);
+    return;
+  }
+  const outcome = parsed.data;
+  if (outcome.status === 'merged') {
+    landMerge(ctx, emit, task, `runner:${command.runnerId}`, outcome.sha);
+  } else {
+    const main = ctx.config.mainBranch;
+    const files = outcome.files.length > 0 ? ` These files conflict: ${outcome.files.join(', ')}.` : '';
+    const feedback =
+      `agflow could not merge your branch into ${main}: ${main} changed since you submitted.${files} Merge ` +
+      `origin/${main} into your branch (\`git fetch origin && git merge origin/${main}\`), resolve the conflicts, run ` +
+      "the project's check, commit, and submit again.";
+    rejectTask(ctx, task.id, AUTO_MERGE, feedback);
+  }
+  queueMerges(ctx);
+}
+
+/** A merge that failed: task.merge_failed, and a message to people the first time a merge of the task fails. */
+function mergeFailed(ctx: HubContext, emit: Emit, task: Task, runnerId: string, error: string): void {
+  const earlier = ctx.db
+    .query(
+      `SELECT 1 FROM events WHERE subject = $taskId AND type = 'task.merge_failed'
+         AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE subject = $taskId AND type = 'task.merging')`,
+    )
+    .get({ taskId: task.id });
+  emit({ type: 'task.merge_failed', actor: `runner:${runnerId}`, subject: task.id, data: { runnerId, error: clip(error, 500) } });
+  if (earlier) return;
+  insertMessage(ctx, emit, {
+    from: 'system',
+    to: 'humans',
+    taskId: task.id,
+    body:
+      `agflow could not merge ${task.id} ("${clip(task.title, 120)}") into ${ctx.config.mainBranch}: runner ` +
+      `${runnerId} said: ${clip(error, 500)}\nagflow tries again every tick. If you merge it yourself, mark it merged.`,
+  });
+}
+
+RESULT_HANDLERS.merge_task = onMergeResult;
 
 function refreshDependents(ctx: HubContext, emit: Emit): void {
   const rows = ctx.db.query(`${TASK_SELECT} WHERE status = 'blocked' AND blocked_kind = 'deps'`).all() as TaskRow[];

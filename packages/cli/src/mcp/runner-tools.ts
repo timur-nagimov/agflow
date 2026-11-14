@@ -102,6 +102,8 @@ const FIX_BY_CODE: Record<FixableSubmitError, string> = {
   protected_paths:
     'your commits change protected paths, which agents may not change. Revert them to the versions your branch started from, or merge main if main changed them, then submit again.',
   needs_merge: 'someone added commits to the task branch on top of agflow work. Run `git fetch origin && git merge origin/<your branch>`, resolve any conflicts, then submit again.',
+  merge_conflict: "main does not merge into your branch cleanly. Run `git fetch origin && git merge origin/main`, resolve the conflicts, run the project's check, commit, then submit again.",
+  check_failed: "the project's check failed on your branch with main merged in. Run it yourself, make it pass, commit, then submit again.",
 };
 
 const SAFE_WORK = 'Your work is safe in your WIP ref. You may submit again, or call declare_blocked.';
@@ -192,7 +194,7 @@ const prepareDependencies = defineTool(
 
 const fetchSubmission = defineTool(
   'fetch_submission',
-  'Lead: fetch a task submission into your runner vault and wait for its submitted head. After success, run git fetch origin <branch> and review FETCH_HEAD before accepting or rejecting.',
+  "Lead: fetch a task submission into your runner vault and wait for its submitted head. After success, run git fetch origin <branch> and review FETCH_HEAD before accepting or rejecting. The answer carries the runner's check of the submission when it ran one.",
   { task_id: TaskIdSchema },
   async ({ task_id }, ctx) => {
     const bridge = runnerContext(ctx);
@@ -209,7 +211,12 @@ const fetchSubmission = defineTool(
     }
     pending.delete(task_id);
     if (decided.status === 'failed') throw new ToolError(`The submission fetch failed: ${decided.error ?? 'no reason given'}`);
-    return JSON.stringify({ branch: decided.branch, head_sha: decided.head_sha, ...(decided.note ? { note: decided.note } : {}) });
+    return JSON.stringify({
+      branch: decided.branch,
+      head_sha: decided.head_sha,
+      ...(decided.note ? { note: decided.note } : {}),
+      ...(decided.check ? { check: decided.check } : {}),
+    });
   },
 );
 

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import {
   type Fence,
   HubMessageSchema,
+  PROTOCOL_VERSION,
   RUNNER_COMMAND_KINDS,
   type RunnerCommandKind,
 } from '@agflow/core';
@@ -70,8 +71,10 @@ describe('the command queue', () => {
       expect([kind, HubMessageSchema.safeParse(wire).success]).toEqual([kind, true]);
       expect(wire).toMatchObject({ t: 'command', id: row.id, seq: row.seq, command: { kind } });
     }
-    expect(pendingCommands(ctx, runner.id, 1).map((row) => row.kind)).toEqual([...RUNNER_COMMAND_KINDS]);
-    // Every kind needs protocol 1, so a runner below it gets nothing.
+    expect(pendingCommands(ctx, runner.id, PROTOCOL_VERSION).map((row) => row.kind)).toEqual([...RUNNER_COMMAND_KINDS]);
+    // merge_task needs protocol 3; every other kind needs protocol 1, so a runner below it gets nothing.
+    const older = RUNNER_COMMAND_KINDS.filter((kind) => kind !== 'merge_task');
+    expect(pendingCommands(ctx, runner.id, 2).map((row) => row.kind)).toEqual(older);
     expect(pendingCommands(ctx, runner.id, 0)).toEqual([]);
   });
 

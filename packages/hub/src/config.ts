@@ -186,6 +186,8 @@ export function loadConfig(env: Env): LoadedConfig {
   const agentFetch = switchOf(env, 'AGFLOW_AGENT_FETCH');
   const leadApprovals = switchOf(env, 'AGFLOW_LEAD_APPROVALS');
   const autoApprovals = switchOf(env, 'AGFLOW_AUTO_APPROVALS');
+  const autoMerge = switchOf(env, 'AGFLOW_AUTO_MERGE');
+  const autoAccept = switchOf(env, 'AGFLOW_AUTO_ACCEPT');
   const testMode = env.AGFLOW_TEST === '1';
   if (env.AGFLOW_TEST_CONFIG && !testMode) throw new Error('AGFLOW_TEST_CONFIG is honoured only with AGFLOW_TEST=1');
   const config: HubConfig = {
@@ -209,6 +211,8 @@ export function loadConfig(env: Env): LoadedConfig {
     agentFetch,
     leadApprovals,
     autoApprovals,
+    autoMerge,
+    autoAccept,
   };
   const overrides = env.AGFLOW_TEST_CONFIG ? testOverrides(env.AGFLOW_TEST_CONFIG) : {};
   Object.assign(config, overrides);

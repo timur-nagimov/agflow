@@ -245,6 +245,8 @@ export const SUBMIT_ERROR_TEXTS: Record<SubmitError, { text: string; fixable: bo
   branch_moved: { text: 'Refused: the task branch moved outside agflow', fixable: false },
   remote: { text: 'Failed: pushing to the remote kept failing', fixable: false },
   interrupted: { text: 'Interrupted: a stop arrived while it was pushing', fixable: false },
+  merge_conflict: { text: 'Refused: main does not merge into the branch cleanly', fixable: true },
+  check_failed: { text: "Refused: the project's check failed", fixable: true },
 };
 
 /**

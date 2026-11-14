@@ -153,6 +153,17 @@ export interface HubConfig extends HubRunnerSettings {
    * Off by default.
    */
   autoApprovals?: boolean | undefined;
+  /**
+   * AGFLOW_AUTO_MERGE: accepting a task moves it to merging, and a runner merges it into main and pushes main
+   * (merges.ts); a conflict sends it back to its author. A dependency then counts as done only once merged, and
+   * accepted and merging tasks keep holding their owned paths. Off by default: people merge accepted work.
+   */
+  autoMerge?: boolean | undefined;
+  /**
+   * AGFLOW_AUTO_ACCEPT: the hub accepts a runner submission whose check passed the moment it records it, as
+   * hub:auto-accept, and does not wake the lead for it. Off by default: the lead reviews every submission.
+   */
+  autoAccept?: boolean | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */

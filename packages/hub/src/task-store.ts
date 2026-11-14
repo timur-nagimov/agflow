@@ -264,9 +264,13 @@ export function addNote(
     .run({ taskId, kind, body, author, now: ctx.now(), attemptId });
 }
 
-/** The dependencies not done yet: accepted counts, unless the hub is set to wait for the merge (dependenciesNeedMerge). */
+/**
+ * The dependencies not done yet: accepted counts, unless the hub waits for the merge (dependenciesNeedMerge, or
+ * autoMerge, which merges accepted work itself).
+ */
 export function unmetDependencies(ctx: HubContext, dependsOn: string[]): string[] {
-  const done = ctx.config.dependenciesNeedMerge ? (status: TaskStatus) => status === 'merged' : isDone;
+  const needMerge = ctx.config.dependenciesNeedMerge || ctx.config.autoMerge;
+  const done = needMerge ? (status: TaskStatus) => status === 'merged' : isDone;
   return dependsOn.filter((id) => {
     const dependency = findTask(ctx, id);
     return !dependency || !done(dependency.status);
@@ -294,23 +298,28 @@ export function dependencyReason(ctx: HubContext, waiting: string[]): string {
  * it is held, if another task whose owned paths overlap it holds them. Held work and work waiting for review
  * hold their paths, because a second branch on the same paths would conflict with it. So does work a person
  * took over or stopped and held, and work whose branch moved outside agflow: each comes back to the same
- * branch. The overlap test is conservative: it may block a pair that a full glob engine would allow, never
+ * branch. With auto merge, accepted work holds its paths until it is in main, since a merge conflict sends it back
+ * to its author. The overlap test is conservative: it may block a pair that a full glob engine would allow, never
  * the reverse.
  */
 const HOLDING_STATUSES: readonly TaskStatus[] = ['claimed', 'working', 'submitted', 'checking', 'reviewing'];
+const MERGE_HOLDING_STATUSES: readonly TaskStatus[] = ['accepted', 'merging'];
 const HOLDING_BLOCKS: readonly BlockedKind[] = ['takeover', 'paused', 'branch_moved'];
 
-export function isPathHolder(task: Pick<Task, 'status' | 'blockedKind'>): boolean {
+export function isPathHolder(task: Pick<Task, 'status' | 'blockedKind'>, autoMerge = false): boolean {
   if (HOLDING_STATUSES.includes(task.status)) return true;
+  if (autoMerge && MERGE_HOLDING_STATUSES.includes(task.status)) return true;
   return task.status === 'blocked' && task.blockedKind !== null && HOLDING_BLOCKS.includes(task.blockedKind);
 }
 
 /** Another task that holds paths overlapping the given task's, or null. */
 export function overlappingPathHolder(ctx: HubContext, task: Pick<Task, 'id' | 'ownedPaths'>): Task | null {
   if (task.ownedPaths.length === 0) return null;
+  const autoMerge = ctx.config.autoMerge === true;
   return (
-    listTasks(ctx, { status: [...HOLDING_STATUSES, 'blocked'] }).find(
-      (other) => other.id !== task.id && isPathHolder(other) && pathsOverlap(task.ownedPaths, other.ownedPaths),
+    listTasks(ctx, { status: [...HOLDING_STATUSES, ...MERGE_HOLDING_STATUSES, 'blocked'] }).find(
+      (other) =>
+        other.id !== task.id && isPathHolder(other, autoMerge) && pathsOverlap(task.ownedPaths, other.ownedPaths),
     ) ?? null
   );
 }

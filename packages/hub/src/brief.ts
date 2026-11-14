@@ -15,6 +15,7 @@ import { currentGoalVersion, getCurrentGoal } from './goal';
 import { type LeadNoteRow, holdsSeat, leadNoteFromRow } from './hub-state';
 import { listStandingRules, unreadFor } from './messages';
 import { getProject } from './project';
+import { AUTO_ACCEPT } from './submission-store';
 import { findTask, listTaskNotes, listTasks } from './task-store';
 import { clip, quotedWithin } from './text';
 
@@ -399,6 +400,36 @@ function yourTask(ctx: HubContext, agent: Agent, budget: number): string {
   return `${clip(text, budget - pointer.length - 1)}\n${pointer}`;
 }
 
+/** When a lead last woke: the newest start, resume or delivery of any lead attempt; 0 before the first. */
+function lastLeadWakeup(ctx: HubContext): number {
+  const row = ctx.db
+    .query(
+      `SELECT MAX(runner_commands.created_at) AS at FROM runner_commands
+       JOIN attempts ON attempts.id = runner_commands.attempt_id
+       WHERE attempts.role = 'lead' AND runner_commands.kind IN ('start_attempt', 'resume_attempt', 'deliver')`,
+    )
+    .get() as { at: number | null };
+  return row.at ?? 0;
+}
+
+/**
+ * The line naming the tasks the hub accepted itself (AGFLOW_AUTO_ACCEPT, hub:auto-accept) since the lead last woke,
+ * which no message woke it for; null when there are none.
+ */
+function autoAcceptedLine(ctx: HubContext, tasks: readonly Task[]): string | null {
+  const rows = ctx.db
+    .query(
+      `SELECT subject, MIN(id) AS first FROM events WHERE type = 'task.accepted' AND actor = $actor
+         AND ts > $since GROUP BY subject ORDER BY first`,
+    )
+    .all({ actor: AUTO_ACCEPT, since: lastLeadWakeup(ctx) }) as { subject: string }[];
+  if (rows.length === 0) return null;
+  const titles = new Map(tasks.map((task) => [task.id, task.title]));
+  const named = rows.slice(0, 10).map(({ subject }) => `${subject} "${clip(titles.get(subject) ?? '', 60)}"`);
+  const more = rows.length > named.length ? ` and ${rows.length - named.length} more` : '';
+  return `Accepted by the hub since your last wake-up, their check passed: ${named.join(', ')}${more}.`;
+}
+
 export function situationReport(ctx: HubContext): string {
   const tasks = listTasks(ctx);
   const counts = new Map<string, number>();
@@ -413,6 +444,8 @@ export function situationReport(ctx: HubContext): string {
       ...submitted.slice(0, 10).map((task) => `- ${task.id} "${clip(task.title, 80)}" by ${task.assignee ?? 'unknown'}`),
     );
   }
+  const autoAccepted = autoAcceptedLine(ctx, tasks);
+  if (autoAccepted !== null) lines.push(autoAccepted);
   const blocked = tasks.filter((task) => task.status === 'blocked' && task.blockedKind !== 'deps');
   if (blocked.length > 0) {
     lines.push('Blocked:', ...blocked.slice(0, 10).map((task) => `- ${task.id}:\n${quoted(task.blockedReason ?? '', 150)}`));

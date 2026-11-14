@@ -1,4 +1,5 @@
-// A lead explicitly waits for its own vault fetch. Review notices and other commands never wait for it.
+// A lead explicitly waits for its own vault fetch. Review notices and other commands never wait for it. The answer
+// carries the runner's check of the submission, when it reported one.
 import type { Agent, FetchSubmissionRequest } from '@agflow/core';
 import { findAttempt } from './attempt-store';
 import { enqueueCommand, findCommand, type CommandRow } from './commands';
@@ -6,13 +7,15 @@ import { type HubContext, tx } from './context';
 import { conflict, forbidden, notFound } from './errors';
 import { holdsSeat, leadSeat } from './hub-state';
 import { findRunnerRow } from './runners';
+import { findSubmission } from './submission-store';
 import { getTask } from './task-store';
 
 function submission(ctx: HubContext, taskId: string) {
   const task = getTask(ctx, taskId);
-  const { branch, headSha } = task.submission ?? {};
+  const { branch, headSha, submissionId } = task.submission ?? {};
   if (!branch || !headSha) throw conflict(`${taskId} has no submission with a branch and head to review`);
-  return { branch, head_sha: headSha };
+  const check = submissionId ? findSubmission(ctx, submissionId)?.check : undefined;
+  return { branch, head_sha: headSha, ...(check ? { check } : {}) };
 }
 
 function caller(ctx: HubContext, agent: Agent) {

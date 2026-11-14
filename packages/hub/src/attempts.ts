@@ -620,8 +620,11 @@ export interface Ending {
   ladder: LadderOutcome | null;
 }
 
-/** A task in these statuses keeps its assignee when the attempt ends: it names whose work is in review or merged. */
-const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted'];
+/**
+ * A task in these statuses keeps its assignee when the attempt ends: it names whose work is in review or merged. With
+ * auto merge, the author's attempt ends once the task is merging or merged.
+ */
+const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted', 'merging', 'merged'];
 
 /**
  * Ends an attempt, whatever triggered it (design 6.4): the one path every ending takes, in the caller's transaction or

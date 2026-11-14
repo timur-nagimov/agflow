@@ -250,7 +250,7 @@ export function addLeadNote(
     .run({ attemptId: note.attemptId, kind: note.kind ?? 'handoff', body: note.body, author: note.author, now: ctx.now() });
 }
 
-/** One tokenless command of each kind for the attempt; the mapped type makes the compiler insist on all 17. */
+/** One tokenless command of each kind for the attempt; the mapped type makes the compiler insist on all 18. */
 export function sampleCommands(attempt: Attempt): { [K in RunnerCommandKind]: Extract<StoredCommand, { kind: K }> } {
   const { id: attemptId, fence } = attempt;
   const restore = { paths: ['.claude/**'], base: 'refs/heads/main' };
@@ -327,5 +327,12 @@ export function sampleCommands(attempt: Attempt): { [K in RunnerCommandKind]: Ex
     preflight: { kind: 'preflight', vendor: 'codex' },
     delete_refs: { kind: 'delete_refs', refs: [{ ref: 'refs/agflow/T-1/a1', expectedSha: 'c'.repeat(40) }] },
     update_settings: { kind: 'update_settings', settings: { capacity: 3 }, version: 2 },
+    merge_task: {
+      kind: 'merge_task',
+      taskId: attempt.taskId ?? 'T-1',
+      title: 'Do the thing',
+      branch: 'agflow/T-1-do-the-thing',
+      headSha: 'd'.repeat(40),
+    },
   };
 }
