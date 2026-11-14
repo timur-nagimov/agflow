@@ -86,11 +86,14 @@ function requestApproval(hub: HubFixture, asking: RunnerAgent, detail: RunnerEve
   return approvalId;
 }
 
-/** Makes the runner's stored vendor reports say that a managed device policy applies. */
-function setManaged(hub: HubFixture, runnerId: string): void {
+/**
+ * Makes the runner's stored vendor reports say that the device policy reserves approvals to the owner. Managed
+ * configuration alone decides nothing (design 6.10, Managed devices): only this fact keeps the lead to declining.
+ */
+function reserveApprovals(hub: HubFixture, runnerId: string): void {
   const row = hub.ctx.db.query('SELECT info FROM runners WHERE id = $id').get({ id: runnerId }) as { info: string };
   const info = JSON.parse(row.info) as { vendors: Record<string, unknown>[] };
-  const vendors = info.vendors.map((vendor) => ({ ...vendor, managedPolicy: true }));
+  const vendors = info.vendors.map((vendor) => ({ ...vendor, managedPolicy: true, approvalsReservedToOwner: true }));
   hub.ctx.db.query('UPDATE runners SET info = $info WHERE id = $id').run({ id: runnerId, info: JSON.stringify({ ...info, vendors }) });
 }
 
@@ -169,12 +172,12 @@ describe('approvals answered by the lead, end to end', () => {
     expect((await leadBridge.call('list_approvals')).text).toBe('No approvals wait for your answer.');
   });
 
-  test('on a managed device the lead may only decline, and the asking agent gets the reason', async () => {
+  test('where the device policy reserves approvals the lead may only decline, and the asking agent gets the reason', async () => {
     const { hub } = unattendedHub();
     const lead = hub.runnerAgent({ role: 'lead' });
     const codex = hub.runnerAgent({ vendor: 'codex', owner: 'bob' });
     const worker = hub.runnerAgent();
-    setManaged(hub, codex.attempt.runnerId as string);
+    reserveApprovals(hub, codex.attempt.runnerId as string);
     const [leadBridge, workerBridge] = await Promise.all([bridgeFor(hub, lead), bridgeFor(hub, worker)]);
     const id = requestApproval(hub, codex, detail);
 

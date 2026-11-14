@@ -19,7 +19,7 @@ import {
   type RunnerEventData,
   quoteLines,
 } from '@agflow/core';
-import { type ApprovalJudgement, judgeApproval } from './approval-policy';
+import type { ApprovalJudgement } from './approval-policy';
 import { appendAttemptLog, attemptSubject, findAttempt } from './attempt-store';
 import { enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
@@ -29,7 +29,7 @@ import { leadSeat } from './hub-state';
 import { insertMessage } from './messages';
 import { type OwnerAwayInput, clearOwnerAway, setOwnerAway } from './quota';
 import { findRunnerRow, runnerInfo } from './runners';
-import { clip } from './text';
+import { clip, oneLine } from './text';
 
 interface ApprovalRow {
   id: string;
@@ -192,6 +192,34 @@ function sendDecision(
  * keeps a line of it and the runner is sent the decision as a person's is. No owner-away mark is touched and no
  * owner-away mark is cleared: nobody was asked and nobody answered.
  */
+/** The rule a request gets when judging it threw: the rules did not answer, so neither does anything built on them. */
+const RULES_FAILED = 'rules-failed';
+
+/**
+ * The rules' verdict on a request, with a throw read as no verdict at all. The rules are pure and parse defensively,
+ * but they read text an agent wrote, so a request they choke on must still be stored and reach a person: a throw here
+ * would roll back the transaction that carries the request, and the asking agent would wait for an answer nobody can
+ * see. The failure goes on the attempt's log, so a defect in the rules is seen rather than hidden. Callers that build a
+ * floor on the verdict treat RULES_FAILED as a refusal: an input that crashes the reader must not be a way past it.
+ */
+function judgeSafely(ctx: HubContext, approval: Approval): ApprovalJudgement {
+  try {
+    return ctx.judgeApproval(approval, { cloneRoot: approval.detail.cloneRoot ?? null });
+  } catch (error) {
+    appendAttemptLog(
+      ctx,
+      approval.attemptId,
+      'note',
+      `approval ${approval.id}: the hub's rules could not judge it (${clip(oneLine(String(error)), 300)}); it waits for an answer`,
+    );
+    return {
+      verdict: 'undecided',
+      rule: RULES_FAILED,
+      reason: "the hub's rules could not read this request, so they give no verdict on it",
+    };
+  }
+}
+
 function decideByRule(
   ctx: HubContext,
   emit: Emit,
@@ -263,7 +291,7 @@ export function onApprovalRequested(
   // anyone, declining being always safe; an approval needs the device to leave approvals to an agent, and where it
   // does not, the request waits for the owner rather than being refused an approval the rules allow.
   if (ctx.config.autoApprovals) {
-    const judged = judgeApproval(approval, { cloneRoot: approval.detail.cloneRoot ?? null });
+    const judged = judgeSafely(ctx, approval);
     if (judged.verdict === 'decline') return decideByRule(ctx, emit, approval, 'decline', judged);
     if (judged.verdict === 'approve' && agentMayApprove(ctx, approval)) {
       return decideByRule(ctx, emit, approval, 'approve', judged);
@@ -455,8 +483,9 @@ export function decideApprovalAsLead(
     if (decision === 'decline' && given === null) throw approvalReasonRequired(id);
     if (decision === 'approve') {
       if (!agentMayApprove(ctx, approval)) throw approvalManaged(approval);
-      const judged = judgeApproval(approval, { cloneRoot: approval.detail.cloneRoot ?? null });
-      if (judged.verdict === 'decline') throw approvalRefusedByRule(approval, judged);
+      // The floor holds when the rules fail too: an input that crashes the reader is no way past it.
+      const judged = judgeSafely(ctx, approval);
+      if (judged.verdict === 'decline' || judged.rule === RULES_FAILED) throw approvalRefusedByRule(approval, judged);
     }
     const by = `agent:${lead.agentId}`;
     const decided = settle(ctx, approval, decision === 'approve' ? 'approved' : 'declined', by);

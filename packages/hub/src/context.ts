@@ -1,5 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import { DEFAULT_INFRA_BACKOFF_MS, DEFAULT_WIP_REF_PREFIX } from '@agflow/core';
+import { judgeApproval } from './approval-policy';
 import { openDb } from './db';
 import { type Emit, EventBus, insertEvent } from './events';
 import { FetchLimiter } from './fetch-limits';
@@ -189,6 +190,8 @@ export interface HubContext {
   fetch: FetchFn;
   link: RunnerLink;
   agentFetch: AgentFetchRuntime;
+  /** The rules approval requests are judged by (approval-policy.ts); tests replace them to see what a failure does. */
+  judgeApproval: typeof judgeApproval;
 }
 
 export interface ContextOptions {
@@ -198,6 +201,7 @@ export interface ContextOptions {
   fetch?: FetchFn | undefined;
   link?: RunnerLink | undefined;
   agentFetch?: Partial<AgentFetchRuntime> | undefined;
+  judgeApproval?: typeof judgeApproval | undefined;
 }
 
 /**
@@ -229,6 +233,7 @@ export function createContext(options: ContextOptions): HubContext {
       limits: {},
       ...options.agentFetch,
     },
+    judgeApproval: options.judgeApproval ?? judgeApproval,
   };
 }
 
