@@ -132,6 +132,11 @@ export interface HubConfig extends HubRunnerSettings {
   /** AGFLOW_OPERATOR_USER: the allowed person the operator acts as, in lower case. */
   operatorUser?: string | null | undefined;
   /**
+   * AGFLOW_BACKUP_DIR, where the hub process writes its backups: a project reset writes its archive of the old project
+   * there too. Unset (tests, the demo): a reset writes no archive.
+   */
+  backupDir?: string | undefined;
+  /**
    * AGFLOW_DEPENDENCIES_NEED_MERGE: a dependency counts as done only once it is merged, not when it is accepted, so a
    * dependent's work starts from a main branch that holds it. Off by default (M2: acceptance counts).
    */

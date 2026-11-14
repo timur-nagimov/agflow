@@ -639,6 +639,8 @@ export function describeEvent(event: HubEvent): string {
       return `${by} paused the project`;
     case 'project.resumed':
       return `${by} resumed the project`;
+    case 'project.reset':
+      return `${by} started the project ${text(d.name)} in place of ${text(d.previous)}`;
     case 'agent.session_started':
       return `${by} connected ${on}, a ${text(d.vendor)} ${text(d.role)}${d.label ? ` (${text(d.label)})` : ''}`;
     case 'agent.lead_changed':
