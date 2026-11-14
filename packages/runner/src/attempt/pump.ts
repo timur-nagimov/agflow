@@ -10,9 +10,13 @@
 //   hub has no other way to learn; every text is clipped to fit the outbox, and the owner gets one notification keyed
 //   by that UUID. A withdrawn request is approval.voided; decide_approval answers at once whether it applied.
 //   A request the outbox refuses all the same is declined to the agent with the reason, so it never waits in vain.
+//   cloneRoot goes only while the clone's path still names the directory the pump started with: one that is gone, a
+//   link, or another directory (its device and inode changed) relays the request without it, and the hub's rules
+//   then leave it undecided.
 // - Descendants: every tool start, and every 5 s while a tool runs, snapshots the agent's descendants and records
 //   their groups, so a tool's group can be stopped even after its parent is gone.
 import { randomUUID } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import {
   APPROVAL_CLIPPED_MARK,
   type Approval,
@@ -84,6 +88,28 @@ export function moreMessagesLine(more: number): string {
   return `${more} more agflow messages are waiting: call check_inbox`;
 }
 
+/** Which directory a path names: its device and inode, exact as bigints. */
+interface DirectoryIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+/**
+ * The directory at the clone's path, never followed if it is a link, or why the path names none: it is gone, a link,
+ * not a directory, or cannot be read.
+ */
+function cloneDirectory(clone: string): DirectoryIdentity | string {
+  try {
+    const stat = lstatSync(clone, { bigint: true, throwIfNoEntry: false });
+    if (stat === undefined) return 'the clone is gone';
+    if (stat.isSymbolicLink()) return 'the clone is a symbolic link';
+    if (!stat.isDirectory()) return 'the clone is not a directory';
+    return { dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    return `the clone cannot be read: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 export interface EventPumpOptions {
   spec: Pick<AttemptSpec, 'attemptId' | 'successor' | 'hubUrl'>;
   session: AgentSession;
@@ -119,10 +145,13 @@ export class EventPump {
   private snapshotting: Promise<void> = Promise.resolve();
   private firstOutputSent = false;
   private handoffCount = 0;
+  /** The directory the clone's path named when the pump started, or why it named none. */
+  private readonly cloneAtStart: DirectoryIdentity | string;
 
   constructor(options: EventPumpOptions) {
     this.options = options;
     this.firstOutputSent = options.firstOutputReported ?? false;
+    this.cloneAtStart = cloneDirectory(options.clone);
   }
 
   /**
@@ -310,8 +339,21 @@ export class EventPump {
     // The agent and the adapter write these: clipped, so the event always fits the outbox.
     const summary = clip(event.summary, APPROVAL_SUMMARY_MAX);
     // The runner's own fact, added after any enrichment, so neither the agent nor the adapter writes it: the hub
-    // knows no path of this laptop, and judges a cwd against this one (design 6.10).
-    const relayed = clipApprovalDetail({ ...detail, cloneRoot: this.options.clone });
+    // knows no path of this laptop, and judges a cwd against this one (design 6.10). It goes only while the path still
+    // names the directory the pump started with, checked here with nothing awaited before the report: an agent that
+    // once wrote outside its workspace could have put a link or another directory there, and every path under it would
+    // look contained. Without it the hub's rules approve nothing.
+    const { cloneRoot: _notTheRunners, ...asked } = detail;
+    const moved = this.cloneMoved();
+    if (moved !== null) {
+      logger.warn('an approval request is relayed without cloneRoot, so no rule approves it', {
+        attemptId: spec.attemptId,
+        approvalId,
+        clone: this.options.clone,
+        why: moved,
+      });
+    }
+    const relayed = clipApprovalDetail(moved === null ? { ...asked, cloneRoot: this.options.clone } : asked);
     try {
       this.options.report({
         type: 'approval.requested',
@@ -338,6 +380,19 @@ export class EventPump {
     } catch (error) {
       logger.warn('cannot post the approval notification', { attemptId: spec.attemptId, error: String(error) });
     }
+  }
+
+  /**
+   * Why the clone's path no longer names the directory it named when the pump started, or null while it does. A path
+   * that named none at the start never does.
+   */
+  private cloneMoved(): string | null {
+    const start = this.cloneAtStart;
+    if (typeof start === 'string') return `when the pump started, ${start}`;
+    const now = cloneDirectory(this.options.clone);
+    if (typeof now === 'string') return now;
+    if (now.dev === start.dev && now.ino === start.ino) return null;
+    return 'the clone is another directory than the one the pump started with';
   }
 
   private voidApproval(vendorId: string): void {
