@@ -174,7 +174,7 @@ The allowlist is checked whenever a session verifies; removing a login invalidat
 M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. To run a
 project unattended, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
 for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login the script acts as) in
-`/etc/agflow/hub.env` and restart. Four routes then accept the header `X-Agflow-Operator: <token>`:
+`/etc/agflow/hub.env` and restart. Five routes then accept the header `X-Agflow-Operator: <token>`:
 
 | Route | Does |
 |---|---|
@@ -182,13 +182,45 @@ for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login
 | `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
 | `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
 | `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
+| `POST /api/operator/project/reset` `{ "name", "repo", "deadline": ISO 8601 or null, "goal", "rules": string[] }` | replaces the project with a new one ([Start a new project](#start-a-new-project)) |
 
-Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it. Without the token the routes
-do not exist. A person's CLI token, which runners hold, still cannot use people's controls. The events record the
-operator's person as the actor.
+Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it; `agflow start` is the one
+caller meant for a laptop. Without the token the routes do not exist. A person's CLI token, which runners hold, still
+cannot use people's controls. The events record the operator's person as the actor.
 
 With an operator that merges, also set `AGFLOW_DEPENDENCIES_NEED_MERGE=1`: a dependency then counts as done only once
 it is marked merged, so the hub releases dependent tasks after their dependencies are in `main`, not at acceptance.
+
+## Start a new project
+
+`agflow start` on the owner's Mac seeds a repository with a spec and calls `POST /api/operator/project/reset`, so a new
+project needs no ssh; the README's [Start a project](../README.md#start-a-project) shows the command. Store the operator
+token on that Mac once, with `agflow operator-token set < token-file` (the Keychain item `agflow-operator`). The token
+then lives on a laptop where agents run: whoever reads it can replace the project. Prefer the Keychain to
+`~/.agflow/operator-token`, which any process of the owner's can read.
+
+The reset, in one go:
+
+1. writes a copy of the whole database to `agflow-archive-<old project>-<time>.db` in the backup folder, which
+   retention never prunes;
+2. empties the old project: tasks, attempts, submissions, messages, events, goal versions and notes, lead and task
+   notes, approvals, deliveries, the runner commands about its work, internet grants and the record of agent fetches,
+   runner agents and their tokens, attempt logs, rejected runner events and the lead seat;
+3. keeps sessions, CLI sign-ins, people's live agents, runners and vendor accounts;
+4. sets the name, repository and deadline, unpauses, clears the worker target and the vendor preference, and raises
+   the epoch and the id counters as a restore does, so no new attempt, branch or ref collides with an old one;
+5. sets goal v1 and posts the rules as standing rules, as the operator's person (event `project.reset`);
+6. closes every runner link. Each runner says hello again, and the hub, which no longer knows the attempts it
+   reports, lists them in the welcome's stop list, as after a restore.
+
+Runners of this release hear the new project in the welcome and open its vault without a restart; the old project's
+last work goes to its own repository. A runner of an older release keeps the old repository until it restarts.
+`AGFLOW_PROJECT_NAME` and `AGFLOW_PROJECT_REPO` only name a new database's first project: after a reset, the
+database's project is the hub's.
+
+This replaces the manual procedure: drain the runners, stop the hub, move the database aside, start it, copy the
+sessions back, raise the epoch with the restore tool, set the goal and undrain. To go back to an archived project,
+restore its archive as a backup ([Backups and restore](#backups-and-restore)).
 
 ## Unattended operation
 
@@ -198,8 +230,9 @@ after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
 - **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal, marking tasks
-  merged, unblocking and messaging the lead by hand. Risk: whoever reads the token acts as the operator's person on
-  those routes, so keep it on the server only.
+  merged, unblocking, messaging the lead and starting a new project by hand. Risk: whoever reads the token acts as the
+  operator's person on those routes, the project reset included, so keep it on the server, or in the owner's Keychain
+  for `agflow start`.
 - **`AGFLOW_DEPENDENCIES_NEED_MERGE=1`.** Removes: checking that a dependency reached `main` before dependent work
   starts. Risk: if nothing marks accepted tasks merged, dependent tasks wait forever. Set it only together with an
   operator that merges.

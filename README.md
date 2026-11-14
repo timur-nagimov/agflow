@@ -111,6 +111,40 @@ Checks run **inside the service**: hub identity, repository access (`git ls-remo
 
 `AGFLOW_HOME` relocates runner storage (default `~/.agflow`). Logs are under `runner/logs/`. If status says `needs_login`, run `agflow login` again; the runner reconnects itself. Three unclean exits in ten minutes cause a self-drain until `undrain`. Keep-awake on AC prevents idle sleep, not a closed lid; after a lost runner's lease expires, another attempt can continue from pushed WIP, and later recovered work is recorded separately.
 
+## Start a project
+
+`agflow start` turns a written spec into the hub's project in a few minutes: it seeds the repository, and the hub and
+its runners move to it by themselves.
+
+```bash
+agflow operator-token set < operator-token.txt    # once: the hub's AGFLOW_OPERATOR_TOKEN, kept in the Keychain
+agflow start --spec brief.pdf --spec https://example.com/rules.html --repo acme/afisha --create \
+  --collaborator bob --stack python --deadline +36h
+```
+
+- **The spec.** Each `--spec` is a file or a URL, which curl downloads. Markdown and text are taken as they are, a PDF
+  goes through `pdftotext -layout` when it is installed, and Word, RTF, OpenDocument and HTML files through macOS
+  `textutil`. SPEC.md holds their text, and the originals go to `docs/spec/`. A file with no text, such as an image or
+  a scanned PDF, gets a section in SPEC.md that asks the first task to transcribe it.
+- **The seed commit.** SPEC.md, `docs/spec/`, AGENTS.md (the stack, where things go, the commands and the definition
+  of done), a CLAUDE.md that includes it, `.agflow/config.json` (dependency preparation runs `scripts/install.sh`, and
+  the check is `bash scripts/check.sh`), `scripts/install.sh`, `scripts/check.sh`, `scripts/demo.sh` and a
+  `.gitignore`. The scripts do nothing in an empty project and run the stack's tools once its manifest exists:
+  `--stack python` runs uv, pytest and ruff; `--stack typescript` runs Bun or npm, the tests and tsc; any other text
+  gets scripts that say what to fill in. An empty repository gets the seed as its first commit on `main`, one with
+  commits as a new commit on top of its default branch. Nothing is force-pushed.
+- **`--create`** makes the repository with `gh repo create --private`, and each `--collaborator <login>` gets write
+  access. Both need `--repo owner/name`.
+- **The hub.** The project is named `--name`, or after the repository. The hub writes an archive of its database to
+  its backup folder, empties the old project (tasks, attempts, messages, events, the goal, approvals), keeps sign-ins,
+  runners and vendor accounts, and sets the goal: implement SPEC.md, then keep improving the product until the
+  deadline. A standing rule names the stack. `--deadline` is an ISO 8601 time or a span such as `+36h`. The hub is the
+  one `agflow login` signed in to, or `--hub <url>`.
+
+The operator token is read from `AGFLOW_OPERATOR_TOKEN`, then from the Keychain item `agflow-operator`, then from
+`~/.agflow/operator-token` (mode 600). Whoever holds it can replace the hub's project, so prefer the Keychain. A
+runner of an older agflow, which does not hear the project from the hub, keeps the old repository until it restarts.
+
 ## Runner permissions and risks
 
 Agents run as the laptop owner's user. Four boundaries apply to their tools:
@@ -163,15 +197,15 @@ Protected paths are matched case-insensitively. The runner restores them before 
 |---|---|---|
 | `AGFLOW_AUTH` | `github` | `github` for GitHub sign-in, `dev` for local testing |
 | `AGFLOW_ALLOWED_USERS` | (required) | Comma-separated GitHub logins allowed to sign in |
-| `AGFLOW_PROJECT_NAME` | (required) | Project name shown to people and agents |
-| `AGFLOW_PROJECT_REPO` | (required) | URL of the project's git repository |
+| `AGFLOW_PROJECT_NAME` | (required) | Project name shown to people and agents, for a new database; a project reset (`agflow start`) replaces it |
+| `AGFLOW_PROJECT_REPO` | (required) | URL of the project's git repository, for a new database; a project reset replaces it |
 | `AGFLOW_PUBLIC_URL` | `http://localhost:<port>` | Address people and laptops use to reach the hub, an `http://` or `https://` URL; `https://` makes session cookies secure |
 | `AGFLOW_HOST` | `127.0.0.1` with `AGFLOW_AUTH=dev`, otherwise `0.0.0.0` | Listening address; `::` accepts IPv6 as well as IPv4 |
 | `AGFLOW_PORT` | `8787` | Listening port, 1 to 65535 |
 | `AGFLOW_DB` | `data/agflow.db` | SQLite database file |
-| `AGFLOW_BACKUP_DIR` | `data/backups` | Hourly snapshots (24 hours), daily snapshots (newest 7) and start snapshots (newest 3) |
+| `AGFLOW_BACKUP_DIR` | `data/backups` | Hourly snapshots (24 hours), daily snapshots (newest 7) and start snapshots (newest 3), and the archive of each project a reset replaced (never pruned) |
 | `AGFLOW_WEB_DIST` | (unset) | Folder with the built web UI |
-| `AGFLOW_OPERATOR_TOKEN`, `AGFLOW_OPERATOR_USER` | (unset) | Server-only token for the operator routes (goal, mark merged, unblock, message) and the allowed login they act as; see [docs/deploy-hub.md](docs/deploy-hub.md#operator-access) |
+| `AGFLOW_OPERATOR_TOKEN`, `AGFLOW_OPERATOR_USER` | (unset) | Token for the operator routes (goal, mark merged, unblock, message, project reset) and the allowed login they act as; `agflow start` reads it on the owner's laptop. See [docs/deploy-hub.md](docs/deploy-hub.md#operator-access) |
 | `AGFLOW_DEPENDENCIES_NEED_MERGE` | `0` | `1`: a dependency is done only once it is merged, not when it is accepted, so dependents start from a main branch that holds it |
 | `AGFLOW_AGENT_FETCH` | `0` | `1`: the hub downloads public web pages for Claude runner agents, for the lead and for the tasks the lead grants internet access; an agent that reads hostile text can then leak what its sandbox lets it read through the addresses it asks for. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
 | `AGFLOW_LEAD_APPROVALS` | `0` | `1`: the agent holding the lead seat may answer the approval requests of other agents' Codex attempts: decline any of them with a reason, and approve them on a runner whose device policy does not reserve approvals to its owner, so a command the lead approves runs outside the sandbox on its owner's laptop without a person looking at it. |
