@@ -16,6 +16,7 @@ import {
   type TaskCandidate,
   type Vendor,
   countedAttempts,
+  minutesUntil,
   orderReady,
   pathsOverlap,
   place,
@@ -30,7 +31,7 @@ import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
 import { ensureDemoCheck } from './demo-check';
-import { churnPaused, inRecovery } from './hub-state';
+import { churnPaused, getHubState, inRecovery } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
@@ -415,15 +416,13 @@ export interface TickResult {
  * dispatch (churnPaused), the lead seat step still runs and no worker starts.
  */
 export function runTick(ctx: HubContext): TickResult {
-  // The wait reasons are this tick's: one that dispatches nothing leaves none.
-  memoryOf(ctx).waiting = new Map();
   const clock = checkClock(ctx);
-  if (inRecovery(ctx)) return { clock, recovering: true, reconciled: null, lead: null, started: [] };
+  if (inRecovery(ctx)) return held(ctx, { clock, recovering: true, reconciled: null, lead: null, started: [] });
   const reconciled = reconcile(ctx);
-  if (getProject(ctx).paused) return { clock, recovering: false, reconciled, lead: null, started: [] };
+  if (getProject(ctx).paused) return held(ctx, { clock, recovering: false, reconciled, lead: null, started: [] });
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
   // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).
-  if (churnPaused(ctx)) return { clock, recovering: false, reconciled, lead, started: [] };
+  if (churnPaused(ctx)) return held(ctx, { clock, recovering: false, reconciled, lead, started: [] });
   // Before dispatch, so that a new demo check can start in this tick.
   duty('the demo check', () => ensureDemoCheck(ctx), null);
   return { clock, recovering: false, reconciled, lead, started: dispatch(ctx).started };
@@ -540,7 +539,7 @@ interface SlotSample {
 
 /** Kept in memory only: a hub that restarts begins both afresh. */
 interface TickMemory {
-  /** Why each ready task did not start in the last tick (dispatch). */
+  /** Why each ready task did not start in the last tick (dispatch, or held when the tick started no worker). */
   waiting: Map<string, string>;
   /** The last hour's samples, oldest first. */
   samples: SlotSample[];
@@ -555,6 +554,32 @@ function memoryOf(ctx: HubContext): TickMemory {
     memories.set(ctx, memory);
   }
   return memory;
+}
+
+/**
+ * Why no worker starts now, in one line for the board and the Load page; null when dispatch runs. Within the recovery
+ * window the tick does nothing, a paused project starts nothing, and the churn guard holds worker dispatch (runTick).
+ */
+export function dispatchHold(ctx: HubContext): string | null {
+  const now = ctx.now();
+  const { recoveryUntil, dispatchPausedUntil } = getHubState(ctx);
+  const minutes = (until: number | null): number => minutesUntil(until ?? now, now);
+  if (inRecovery(ctx)) {
+    return `the hub is recovering after downtime: nothing starts for up to ${minutes(recoveryUntil)} min`;
+  }
+  if (getProject(ctx).paused) return 'the project is paused';
+  if (churnPaused(ctx)) return `the churn guard holds worker dispatch for ${minutes(dispatchPausedUntil)} more min`;
+  return null;
+}
+
+/** A tick that starts no worker: the ready set waits for dispatchHold's reason, other ready tasks for their own. */
+function held(ctx: HubContext, result: TickResult): TickResult {
+  const waiting = new Map<string, string>();
+  const ready = readySet(ctx, waiting);
+  const why = dispatchHold(ctx);
+  if (why !== null) for (const task of ready) waiting.set(task.id, why);
+  memoryOf(ctx).waiting = waiting;
+  return result;
 }
 
 /** The task with its waitReason: why the last tick did not start it, while it is still ready; null otherwise. */

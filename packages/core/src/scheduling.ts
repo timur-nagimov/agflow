@@ -268,7 +268,7 @@ export interface DispatchContext {
 }
 
 /** Whole minutes from now until a time, at least 1, for a reason people read. */
-const minutesUntil = (at: number, now: number): number => Math.max(1, Math.ceil((at - now) / 60_000));
+export const minutesUntil = (at: number, now: number): number => Math.max(1, Math.ceil((at - now) / 60_000));
 
 /**
  * Why a task is not in the ready set (design 6.6, step 3), in one line for the board; null when it is. The ready set

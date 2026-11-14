@@ -605,9 +605,9 @@ export interface AccountLoad {
   accountId: string | null;
   /** 'Claude Max', 'ChatGPT Plus'; null when no runner reports one. */
   plan: string | null;
-  /** The vendor's starting, running and quota_wait attempts on those runners. */
+  /** The vendor's starting, running and quota_wait attempts on those runners that are online and not draining. */
   busy: number;
-  /** The slots of those runners, which the owner's other vendor shares. */
+  /** The slots of the same runners, which the owner's other vendor shares. */
   capacity: number;
   /** Utilization 0..1 as placement counts it; null when unknown. */
   fiveHour: number | null;
@@ -630,7 +630,10 @@ export interface ProjectLoad {
   idleSlotMinutes: number;
   tasks: {
     ready: number;
-    /** Ready tasks the scheduler may start now (design 6.6, step 3). */
+    /**
+     * Ready tasks the scheduler may start now (design 6.6, step 3); none while it holds dispatch: the project is
+     * paused, the churn guard holds it, or the hub recovers after downtime.
+     */
     dispatchable: number;
     blockedOnDependencies: number;
     submitted: { count: number; oldestAgeMs: number | null };

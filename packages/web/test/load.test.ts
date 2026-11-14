@@ -13,7 +13,6 @@ import {
   slotsText,
   stripNumbers,
   windowText,
-  workerLimit,
   workersText,
 } from '../src/load';
 
@@ -86,7 +85,6 @@ describe('the Load page', () => {
   test("the project's workers, slots, queues and deadline", () => {
     expect(workersText({ running: 2, target: null, cap: 4 })).toBe('2 running of 4, the cap');
     expect(workersText({ running: 1, target: 3, cap: 4 })).toBe("1 running of 3, the lead's target (the cap is 4)");
-    expect(workerLimit({ running: 1, target: 0, cap: 4 })).toBe(0);
     expect(slotsText({ capacity: 6, busy: 4, idle: 2 })).toBe('4 of 6 taken, 2 free');
     expect(queueText({ count: 2, oldestAgeMs: 12 * MINUTE })).toBe('2, the oldest for 12 min');
     expect(queueText({ count: 0, oldestAgeMs: null })).toBe('none');
@@ -97,11 +95,12 @@ describe('the Load page', () => {
     expect(deadlineText({ at: NOW - 10 * MINUTE, leftMs: -10 * MINUTE }, NOW)).toBe('13:50, passed 10 min ago');
   });
 
-  test('the strip shows workers running of the limit, the ready tasks and the free slots', () => {
+  test('the strip shows workers running of the cap, the ready tasks and the free slots', () => {
     const load: HubLoad = { now: NOW, accounts: [account()], project: project() };
     expect(stripNumbers(load)).toEqual({ workers: '2/4', ready: 3, dispatchable: 1, idle: 2 });
+    // The lead's target does not change it: the Load page shows the target.
     const targeted = { ...load, project: project({ workers: { running: 1, target: 2, cap: 4 } }) };
-    expect(stripNumbers(targeted).workers).toBe('1/2');
+    expect(stripNumbers(targeted).workers).toBe('1/4');
   });
 
   test('the page reads GET /api/load', async () => {

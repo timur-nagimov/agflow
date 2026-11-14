@@ -5,7 +5,7 @@ import { DEMO_CHECK_PATHS, ensureDemoCheck } from '../src/demo-check';
 import { listMessages } from '../src/messages';
 import { runTick } from '../src/scheduler';
 import { getTask, listTasks, move } from '../src/task-store';
-import { cancelTask } from '../src/tasks';
+import { cancelTask, updateTask } from '../src/tasks';
 import { addRunnerAttempt, createTestContext } from './helpers';
 
 /** A task a runner attempt of the vendor finished: accepted, and merged when asked; returns its id. */
@@ -79,6 +79,25 @@ describe('the demo check', () => {
     finish(ctx, 'claude');
     expect(ensureDemoCheck(ctx)).toBeNull();
     finish(ctx, 'claude');
+    expect(ensureDemoCheck(ctx)?.title).toBe('Demo check after 4 tasks');
+  });
+
+  test('a check keeps counting as one when someone renames it', () => {
+    const { ctx } = createTestContext({ demoCheckEvery: 2 });
+    finish(ctx, 'claude');
+    finish(ctx, 'codex');
+    const id = ensureDemoCheck(ctx)?.id as string;
+    updateTask(ctx, id, { title: 'QA pass: run the product from main' }, 'user:alice');
+    finish(ctx, 'claude');
+    finish(ctx, 'codex');
+    // Still open, so no second one.
+    expect(ensureDemoCheck(ctx)).toBeNull();
+    tx(ctx, (emit) => {
+      const claimed = move(ctx, emit, getTask(ctx, id), 'claimed', 'system');
+      const submitted = move(ctx, emit, claimed, 'submitted', 'system');
+      move(ctx, emit, submitted, 'accepted', 'user:alice');
+    });
+    // Accepted, it is not one of the tasks done.
     expect(ensureDemoCheck(ctx)?.title).toBe('Demo check after 4 tasks');
   });
 

@@ -9,24 +9,26 @@ import { insertMessage } from './messages';
 import { findTask } from './task-store';
 import { createTasks, creationGuard } from './tasks';
 
-/** A task the system created with a title that starts so is a demo check. */
+/** A task the system created with a title that starts so is a demo check, whatever its title is now. */
 export const DEMO_CHECK_TITLE = 'Demo check after';
 
 /** The only paths a demo check may change. */
 export const DEMO_CHECK_PATHS = ['docs/STATUS.md', 'docs/qa/**', 'scripts/demo.sh'] as const;
 
-/** The demo checks so far, oldest first, each with the id of the event that created it. */
+/**
+ * The demo checks so far, oldest first, each with the id of the event that created it. They are found by the title in
+ * that event, which update_task does not change.
+ */
 function demoChecks(ctx: HubContext): { task: Task; createdEvent: number }[] {
   const rows = ctx.db
     .query(
-      `SELECT tasks.id, (SELECT MIN(events.id) FROM events WHERE events.type = 'task.created'
-         AND events.subject = tasks.id) AS created_event
-       FROM tasks WHERE created_by = 'system' AND json_extract(contract, '$.title') LIKE $title ORDER BY seq`,
+      `SELECT subject AS id, id AS created_event FROM events
+       WHERE type = 'task.created' AND actor = 'system' AND json_extract(data, '$.title') LIKE $title ORDER BY id`,
     )
-    .all({ title: `${DEMO_CHECK_TITLE} %` }) as { id: string; created_event: number | null }[];
+    .all({ title: `${DEMO_CHECK_TITLE} %` }) as { id: string; created_event: number }[];
   return rows.flatMap((row) => {
     const task = findTask(ctx, row.id);
-    return task ? [{ task, createdEvent: row.created_event ?? 0 }] : [];
+    return task ? [{ task, createdEvent: row.created_event }] : [];
   });
 }
 

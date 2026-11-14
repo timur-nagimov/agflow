@@ -23,7 +23,7 @@ export function accountName(account: Pick<AccountLoad, 'owner' | 'vendor' | 'pla
   return [account.owner, VENDOR_NAMES[account.vendor], account.plan].filter((part) => part !== null).join(' · ');
 }
 
-/** The slots the vendor's attempts take on the owner's online runners: "1 of 2". */
+/** The slots the vendor's attempts take on the owner's online runners that are not draining: "1 of 2". */
 export function slotText(account: Pick<AccountLoad, 'busy' | 'capacity'>): string {
   return `${account.busy} of ${account.capacity}`;
 }
@@ -39,11 +39,6 @@ export const overCeiling = (used: number | null, ceiling: number): boolean => us
 /** When the limiting window resets, as a clock time; "unknown" without one. */
 export function resetText(resetsAt: number | null, now: number): string {
   return resetsAt === null ? 'unknown' : clockTime(resetsAt, now);
-}
-
-/** The most workers the scheduler runs now: the lead's target, or AGFLOW_MAX_WORKERS without one. */
-export function workerLimit(workers: ProjectLoad['workers']): number {
-  return workers.target ?? workers.cap;
 }
 
 /** "2 running of 4, the lead's target (the cap is 6)", or "3 running of 4, the cap". */
@@ -72,11 +67,11 @@ export function deadlineText(deadline: ProjectLoad['deadline'], now: number): st
   return `${at}, passed ${duration(-deadline.leftMs)} ago`;
 }
 
-/** What the strip shows: workers running of the limit, ready tasks (and how many can start now), free slots now. */
+/** What the strip shows: workers running of the cap, ready tasks (and how many can start now), free slots now. */
 export function stripNumbers(load: HubLoad): { workers: string; ready: number; dispatchable: number; idle: number } {
   const { workers, tasks, slots } = load.project;
   return {
-    workers: `${workers.running}/${workerLimit(workers)}`,
+    workers: `${workers.running}/${workers.cap}`,
     ready: tasks.ready,
     dispatchable: tasks.dispatchable,
     idle: slots.idle,

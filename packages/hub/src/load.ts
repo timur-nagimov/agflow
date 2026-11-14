@@ -16,7 +16,7 @@ import type { HubContext } from './context';
 import { placementSnapshot } from './placement';
 import { getStaffing } from './project';
 import { findRunnerRows, runnerInfo } from './runners';
-import { idleSlotMinutes, readySet, runnerSlots, runningWorkers } from './scheduler';
+import { dispatchHold, idleSlotMinutes, readySet, runnerSlots, runningWorkers } from './scheduler';
 import { listTasks } from './task-store';
 
 const HOUR = 60 * 60_000;
@@ -25,10 +25,10 @@ const HOUR = 60 * 60_000;
 const rank = (state: AccountLoad['state']): number => (state === 'ok' ? 0 : state === 'offline' ? 2 : 1);
 
 /**
- * One row per account (owner, vendor and account id) that a runner of the owner reports. Its capacity is that of the
- * owner's online runners logged in to it; its windows read as placement reads them, a window that has reset since the
- * report as unknown; its state is 'ok' when one of those runners can take an attempt of the vendor now, and otherwise
- * the vendor's refusal there, or the runner's.
+ * One row per account (owner, vendor and account id) that a runner of the owner reports. Its taken and total slots
+ * count the owner's runners logged in to it that are online and not draining, as the project's slots do; its windows
+ * read as placement reads them, a window that has reset since the report as unknown; its state is 'ok' when one of
+ * those runners can take an attempt of the vendor now, and otherwise the vendor's refusal there, or the runner's.
  */
 function accountLoads(ctx: HubContext): AccountLoad[] {
   const snapshot = placementSnapshot(ctx);
@@ -81,8 +81,10 @@ function accountLoads(ctx: HubContext): AccountLoad[] {
         rows.set(key, row);
       }
       row.plan ??= plans.get(runner.id)?.get(slot.vendor) ?? null;
-      row.busy += busyOn(runner.id, slot.vendor);
-      if (runner.state === 'online') row.capacity += runner.capacity;
+      if (runner.state === 'online' && !runner.draining) {
+        row.busy += busyOn(runner.id, slot.vendor);
+        row.capacity += runner.capacity;
+      }
       row.ceilings = {
         fiveHour: Math.min(row.ceilings.fiveHour, slot.ceilings.fiveHour),
         weekly: Math.min(row.ceilings.weekly, slot.ceilings.weekly),
@@ -125,7 +127,7 @@ function projectLoad(ctx: HubContext): ProjectLoad {
     idleSlotMinutes: idleSlotMinutes(ctx),
     tasks: {
       ready: tasks.filter((task) => task.status === 'ready').length,
-      dispatchable: readySet(ctx).length,
+      dispatchable: dispatchHold(ctx) === null ? readySet(ctx).length : 0,
       blockedOnDependencies: tasks.filter((task) => task.status === 'blocked' && task.blockedKind === 'deps').length,
       submitted: {
         count: submitted.length,

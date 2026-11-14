@@ -168,7 +168,7 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 <a
                   className="readout"
                   href={routeHref({ view: 'load' })}
-                  title="Runner workers running, of the most the scheduler starts"
+                  title="Runner workers running, of the cap, AGFLOW_MAX_WORKERS; the Load page shows the lead's target"
                 >
                   Workers <b>{numbers.workers}</b>
                 </a>

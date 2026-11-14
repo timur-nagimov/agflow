@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { type HubLoad, TEST_ACCOUNT_ID, type Vendor, type VendorQuota } from '@agflow/core';
 import { type HubContext, tx } from '../src/context';
+import { updateHubState } from '../src/hub-state';
 import { setPaused, setWorkerTarget } from '../src/project';
 import { upsertAccountQuota } from '../src/quota';
 import { Scheduler, idleSlotMinutes, runTick, sampleSlots, withWaitReason } from '../src/scheduler';
@@ -95,15 +96,30 @@ describe('why a ready task waits', () => {
     expect(reasonOf(ctx, waiting)).toBe(`its owned paths overlap those of ${holder}`);
   });
 
-  test('a tick that dispatches nothing, as while the project is paused, leaves no reasons', () => {
-    const { ctx } = createTestContext();
+  test('a tick that starts no worker says why: a paused project, the churn guard or the recovery window', () => {
+    const { ctx, clock } = createTestContext();
     noLeads(ctx);
-    const id = ready(ctx);
-    runTick(ctx);
-    expect(reasonOf(ctx, id)).not.toBeNull();
+    addRunner(ctx);
+    const id = ready(ctx, { title: 'Held' });
+    const backingOff = ready(ctx, { title: 'Backing off' });
+    writeTask(ctx, backingOff, { nextDispatchAt: ctx.now() + HOUR });
     setPaused(ctx, true, 'user:alice');
     runTick(ctx);
-    expect(reasonOf(ctx, id)).toBeNull();
+    expect(reasonOf(ctx, id)).toBe('the project is paused');
+    // A task out of the ready set keeps its own reason.
+    expect(reasonOf(ctx, backingOff)).toBe('it waits 60 min after an infrastructure failure');
+
+    setPaused(ctx, false, 'user:alice');
+    updateHubState(ctx, { dispatchPausedUntil: ctx.now() + 50 * MINUTE });
+    runTick(ctx);
+    expect(reasonOf(ctx, id)).toBe('the churn guard holds worker dispatch for 50 more min');
+
+    updateHubState(ctx, { dispatchPausedUntil: null });
+    // Downtime: the tick opens a recovery window of recoveryMs.
+    clock.advance(10 * MINUTE);
+    expect(runTick(ctx).recovering).toBe(true);
+    expect(reasonOf(ctx, id)).toBe('the hub is recovering after downtime: nothing starts for up to 2 min');
+    expect(getTask(ctx, id).status).toBe('ready');
   });
 
   test('the task API gives each task its reason while it is ready, and null otherwise', async () => {
@@ -195,6 +211,24 @@ describe('GET /api/load', () => {
     });
   });
 
+  test('counts no ready task as able to start while the scheduler holds dispatch', async () => {
+    const hub = createTestHub();
+    const { ctx } = hub;
+    noLeads(ctx);
+    addRunner(ctx);
+    ready(ctx);
+    const tasks = async () =>
+      ((await hub.call('GET', '/api/load', { user: 'alice', via: 'web' })).json as HubLoad).project.tasks;
+    expect(await tasks()).toMatchObject({ ready: 1, dispatchable: 1 });
+    setPaused(ctx, true, 'user:alice');
+    expect(await tasks()).toMatchObject({ ready: 1, dispatchable: 0 });
+    setPaused(ctx, false, 'user:alice');
+    updateHubState(ctx, { dispatchPausedUntil: ctx.now() + HOUR });
+    expect(await tasks()).toMatchObject({ ready: 1, dispatchable: 0 });
+    updateHubState(ctx, { dispatchPausedUntil: null, recoveryUntil: ctx.now() + MINUTE });
+    expect(await tasks()).toMatchObject({ ready: 1, dispatchable: 0 });
+  });
+
   test('gives one row per account, with its slots, its windows against the ceilings and its state', async () => {
     const hub = createTestHub();
     const { ctx } = hub;
@@ -203,12 +237,17 @@ describe('GET /api/load', () => {
     addRunnerAttempt(ctx, { runnerId: alice, vendor: 'codex' });
     report(ctx, alice, 'claude', { windows: { fiveHour: 0.5, weekly: 0.9 } });
     report(ctx, alice, 'codex', { state: 'exhausted', resetsAt: ctx.now() + 30 * MINUTE });
-    // Bob's runners on one account: one offline, one full.
+    // Bob's runners on one account: one full, one offline and one draining. As in the project's slots, the last two
+    // count no slots, taken or free, though each still has an attempt open.
     const away = addRunner(ctx, { owner: 'bob' });
+    addRunnerAttempt(ctx, { runnerId: away, owner: 'bob' });
     ctx.db.run(`UPDATE runners SET state = 'offline' WHERE id = '${away}'`);
     const busy = addRunner(ctx, { owner: 'bob' });
     addRunnerAttempt(ctx, { runnerId: busy, owner: 'bob' });
     addRunnerAttempt(ctx, { runnerId: busy, owner: 'bob' });
+    const drained = addRunner(ctx, { owner: 'bob' });
+    addRunnerAttempt(ctx, { runnerId: drained, owner: 'bob' });
+    ctx.db.run(`UPDATE runners SET draining = 1 WHERE id = '${drained}'`);
 
     const load = (await hub.call('GET', '/api/load', { user: 'alice', via: 'web' })).json as HubLoad;
     const ceilings = { fiveHour: 0.85, weekly: 0.85 };
