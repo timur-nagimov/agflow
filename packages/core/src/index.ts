@@ -16,5 +16,6 @@ export * from './protected-paths';
 export * from './stall';
 export * from './ladder';
 export * from './scheduling';
+export * from './shell-words';
 
 export const AGFLOW_VERSION = '0.1.0';
