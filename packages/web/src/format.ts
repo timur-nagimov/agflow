@@ -244,7 +244,7 @@ export type TaskHolder = 'runner' | 'live' | 'nobody';
 export function actionsFor(task: Pick<Task, 'status' | 'blockedKind'>, holder?: TaskHolder): TaskAction[] {
   const actions: TaskAction[] = [];
   if (task.status === 'submitted') actions.push('accept', 'reject');
-  if (task.status === 'accepted') actions.push('merged');
+  if (task.status === 'accepted' || task.status === 'merging') actions.push('merged');
   if (task.status === 'blocked' && task.blockedKind !== 'takeover') actions.push('unblock');
   if ((task.status === 'claimed' || task.status === 'working') && holder !== 'runner') actions.push('release');
   if (canTransition(task.status, 'cancelled')) actions.push('cancel');
@@ -269,6 +269,8 @@ export function actionHint(
       return `${task.submission?.by ?? 'The agent'} submitted this for review. Accept it, or reject it with feedback.`;
     case 'accepted':
       return 'Accepted. Merge its branch, then mark it merged.';
+    case 'merging':
+      return 'agflow is merging this into main. Mark it merged only if you merged it yourself.';
     case 'blocked':
       return (
         (task.blockedKind && BLOCKED_HINTS[task.blockedKind]) ?? 'Unblock it once the problem is solved, or cancel it.'

@@ -1,12 +1,12 @@
 // Merging inside agflow (AGFLOW_AUTO_MERGE). An accepted task waits in merging, and one merge at a time goes to a
 // runner as merge_task: the runner merges the accepted head into main in its vault and pushes main with its owner's
 // git credentials, the ones that push task branches. The author's runner merges when it can, else any online runner
-// whose protocol knows merge_task. A merge_task left with a runner that went offline, or for a task no longer
-// merging, is cancelled, and the next one goes out. tasks.ts records what a merge gave.
+// whose git is ready and whose protocol knows merge_task. A merge_task left with a runner that went offline, or for a
+// task no longer merging, is cancelled, and the next one goes out. tasks.ts records what a merge gave.
 import { COMMAND_MIN_PROTOCOL, CommitShaSchema, type Task, isTaskBranch } from '@agflow/core';
 import { type CommandRow, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
-import { findRunnerRows } from './runners';
+import { findRunnerRows, runnerInfo } from './runners';
 import { TASK_SELECT, type TaskRow, findTask, rowToTask } from './task-store';
 
 /** What a runner merges for a task: its submitted branch and head, when the branch is the task's own. */
@@ -49,7 +49,7 @@ function mergingTasks(ctx: HubContext): Task[] {
 /** Where a task's merge goes: the runner of its last attempt, when it can take merge_task now, else the first that can. */
 function mergeRunner(ctx: HubContext, taskId: string): string | null {
   const able = findRunnerRows(ctx).filter(
-    (row) => row.state === 'online' && row.protocol >= COMMAND_MIN_PROTOCOL.merge_task,
+    (row) => row.state === 'online' && row.protocol >= COMMAND_MIN_PROTOCOL.merge_task && runnerInfo(row).git.ready,
   );
   const last = ctx.db
     .query(

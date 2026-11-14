@@ -7,6 +7,7 @@ import { type HubContext, tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { queueMerges } from '../src/merges';
 import { listMessages } from '../src/messages';
+import { markGitNotReady } from '../src/runners';
 import { readySet } from '../src/scheduler';
 import { getTask, move, overlappingPathHolder } from '../src/task-store';
 import { acceptTask, createTasks, markMerged } from '../src/tasks';
@@ -153,6 +154,16 @@ describe('accepting with AGFLOW_AUTO_MERGE', () => {
     expect(findCommand(ctx, sent?.id as string)?.status).toBe('cancelled');
   });
 
+  test("passes over a runner whose git is not ready, the author's included", () => {
+    const { ctx, held, taskId } = setup();
+    markGitNotReady(ctx, held.runner.id, 'the last 3 WIP pushes failed: denied');
+    const other = addRunner(ctx, { owner: 'bob' });
+    current(ctx, other);
+    acceptTask(ctx, taskId, 'user:alice');
+    expect(merges(ctx, held.runner.id)).toEqual([]);
+    expect(merges(ctx, other).map((row) => row.command)).toMatchObject([{ kind: 'merge_task', taskId }]);
+  });
+
   test('a person who merged a merging task by hand marks it merged; its merge is cancelled', () => {
     const { ctx, held, taskId } = setup();
     acceptTask(ctx, taskId, 'user:alice');
@@ -163,6 +174,15 @@ describe('accepting with AGFLOW_AUTO_MERGE', () => {
     // Its late result changes nothing.
     expect(recordResult(ctx, held.runner.id, { commandId: merge?.id as string, ok: true, data: { status: 'merged', sha: sha('f') } })).toBeNull();
     expect(getTask(ctx, taskId).mergedSha).toBe('abc1234');
+  });
+
+  test('the lead cannot mark a merging task merged: the merge into main goes on', () => {
+    const { ctx, held, taskId } = setup();
+    acceptTask(ctx, taskId, 'agent:A-9');
+    const [merge] = merges(ctx, held.runner.id);
+    expect(() => markMerged(ctx, taskId, 'agent:A-9')).toThrow(`${taskId} is merging`);
+    expect(getTask(ctx, taskId).status).toBe('merging');
+    expect(findCommand(ctx, merge?.id as string)?.status).toBe('pending');
   });
 
   test('a task not submitted on its own branch is accepted as without auto merge, for people to merge', () => {

@@ -891,7 +891,8 @@ export function unblockTask(ctx: HubContext, id: string, actor: string, note?: s
 export function markMerged(ctx: HubContext, id: string, actor: string, sha?: string): Task {
   return tx(ctx, (emit) => {
     const task = getTask(ctx, id);
-    if (task.status !== 'accepted' && task.status !== 'merging') {
+    // A merging task is agflow's to merge: only a person, or the operator acting as one, says it was merged by hand.
+    if (task.status !== 'accepted' && !(task.status === 'merging' && actor.startsWith('user:'))) {
       throw conflict(`${id} is ${task.status}; only accepted tasks can be marked merged`);
     }
     const merged = landMerge(ctx, emit, task, actor, sha ?? null);
