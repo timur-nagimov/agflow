@@ -370,7 +370,7 @@ for (const capacity of ['0', '17', '2.5', 'many']) {
   });
 }
 
-test('a running runner keeps ownership of runner.json and setup asks nothing', async () => {
+test('a running runner keeps ownership of runner.json: setup asks nothing and refuses flags that would change it', async () => {
   const f = await fixture();
   await f.run();
   const before = readFileSync(f.paths.config, 'utf8');
@@ -380,6 +380,14 @@ test('a running runner keeps ownership of runner.json and setup asks nothing', a
   expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
   expect(f.out.join('')).toContain(`pid ${process.pid}`);
   expect(f.out.join('')).toContain('change capacity on the hub');
+  // Flags that would change runner.json fail setup, so a running standard runner never stays one unnoticed.
+  await expect(f.run(['--yes', '--no-service', '--preset', 'hackathon'])).rejects.toThrow(
+    `the runner (pid ${process.pid}) is running, so setup cannot change runner.json; stop it first (agflow runner stop)`,
+  );
+  await expect(f.run(['--yes', '--no-service', '--name', 'Other Mac'])).rejects.toThrow('agflow runner stop');
+  expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
+  // Flags that match it change nothing.
+  expect(await f.run(['--no-service', '--name', 'Test Mac', '--capacity', '2', '--profile', 'standard'])).toBe(0);
 });
 
 test('socket timeout points to status and the runner log', async () => {

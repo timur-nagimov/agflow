@@ -105,7 +105,7 @@ agflow runner status
 
 Setup records the machine identity, login-shell PATH, proxy/certificate settings and git commit identity in `~/.agflow/runner/runner.json` (mode 0600). Defaults include capacity 2, keep-awake on AC and paid usage off. It installs pinned vendor binaries into its own vendor directory, logs in to separate runner vendor homes, and installs the macOS LaunchAgent. It leaves your own vendor installations alone. `--relogin` repeats vendor logins; `--no-service` omits service installation; `--yes` accepts setup defaults.
 
-Flags answer setup's questions and set the rest of `runner.json`: `--name <name>`, `--capacity <1-16>`, `--ceiling <0.5-1>` (both quota windows of both vendors), `--keep-awake always|ac|off` and `--profile standard|auto|open`. `--preset hackathon` means capacity 6, ceilings 1, keep-awake always and the open profile; a flag given beside it wins. Rerunning setup with flags changes a kept `runner.json` as local edits, which the hub hears at the runner's next connection.
+Flags answer setup's questions and set the rest of `runner.json`: `--name <name>`, `--capacity <1-16>`, `--ceiling <0.5-1>` (both quota windows of both vendors), `--keep-awake always|ac|off` and `--profile standard|auto|open`. `--preset hackathon` means capacity 6, ceilings 1, keep-awake always and the open profile; a flag given beside it wins. Rerunning setup with flags changes a kept `runner.json` as local edits, which the hub hears at the runner's next connection. While the runner runs, setup refuses flags that would change `runner.json`: stop it first with `agflow runner stop`.
 
 ```bash
 agflow runner setup --preset hackathon --name hack-mac

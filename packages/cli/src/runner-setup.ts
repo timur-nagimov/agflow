@@ -137,6 +137,15 @@ export function setupChoices(args: ParsedArgs): SetupChoices {
   return choices;
 }
 
+/** The config with the choices laid over it, the settings among them as local edits; null when they change nothing. */
+function withChoices(config: RunnerConfig, choices: SetupChoices): RunnerConfig | null {
+  const { name = config.name, profile = config.profile, capacity, keepAwake, ceiling } = choices;
+  const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
+  const edited = editLocalSettings(config, { capacity, keepAwake, ceilings });
+  if (name === config.name && profile === config.profile && Object.keys(edited.changed).length === 0) return null;
+  return { ...edited.config, name, profile };
+}
+
 async function configure(
   paths: RunnerPaths,
   env: RunnerSetupDeps['env'],
@@ -152,11 +161,19 @@ async function configure(
     lock = await acquireRunnerLock(paths, { mode: 'foreground', wait: false });
   } catch (error) {
     if (!(error instanceof AlreadyRunningError)) throw error;
+    const running = loadRunnerConfig(paths.config, env);
+    // The running runner owns runner.json: flags that would change it fail setup rather than go unheard.
+    if (withChoices(running, choices) !== null) {
+      throw new Error(
+        `the runner (pid ${error.pid ?? 'unknown'}) is running, so setup cannot change runner.json; ` +
+          'stop it first (agflow runner stop), then run setup again',
+      );
+    }
     log(
       `the runner (pid ${error.pid ?? 'unknown'}) is running, so runner.json stays as it is; ` +
         'change capacity on the hub, or stop the runner and run setup again',
     );
-    return loadRunnerConfig(paths.config, env);
+    return running;
   }
   try {
     // Re-read under the lock: a service may have saved settings while setup checked sign-in.
@@ -174,15 +191,14 @@ async function configure(
     if (!Number.isInteger(capacity) || capacity < 1 || capacity > 16) {
       throw new Error('capacity must be a whole number from 1 to 16');
     }
-    const { ceiling, keepAwake, profile } = choices;
-    const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
     if (kept) {
-      const edited = editLocalSettings(kept, { capacity, keepAwake, ceilings });
-      const next = { ...edited.config, name, profile: profile ?? kept.profile };
-      if (name === kept.name && next.profile === kept.profile && Object.keys(edited.changed).length === 0) return kept;
+      const next = withChoices(kept, { ...choices, name, capacity });
+      if (next === null) return kept;
       saveRunnerConfig(paths.config, next);
       return next;
     }
+    const { ceiling, keepAwake, profile } = choices;
+    const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
     const captured = await captureLoginShellEnv({ env, exec });
     const config = createRunnerConfig(
       {
