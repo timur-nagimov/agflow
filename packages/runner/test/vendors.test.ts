@@ -167,5 +167,7 @@ describe('vendorReport', () => {
     expect(nameOf(auto, ['auto'])).toBe('auto');
     expect(nameOf(auto, ['/tmp/claude'])).toBe('standard');
     expect(nameOf(standard, ['auto'])).toBe('standard');
+    // The open profile needs nothing of the account, so runner.json alone decides it.
+    expect(nameOf(setup({ profile: 'open' }).config, [])).toBe('open');
   });
 });

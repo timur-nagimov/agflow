@@ -1,7 +1,8 @@
 // One dependency-preparation command inside Anthropic's sandbox runtime (design 7.7), in the runner process:
 // SandboxManager is initialised once with the profile's domains, and each command is wrapped with its attempt's
-// prepPolicy. Commands are always spawned asynchronously, because the runtime's proxies run on this process's event
-// loop and spawnSync would deadlock on them. checkPrepSandbox is the self-check behind profile.dependencyPrep.
+// prepPolicy. Under the open profile commands reach any host and use local ports. Commands are always spawned
+// asynchronously, because the runtime's proxies run on this process's event loop and spawnSync would deadlock on them.
+// checkPrepSandbox is the self-check behind profile.dependencyPrep.
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +21,8 @@ export type SandboxBackend = Pick<
 
 export interface PrepSandboxOptions {
   allowedDomains: readonly string[];
+  /** The open profile: commands reach any host, not only allowedDomains, and may bind and reach local ports. */
+  open?: boolean;
   timeoutMs?: number;
   logger?: Logger;
   /** Maximum UTF-8 bytes, including the truncation marker. Defaults to 16 KiB. */
@@ -106,6 +109,7 @@ async function drain(reader: ReadableStreamDefaultReader<Uint8Array>, tail: LogT
 
 export class PrepSandbox {
   readonly allowedDomains: readonly string[];
+  readonly open: boolean;
   private readonly manager: SandboxBackend;
   private readonly timeoutMs: number;
   private readonly tailBytes: number;
@@ -113,6 +117,7 @@ export class PrepSandbox {
 
   constructor(options: PrepSandboxOptions) {
     this.allowedDomains = Object.freeze([...new Set(options.allowedDomains)].sort());
+    this.open = options.open ?? false;
     this.manager = options.manager ?? SandboxManager;
     this.timeoutMs = positiveInteger(options.timeoutMs ?? DEFAULT_TIMINGS.prep, 'timeoutMs');
     this.tailBytes = positiveInteger(options.tailBytes ?? 16 * 1024, 'tailBytes');
@@ -121,7 +126,7 @@ export class PrepSandbox {
 
   /** The manager is process-global. A failure is sticky; restart the runner before trying initialization again. */
   init(): Promise<void> {
-    const domains = domainKey(this.allowedDomains);
+    const domains = `${this.open ? 'open ' : ''}${domainKey(this.allowedDomains)}`;
     const existing = initializations.get(this.manager);
     if (existing) {
       return existing.domains === domains
@@ -137,13 +142,14 @@ export class PrepSandbox {
           network: {
             allowedDomains: [...this.allowedDomains],
             deniedDomains: [],
-            strictAllowlist: true,
-            allowLocalBinding: false,
+            // Without the strict allowlist the runtime asks about a host the list leaves out: open says yes.
+            strictAllowlist: !this.open,
+            allowLocalBinding: this.open,
           },
           // No command may rely on the fallback. Task 10 supplies complete per-call filesystem lists.
           filesystem: { allowWrite: [], denyWrite: ['/'], denyRead: ['/'], allowRead: [] },
         },
-        undefined,
+        this.open ? async () => true : undefined,
         false,
       );
     });

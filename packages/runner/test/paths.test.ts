@@ -1,8 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { agflowHome, makeAttemptTmpDir, projectKey, runnerPaths } from '../src/paths';
+import { agflowHome, ensureSharedCaches, makeAttemptTmpDir, projectKey, runnerPaths } from '../src/paths';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -37,6 +47,8 @@ describe('runnerPaths', () => {
     expect(paths.gitConfig).toBe('/h/runner/git/local.gitconfig');
     expect(paths.gitExcludes).toBe('/h/runner/git/excludes');
     expect(paths.prep('demo-1a2b')).toBe('/h/runner/prep/demo-1a2b');
+    // Outside the runner tree, which agents may not write.
+    expect(paths.caches).toEqual({ pip: '/h/cache/pip', uv: '/h/cache/uv' });
     expect(paths.forensics('T-4-a1')).toBe('/h/runner/forensics/T-4-a1');
     expect(paths.vaults).toBe('/h/vaults');
     expect(paths.vault('demo-1a2b')).toBe('/h/vaults/demo-1a2b.git');
@@ -137,5 +149,24 @@ describe('makeAttemptTmpDir', () => {
     const elsewhere = shortRoot();
     symlinkSync(elsewhere, join(root, 'agf'));
     expect(() => makeAttemptTmpDir({ root })).toThrow('not a private directory');
+  });
+});
+
+describe('ensureSharedCaches', () => {
+  test('makes the shared caches private directories, keeps what they hold, and replaces a planted link', () => {
+    const paths = runnerPaths(join(shortRoot(), 'agflow'));
+    ensureSharedCaches(paths);
+    for (const dir of Object.values(paths.caches)) {
+      expect(statSync(dir).isDirectory()).toBe(true);
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+    }
+    writeFileSync(join(paths.caches.pip, 'wheel'), 'kept');
+    const elsewhere = shortRoot();
+    rmSync(paths.caches.uv, { recursive: true });
+    symlinkSync(elsewhere, paths.caches.uv);
+    ensureSharedCaches(paths);
+    expect(readFileSync(join(paths.caches.pip, 'wheel'), 'utf8')).toBe('kept');
+    expect(lstatSync(paths.caches.uv).isDirectory()).toBe(true);
+    expect(statSync(elsewhere).isDirectory()).toBe(true);
   });
 });

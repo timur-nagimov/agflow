@@ -117,8 +117,9 @@ export async function verifyPrepMain(
         prep,
         tmpDir,
         entry,
+        caches: paths.caches,
       });
-      // bun install shares the project cache; pip may build agent-edited packages, so its cache is per attempt.
+      // bun install shares the project cache; pip uses the runner's shared cache, as agents do.
       const cache = fixture.name === 'bun' ? runEnv.BUN_INSTALL_CACHE_DIR! : runEnv.PIP_CACHE_DIR!;
       for (const path of [runEnv.HOME!, cache]) mkdirSync(path, { recursive: true, mode: 0o700 });
       if (readdirSync(cache).length) throw new Error(`${fixture.name}: cache was not empty`);

@@ -2,10 +2,10 @@
 // start", "Base checkouts"). The vault is fetched and the clone made at the start tip the vault actually holds, or
 // an existing clone kept at the start it was made at (openWorkspace, so the controller can push a kept clone's work
 // before anything in it changes). Then the Claude CLI's staging directory is removed, .agflow/run/ written with the
-// brief extended by the clone's path (X-17), and the protected paths restored from the restore base (X-16). A Claude
-// attempt also gets a base checkout of main and a private temporary directory (X-5). Right before the agent starts,
-// after any dependency preparation, finishWorkspace restores the protected paths once more and verifies the clone's
-// .codex/ (design 9.2).
+// brief extended by the clone's path (X-17), the runner's shared caches made, and the protected paths restored from
+// the restore base (X-16). A Claude attempt also gets a base checkout of main and a private temporary directory
+// (X-5). Right before the agent starts, after any dependency preparation, finishWorkspace restores the protected paths
+// once more and verifies the clone's .codex/ (design 9.2).
 // The clone and the recorded temporary directory belong to the agent, which can replace either with a link: the
 // runner never follows their last component, and refuses the start when anything but a directory stands there.
 import { lstat, mkdtemp, realpath, rm } from 'node:fs/promises';
@@ -18,7 +18,7 @@ import { cloneExists, createLeadClone, createTaskClone } from '../git/clone';
 import { detectProtected, resolveRestoreBase, restoreProtected } from '../git/protect';
 import { type GitEnvironment, runGit } from '../git/run';
 import type { BaseCheckout, Vault } from '../git/vault';
-import { makeAttemptTmpDir, type RunnerPaths } from '../paths';
+import { ensureSharedCaches, makeAttemptTmpDir, type RunnerPaths } from '../paths';
 import { type RunDir, withWorkingDirectory, writeRunDir } from '../run-dir';
 
 export interface WorkspaceDeps {
@@ -245,6 +245,7 @@ export async function prepareOpened(
     brief,
     identity: deps.config().commitIdentity,
   });
+  ensureSharedCaches(paths);
   const git = { vault, local };
   const base = await resolveRestoreBase(vault, spec);
   const changes = await detectProtected(git, { base, head: startSha, paths: spec.restore.paths });

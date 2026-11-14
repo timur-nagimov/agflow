@@ -5,9 +5,9 @@
 // functions. Pure, with no zod at run time, so the web UI may import it too (X-48).
 import type { VendorRequirement } from './ladder';
 import { pathsOverlap } from './paths';
-import { liveChatOnly } from './protected-paths';
+import { liveChatOnly, needsOpenProfile } from './protected-paths';
 import type { StartRefusal } from './runner-protocol';
-import type { AccountQuota, FailureClass, Runner, RunnerState, Task, Vendor } from './types';
+import type { AccountQuota, FailureClass, ProfileSummary, Runner, RunnerState, Task, Vendor } from './types';
 
 /**
  * Why placement passes over a runner, then over a vendor on it, in the order they are checked:
@@ -74,6 +74,8 @@ export interface RunnerSlot {
   openAttempts: number;
   /** Its power source, for the runner preference. */
   power: Runner['power'];
+  /** The profile it reports: only an open one takes a task that owns greenfield files (needsOpenProfile). */
+  profile: ProfileSummary['name'];
   vendors: VendorSlot[];
 }
 
@@ -253,7 +255,7 @@ export interface DispatchContext {
 
 /**
  * Whether a task is in the ready set (design 6.6, step 3): ready with its dependencies done; no open attempt; no path
- * a runner agent may not change (such a task stays ready for live chats); no overlap with a path holder;
+ * that no runner agent may change (such a task stays ready for live chats); no overlap with a path holder;
  * next_dispatch_at and dispatch_hold_until come; and counted attempts below the ladder's limit.
  */
 export function isDispatchable(task: TaskCandidate, context: DispatchContext): boolean {
@@ -421,16 +423,30 @@ function offeredVendors(snapshot: PlacementSnapshot): Vendor[] {
 }
 
 /**
+ * The snapshot a task's placement reads: a task that owns greenfield files (needsOpenProfile) goes only to a runner
+ * that reports the open profile. The runners are the snapshot's own, so a placement recorded on them counts.
+ */
+function runnersFor(
+  snapshot: PlacementSnapshot,
+  task: Pick<TaskCandidate, 'ownedPaths' | 'kind' | 'createdBy'>,
+): PlacementSnapshot {
+  if (!needsOpenProfile(task)) return snapshot;
+  return { ...snapshot, runners: snapshot.runners.filter((runner) => runner.profile === 'open') };
+}
+
+/**
  * Places a ready task (design 6.6, step 5): the most preferred vendor (preferredVendors) usable on some candidate
- * runner, on the best of those runners (orderRunners, avoiding task.avoidRunner). With no placement, refused names
- * every runner and vendor passed over, owner_away included, which the scheduler tells the lead about.
+ * runner, on the best of those runners (orderRunners, avoiding task.avoidRunner); a task that owns greenfield files
+ * only on a runner with the open profile. With no placement, refused names every runner and vendor passed over,
+ * owner_away included, which the scheduler tells the lead about.
  */
 export function place(
   snapshot: PlacementSnapshot,
-  task: Pick<TaskCandidate, 'vendorHint' | 'requirement' | 'avoidRunner'>,
+  task: Pick<TaskCandidate, 'vendorHint' | 'requirement' | 'avoidRunner' | 'ownedPaths' | 'kind' | 'createdBy'>,
   project: { projectPref: VendorPreferenceInput['projectPref'] },
 ): PlaceResult {
-  const found = options(snapshot);
+  const scope = runnersFor(snapshot, task);
+  const found = options(scope);
   const utilization: Partial<Record<Vendor, number>> = {};
   for (const { usable } of found.options) {
     const { vendor } = usable.slot;
@@ -441,7 +457,7 @@ export function place(
     vendorHint: task.vendorHint,
     projectPref: project.projectPref,
     now: snapshot.now,
-    offered: offeredVendors(snapshot),
+    offered: offeredVendors(scope),
     utilization,
   });
   for (const vendor of vendors) {

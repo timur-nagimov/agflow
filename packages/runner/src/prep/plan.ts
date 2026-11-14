@@ -1,6 +1,7 @@
 // What a dependency preparation runs with (design 7.7, X-40): the when-file fingerprints that decide whether an entry
 // runs again, kept per attempt under prep/<project>/state/; the environment, the agent's allowlist with the
-// preparation's own HOME, TMPDIR and caches; and the sandbox runtime's per-call policy. Nothing here runs a command.
+// preparation's own HOME, TMPDIR and caches, pip's and uv's being the runner's shared ones; and the sandbox runtime's
+// per-call policy. Nothing here runs a command.
 import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
@@ -20,6 +21,7 @@ import {
 } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
+import type { RunnerPaths } from '../paths';
 import { deniedReadPaths, type DeniedPathsInput, type PermissionProfile } from '../profile';
 import { runDirOf } from '../run-dir';
 import { type PrepConfig, PrepConfigSchema } from './config';
@@ -120,9 +122,10 @@ const SHARED_INSTALLS: Record<string, readonly string[]> = {
 };
 
 /**
- * Only these installs run no repository code with scripts off, so only they may write the shared cache. Anything
- * else can (pip and uv build agent-edited local packages, yarn runs .yarn/releases and plugins, a shell runs
- * anything), so like "scripts": true it gets per-attempt caches. A relative argv[0] is the agent's own file.
+ * Only these installs run no repository code with scripts off, so only they may write the project's shared cache.
+ * Anything else can (yarn runs .yarn/releases and plugins, a shell runs anything), so like "scripts": true it gets
+ * per-attempt caches. A relative argv[0] is the agent's own file. pip and uv, which build agent-edited local packages,
+ * use the runner's shared caches whatever runs, as agents do.
  */
 export function sharesCache(command: PrepCommand): boolean {
   const [program, subcommand] = command.run;
@@ -247,6 +250,8 @@ export interface PrepEnvInput {
   tmpDir: string;
   /** The config entry: scripts decides the no-scripts switches, sharesCache the caches. */
   entry: PrepCommand;
+  /** paths.caches: pip's and uv's, shared with every attempt of the runner. */
+  caches: RunnerPaths['caches'];
 }
 
 export function prepEnv(input: PrepEnvInput): Record<string, string> {
@@ -268,8 +273,8 @@ export function prepEnv(input: PrepEnvInput): Record<string, string> {
     BUN_INSTALL_CACHE_DIR: join(cache, 'bun'),
     npm_config_cache: join(cache, 'npm'),
     npm_config_store_dir: join(cache, 'pnpm'),
-    PIP_CACHE_DIR: join(cache, 'pip'),
-    UV_CACHE_DIR: join(cache, 'uv'),
+    PIP_CACHE_DIR: input.caches.pip,
+    UV_CACHE_DIR: input.caches.uv,
     GOMODCACHE: join(run.cache, 'go-mod'),
     CARGO_HOME: join(run.cache, 'cargo'),
     npm_config_package_import_method: 'clone-or-copy',
@@ -294,6 +299,7 @@ export function prepEnv(input: PrepEnvInput): Record<string, string> {
 export type PrepPolicy = Pick<SandboxRuntimeConfig, 'filesystem' | 'network'>;
 
 export interface PrepPolicyInput extends DeniedPathsInput {
+  paths: Pick<RunnerPaths, 'runner' | 'vaults' | 'work' | 'caches'>;
   clone: string;
   /** paths.prep(project). */
   prep: string;
@@ -304,10 +310,12 @@ export interface PrepPolicyInput extends DeniedPathsInput {
 
 /** Complete per-call lists: the runtime replaces its global filesystem lists with these. */
 export function prepPolicy(input: PrepPolicyInput): PrepPolicy {
-  // Agent-controlled code (lifecycle scripts, build backends) must not reach the shared cache at all.
+  // Agent-controlled code (lifecycle scripts, build backends) must not reach the project's shared cache at all. The
+  // runner's pip and uv caches are the agents' too.
+  const caches = Object.values(input.paths.caches);
   const allowed = sharesCache(input.entry)
-    ? [input.clone, prepLayout(input.prep).cache, input.tmpDir]
-    : [input.clone, input.tmpDir];
+    ? [input.clone, prepLayout(input.prep).cache, input.tmpDir, ...caches]
+    : [input.clone, input.tmpDir, ...caches];
   return {
     filesystem: {
       allowWrite: [...allowed],

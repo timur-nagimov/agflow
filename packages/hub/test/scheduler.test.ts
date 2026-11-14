@@ -1,5 +1,12 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { type AttemptFacts, type RawRunnerEvent, TEST_ACCOUNT_ID, type Vendor, type VendorQuota } from '@agflow/core';
+import {
+  type AttemptFacts,
+  type RawRunnerEvent,
+  TEST_ACCOUNT_ID,
+  type Vendor,
+  type VendorQuota,
+  restoreSet,
+} from '@agflow/core';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, requestStop, startRunnerAttempt } from '../src/attempts';
 import { pendingCommands } from '../src/commands';
@@ -258,6 +265,34 @@ describe('dispatch', () => {
     markHubAlive(ctx);
     expect(tick(ctx)).toEqual([[hold, runnerId, 'claude']]);
     expect(statusOf(ctx, config as string)).toBe('ready');
+  });
+
+  test('a task that owns greenfield files goes to a runner with the open profile, which may change them', () => {
+    const { ctx } = schedulerContext();
+    const standard = addRunner(ctx);
+    const open = addRunner(ctx, { profile: 'open' });
+    const [ordinary, bunfig] = tasks(ctx, { title: 'Parser' }, { title: 'Bun config', ownedPaths: ['bunfig.toml'] });
+    expect(tick(ctx)).toEqual([
+      [ordinary, standard, 'claude'],
+      [bunfig, open, 'claude'],
+    ]);
+    const restore = (runnerId: string) => {
+      const start = pendingCommands(ctx, runnerId, 1).find((row) => row.command.kind === 'start_attempt')?.command;
+      if (start?.kind !== 'start_attempt') throw new Error('no start');
+      return start.attempt.restore.paths;
+    };
+    expect(restore(standard)).toContain('bunfig.toml');
+    expect(restore(open)).toEqual(restoreSet(getTask(ctx, bunfig as string), 'open'));
+    expect(restore(open)).not.toContain('bunfig.toml');
+    expect(restore(open)).toContain('.claude/**');
+  });
+
+  test('without a runner with the open profile, a task that owns greenfield files waits', () => {
+    const { ctx } = schedulerContext();
+    addRunner(ctx);
+    const [agents] = tasks(ctx, { title: 'Agent notes', ownedPaths: ['AGENTS.md'] });
+    expect(tick(ctx)).toEqual([]);
+    expect(statusOf(ctx, agents as string)).toBe('ready');
   });
 
   test('the ladder requirement and vendorHint steer the vendor', () => {

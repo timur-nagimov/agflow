@@ -1,4 +1,14 @@
-import type { Agent, AgentRole, Attempt, LeadNote, RunnerCommandKind, RunnerVendor, Task, Vendor } from '@agflow/core';
+import type {
+  Agent,
+  AgentRole,
+  Attempt,
+  LeadNote,
+  ProfileSummary,
+  RunnerCommandKind,
+  RunnerVendor,
+  Task,
+  Vendor,
+} from '@agflow/core';
 import {
   AGFLOW_VERSION,
   type NewTask,
@@ -118,8 +128,14 @@ export function testVendor(vendor: Vendor): RunnerVendor {
   };
 }
 
-/** An online runner of the owner's, offering the vendors in test mode, with room for two attempts; returns its id. */
-export function addRunner(ctx: HubContext, options: { owner?: string; vendors?: Vendor[] } = {}): string {
+/**
+ * An online runner of the owner's, offering the vendors in test mode, with room for two attempts and the standard
+ * profile unless told otherwise; returns its id.
+ */
+export function addRunner(
+  ctx: HubContext,
+  options: { owner?: string; vendors?: Vendor[]; profile?: ProfileSummary['name'] } = {},
+): string {
   const owner = options.owner ?? 'alice';
   const now = ctx.now();
   const seq = nextId(ctx.db, 'runner');
@@ -128,7 +144,7 @@ export function addRunner(ctx: HubContext, options: { owner?: string; vendors?: 
     agflowVersion: AGFLOW_VERSION,
     platform: 'darwin-arm64',
     vendors: (options.vendors ?? ['claude']).map(testVendor),
-    profile: { name: 'standard', weakened: [], dependencyPrep: true },
+    profile: { name: options.profile ?? 'standard', weakened: [], dependencyPrep: true },
     git: { ready: true, problem: null, lastPushAt: null },
     power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
     disk: { freeBytes: 100e9, agflowBytes: 0 },

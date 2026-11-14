@@ -74,8 +74,14 @@ function endedView(ctx: HubContext, task: Task, attempt: Attempt): EndedAttemptV
   };
 }
 
-/** What steers where a task's next attempt goes: the ladder's vendor, the task's hint and the runner to avoid. */
-type PlacementPrefs = Pick<TaskCandidate, 'vendorHint' | 'requirement' | 'avoidRunner'>;
+/**
+ * What steers where a task's next attempt goes: the ladder's vendor, the task's hint, the runner to avoid, and the
+ * paths it owns, since greenfield files need a runner with the open profile.
+ */
+type PlacementPrefs = Pick<
+  TaskCandidate,
+  'vendorHint' | 'requirement' | 'avoidRunner' | 'ownedPaths' | 'kind' | 'createdBy'
+>;
 
 function placementPrefs(ctx: HubContext, task: Task, attempts: readonly Attempt[]): PlacementPrefs {
   const ended = attempts.filter((attempt) => attempt.status === 'ended');
@@ -83,6 +89,9 @@ function placementPrefs(ctx: HubContext, task: Task, attempts: readonly Attempt[
     vendorHint: task.vendorHint ?? null,
     requirement: ladderRequirement(ctx, task.id),
     avoidRunner: runnerToAvoid(ended.map((attempt) => endedView(ctx, task, attempt))),
+    ownedPaths: task.ownedPaths,
+    kind: task.kind,
+    createdBy: task.createdBy,
   };
 }
 

@@ -448,10 +448,16 @@ export function settingsPatch(
 // Profile, ownership and order
 // ---------------------------------------------------------------------------
 
+const PROFILE_NAMES: Record<ProfileSummary['name'], string> = {
+  standard: 'Standard profile',
+  auto: 'Auto profile',
+  open: 'Open profile: agents have the network and may change the greenfield files',
+};
+
 /** The profile's name, then each boundary this laptop cannot enforce, then a missing preparation sandbox (7.7). */
 export function profileLines(profile: ProfileSummary): { text: string; tone: Tone }[] {
   const lines: { text: string; tone: Tone }[] = [
-    { text: profile.name === 'auto' ? 'Auto profile' : 'Standard profile', tone: 'done' },
+    { text: PROFILE_NAMES[profile.name], tone: 'done' },
     ...profile.weakened.map((item) => ({ text: `Not enforced on this laptop: ${item}`, tone: 'trouble' as const })),
   ];
   if (!profile.dependencyPrep) {

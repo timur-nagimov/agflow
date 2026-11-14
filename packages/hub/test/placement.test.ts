@@ -90,6 +90,7 @@ describe('placementSnapshot', () => {
       // The worker and the lead; the holding and the ended attempts take no slot.
       openAttempts: 2,
       power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
+      profile: 'standard',
       vendors: [
         {
           vendor: 'claude',

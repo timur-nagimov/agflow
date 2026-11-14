@@ -101,6 +101,7 @@ import {
   recordFailedStart,
   recordStartRefusal,
   resetFailedStarts,
+  runnerInfo,
 } from './runners';
 import { failPendingSubmission, pendingSubmissionOf } from './submission-store';
 import {
@@ -169,9 +170,14 @@ function unpushedWork(ctx: HubContext, task: Task): { attemptId: string; runnerI
   return unpushed && { attemptId: last.id, ...unpushed };
 }
 
-/** The restore set and its base, recomputed for every start and resume (X-16). */
-function restoreFor(ctx: HubContext, task: Task | null): AttemptSpec['restore'] {
-  return { paths: restoreSet(task), base: restoreBase(ctx) };
+/**
+ * The restore set and its base, recomputed for every start and resume (X-16), for the profile the attempt's runner
+ * reports: the open profile leaves the greenfield files to its agents.
+ */
+function restoreFor(ctx: HubContext, task: Task | null, runnerId: string | null): AttemptSpec['restore'] {
+  const runner = runnerId === null ? null : findRunnerRow(ctx, runnerId);
+  const profile = runner === null ? 'standard' : runnerInfo(runner).profile.name;
+  return { paths: restoreSet(task, profile), base: restoreBase(ctx) };
 }
 
 /**
@@ -197,7 +203,7 @@ export function buildAttemptSpec(
     start: { ref: attempt.startRef ?? restoreBase(ctx), sha: attempt.startSha },
     branch: task?.branch ?? null,
     wipRef: attempt.wipRef,
-    restore: restoreFor(ctx, task),
+    restore: restoreFor(ctx, task, attempt.runnerId),
     acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     toolCaps: computeToolCaps(ctx.config, task?.checks ?? []),
     // A lead holds no task, so its task.md is empty; its brief carries what it needs.
@@ -567,7 +573,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
       prompt,
       messages,
       taskPack: task ? composeTaskPack(task) : null,
-      restore: restoreFor(ctx, task),
+      restore: restoreFor(ctx, task, attempt.runnerId),
       acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     });
     retargetDeliveries(ctx, attempt.id, command.id, messages);
