@@ -14,10 +14,11 @@
 // ~/.aws, ~/.gnupg, ~/.config/containers/auth.json, the keychains, /etc/shadow) together with the rest of the
 // credentials an agent could carry off a laptop.
 //
-// Pure: no database, no hub context, no clock, no file system, no network. The hub cannot import the runner's shell
-// lexer (packages/runner depends on the hub, not the other way round), so the smaller one these rules need is below.
+// Pure: no database, no hub context, no clock, no file system, no network. Core's reader takes the wrapping shell
+// off a command, the same way the runner does when it shows the owner what was asked; past that the rules need a
+// reader that keeps going across operators and redirections, which core's refuses outright, so it is below.
 import { posix } from 'node:path';
-import type { Approval } from '@agflow/core';
+import { type Approval, innerCommand } from '@agflow/core';
 import { clip, oneLine } from './text';
 
 export type ApprovalJudgement = {
@@ -829,8 +830,26 @@ interface Context {
  * Rules 3 to 13 over a command. The segments are judged one by one and the worst verdict wins, except for rule 6,
  * which spans them: neither the download nor the shell that runs it says anything on its own.
  */
+/**
+ * Codex relays a command the way it runs it, wrapped in a login shell: `bash -lc "npm ci"`. These rules judge what
+ * the agent asked for, so the wrapper comes off first, with core's reader. A script that wraps itself again is
+ * unwrapped again, to a bound: a round can only uncover the command, never hide one, so `bash -lc "sudo rm -rf /"`
+ * reaches the rule that declines it instead of reading as the program `bash`. A wrapper core's reader cannot read
+ * (an expansion in the script, an unterminated quote) is left whole, which leaves the program `bash` and no
+ * approval.
+ */
+function unwrapped(command: string): string {
+  let text = command;
+  for (let round = 0; round < 8; round++) {
+    const inner = innerCommand(text);
+    if (inner === text) break;
+    text = inner;
+  }
+  return text;
+}
+
 function judgeCommand(detail: Approval['detail'], clone: Clone): ApprovalJudgement {
-  const command = detail.command ?? '';
+  const command = unwrapped(detail.command ?? '');
   if (command.trim() === '') {
     return undecided(
       'unparsed-command',
