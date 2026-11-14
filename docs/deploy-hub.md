@@ -243,8 +243,9 @@ One more setting is on by default:
   lead one message: the free slots, the ready, blocked, submitted and accepted tasks, each account's quota, the time
   left to the deadline, and what to plan next (the spec until it is covered, then defects, missing tests, demo polish
   and new features, and only fixes in the last hour). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
-  `lead.idle_nudged` records each one. `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk: the lead keeps adding work
-  until the deadline, so the subscriptions stay in use; pause the project, or set a lower worker target, to stop it.
+  `lead.idle_nudged` records each one. None goes out once the deadline has passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0`
+  turns it off. Risk: the lead keeps adding work until the deadline, so the subscriptions stay in use; pause the
+  project, or set a lower worker target, to stop it.
 
 ### What agents fetched
 

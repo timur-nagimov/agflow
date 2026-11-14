@@ -617,13 +617,14 @@ function lastNudgeAt(ctx: HubContext): number | null {
  * The idle nudge: while a runner lead holds the seat and free worker slots outnumber the dispatchable ready tasks for
  * idleNudgeMs without a break, the lead gets one system message with the load, each account's quota, the deadline and
  * what to plan; then none before idleNudgeIntervalMs has passed since the last (lead.idle_nudged), and none at all
- * while it is 0. A paused project or a churn pause starts no worker, so neither nudges. Part of the tick's reconcile
- * step. Returns the message, or null.
+ * while it is 0. A paused project or a churn pause starts no worker, so neither nudges, and the work is planned until
+ * the deadline, so none goes out once it has passed. Part of the tick's reconcile step. Returns the message, or null.
  */
 export function nudgeIdleLead(ctx: HubContext): Message | null {
   if (ctx.config.idleNudgeIntervalMs === 0) return null;
-  const seated = leadSeat(ctx).kind === 'runner' && !getProject(ctx).paused && !churnPaused(ctx);
-  const load = seated ? workerLoad(ctx) : null;
+  const { paused, deadlineAt } = getProject(ctx);
+  const due = !paused && !churnPaused(ctx) && (deadlineAt === null || ctx.now() < deadlineAt);
+  const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
   if (load === null || load.freeSlots <= load.dispatchable) {
     idleSince.delete(ctx);
     return null;
@@ -636,7 +637,7 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
   if (last !== null && now - last < ctx.config.idleNudgeIntervalMs) return null;
   const lines = loadLines(ctx, load);
   return tx(ctx, (emit) => {
-    emit({ type: 'lead.idle_nudged', actor: 'system', data: { ...load, deadlineAt: getProject(ctx).deadlineAt } });
+    emit({ type: 'lead.idle_nudged', actor: 'system', data: { ...load, deadlineAt } });
     return insertMessage(ctx, emit, {
       from: 'system',
       to: 'lead',

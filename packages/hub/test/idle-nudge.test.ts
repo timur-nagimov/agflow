@@ -171,6 +171,19 @@ describe('the idle nudge', () => {
     expect(nudges(ctx)).toEqual([]);
   });
 
+  test('none once the deadline has passed: the work is planned until then', () => {
+    const { ctx, clock } = idleProject();
+    setDeadline(ctx, ctx.now() + 30_000, 'user:alice');
+    nudgeIdleLead(ctx);
+    clock.advance(ctx.config.idleNudgeMs);
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    // A later deadline brings it back.
+    setDeadline(ctx, ctx.now() + 60 * MINUTE, 'user:alice');
+    nudgeIdleLead(ctx);
+    clock.advance(ctx.config.idleNudgeMs);
+    expect(nudgeIdleLead(ctx)?.body).toContain('59 min left.');
+  });
+
   test('the tick runs it in its reconcile step', () => {
     const { ctx, clock } = idleProject();
     expect(runTick(ctx).reconciled?.idleNudge).toBe(false);
