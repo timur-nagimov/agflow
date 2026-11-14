@@ -124,6 +124,141 @@ describe('classifyCodexPolicy', () => {
       expect(classifyCodexPolicy(input)).toEqual({ managedPolicy: true, approvalsReservedToOwner, problem: null });
   });
 
+  // What a requirements call that failed gives beside the recorded config: both facts true, no problem of their own.
+  const unread = { managedPolicy: true, approvalsReservedToOwner: true, problem: null };
+  const known: Record<string, unknown> = { ...requirements.requirements };
+  const withFields = (fields: Record<string, unknown>) => ({ requirements: { ...known, ...fields } });
+  const without = (field: string) => ({
+    requirements: Object.fromEntries(Object.entries(known).filter(([key]) => key !== field)),
+  });
+
+  test('the shapes that once read as a policy saying nothing about approvals now reserve them', () => {
+    // No requirements key at all: an answer the runner cannot read.
+    expect(classifyCodexPolicy({ requirements: {}, config })).toEqual(unread);
+    // Requirements without the two fields that say who answers: the runner heard nothing that leaves approvals open.
+    expect(classifyCodexPolicy({ requirements: { requirements: {} }, config })).toEqual(unread);
+    // The reviewers field as requirements.toml spells it: a field the runner does not recognise, about approvals.
+    expect(
+      classifyCodexPolicy({ requirements: { requirements: { allowed_approvals_reviewers: ['user'] } }, config }),
+    ).toEqual(unread);
+  });
+
+  test('an answer of a shape the runner does not expect is read exactly as a call that failed', () => {
+    const granular = {
+      granular: { sandbox_approval: true, rules: true, skill_approval: true, request_permissions: true, mcp_elicitations: true },
+    };
+    const shapes: unknown[] = [
+      {},
+      { other: null },
+      { requirements: 'none' },
+      { requirements: [] },
+      { requirements: 0 },
+      [],
+      'requirements',
+      true,
+      // A read field that is not a list of strings or null.
+      withFields({ allowedApprovalsReviewers: 'user' }),
+      withFields({ allowedApprovalPolicies: ['on-request', 7] }),
+      withFields({ allowedApprovalPolicies: ['on-request', granular] }),
+      withFields({ allowedSandboxModes: 'workspace-write' }),
+      withFields({ allowedSandboxModes: {} }),
+    ];
+    const mdm: ConfigLayerSource = { type: 'legacyManagedConfigTomlFromMdm' };
+    const configs: (ConfigReadResponse | null)[] = [
+      config,
+      layers(),
+      layers({ type: 'user', file: '/tmp/config.toml', profile: null }),
+      {
+        ...config,
+        config: { ...config.config, web_search: 'live' } as ConfigReadResponse['config'],
+        origins: { ...config.origins, web_search: { name: mdm, version: 'test' } },
+      },
+      null,
+    ];
+    for (const shape of shapes) {
+      for (const read of configs) {
+        const failed = classifyCodexPolicy({ requirements: null, config: read });
+        expect({ shape, result: classifyCodexPolicy({ requirements: shape, config: read }) }).toEqual({
+          shape,
+          result: failed,
+        });
+        expect(failed).toMatchObject({ managedPolicy: true, approvalsReservedToOwner: true });
+      }
+    }
+  });
+
+  test('a field the runner does not recognise that speaks of approvals reserves them, wherever it stands', () => {
+    // The recorded sample names approvals only in the two fields that are read.
+    expect(JSON.stringify(recorded['configRequirements/read']).match(/"[^"]*approval[^"]*":/gi)).toEqual([
+      '"allowedApprovalPolicies":',
+      '"allowedApprovalsReviewers":',
+    ]);
+    const fields: Record<string, unknown>[] = [
+      { allowed_approvals_reviewers: ['user'] },
+      // A known field renamed by one letter, and new fields, null or not.
+      { allowedApprovalReviewers: ['user'] },
+      { approvalsReviewer: 'user' },
+      { defaultApprovalPolicy: null },
+      // Deeper down, in fields the classification does not read.
+      { network: { requireApproval: true } },
+      { featureRequirements: { browser_use_external: false, computer_use: false, guardian_approval: true } },
+      { hooks: [{ event: 'PreToolUse', approvalMode: 'never' }] },
+      // Computer use's persistent approvals too: the field names approvals, so it is not read as silence.
+      {
+        computerUse: {
+          allowLockedComputerUse: null,
+          allowPersistentApproval: false,
+          defaultAppAccess: null,
+          macos: null,
+          windows: null,
+        },
+      },
+      // A known name where it is not read.
+      { models: { allowedApprovalPolicies: ['never'] } },
+    ];
+    for (const field of fields) {
+      expect({ field, result: classifyCodexPolicy({ requirements: withFields(field), config }) }).toEqual({
+        field,
+        result: unread,
+      });
+    }
+    // Beside the requirements, where no field but requirements is read, the known names included.
+    expect(classifyCodexPolicy({ requirements: { ...requirements, approvalsReviewer: 'user' }, config })).toEqual(unread);
+    expect(
+      classifyCodexPolicy({ requirements: { requirements: null, allowedApprovalsReviewers: null }, config }),
+    ).toEqual(unread);
+  });
+
+  test('a field that does not speak of approvals passes through, and reserves nothing', () => {
+    const open = { managedPolicy: true, approvalsReservedToOwner: false, problem: null };
+    expect(classifyCodexPolicy({ requirements: withFields({ allowNewThing: true, newThing: { mode: 'strict' } }), config })).toEqual(open);
+    expect(classifyCodexPolicy({ requirements: { ...requirements, source: 'mdm' }, config })).toEqual(open);
+    expect(classifyCodexPolicy({ requirements: { requirements: null, source: 'none' }, config: layers() })).toEqual({
+      ...open,
+      managedPolicy: false,
+    });
+  });
+
+  test('requirements that leave out a field that says who answers reserve approvals, and still restrict the rest', () => {
+    for (const field of ['allowedApprovalsReviewers', 'allowedApprovalPolicies']) {
+      expect({ field, result: classifyCodexPolicy({ requirements: without(field), config }) }).toEqual({
+        field,
+        result: unread,
+      });
+    }
+    // The sandbox modes are optional, and what the answer says about them still holds.
+    expect(classifyCodexPolicy({ requirements: without('allowedSandboxModes'), config })).toEqual({
+      managedPolicy: true,
+      approvalsReservedToOwner: false,
+      problem: null,
+    });
+    expect(classifyCodexPolicy({ requirements: { requirements: { allowedSandboxModes: ['read-only'] } }, config })).toEqual({
+      managedPolicy: true,
+      approvalsReservedToOwner: true,
+      problem: 'managed policy does not allow workspace-write',
+    });
+  });
+
   test('a policy that speaks about reviewers reserves approvals, even when it allows the user', () => {
     for (const reviewers of [['user'], ['user', 'auto_review'], []] as ApprovalsReviewer[][]) {
       const result = classifyCodexPolicy({ requirements: restricted({ allowedApprovalsReviewers: reviewers }), config });

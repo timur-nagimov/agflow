@@ -1,14 +1,8 @@
 // Managed requirements and ChatGPT identity for the zero-model preflight.
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
 import type { PlanType } from './protocol/PlanType';
-import type {
-  ApprovalsReviewer,
-  ConfigLayerSource,
-  ConfigReadResponse,
-  ConfigRequirements,
-  ConfigRequirementsReadResponse,
-  GetAccountResponse,
-} from './protocol/v2';
+import type { ConfigLayerSource, ConfigReadResponse, ConfigRequirements, GetAccountResponse } from './protocol/v2';
 
 // A re-pin must explicitly classify every new layer and plan.
 const MANAGED_LAYERS = {
@@ -49,29 +43,86 @@ const PLAN_NAMES = {
   unknown: 'ChatGPT (unknown plan)',
 } satisfies Record<PlanType, string>;
 
+/** A restriction a policy may set: the values it allows, or null for none. */
+const allowedValues = z.array(z.string()).nullish();
+
 /**
- * null for a call that failed. managedPolicy says only that the device has managed configuration; whether that
- * configuration regulates who answers approvals is the separate fact approvalsReservedToOwner (design 6.10).
+ * The fields of the requirements the classification reads. The generated type names two of them, so a re-pin that
+ * renames either stops compiling here; allowedApprovalsReviewers is on 0.159.2's wire, though its generated type
+ * omits it.
+ */
+const READ_FIELDS = {
+  allowedApprovalsReviewers: allowedValues,
+  allowedApprovalPolicies: allowedValues,
+  allowedSandboxModes: allowedValues,
+} satisfies Partial<Record<keyof ConfigRequirements | 'allowedApprovalsReviewers', unknown>>;
+
+/**
+ * What configRequirements/read must answer to be read at all: a requirements key, null on a device with none, or an
+ * object whose read fields are lists of strings or null. Every other field passes through, to be read for what its
+ * name says about approvals.
+ */
+const RequirementsAnswerSchema = z.looseObject({ requirements: z.looseObject(READ_FIELDS).nullable() });
+type RequirementsAnswer = z.output<typeof RequirementsAnswerSchema>;
+
+/** The two fields that say who may answer approvals, read where they stand: among the requirements' own fields. */
+const APPROVAL_FIELDS: readonly string[] = ['allowedApprovalsReviewers', 'allowedApprovalPolicies'];
+const SPEAKS_OF_APPROVALS = /approval/i;
+
+/**
+ * Whether any field of the answer, at any depth, speaks of approvals by its name and is not one of the two read where
+ * they stand. Such a field is one the runner does not recognise, so what it says is unknown.
+ */
+function unrecognisedApprovalField(answer: RequirementsAnswer): boolean {
+  const pending: unknown[] = [answer];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value !== 'object' || value === null) continue;
+    for (const [key, child] of Object.entries(value)) {
+      const read = value === answer.requirements && APPROVAL_FIELDS.includes(key);
+      if (!read && SPEAKS_OF_APPROVALS.test(key)) return true;
+      pending.push(child);
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether requirements that were read reserve approvals to the owner: they do when they speak about reviewers, or allow
+ * approval policies without on-request. Silence the runner did not hear is not permission (design 4, Device policy):
+ * a field it does not recognise that speaks of approvals reserves them, and so does either known field left out.
+ */
+function reservesApprovals(answer: RequirementsAnswer): boolean {
+  if (unrecognisedApprovalField(answer)) return true;
+  const { requirements } = answer;
+  if (requirements === null) return false;
+  const { allowedApprovalsReviewers: reviewers, allowedApprovalPolicies: policies } = requirements;
+  if (reviewers === undefined || policies === undefined) return true;
+  return reviewers !== null || (policies !== null && !policies.includes('on-request'));
+}
+
+/**
+ * managedPolicy says only that the device has managed configuration; whether that configuration regulates who answers
+ * approvals is the separate fact approvalsReservedToOwner (design 6.10). Requirements the runner could not read leave
+ * both true: a call that failed, and an answer of a shape it does not know, which is treated exactly alike.
  */
 export function classifyCodexPolicy(input: {
-  requirements: ConfigRequirementsReadResponse | null;
+  /** The configRequirements/read answer as it came, or null for a call that failed. */
+  requirements: unknown;
+  /** The config/read answer, or null for a call that failed. */
   config: ConfigReadResponse | null;
 }): { managedPolicy: boolean; approvalsReservedToOwner: boolean; problem: string | null } {
-  // 0.159.2 sends this field even though its generated ConfigRequirements omits it.
-  const requirements: (ConfigRequirements & { allowedApprovalsReviewers?: ApprovalsReviewer[] | null }) | null =
-    input.requirements?.requirements ?? null;
+  const parsed = RequirementsAnswerSchema.safeParse(input.requirements);
+  const answer = parsed.success ? parsed.data : null;
+  const requirements = answer?.requirements ?? null;
   const managedPolicy =
-    input.requirements === null ||
+    answer === null ||
     input.config === null ||
     requirements !== null ||
     input.config.layers === null ||
     input.config.layers.some((layer) => managedLayer(layer.name.type));
-  // Only a policy that speaks about reviewers or approval policies reserves approvals to the owner; a policy that
-  // could not be read reserves them too, since what it says is unknown. Managed layers alone say nothing here.
-  const approvalsReservedToOwner =
-    input.requirements === null ||
-    requirements?.allowedApprovalsReviewers != null ||
-    (requirements?.allowedApprovalPolicies != null && !requirements.allowedApprovalPolicies.includes('on-request'));
+  // Managed layers alone say nothing about approvals: only the requirements do, or their being unknown.
+  const approvalsReservedToOwner = answer === null || reservesApprovals(answer);
   // A managed layer outranks the thread's web_search override, and no later check sees web search.
   const webSearch = input.config?.config.web_search ?? null;
   const webSearchOrigin = input.config?.origins.web_search?.name.type;
