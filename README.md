@@ -134,7 +134,7 @@ When finished, exit the resumed chat and every terminal/editor process in the cl
 
 ## Dependencies and protected paths
 
-People configure preparation in a committed `.agflow/config.json`:
+People configure preparation, and the check every submission must pass, in a committed `.agflow/config.json`:
 
 ```json
 {
@@ -143,11 +143,14 @@ People configure preparation in a committed `.agflow/config.json`:
       "run": ["bun", "install", "--frozen-lockfile", "--ignore-scripts"],
       "when": ["package.json", "bun.lock"]
     }
-  ]
+  ],
+  "check": "bun test"
 }
 ```
 
 Without the file, nothing is prepared. The runner reads it from the vault at the protected restore base, never from agent-edited working files. Worker starts/resumes prepare when the listed files change; workers can also request `prepare_dependencies`. Leads get no preparation. Commands run in a sandbox with registry-only network, no owner credentials and writes confined to the clone and preparation cache, with a 15-minute timeout. Private registries are outside M2. Lifecycle scripts are disabled by default; an entry that needs them declares `"scripts": true` and uses a per-attempt cache (remove `--ignore-scripts` from that command). Go and Cargo always use per-attempt caches. If the sandbox check fails, preparation is unavailable on that runner.
+
+`check` is one shell command. At each submission the runner reads it from `main`, merges `main` into the agent's branch in its clone (a conflict refuses the submission and names the files), then runs the check there with `/bin/sh -c`, in the preparation sandbox and environment, with scripts allowed. It may run for `checkMinutes` of `runner.json`, 10 by default. A check that fails refuses the submission with the last 60 lines of its output, and the agent fixes it. The result (passed, failed or none, with the end of the output) goes with the submission to the lead and to `fetch_submission`, and with `AGFLOW_AUTO_ACCEPT=1` a passed check accepts the submission. Without a check, or on a runner that cannot run one, submissions go to the lead as before.
 
 Protected paths are matched case-insensitively. The runner restores them before starts, resumes, preparation and take-over, strips unauthorized changes from WIP, and refuses a submission containing them:
 
@@ -176,6 +179,8 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_AGENT_FETCH` | `0` | `1`: the hub downloads public web pages for Claude runner agents, for the lead and for the tasks the lead grants internet access; an agent that reads hostile text can then leak what its sandbox lets it read through the addresses it asks for. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
 | `AGFLOW_LEAD_APPROVALS` | `0` | `1`: the agent holding the lead seat may answer the approval requests of other agents' Codex attempts: decline any of them with a reason, and approve them on a runner whose device policy does not reserve approvals to its owner, so a command the lead approves runs outside the sandbox on its owner's laptop without a person looking at it. |
 | `AGFLOW_AUTO_APPROVALS` | `0` | `1`: the hub approves every approval request itself the moment it arrives, on any runner whose device policy does not reserve approvals to its owner: every command an agent asks to run outside the sandbox runs there, and no one reads it first. |
+| `AGFLOW_AUTO_MERGE` | `0` | `1`: agflow merges accepted work into main itself. A runner merges one accepted task at a time and pushes main with its owner's git credentials, so main must accept direct pushes; a conflict sends the task back to its author. Dependencies then wait for the merge, and accepted work keeps its owned paths until it is merged. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
+| `AGFLOW_AUTO_ACCEPT` | `0` | `1`: the hub accepts a runner submission whose check passed (`check` in `.agflow/config.json`) the moment it is recorded, without waking the lead; the lead's next situation report lists these tasks. A submission with no check goes to the lead as before. |
 | `AGFLOW_LEASE_MINUTES` | `120` | How long a claim survives without agent activity |
 | `AGFLOW_REMINDER_MINUTES` | `30` | Minimum time between "you hold a task" reminders |
 | `AGFLOW_MAX_OPEN_TASKS` | `200` | Guard: refuse new tasks beyond this many open tasks |
