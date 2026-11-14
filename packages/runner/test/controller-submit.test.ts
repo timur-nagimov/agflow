@@ -202,7 +202,8 @@ describe('AttemptController: submissions', () => {
   test('remote failures are retried until submitRetry passes (remote) or a stop or hold arrives (interrupted)', async () => {
     const setOrigin = (f: RunnerFixture, url: string) =>
       runGit(f.local, [`--git-dir=${f.vault.path}`, 'config', 'remote.origin.url', url]);
-    const failing = await workedOn(COMMITTED, { timings: { submitRetry: 1_200 } });
+    // submitRetry counts from the submission's start, so the harvest before the push takes some of it.
+    const failing = await workedOn(COMMITTED, { timings: { submitRetry: 3_000 } });
     await setOrigin(failing.f, join(failing.f.home, 'no-such-origin'));
     const began = performance.now();
     const remote = await failing.controller.submit(submission());

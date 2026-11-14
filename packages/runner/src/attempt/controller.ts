@@ -76,7 +76,7 @@ import { readPrepConfig } from '../prep/config';
 import type { SerialQueue } from '../queue';
 import { removeAgentTools } from '../run-dir';
 import { boundedWait, findCloneProcesses, type ProcessIdentity } from '../processes';
-import type { CheckRun, DependencyPreparer, Notifier, PrepareOutcome, RunnerHealth } from '../seams';
+import type { DependencyPreparer, Notifier, PrepareOutcome, RunnerHealth } from '../seams';
 import { killAndSweep, runStopLadder } from '../stop-ladder';
 import { vendorBinary } from '../vendor/pins';
 import { clipPushError, EVENTS_AFTER_EXIT_MS, LateWorkRetries, pushWithRetries, uploadTranscriptTail } from './exit';
@@ -97,6 +97,8 @@ import {
   dirtyDetail,
   isOwnBranch,
   noCheck,
+  prepFailedCheck,
+  prepFailedDetail,
   protectedDetail,
   pushSubmissionWithRetries,
   type SubmitCommand,
@@ -988,6 +990,9 @@ export class AttemptController {
     stops: number,
   ): Promise<SubmittedData> {
     const { vault, local, logger, store, wipGate } = this.deps;
+    // submitRetry is as long as the hub waits for the whole submission: the push gets what the merge, the preparation
+    // and the check leave of it.
+    const began = Date.now();
     const branch = command.branch;
     const refused = (fields: Pick<SubmittedData, 'error' | 'detail'> & Partial<SubmittedData>): SubmittedData => ({
       submissionId: command.submissionId,
@@ -1047,7 +1052,7 @@ export class AttemptController {
     const wipRef = spec.wipRef as string;
     const settled = () => this.standing.fenced || this.standing.ended || this.standing.exited;
     const pushed = await pushSubmissionWithRetries({
-      budgetMs: this.deps.config().timings.submitRetry,
+      budgetMs: this.deps.config().timings.submitRetry - (Date.now() - began),
       interrupted: () => this.stopsArrived !== stops,
       stopArrived: () => this.nextStop(),
       // Only the link's gate clears by itself; a fenced, ended or exited attempt never pushes again.
@@ -1094,9 +1099,9 @@ export class AttemptController {
   /**
    * A submission's merge of main and its check (design 6.13). Unless the branch holds main already, main merges into
    * it in the vault, and the clone moves to the merge commit while the agent's groups are paused; a conflict changes
-   * nothing. The project's check then runs in the clone. Gives the merge commit and its tree, null when the branch
-   * held main, or the refusal: merge_conflict naming the files, or check_failed with the end of the output. Each gives
-   * what the check gave.
+   * nothing. The project's check then runs in the clone, after the dependencies are prepared again when main merged
+   * in. Gives the merge commit and its tree, null when the branch held main, or the refusal: merge_conflict naming the
+   * files, or check_failed with the end of the output. Each gives what the check gave.
    */
   private async mergeAndCheck(
     spec: Omit<AttemptSpec, 'agentToken'>,
@@ -1112,6 +1117,7 @@ export class AttemptController {
     const git = { vault, local };
     const main = await mainOf(git);
     let merge: { sha: string; tree: string } | null = null;
+    let mergedBase: string | null = null;
     if (!(await isAncestor(git, main, head))) {
       const message = `Merge ${vault.mainBranch} into ${branch}`;
       const merged = await mergeMainInto({ ...git, head, main, message, identity: config.commitIdentity });
@@ -1123,37 +1129,44 @@ export class AttemptController {
       const target = { vault, local, attemptId: this.attemptId, clone, branch, from: head, to: merged.sha };
       await withPausedGroups(groups, () => moveTaskClone(target));
       merge = { sha: merged.sha, tree: merged.tree };
+      // The pins moved: the restore base is the main that merged in, for the preparation below and any later one.
+      mergedBase = await resolveRestoreBase(vault, spec);
+      if (this.prepared !== null) this.prepared.base = mergedBase;
     }
     const timeoutMs = Math.max(1, Math.round(config.checkMinutes * 60_000));
-    const ran = await this.runCheck(spec, clone, main, timeoutMs);
-    if (ran.run !== null && ran.check.status === 'failed') {
-      const detail = checkFailedDetail(ran.check, ran.run, timeoutMs, vault.mainBranch);
-      return { ok: false, error: 'check_failed', head: merge?.sha ?? head, detail, check: ran.check };
+    const ran = await this.runCheck(spec, clone, main, timeoutMs, mergedBase);
+    if (ran.refusal !== null) {
+      return { ok: false, error: 'check_failed', head: merge?.sha ?? head, detail: ran.refusal, check: ran.check };
     }
     return { ok: true, merge, check: ran.check };
   }
 
   /**
    * The project's check, read from .agflow/config.json on main, run in the clone by the preparer's sandbox with the
-   * agent's environment and no agent token. A check that cannot run (no command, a config that does not read, a
-   * runner with no sandbox, a failure to start it) is none, with why in its tail: the submission goes on without it.
+   * agent's environment and no agent token. When main merged in, it may have changed what the dependencies need: they
+   * are prepared first, as at a start, at mergedBase, the restore base the merge gave. A check that cannot run (no
+   * command, a config that does not read, a runner with no sandbox, a failure to start it) is none, with why in its
+   * tail: the submission goes on without it. Gives what the check gave, and the refusal's detail when the check, or
+   * the preparation before it, failed.
    */
   private async runCheck(
     spec: Omit<AttemptSpec, 'agentToken'>,
     clone: string,
     main: string,
     timeoutMs: number,
-  ): Promise<{ check: SubmissionCheck; run: CheckRun | null }> {
+    mergedBase: string | null,
+  ): Promise<{ check: SubmissionCheck; refusal: string | null }> {
     const { preparer, vault, paths, store } = this.deps;
     let command: string | undefined;
     try {
       command = (await readPrepConfig(vault, main))?.check;
     } catch (error) {
-      return { check: noCheck(null, describe(error)), run: null };
+      return { check: noCheck(null, describe(error)), refusal: null };
     }
-    if (command === undefined) return { check: noCheck(null, ''), run: null };
+    if (command === undefined) return { check: noCheck(null, ''), refusal: null };
     if (!preparer.available || preparer.check === undefined) {
-      return { check: noCheck(command, 'this runner cannot run it: it has no sandbox for preparation commands'), run: null };
+      const why = 'this runner cannot run it: it has no sandbox for preparation commands';
+      return { check: noCheck(command, why), refusal: null };
     }
     const env = buildAgentEnv({
       vendor: spec.vendor,
@@ -1165,11 +1178,26 @@ export class AttemptController {
       paths,
     });
     delete env.AGFLOW_AGENT_TOKEN;
+    if (mergedBase !== null) {
+      const input = { attemptId: this.attemptId, vendor: spec.vendor, clone, vault, baseSha: mergedBase, env };
+      let prep: Omit<PrepareOutcome, 'ran'>;
+      try {
+        prep = await preparer.prepare({ ...input, requestId: null });
+      } catch (error) {
+        prep = { ok: false, error: describe(error), logTail: null };
+      }
+      if (!prep.ok) {
+        const check = prepFailedCheck(command, prep);
+        return { check, refusal: prepFailedDetail(check, vault.mainBranch) };
+      }
+    }
     try {
       const run = await preparer.check({ clone, vault, command, env, timeoutMs });
-      return { check: checkOf(command, run), run };
+      const check = checkOf(command, run);
+      const refusal = check.status === 'failed' ? checkFailedDetail(check, run, timeoutMs, vault.mainBranch) : null;
+      return { check, refusal };
     } catch (error) {
-      return { check: noCheck(command, `the runner could not run it: ${describe(error)}`), run: null };
+      return { check: noCheck(command, `the runner could not run it: ${describe(error)}`), refusal: null };
     }
   }
 

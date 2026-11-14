@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { FakeStep } from '@agflow/testkit';
 import { commitFiles, fileAt, gitIn } from '@agflow/testkit';
 import { resolveRestoreBase } from '../src/git/protect';
+import { runGit } from '../src/git/run';
 import { createDependencyPreparer } from '../src/prep/preparer';
 import { PrepSandbox, type SandboxBackend } from '../src/prep/sandbox';
 import { standardProfile } from '../src/profile';
@@ -47,10 +48,10 @@ const originRef = (f: RunnerFixture, ref: string) =>
  */
 async function workedOn(
   check: string | null,
-  options: { checkMinutes?: number; sandbox?: boolean } = {},
+  options: { checkMinutes?: number; sandbox?: boolean; files?: Record<string, string> } = {},
 ) {
   const f = await createRunnerFixture({
-    files: files(check),
+    files: { ...files(check), ...options.files },
     script: { turns: [COMMITTED] },
     config: options.checkMinutes === undefined ? {} : { checkMinutes: options.checkMinutes },
   });
@@ -113,6 +114,16 @@ describe('the check at submission', () => {
     expect(await originRef(f, `refs/heads/${BRANCH}`)).toBeNull();
   });
 
+  test('the push gets only what the check left of submitRetry, the time the hub gives the whole submission', async () => {
+    const { f, submit } = await workedOn('sleep 2; echo slow');
+    f.config.timings.submitRetry = 1_000;
+    await runGit(f.local, [`--git-dir=${f.vault.path}`, 'config', 'remote.origin.url', join(f.home, 'no-such-origin')]);
+    const outcome = await submit();
+    expect(outcome).toMatchObject({ ok: false, error: 'remote', check: { status: 'passed', tail: 'slow' } });
+    // One try and no retry: the check took longer than submitRetry.
+    expect(f.logger.entries.filter((entry) => entry.message.startsWith('a submission push failed'))).toEqual([]);
+  });
+
   test("main merges into the branch first, in the clone: the check runs on the merge, and the merge is what goes", async () => {
     const { f, submit } = await workedOn('test -f main.txt && echo has-main');
     const main = await commitFiles(f.origin.path, { branch: 'main', files: { 'main.txt': 'from main\n' } });
@@ -132,6 +143,41 @@ describe('the check at submission', () => {
     expect(await gitIn(clone, ['status', '--porcelain'])).toBe('');
     // Protected paths are restored from the main it merged from now on.
     expect(await resolveRestoreBase(f.vault, f.spec())).toBe(main);
+  });
+
+  test('a merge of main that changes what the dependencies need prepares them again before the check', async () => {
+    const entry = { run: ['/bin/sh', '-c', 'cp deps.txt installed.txt'], when: ['deps.txt'] };
+    const config = (check: string) => JSON.stringify({ dependencies: [entry], check });
+    const { f, submit } = await workedOn(null, {
+      files: { '.gitignore': 'installed.txt\n', 'deps.txt': 'v1\n', '.agflow/config.json': config('echo v1') },
+    });
+    const clone = cloneOf(f);
+    expect(await Bun.file(join(clone, 'installed.txt')).text()).toBe('v1\n');
+    // main moves on: a new dependency, and a check that needs it installed.
+    const check = 'test "$(cat deps.txt)" = "$(cat installed.txt)" && echo deps-ok';
+    const moved = { 'deps.txt': 'v2\n', '.agflow/config.json': config(check) };
+    await commitFiles(f.origin.path, { branch: 'main', files: moved });
+    const outcome = await submit();
+    expect(outcome).toMatchObject({ ok: true, check: { status: 'passed', command: check, tail: 'deps-ok' } });
+    expect(await Bun.file(join(clone, 'installed.txt')).text()).toBe('v2\n');
+    // The preparation restored the protected paths from the main that merged in, not from the one the attempt began at.
+    expect(await Bun.file(join(clone, '.agflow/config.json')).text()).toBe(config(check));
+  });
+
+  test('a preparation that fails after main merged in refuses the submission as check_failed', async () => {
+    const entry = { run: ['/bin/sh', '-c', 'echo installing; test "$(cat deps.txt)" = v1'], when: ['deps.txt'] };
+    const config = JSON.stringify({ dependencies: [entry], check: 'echo never' });
+    const { f, submit } = await workedOn(null, { files: { 'deps.txt': 'v1\n', '.agflow/config.json': config } });
+    await commitFiles(f.origin.path, { branch: 'main', files: { 'deps.txt': 'v2\n' } });
+    const outcome = await submit();
+    expect(outcome).toMatchObject({ ok: false, error: 'check_failed', remoteHead: null });
+    expect(outcome.check).toMatchObject({ status: 'failed', command: 'echo never', durationMs: 0 });
+    const tail = outcome.check?.tail ?? '';
+    expect(tail.split('\n')[0]).toBe('installing');
+    expect(tail).toContain('exited with code 1');
+    expect(outcome.detail).toContain('Call prepare_dependencies');
+    expect(outcome.detail).toEndWith(`The last lines of its output:\n${tail}`);
+    expect(await originRef(f, `refs/heads/${BRANCH}`)).toBeNull();
   });
 
   test('a conflict with main refuses the submission, naming the files, and leaves the clone as it was', async () => {

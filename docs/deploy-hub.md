@@ -246,8 +246,9 @@ after a change. The details are in the
   accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
   `.agflow/config.json` on `main`, such as `"check": "bun test"`; a submission without one goes to the lead as before.
-  A runner gives a check `checkMinutes` (10 by default, in `runner.json`), so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15)
-  above it. Risk: the check is the only review, so whatever it does not test is accepted unseen.
+  A runner gives a check `checkMinutes` (10 by default, in `runner.json`) out of the 15 minutes it gives a whole
+  submission, push included, so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long. Risk: the check is the
+  only review, so whatever it does not test is accepted unseen.
 
 ### What agents fetched
 

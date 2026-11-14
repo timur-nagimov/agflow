@@ -151,7 +151,10 @@ function whatToFix(error: FixableError, branch: string, main: string): string {
     case 'merge_conflict':
       return `${main} does not merge into your branch cleanly. Merge it yourself and resolve the conflicts the detail names`;
     case 'check_failed':
-      return `the project's check failed on your branch with ${main} merged in. Make it pass, as the detail shows`;
+      return (
+        `the project's check, or the preparation of the dependencies before it, failed on your branch with ${main} ` +
+        'merged in. Make it pass, as the detail shows'
+      );
   }
 }
 

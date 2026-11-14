@@ -153,6 +153,8 @@ describe("the runner's check of a submission", () => {
     expect(getTask(hub.ctx, held.task.id).status).toBe('claimed');
     const told = listMessages(hub.ctx, {}).find((message) => message.to === `agent:${held.agent.id}`);
     expect(told?.body).toContain('was refused (check_failed)');
+    // The runner refuses a preparation that failed before the check the same way; its detail says which.
+    expect(told?.body).toContain("the project's check, or the preparation of the dependencies before it, failed");
     expect(told?.body).toContain('> 1 fail');
   });
 });

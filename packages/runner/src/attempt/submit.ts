@@ -7,12 +7,13 @@
 // that merge's base on main, so a branch that followed the advice carries main's own versions and passes as it is.
 // Then main merges into the branch, unless the branch holds it already: a conflict refuses the submission with
 // merge_conflict, naming the files, and leaves the clone alone; a clean merge becomes a commit on the branch in the
-// clone. The project's check (.agflow/config.json on main) runs in the clone on the result, and a failure refuses the
-// submission with check_failed and the end of its output. What the check gave travels with the outcome either way.
+// clone. The project's check (.agflow/config.json on main) runs in the clone on the result, after the dependencies are
+// prepared again when main merged in, and a failure of either refuses the submission with check_failed and the end of
+// its output. What the check gave travels with the outcome either way.
 // The task branch and the WIP ref then move together under the stale-lease rules (pushSubmission). Remote failures
-// are retried with a doubling delay until submitRetry passes (remote) or a stop or hold for the attempt arrives
-// (interrupted); a refusal that cannot clear (the attempt was fenced, ended or exited) ends the retries at once. The
-// outcome is the outbox event attempt.submitted, and the command result repeats it.
+// are retried with a doubling delay until submitRetry has passed since the submission began (remote) or a stop or
+// hold for the attempt arrives (interrupted); a refusal that cannot clear (the attempt was fenced, ended or exited)
+// ends the retries at once. The outcome is the outbox event attempt.submitted, and the command result repeats it.
 import { type AttemptSpec, CHECK_TAIL_MAX, isTaskBranch, type RunnerEvent, type SubmissionCheck } from '@agflow/core';
 import { doublingDelay } from '../backoff';
 import { mergeBase } from '../git/protect';
@@ -162,10 +163,28 @@ export function checkFailedDetail(check: SubmissionCheck, run: CheckRun, timeout
   return check.tail === '' ? intro : `${intro} The last lines of its output:\n${check.tail}`;
 }
 
+/** A check that did not run because the dependencies, prepared again after main merged in, failed: failed, with why. */
+export function prepFailedCheck(
+  command: string,
+  prep: { error: string | null; logTail: string | null },
+): SubmissionCheck {
+  const output = [prep.logTail?.trimEnd() ?? '', prep.error ?? 'the preparation failed'].filter((part) => part !== '');
+  return { status: 'failed', command, durationMs: 0, tail: checkTail(output.join('\n')) };
+}
+
+/** check_failed's detail when the dependencies could not be prepared for the check: what the agent does about it. */
+export function prepFailedDetail(check: SubmissionCheck, main: string): string {
+  return (
+    `the dependencies could not be prepared again after ${main} merged into your branch, so the project's check ` +
+    `\`${check.command}\` did not run. Call prepare_dependencies, fix what makes it fail, commit, and submit again. ` +
+    `The last lines of its output:\n${check.tail}`
+  );
+}
+
 export interface SubmitPushRetryInput {
   /** One try: the push, or why it may not run now (a remote outcome). */
   push(): Promise<SubmitPushOutcome>;
-  /** submitRetry. */
+  /** What is left of submitRetry; with nothing left, the push still makes its one try. */
   budgetMs: number;
   /** Whether a stop or hold for the attempt arrived since the submission began. */
   interrupted(): boolean;
