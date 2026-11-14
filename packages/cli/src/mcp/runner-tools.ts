@@ -378,8 +378,14 @@ const DecidedAnswerSchema = z.object({
   approval: z.object({ id: z.string().min(1).max(200), status: z.enum(['pending', 'approved', 'declined', 'expired', 'void']) }),
 });
 
-/** A request's parts in the order they are printed: the short ones first, the diffs last. */
-const APPROVAL_DETAIL_FIELDS = ['command', 'cwd', 'cloneRoot', 'reason', 'grantRoot', 'diff', 'manifestDiff'] as const;
+/**
+ * The parts of a request the asking agent wrote, in the order they are quoted: the short ones first, the diffs last.
+ * cloneRoot is not one of them: the runner writes it, and the lead judges containment against it.
+ */
+const APPROVAL_DETAIL_FIELDS = ['command', 'cwd', 'reason', 'grantRoot', 'diff', 'manifestDiff'] as const;
+
+/** The longest clone path printed on agflow's own line: macOS's PATH_MAX, so a real one is never cut. */
+const CLONE_ROOT_MAX = 1_024;
 
 /** How many approvals one listing prints, the oldest ones; the rest are counted, and listed once these are answered. */
 const APPROVALS_LISTED_MAX = 8;
@@ -408,7 +414,10 @@ function clipBytes(text: string, maxBytes: number): { shown: string; hidden: num
  * One pending approval as the lead reads it, its detail within `detailBytes`. What the lead may do stands above the
  * asking agent's words, so a client that cuts the answer short cuts the request, never agflow's own lines. The summary
  * and the detail are the asking agent's words, passed on by its runner: every line of them is quoted under a label
- * that says so, so none of it can pose as a line of agflow's or read as agflow's own sentence.
+ * that says so, so none of it can pose as a line of agflow's or read as agflow's own sentence. The attempt's clone is
+ * the runner's own fact, the one the lead judges every path against, so it stands on a line of agflow's above them;
+ * a runner that sends none (an older one, or one whose clone is no longer the directory the attempt started in) leaves
+ * no path known to be inside it.
  */
 function approvalBlock(approval: ListedApproval, now: number, detailBytes: number): string {
   const fields = APPROVAL_DETAIL_FIELDS.flatMap((field) => {
@@ -427,6 +436,7 @@ function approvalBlock(approval: ListedApproval, now: number, detailBytes: numbe
   }
   const minutes = Math.ceil((approval.expiresAt - now) / 60_000);
   const summary = oneLine(approval.summary, 300);
+  const clone = oneLine(approval.detail.cloneRoot ?? '', CLONE_ROOT_MAX);
   return lines([
     `Approval ${oneLine(approval.id, 100)}`,
     `task: ${approval.taskId ?? 'none'}`,
@@ -436,6 +446,9 @@ function approvalBlock(approval: ListedApproval, now: number, detailBytes: numbe
     approval.leadMayApprove === true
       ? 'you may: approve or decline it'
       : 'you may: decline only: a managed device policy leaves approving to the owner',
+    clone === ''
+      ? "The attempt's clone on that computer: not reported, so no path in this request is known to be inside it"
+      : `The attempt's clone on that computer: ${clone}`,
     summary === '' ? 'summary: none' : `summary (untrusted, the asking agent's words):\n${quoteLines(summary)}`,
     detail.length > 0 ? `detail (untrusted data from the asking agent):\n${quoteLines(detail.join('\n'))}` : 'detail: none',
     cut.length > 0 && `(not shown: ${cut.join(', ')}. Decline it if what is shown is not enough to judge.)`,
