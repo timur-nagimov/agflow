@@ -11,6 +11,14 @@ import { getProject } from '../src/project';
 import { getTask, listTaskNotes } from '../src/tasks';
 import { makeConfig } from './helpers';
 
+/** The statements the runbook feeds to sqlite3 on the stopped hub's database to go back from a schema version. */
+function wayBack(runbook: string, version: number): string {
+  const section = runbook.split(`### Upgrading to schema version ${version}\n`)[1];
+  const statements = section && /sqlite3 \/var\/lib\/agflow\/data\/agflow\.db <<'SQL'\n([\s\S]*?)\nSQL\n/.exec(section)?.[1];
+  if (!statements) throw new Error(`the runbook shows no statements for the way back from schema version ${version}`);
+  return statements;
+}
+
 const NOW = Date.UTC(2026, 9, 29, 12, 0, 0);
 const MINUTE = 60_000;
 
@@ -49,7 +57,7 @@ function v1Database(path: string, leadSeenAt: number): void {
 }
 
 describe('openDb', () => {
-  test('creates every table, column and index of schema versions 2 and 3', () => {
+  test('creates every table, column and index of schema versions 2, 3 and 4', () => {
     const db = openDb(':memory:', NOW);
     const tables = names(db, 'table');
     for (const name of [
@@ -128,12 +136,16 @@ describe('openDb', () => {
       { version: 1, applied_at: NOW },
       { version: 2, applied_at: NOW },
       { version: 3, applied_at: NOW },
+      { version: 4, applied_at: NOW },
     ]);
+    expect(columns(db, 'project')).toContain('deadline_at');
+    expect(columns(db, 'submissions')).toContain('check_result');
   });
 
   test('a schema version 2 database gains the internet grants and the record of fetches, and keeps its rows', () => {
     const db = openDb(':memory:', NOW);
     // As a hub before version 3 left it.
+    db.run(wayBack(readFileSync(join(import.meta.dir, '../../../docs/deploy-hub.md'), 'utf8'), 4));
     db.run('DROP TABLE task_fetch_grants');
     db.run('DROP TABLE agent_fetches');
     db.run('DELETE FROM schema_migrations WHERE version = 3');
@@ -151,9 +163,10 @@ describe('openDb', () => {
   test("the runbook's way back from schema version 3 leaves a whole version 2 database, which takes the upgrade again", () => {
     const runbook = readFileSync(join(import.meta.dir, '../../../docs/deploy-hub.md'), 'utf8');
     // The statements the runbook feeds to sqlite3 on the stopped hub's database.
-    const statements = /sqlite3 \/var\/lib\/agflow\/data\/agflow\.db <<'SQL'\n([\s\S]*?)\nSQL\n/.exec(runbook)?.[1];
-    if (!statements) throw new Error('the runbook shows no statements for the way back from schema version 3');
+    const statements = wayBack(runbook, 3);
     const db = openDb(tempDbPath(), NOW);
+    // The way back from version 3 starts at version 3: the steps of later versions are taken back first.
+    db.run(wayBack(runbook, 4));
     // A hub that ran on version 3: a task, an event, a grant and a recorded fetch.
     db.run(
       `INSERT INTO tasks (id, seq, status, contract, goal_version, created_by, created_at, updated_at)
@@ -191,6 +204,7 @@ describe('openDb', () => {
     });
     // Nothing of version 3 is left behind, or its step could not run again: the upgrade applies, and gives its schema.
     migrate(db, NOW + MINUTE);
+    db.run(wayBack(runbook, 4));
     expect(objects()).toEqual(version3);
     expect(db.query('SELECT version, applied_at FROM schema_migrations WHERE version = 3').get()).toEqual({
       version: 3,
@@ -203,11 +217,28 @@ describe('openDb', () => {
     db.close();
   });
 
+  test("the runbook's way back from schema version 4 leaves a whole version 3 database, which takes the upgrade again", () => {
+    const runbook = readFileSync(join(import.meta.dir, '../../../docs/deploy-hub.md'), 'utf8');
+    const db = openDb(tempDbPath(), NOW);
+    expect(columns(db, 'project')).toContain('deadline_at');
+    expect(columns(db, 'submissions')).toContain('check_result');
+    db.run('UPDATE project SET deadline_at = 1');
+    db.run(wayBack(runbook, 4));
+    expect(db.query('SELECT MAX(version) AS v FROM schema_migrations').get()).toEqual({ v: 3 });
+    expect(columns(db, 'project')).not.toContain('deadline_at');
+    expect(columns(db, 'submissions')).not.toContain('check_result');
+    expect(db.query('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
+    migrate(db, NOW + MINUTE);
+    expect(columns(db, 'project')).toContain('deadline_at');
+    expect(columns(db, 'submissions')).toContain('check_result');
+    db.close();
+  });
+
   test('migrating twice is a no-op', () => {
     const db = openDb(':memory:', NOW);
     migrate(db, NOW + MINUTE);
     const row = db.query('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number };
-    expect(row.n).toBe(3);
+    expect(row.n).toBe(4);
     expect((db.query('SELECT COUNT(*) AS n FROM hub_state').get() as { n: number }).n).toBe(1);
   });
 
@@ -216,7 +247,7 @@ describe('openDb', () => {
     const db = openDb(path, NOW);
     db.run('INSERT INTO schema_migrations (version, applied_at) VALUES (1000, 0)');
     db.close();
-    expect(() => openDb(path, NOW)).toThrow('database schema version 1000 is newer than this hub supports (3)');
+    expect(() => openDb(path, NOW)).toThrow('database schema version 1000 is newer than this hub supports (4)');
   });
 
   test('a version 1 database keeps its data and gets the defaults', () => {
