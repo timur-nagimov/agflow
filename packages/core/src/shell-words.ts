@@ -42,12 +42,19 @@ export function shellWords(command: string): string[] | null {
 }
 
 /**
+ * The shells Codex wraps a command in: sh, bash, zsh, dash, ksh and mksh, by name or from a directory of the system.
+ * A shell anywhere else is a program like any other, and /tmp/x/bash -lc "npm test" runs /tmp/x/bash; ssh -c names
+ * a cipher.
+ */
+const WRAPPING_SHELL = /^(?:(?:\/usr\/local|\/opt\/homebrew|\/usr)?\/bin\/)?(?:ba|z|da|k|mk)?sh$/;
+
+/**
  * Codex runs every command as `<shell> -c <script>` (or -lc), joined with shlex; the agent wrote only the script.
  * Anything that is not exactly those three words stays as it is.
  */
 export function innerCommand(command: string): string {
   const words = shellWords(command);
-  if (words?.length !== 3 || !/^(?:\S*\/)?[a-z]*sh$/.test(words[0]!) || !['-c', '-lc'].includes(words[1]!)) {
+  if (words?.length !== 3 || !WRAPPING_SHELL.test(words[0]!) || !['-c', '-lc'].includes(words[1]!)) {
     return command;
   }
   return words[2]!;
