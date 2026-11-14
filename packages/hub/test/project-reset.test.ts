@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LiveAttempt } from '@agflow/core';
@@ -159,6 +159,8 @@ describe('the project reset', () => {
       epoch: epoch + 1,
       goalVersion: 1,
     });
+    // The restore tool's floor: a backup from before the reset is restored above the reset's epoch.
+    expect(readFileSync(join(dir, 'epoch'), 'utf8')).toBe(`${epoch + 1}\n`);
 
     // The archive holds the old project, whole.
     const archived = new Database(archive, { readonly: true });
@@ -243,12 +245,18 @@ describe('the project reset', () => {
     expect(reset.status).toBe(200);
     expect(reset.json).toMatchObject({ archive: null, epoch: 2, goalVersion: 1 });
     expect(hub.ctx.db.query('SELECT deadline_at FROM project').get()).toEqual({ deadline_at: null });
+    // What agflow start reads first: the branch the seed goes on.
+    expect((await hub.call('GET', '/api/operator/project', op())).json).toMatchObject({
+      project: { name: 'afisha', repo: 'https://github.com/acme/afisha', paused: false },
+      mainBranch: 'main',
+    });
   });
 
   test('refuses a wrong token, a deadline without its offset and a multi-line name, changing nothing', async () => {
     const hub = createTestHub({ operatorToken: TOKEN, operatorUser: 'alice', backupDir: backupDir() });
     createTasks(hub.ctx, [newTask()], 'user:alice');
     const path = '/api/operator/project/reset';
+    expect((await hub.call('GET', '/api/operator/project', op(`${TOKEN}x`))).status).toBe(401);
     expect((await hub.call('POST', path, { ...op(`${TOKEN}x`), body: RESET })).status).toBe(401);
     expect((await hub.call('POST', path, { user: 'alice', via: 'cli', body: RESET })).status).toBe(401);
     expect((await hub.call('POST', path, { ...op(), body: { ...RESET, deadline: '2026-11-16T18:00' } })).status).toBe(400);

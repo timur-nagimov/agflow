@@ -882,18 +882,34 @@ class Runtime {
     } catch (error) {
       this.logger.error('cannot cache the project', { error: describe(error) });
     }
+    // The git readiness the hub holds: the hello's, which this welcome answered, and the WIP pushes since.
+    const told = this.gitReport().ready;
     const vault = projectVault(this.options.paths, this.db, this.hubUrl, project);
     this.project = project;
     this.vault = vault;
-    // The old repository's failures say nothing about the new one; the next hello reports git afresh.
+    // The old repository's failures say nothing about the new one.
     this.gitProblem = null;
     this.wipFailures.succeeded();
     // Taken now, so every fetch the new project's starts make waits behind it on the vault's lock.
-    vault.ensure().catch((error) => {
-      if (this.vault !== vault) return;
-      this.gitProblem = `cannot prepare the vault: ${describe(error)}`;
-      this.logger.error('cannot prepare the vault', { error: this.gitProblem });
-    });
+    vault
+      .ensure()
+      .then(
+        () => this.vaultOpened(vault, told, null),
+        (error) => this.vaultOpened(vault, told, `cannot prepare the vault: ${describe(error)}`),
+      )
+      .catch((error) => this.logger.error("cannot report the new project's git", { error: describe(error) }));
+  }
+
+  /**
+   * The new project's vault is ready, or cannot be made. The hub hears git readiness only in a hello or from a WIP
+   * push, which needs work it placed here first: when the readiness differs from what the hub holds (told), the runner
+   * says hello again, or the hub would keep the old repository's "git not ready" and place nothing here.
+   */
+  private vaultOpened(vault: Vault, told: boolean, problem: string | null): void {
+    if (this.vault !== vault) return;
+    this.gitProblem = problem;
+    if (problem !== null) this.logger.error('cannot prepare the vault', { error: problem });
+    if (this.gitReport().ready !== told) this.link.reconnectNow("the new project's git readiness");
   }
 
   /**

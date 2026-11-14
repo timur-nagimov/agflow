@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { getCurrentGoal } from '@agflow/hub/src/goal';
 import { listStandingRules } from '@agflow/hub/src/messages';
 import { getProject } from '@agflow/hub/src/project';
+import { PrepConfigSchema } from '@agflow/runner/src/prep/config';
 import { UsageError, parseArgs } from '../src/args';
 import { saveCredentials } from '../src/credentials';
 import { KEYCHAIN_SERVICE, findOperatorToken, operatorTokenCommand } from '../src/operator-token';
@@ -143,6 +144,14 @@ describe('the seed files', () => {
     expect(typescript.find((file) => file.path === '.gitignore')?.content).toContain('node_modules/');
   });
 
+  test("the runner's reader takes the seeded .agflow/config.json, whatever the stack", () => {
+    for (const stack of ['python', 'typescript', 'Go with Gin', null]) {
+      const config = seedFiles({ name: 'afisha', stack, specs }).find((file) => file.path === '.agflow/config.json');
+      const parsed = PrepConfigSchema.safeParse(JSON.parse(config?.content as string));
+      expect([stack, parsed.error?.issues ?? []]).toEqual([stack, []]);
+    }
+  });
+
   test('the scripts pass in an empty project, and run the stack tools once its manifest is there', () => {
     const bin = join(tempDir(), 'bin');
     mkdirSync(bin);
@@ -273,6 +282,29 @@ describe('agflow start', () => {
     expect(s.hub.ctx.db.query('SELECT epoch FROM project').get()).toEqual({ epoch: 3 });
   });
 
+  test("the seed goes on the hub's main branch, whatever the repository's default branch is", async () => {
+    // A repository whose only branch is master: main starts from it, with the seed on top.
+    const s = await setup();
+    const old = join(s.root, 'old.git');
+    await gitIn(s.root, ['init', '--quiet', '--bare', '--initial-branch=master', old]);
+    const work = join(s.root, 'old');
+    await gitIn(s.root, ['clone', '--quiet', old, work]);
+    writeFileSync(join(work, 'README.md'), '# Old\n');
+    await gitIn(work, ['add', 'README.md']);
+    await gitIn(work, ['commit', '--quiet', '-m', 'Old work']);
+    await gitIn(work, ['push', '--quiet', 'origin', 'HEAD:refs/heads/master']);
+    const { io, text } = capture();
+    expect(await startCommand(parseArgs(['start', '--spec', s.spec, '--repo', old]), io, s.deps)).toBe(0);
+    expect(await gitIn(old, ['rev-parse', 'main^'])).toBe(await gitIn(old, ['rev-parse', 'master']));
+    expect(await gitIn(old, ['show', 'main:CLAUDE.md'])).toBe('@AGENTS.md');
+    expect(text()).toContain('(main at ');
+
+    // A hub whose main branch is trunk (AGFLOW_MAIN_BRANCH) gets the seed of an empty repository there.
+    const t = await setup({ operatorToken: TOKEN, operatorUser: 'alice', mainBranch: 'trunk' });
+    expect(await startCommand(parseArgs(['start', '--spec', t.spec, '--repo', t.origin]), io, t.deps)).toBe(0);
+    expect(await gitIn(t.origin, ['for-each-ref', '--format=%(refname)', 'refs/heads/'])).toBe('refs/heads/trunk');
+  });
+
   test('--create makes the private repository with gh and gives the collaborators write access', async () => {
     const s = await setup();
     // gh is a stand-in, and git takes github.com from a local folder.
@@ -282,7 +314,8 @@ describe('agflow start', () => {
     const log = join(s.root, 'gh.log');
     writeFileSync(
       join(bin, 'gh'),
-      `#!/bin/sh\necho "$*" >> "${log}"\ncase "$1 $2" in\n  "repo view") exit 1;;\n  "repo create") git init --quiet --bare --initial-branch=main "${github}/$3";;\nesac\n`,
+      `#!/bin/sh\necho "$*" >> "${log}"\ncase "$1 $2" in\n  "repo view") exit 1;;\n  "repo create") git init --quiet --bare --initial-branch=main "${github}/$3";;\n` +
+        `  "api -X") echo '{"id":1}';;\nesac\n`,
     );
     chmodSync(join(bin, 'gh'), 0o755);
     s.deps.env = {
@@ -292,9 +325,12 @@ describe('agflow start', () => {
       GIT_CONFIG_KEY_0: `url.${github}/.insteadOf`,
       GIT_CONFIG_VALUE_0: 'https://github.com/',
     };
-    const { io } = capture();
+    const { io, text } = capture();
     const argv = ['start', '--spec', s.spec, '--repo', 'acme/afisha', '--create', '--collaborator', 'bob'];
     expect(await startCommand(parseArgs(argv), io, s.deps)).toBe(0);
+    // GitHub invites bob, who must accept before his runner can fetch the repository.
+    expect(text()).toContain('Invited bob to acme/afisha with write access');
+    expect(text()).toContain('https://github.com/acme/afisha/invitations');
     expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual([
       'repo view acme/afisha --json name',
       'repo create acme/afisha --private',

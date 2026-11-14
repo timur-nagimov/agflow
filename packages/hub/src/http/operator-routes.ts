@@ -6,6 +6,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import {
   MarkMergedInputSchema,
   NoteInputSchema,
+  type OperatorProject,
   ProjectResetInputSchema,
   SendMessageInputSchema,
   UpdateGoalInputSchema,
@@ -15,6 +16,7 @@ import type { HubContext } from '../context';
 import { unauthorized } from '../errors';
 import { updateGoal } from '../goal';
 import { sendMessage } from '../messages';
+import { getProject } from '../project';
 import { resetProject } from '../reset';
 import { markMerged, unblockTask } from '../tasks';
 import type { App, AppEnv } from './app';
@@ -66,6 +68,13 @@ export function mountOperatorRoutes(app: App, ctx: HubContext): void {
       standingRule: input.standingRule,
     });
     return c.json({ message }, 201);
+  });
+
+  // agflow start reads the main branch before it seeds the repository: attempts start from that branch only.
+  app.get('/api/operator/project', (c) => {
+    operator(c);
+    const answer: OperatorProject = { project: getProject(ctx), mainBranch: ctx.config.mainBranch };
+    return c.json(answer);
   });
 
   // A new project in place of the current one (agflow start): reset.ts says what goes and what stays.

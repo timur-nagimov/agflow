@@ -4,7 +4,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { ProjectResetResult } from '@agflow/core';
+import type { OperatorProject, ProjectResetResult } from '@agflow/core';
 import { type ParsedArgs, UsageError, listFlag, stringFlag } from './args';
 import { loadCredentials } from './credentials';
 import type { FetchFn } from './hub-client';
@@ -117,8 +117,15 @@ function prepareGithub(deps: StartDeps, repo: RepoRef, create: boolean, collabor
     }
   }
   for (const login of collaborators) {
-    must(deps, ['gh', 'api', '-X', 'PUT', `repos/${slug}/collaborators/${login}`, '-f', 'permission=push']);
-    io.out(`Gave ${login} write access to ${slug}.\n`);
+    // GitHub answers with an invitation, which the person must accept, or with nothing when they have access already.
+    const path = `repos/${slug}/collaborators/${login}`;
+    const invitation = must(deps, ['gh', 'api', '-X', 'PUT', path, '-f', 'permission=push']);
+    io.out(
+      invitation
+        ? `Invited ${login} to ${slug} with write access. Their runner can fetch it once they accept at ` +
+            `https://github.com/${slug}/invitations.\n`
+        : `${login} has write access to ${slug}.\n`,
+    );
   }
 }
 
@@ -131,15 +138,26 @@ interface Seeded {
 }
 
 /**
- * Clones the repository and commits the seed: the first commit on main of an empty repository, or a new commit on
- * top of the default branch of one with commits. The push never forces.
+ * Clones the repository and commits the seed on the hub's main branch, the one its attempts start from: the first
+ * commit of an empty repository, a new commit on top of that branch, or, where the repository has no such branch, a
+ * new branch from its default one. The push never forces.
  */
-function seedRepository(deps: StartDeps, url: string, files: SeedFile[], work: string, message: string): Seeded {
+function seedRepository(
+  deps: StartDeps,
+  repo: { url: string; branch: string },
+  files: SeedFile[],
+  work: string,
+  message: string,
+): Seeded {
+  const { url, branch } = repo;
   must(deps, ['git', 'clone', '--quiet', url, work]);
   const git = (...args: string[]) => must(deps, ['git', ...args], work);
-  const empty = deps.run(['git', 'rev-parse', '--verify', '--quiet', 'HEAD'], { env: deps.env, cwd: work }).code !== 0;
-  if (empty) git('symbolic-ref', 'HEAD', 'refs/heads/main');
-  const branch = git('symbolic-ref', '--short', 'HEAD');
+  const has = (ref: string) =>
+    deps.run(['git', 'rev-parse', '--verify', '--quiet', ref], { env: deps.env, cwd: work }).code === 0;
+  const onOrigin = has(`refs/remotes/origin/${branch}`);
+  if (onOrigin) git('checkout', '--quiet', '-B', branch, `origin/${branch}`);
+  else if (has('HEAD')) git('checkout', '--quiet', '-b', branch);
+  else git('symbolic-ref', 'HEAD', `refs/heads/${branch}`);
   for (const file of files) {
     const path = join(work, file.path);
     mkdirSync(dirname(path), { recursive: true });
@@ -150,36 +168,36 @@ function seedRepository(deps: StartDeps, url: string, files: SeedFile[], work: s
   // Executable whatever core.fileMode says.
   git('update-index', '--chmod=+x', '--', ...files.filter((file) => file.executable).map((file) => file.path));
   const staged = deps.run(['git', 'diff', '--cached', '--quiet'], { env: deps.env, cwd: work }).code !== 0;
-  if (!staged) return { branch, sha: git('rev-parse', 'HEAD'), committed: false };
-  git('commit', '--quiet', '-m', message);
-  git('push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`);
-  return { branch, sha: git('rev-parse', 'HEAD'), committed: true };
+  if (staged) git('commit', '--quiet', '-m', message);
+  if (staged || !onOrigin) git('push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`);
+  return { branch, sha: git('rev-parse', 'HEAD'), committed: staged };
 }
 
-/** POST /api/operator/project/reset with the operator token. */
-async function resetHub(
+/** An operator route with the operator token: a GET, or a POST of the body. */
+async function operatorCall<T>(
   deps: StartDeps,
   hub: string,
   token: { token: string; source: string },
-  body: { name: string; repo: string; deadline: string | null; goal: string; rules: string[] },
-): Promise<ProjectResetResult> {
+  path: string,
+  body?: object,
+): Promise<T> {
   let response: Response;
   try {
-    response = await deps.fetch(`${hub}/api/operator/project/reset`, {
-      method: 'POST',
+    response = await deps.fetch(`${hub}${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
       headers: { 'content-type': 'application/json', 'x-agflow-operator': token.token },
-      body: JSON.stringify(body),
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (error) {
     throw new Error(`cannot reach the hub at ${hub}: ${describe(error)}`);
   }
   const json = (await response.json().catch(() => null)) as { message?: string } | null;
-  if (response.ok) return json as ProjectResetResult;
+  if (response.ok) return json as T;
   if (response.status === 404) {
     throw new Error(`the hub at ${hub} has no operator routes: set AGFLOW_OPERATOR_TOKEN and AGFLOW_OPERATOR_USER there`);
   }
   if (response.status === 401) throw new Error(`the hub refused the operator token from ${token.source}`);
-  throw new Error(`the hub refused the reset (HTTP ${response.status}): ${json?.message ?? 'no reason given'}`);
+  throw new Error(`the hub refused ${path} (HTTP ${response.status}): ${json?.message ?? 'no reason given'}`);
 }
 
 export async function startCommand(args: ParsedArgs, io: Io, deps: StartDeps = defaultStartDeps()): Promise<number> {
@@ -204,6 +222,8 @@ export async function startCommand(args: ParsedArgs, io: Io, deps: StartDeps = d
   const deadline = parseDeadline(stringFlag(args, 'deadline'), deps.now());
   const stack = stringFlag(args, 'stack')?.trim() || null;
   const name = stringFlag(args, 'name')?.trim() || repo.name;
+  // Asked before anything is made: the seed goes on the branch the hub's attempts start from (AGFLOW_MAIN_BRANCH).
+  const { mainBranch } = await operatorCall<OperatorProject>(deps, hub, token, '/api/operator/project');
 
   const tmp = mkdtempSync(join(tmpdir(), 'agflow-start-'));
   try {
@@ -213,7 +233,7 @@ export async function startCommand(args: ParsedArgs, io: Io, deps: StartDeps = d
     prepareGithub(deps, repo, args.flags.create === true, listFlag(args, 'collaborator'), io);
     const files = seedFiles({ name, stack, specs });
     const message = `Start ${name}: the spec, AGENTS.md and the scripts`;
-    const seeded = seedRepository(deps, repo.url, files, join(tmp, 'repo'), message);
+    const seeded = seedRepository(deps, { url: repo.url, branch: mainBranch }, files, join(tmp, 'repo'), message);
     const at = `${seeded.branch} at ${seeded.sha.slice(0, 7)}`;
     if (seeded.committed) io.out(`Committed ${files.map((file) => file.path).join(', ')} to ${repo.url} (${at}).\n`);
     else io.out(`${repo.url} holds these files already (${at}).\n`);
@@ -222,7 +242,8 @@ export async function startCommand(args: ParsedArgs, io: Io, deps: StartDeps = d
       io.out(`No text in ${untranscribed.join(', ')}: SPEC.md asks the first task to transcribe it.\n`);
     }
     const goal = startGoal(stack, deadline);
-    const reset = await resetHub(deps, hub, token, { name, repo: repo.url, deadline, goal, rules: [stackRule(stack)] });
+    const body = { name, repo: repo.url, deadline, goal, rules: [stackRule(stack)] };
+    const reset = await operatorCall<ProjectResetResult>(deps, hub, token, '/api/operator/project/reset', body);
     io.out(
       `The hub's project is now "${reset.project.name}" (${reset.project.repo}), epoch ${reset.epoch}, with goal ` +
         `v${reset.goalVersion}, a standing rule for the stack and deadline ${readable(deadline)}.\n`,

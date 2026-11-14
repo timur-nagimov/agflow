@@ -161,7 +161,7 @@ const GITIGNORE: Record<KnownStack | 'other', string> = {
 
 /**
  * Every file of the seed commit. .agflow/config.json runs scripts/install.sh to prepare dependencies, and names the
- * check (the merge lane's reader takes "check").
+ * check a submission must pass; the runner's reader (prep/config.ts) takes both.
  */
 export function seedFiles(input: { name: string; stack: string | null; specs: readonly SpecFile[] }): SeedFile[] {
   const kind = known(input.stack) ?? 'other';

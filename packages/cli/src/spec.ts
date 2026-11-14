@@ -48,9 +48,14 @@ const KNOWN = new Set([...AS_TEXT, ...VIA_TEXTUTIL, ...Object.values(BY_TYPE)]);
 
 export const isUrl = (source: string): boolean => /^https?:\/\//i.test(source);
 
-/** A file name git and every shell take without quoting trouble. */
+/**
+ * A file name git and every shell take without quoting trouble. The extension is kept apart, so a name written in
+ * another script, Cyrillic say, keeps its type: it becomes spec.pdf or spec.docx.
+ */
 function safeName(name: string): string {
-  return name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+/, '') || 'spec';
+  const extension = /^\.[A-Za-z0-9]+$/.test(extname(name)) ? extname(name) : '';
+  const stem = name.slice(0, name.length - extension.length).replace(/[^A-Za-z0-9._-]+/g, '-');
+  return `${stem.replace(/^[-.]+|-+$/g, '') || 'spec'}${extension}`;
 }
 
 /** Downloads a URL with curl; its file is named after the URL, with an extension from the Content-Type if needed. */

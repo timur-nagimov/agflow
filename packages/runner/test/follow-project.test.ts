@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { gitIn, originRepo } from '@agflow/testkit';
 import { projectKey } from '../src/paths';
 import { waitFor } from './fixture';
@@ -68,6 +68,32 @@ describe('a project reset on the hub', () => {
     const clone = s.paths.clone(key, 'T-1004-e2-a1');
     await waitFor(() => existsSync(join(clone, 'SPEC.md')));
     expect(readFileSync(join(clone, 'SPEC.md'), 'utf8')).toBe('# afisha\n');
+  });
+
+  test("a runner whose old vault was not ready says hello again once the new project's vault is ready", async () => {
+    const next = await originRepo({ 'SPEC.md': '# afisha\n' });
+    afterThisTest(() => next.remove());
+    const moved = { name: 'afisha', repo: next.path };
+    const s = await setup({
+      welcome: (_hello, connection) => (connection.index === 0 ? {} : { hubEpoch: 2, project: moved }),
+    });
+    // The old project's vault cannot be made, so git is not ready.
+    const blocked = s.paths.vault(projectKey(s.hub.url, PROJECT));
+    mkdirSync(dirname(blocked), { recursive: true });
+    writeFileSync(blocked, 'not a vault\n');
+    const runner = await s.start();
+    await s.hub.waitFor(() => hellos(s.hub).length > 0);
+    expect(hellos(s.hub)[0]?.git).toMatchObject({ ready: false });
+
+    // The reset: a hello, a hello at the new epoch whose welcome names the new project, and one more once its vault is
+    // ready, so the hub stops holding the old repository's problem against this runner.
+    (await s.hub.connection(0)).close(1001, 'the project was reset; say hello again');
+    const fourth = await s.hub.waitFor(() => hellos(s.hub)[3]);
+    expect(hellos(s.hub).slice(1, 3).map((hello) => hello.git.ready)).toEqual([false, false]);
+    expect(fourth.git).toMatchObject({ ready: true, problem: null });
+    expect(runner.vault.project).toBe(projectKey(s.hub.url, 'afisha'));
+    await waitFor(() => runner.status().link === 'online');
+    expect(hellos(s.hub)).toHaveLength(4);
   });
 
   test("a welcome naming the runner's own project changes nothing", async () => {

@@ -174,7 +174,7 @@ The allowlist is checked whenever a session verifies; removing a login invalidat
 M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. To run a
 project unattended, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
 for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login the script acts as) in
-`/etc/agflow/hub.env` and restart. Five routes then accept the header `X-Agflow-Operator: <token>`:
+`/etc/agflow/hub.env` and restart. Six routes then accept the header `X-Agflow-Operator: <token>`:
 
 | Route | Does |
 |---|---|
@@ -182,6 +182,7 @@ for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login
 | `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
 | `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
 | `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
+| `GET /api/operator/project` | answers the project and the hub's main branch (`AGFLOW_MAIN_BRANCH`), where `agflow start` puts the seed |
 | `POST /api/operator/project/reset` `{ "name", "repo", "deadline": ISO 8601 or null, "goal", "rules": string[] }` | replaces the project with a new one ([Start a new project](#start-a-new-project)) |
 
 Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it; `agflow start` is the one
@@ -208,7 +209,8 @@ The reset, in one go:
    runner agents and their tokens, attempt logs, rejected runner events and the lead seat;
 3. keeps sessions, CLI sign-ins, people's live agents, runners and vendor accounts;
 4. sets the name, repository and deadline, unpauses, clears the worker target and the vendor preference, and raises
-   the epoch and the id counters as a restore does, so no new attempt, branch or ref collides with an old one;
+   the epoch and the id counters as a restore does, so no new attempt, branch or ref collides with an old one; the
+   epoch also goes to the backup folder's `epoch` file, so a later restore of an older backup lands above it;
 5. sets goal v1 and posts the rules as standing rules, as the operator's person (event `project.reset`);
 6. closes every runner link. Each runner says hello again, and the hub, which no longer knows the attempts it
    reports, lists them in the welcome's stop list, as after a restore.
@@ -323,7 +325,7 @@ For live chats in a checkout, use `agflow join --role worker --vendor both`; see
 
 ## Backups and restore
 
-The hub writes consistent SQLite snapshots with `VACUUM INTO`: three start backups, 24 hourly backups and seven daily backups. The first hourly backup is an hour after start; a missing daily backup is written on startup. They live in `/var/lib/agflow/backups`, independent of releases. Check backup timestamps and the journal for failures; a full disk can leave the hub running without a new backup. Preserve the `epoch` file alongside backups after a restore.
+The hub writes consistent SQLite snapshots with `VACUUM INTO`: three start backups, 24 hourly backups and seven daily backups. The first hourly backup is an hour after start; a missing daily backup is written on startup. They live in `/var/lib/agflow/backups`, independent of releases. Check backup timestamps and the journal for failures; a full disk can leave the hub running without a new backup. Preserve the `epoch` file alongside backups after a restore or a project reset.
 
 Daily cloud disk snapshots protect against VM/disk loss, including the database, backups, configuration and Caddy certificates. Treat snapshots as sensitive (they contain session tokens and the OAuth secret). They are crash-consistent, not a replacement for application snapshots or a restore drill. Retain an additional known-good backup before schema changes. On a 10 GB disk, monitor `df -h /`, DB/WAL and backup sizes; 34 full SQLite copies plus three dependency trees can outgrow it. Expand the disk or move retained copies before it fills; do not delete live WAL/SHM files to free space.
 

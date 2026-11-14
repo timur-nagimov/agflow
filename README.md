@@ -131,10 +131,12 @@ agflow start --spec brief.pdf --spec https://example.com/rules.html --repo acme/
   the check is `bash scripts/check.sh`), `scripts/install.sh`, `scripts/check.sh`, `scripts/demo.sh` and a
   `.gitignore`. The scripts do nothing in an empty project and run the stack's tools once its manifest exists:
   `--stack python` runs uv, pytest and ruff; `--stack typescript` runs Bun or npm, the tests and tsc; any other text
-  gets scripts that say what to fill in. An empty repository gets the seed as its first commit on `main`, one with
-  commits as a new commit on top of its default branch. Nothing is force-pushed.
-- **`--create`** makes the repository with `gh repo create --private`, and each `--collaborator <login>` gets write
-  access. Both need `--repo owner/name`.
+  gets scripts that say what to fill in. The seed goes on the hub's main branch (`AGFLOW_MAIN_BRANCH`, `main` by
+  default), the one its attempts start from: the first commit of an empty repository, or a new commit on top of that
+  branch, which starts from the default branch where the repository has none. Nothing is force-pushed.
+- **`--create`** makes the repository with `gh repo create --private`, and each `--collaborator <login>` is invited
+  with write access. Both need `--repo owner/name`. A colleague accepts the invitation at
+  `https://github.com/<owner>/<name>/invitations`; until then their runner cannot fetch the repository.
 - **The hub.** The project is named `--name`, or after the repository. The hub writes an archive of its database to
   its backup folder, empties the old project (tasks, attempts, messages, events, the goal, approvals), keeps sign-ins,
   runners and vendor accounts, and sets the goal: implement SPEC.md, then keep improving the product until the

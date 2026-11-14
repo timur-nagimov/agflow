@@ -87,6 +87,24 @@ describe('reading a spec', () => {
     expect(readSpec(specFile('brief.docx'), 0, { ...deps, env: { PATH: '/nonexistent' } }).text).toBeNull();
   });
 
+  test('a name in another script keeps its type, so its text is read; the original is kept under a plain name', () => {
+    const deps = fakeTools();
+    expect(readSpec(specFile('ТЗ.md', '# ТЗ\n'), 0, deps)).toMatchObject({ name: 'spec.md', text: '# ТЗ\n' });
+    expect(readSpec(specFile('Техническое задание.txt', 'Сделать.\n'), 0, deps)).toMatchObject({
+      name: 'spec.txt',
+      text: 'Сделать.\n',
+    });
+    expect(readSpec(specFile('ТЗ.pdf'), 0, deps)).toMatchObject({ name: 'spec.pdf', text: 'pdftotext read ТЗ.pdf\n' });
+    expect(readSpec(specFile('Задание (v2).docx'), 0, deps)).toMatchObject({
+      name: 'v2.docx',
+      text: 'textutil read Задание (v2).docx\n',
+    });
+    expect(readSpec('https://example.com/files/%D0%A2%D0%97.md', 1, deps)).toMatchObject({
+      name: 'spec.md',
+      text: '# Remote spec\n',
+    });
+  });
+
   test('an image yields no text, and its original is kept', () => {
     const spec = readSpec(specFile('mockup.png', 'PNG'), 0, fakeTools());
     expect(spec).toEqual({ name: 'mockup.png', bytes: new TextEncoder().encode('PNG'), text: null });

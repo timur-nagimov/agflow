@@ -478,6 +478,13 @@ export interface ProjectResetResult {
   goalVersion: number;
 }
 
+/** What GET /api/operator/project answers: the project, and the branch its attempts start from. */
+export interface OperatorProject {
+  project: Project;
+  /** AGFLOW_MAIN_BRANCH, the branch agflow start puts the seed on. */
+  mainBranch: string;
+}
+
 /** POST /api/tasks/:id/fetch-grant: why the task needs data from outside; its event and the assignee's message quote it. */
 export const FetchGrantInputSchema = z.strictObject({ reason: z.string().min(1).max(500) });
 

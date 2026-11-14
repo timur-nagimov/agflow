@@ -2,6 +2,8 @@
 // on the same hub, without ssh. It replaces the manual procedure of draining runners, stopping the hub, moving the
 // database aside, copying the sessions back and raising the epoch with the restore tool. People's sign-ins, runners and
 // vendor accounts stay; the old project's work is archived and emptied.
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Project, ProjectResetResult } from '@agflow/core';
 import { archiveDatabase } from './backup';
 import { type HubContext, afterCommit, tx } from './context';
@@ -97,6 +99,9 @@ export function resetProject(ctx: HubContext, input: ProjectReset, actor: string
     });
     const goal = updateGoal(ctx, { text: input.goal, baseVersion: 0 }, actor);
     for (const rule of input.rules) sendMessage(ctx, { from: actor, to: 'all', body: rule, standingRule: true });
+    // The restore tool's floor (restore.ts), so a backup taken before the reset is restored at a higher epoch.
+    const { backupDir } = ctx.config;
+    if (backupDir) afterCommit(ctx, () => writeFileSync(join(backupDir, 'epoch'), `${epoch}\n`));
     const runners = ctx.db.query('SELECT id FROM runners WHERE connection_id IS NOT NULL').all() as { id: string }[];
     afterCommit(ctx, () => {
       for (const { id } of runners) ctx.link.closeRunner(id, GOING_AWAY_CLOSE, 'the project was reset; say hello again');
