@@ -21,11 +21,17 @@ import {
   packTarball,
   startOriginHub,
 } from '@agflow/runner/test/service-helpers';
-import { parseArgs } from '../src/args';
+import { parseArgs, UsageError } from '../src/args';
 import { deleteCredentials, saveCredentials } from '../src/credentials';
 import { HubClient } from '../src/hub-client';
 import { runnerCommand } from '../src/runner-command';
-import { type Prompt, runnerSetup, type RunnerSetupDeps } from '../src/runner-setup';
+import {
+  HACKATHON_PRESET,
+  type Prompt,
+  runnerSetup,
+  type RunnerSetupDeps,
+  setupChoices,
+} from '../src/runner-setup';
 import { shellQuote } from '../src/self';
 
 setDefaultTimeout(60_000);
@@ -423,6 +429,68 @@ test('checks retry startup route errors within the socket deadline', async () =>
   expect(tries).toBe(3);
   expect(f.out.join('')).toContain('started');
   expect(f.logins()).toEqual([]);
+});
+
+test('setup flags choose the runner settings, and the hackathon preset chooses them all', () => {
+  const choices = (...flags: string[]) => setupChoices(parseArgs(['runner', 'setup', ...flags]));
+  expect(choices('--yes')).toEqual({});
+  expect(HACKATHON_PRESET).toEqual({ capacity: 6, ceiling: 1, keepAwake: 'always', profile: 'open' });
+  expect(choices('--preset', 'hackathon')).toEqual(HACKATHON_PRESET);
+  expect(choices('--preset', 'hackathon', '--capacity', '8', '--profile', 'standard')).toEqual({
+    ...HACKATHON_PRESET,
+    capacity: 8,
+    profile: 'standard',
+  });
+  expect(
+    choices('--name', ' Hack Mac ', '--capacity=16', '--ceiling', '0.5', '--keep-awake', 'off', '--profile', 'auto'),
+  ).toEqual({ name: 'Hack Mac', capacity: 16, ceiling: 0.5, keepAwake: 'off', profile: 'auto' });
+  for (const flags of [
+    ['--preset', 'party'],
+    ['--name', ' '],
+    ['--name'],
+    ['--capacity', '0'],
+    ['--capacity', '17'],
+    ['--capacity', '2.5'],
+    ['--capacity', 'many'],
+    ['--capacity'],
+    ['--ceiling', '0.4'],
+    ['--ceiling', '1.1'],
+    ['--ceiling', 'high'],
+    ['--keep-awake', 'never'],
+    ['--profile', 'wide'],
+  ]) {
+    expect(() => choices(...flags)).toThrow(UsageError);
+  }
+});
+
+test('--preset hackathon sets up a busy open runner without asking', async () => {
+  const f = await fixture();
+  expect(await f.run(['--preset', 'hackathon', '--name', 'Hack Mac', '--no-service'])).toBe(0);
+  const config = loadRunnerConfig(f.paths.config);
+  expect(config).toMatchObject({
+    name: 'Hack Mac',
+    capacity: 6,
+    keepAwake: 'always',
+    profile: 'open',
+    ceilings: { claude: { fiveHour: 1, weekly: 1 }, codex: { fiveHour: 1, weekly: 1 } },
+  });
+  expect(config.confirmedSettings).toMatchObject({ capacity: 6, keepAwake: 'always', version: 0 });
+});
+
+test('setup flags change a kept runner.json as local edits, and nothing when they match it', async () => {
+  const f = await fixture();
+  await f.run();
+  const initial = loadRunnerConfig(f.paths.config);
+  await f.run(['--yes', '--no-service', '--preset', 'hackathon', '--keep-awake', 'ac']);
+  const edited = loadRunnerConfig(f.paths.config);
+  expect(edited).toMatchObject({ runnerKey: initial.runnerKey, name: 'Test Mac', capacity: 6, keepAwake: 'ac' });
+  expect(edited.profile).toBe('open');
+  expect(edited.ceilings.codex).toEqual({ fiveHour: 1, weekly: 1 });
+  // The hub hears of the edits after its next welcome; the confirmed snapshot stays as it was.
+  expect(edited.confirmedSettings).toEqual(initial.confirmedSettings);
+  const before = statSync(f.paths.config).mtimeMs;
+  await f.run(['--no-service', '--name', 'Test Mac', '--capacity', '6', '--profile', 'open']);
+  expect(statSync(f.paths.config).mtimeMs).toBe(before);
 });
 
 test('runnerWhoami validates the response schema', async () => {
