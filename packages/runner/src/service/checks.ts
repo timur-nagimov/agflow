@@ -162,6 +162,8 @@ export async function runServiceChecks(input: ServiceChecksInput): Promise<Check
   );
   results.push(
     await check('sleep', async () => {
+      // A Linux runner is a cloud machine, which never sleeps.
+      if (input.platform === 'linux') return { status: 'pass', detail: 'a Linux runner does not sleep' };
       let minutes: number | null = null;
       if (input.platform === 'darwin') {
         try {

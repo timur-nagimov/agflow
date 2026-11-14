@@ -37,11 +37,12 @@ function stub(body: string): string {
 }
 
 describe('the Claude pin', () => {
-  test('claudePin gives the darwin-arm64 pin from VENDOR_PINS and null elsewhere', () => {
+  test('claudePin gives the platform pin from VENDOR_PINS and null where nothing is pinned', () => {
     expect(claudePin('darwin-arm64')).toEqual(VENDOR_PINS['darwin-arm64']?.claude ?? null);
     expect(claudePin('darwin-arm64')).toMatchObject({ version: '2.1.285', sdkVersion: '0.3.285' });
-    expect(claudePin('linux-x64')).toBeNull();
+    expect(claudePin('linux-x64')).toMatchObject({ version: '2.1.285', package: '@anthropic-ai/claude-agent-sdk-linux-x64' });
     expect(claudePin('darwin-x64')).toBeNull();
+    expect(claudePin('win32-x64')).toBeNull();
     expect(CLAUDE_CLI_VERSION).toBe('2.1.285');
     expect(CLAUDE_SDK_VERSION).toBe('0.3.285');
   });

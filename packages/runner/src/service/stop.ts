@@ -9,6 +9,7 @@ import { controlRequest, ControlUnavailableError } from './control';
 import { bootoutService, disableService, kickstartService, plistPath, serviceLoaded } from './launchd';
 import { readLockOwner } from './lock';
 import { ServiceRuns } from './runs';
+import { disableSystemdService, restartSystemdService, systemdServiceEnabled } from './systemd';
 import type { Exec } from './system';
 
 type StopHandle = Pick<RunnerHandle, 'changeSettings' | 'pause' | 'stopAgents' | 'waitAcked' | 'status'>;
@@ -117,9 +118,11 @@ export interface StopRunnerOptions {
   label?: string;
   /**
    * The user's home: an installed plist that launchd has not loaded is disabled too, or the next login would start
-   * it. Uninstall, which removes the plist instead, leaves it out.
+   * it. Uninstall, which removes the plist instead, leaves it out. On Linux it is where the systemd unit lies.
    */
   home?: string;
+  /** Linux drives the systemd unit instead of the LaunchAgent; process.platform by default. */
+  platform?: NodeJS.Platform;
   /** stopWaitMs by default for a stop, two minutes for a restart. */
   lockWaitMs?: number;
   pollMs?: number;
@@ -196,6 +199,11 @@ export async function stopRunner(
     if (exit !== null) options.log?.(`the runner exited: ${exit.reason}`);
   }
   if ((options.env ?? process.env).AGFLOW_TEST === '1') return { wasRunning, bootedOut: false, disabled: false };
+  if ((options.platform ?? process.platform) === 'linux') {
+    // The unit's Restart= ignores a clean exit; stopping it also cancels a restart planned after a crash.
+    const disabled = await disableSystemdService(options);
+    return { wasRunning, bootedOut: disabled, disabled };
+  }
   let bootedOut = false;
   let disabled = false;
   if (await serviceLoaded(options)) {
@@ -214,16 +222,29 @@ export async function stopRunner(
   return { wasRunning, bootedOut, disabled };
 }
 
-/** Checks launchd before touching a foreground runner; kickstart follows the suspend's lock release. */
+/**
+ * Checks launchd (or on Linux that the systemd unit is enabled) before touching a foreground runner; kickstart (or
+ * systemctl restart) follows the suspend's lock release.
+ */
 export async function restartRunner(options: StopRunnerOptions = {}): Promise<void> {
   const budget = bounds(options, 120_000);
-  if ((options.env ?? process.env).AGFLOW_TEST === '1' || !(await serviceLoaded(options))) {
+  const linux = (options.platform ?? process.platform) === 'linux';
+  const loaded =
+    (options.env ?? process.env).AGFLOW_TEST !== '1' &&
+    (linux ? await systemdServiceEnabled(options) : await serviceLoaded(options));
+  if (!loaded) {
+    const service = linux ? 'systemd unit' : 'LaunchAgent';
     throw new Error(
-      'no runner service is loaded; agflow runner install installs and starts the LaunchAgent; ' +
+      `no runner service is loaded; agflow runner install installs and starts the ${service}; ` +
         'agflow runner start runs it in the foreground',
     );
   }
   await requestExit(options.paths ?? runnerPaths(), '/suspend', options, budget);
+  if (linux) {
+    options.log?.('starting the runner under systemd');
+    await restartSystemdService(options);
+    return;
+  }
   options.log?.('starting the runner under launchd; launchd can hold a quick restart for up to a minute');
   await kickstartService(options);
 }

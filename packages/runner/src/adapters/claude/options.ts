@@ -64,6 +64,8 @@ export interface ClaudeOptionDeps {
   compaction: { preCompact: HookCallback; postCompact: HookCallback };
   /** A new session's id; randomUUID by default. */
   newSessionId?: () => string;
+  /** The machine's OS, which picks the CLI's shell (CLAUDE_LINUX_SHELL on Linux); process.platform by default. */
+  platform?: NodeJS.Platform;
 }
 
 /**
@@ -96,9 +98,19 @@ export function ensureClaudeEmptyDir(claudeHome: string): string {
  */
 export const CLAUDE_SHELL = '/bin/zsh';
 
-/** The CLI's environment: the launch's, with the empty directory as ZDOTDIR and zsh as the CLI's shell. */
-function claudeEnv(env: Record<string, string>, emptyDir: string): Record<string, string> {
+/**
+ * The CLI's shell on Linux, whatever the owner's SHELL: a cloud machine has no zsh unless someone installs it. Ubuntu's
+ * stock ~/.bashrc returns at once in a shell that is not interactive, so the bashrc read above runs nothing.
+ */
+export const CLAUDE_LINUX_SHELL = '/bin/bash';
+
+/**
+ * The CLI's environment: the launch's, with the empty directory as ZDOTDIR and zsh as the CLI's shell, or bash on
+ * Linux.
+ */
+function claudeEnv(env: Record<string, string>, emptyDir: string, platform: NodeJS.Platform): Record<string, string> {
   const { CLAUDE_CODE_SHELL: _owner, ...rest } = env;
+  if (platform === 'linux') return { ...rest, ZDOTDIR: emptyDir, CLAUDE_CODE_SHELL: CLAUDE_LINUX_SHELL };
   const zsh = env.SHELL !== undefined && basename(env.SHELL) === 'zsh';
   return { ...rest, ZDOTDIR: emptyDir, ...(zsh ? {} : { CLAUDE_CODE_SHELL: CLAUDE_SHELL }) };
 }
@@ -190,7 +202,7 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
     spawnClaudeCodeProcess: deps.spawnClaudeCodeProcess,
     cwd: launch.clone,
     // Whole: the SDK gives the child exactly this environment.
-    env: claudeEnv(launch.env, emptyDir),
+    env: claudeEnv(launch.env, emptyDir, deps.platform ?? process.platform),
     ...session,
     model: launch.model,
     systemPrompt: { type: 'preset', preset: 'claude_code', append: CLAUDE_BASH_NOTE },

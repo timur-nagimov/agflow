@@ -5,7 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Vendor } from '@agflow/core';
 import { CONNECTIVITY_VARS, type RunnerConfig, vendorHomes } from '../config';
-import { userVariables } from '../env';
+import { readRunnerEnvFile, userVariables } from '../env';
 import type { RunnerPaths } from '../paths';
 import { defaultExec, type Exec, type ExecResult } from '../service/system';
 import { VENDOR_PINS, vendorBinary, vendorPlatform } from './pins';
@@ -23,6 +23,8 @@ export interface VendorLoginOptions {
   platform?: string;
   /** The caller's environment, read only for the user and system variables and the owner's HOME. */
   base?: Env;
+  /** Codex signs in with a device code (`codex login --device-auth`): a machine with no browser, such as Linux. */
+  deviceAuth?: boolean;
 }
 
 /**
@@ -50,6 +52,8 @@ export function vendorCliEnv(
     // Claude's login keychain item depends on this exact config-directory string.
     env.HOME = base.HOME ?? homedir();
     env.CLAUDE_CONFIG_DIR = homes.claude;
+    // A runner with no browser signs in with a token in its environment file instead.
+    Object.assign(env, readRunnerEnvFile(paths));
   } else {
     env.HOME = paths.homes.codexUser;
     env.CODEX_HOME = homes.codex;
@@ -89,7 +93,10 @@ function commandFailure(vendor: Vendor, command: string, result: ExecResult): st
   return `${vendor} ${command} ${result.timedOut ? 'timed out' : `failed with exit code ${result.exitCode}`}`;
 }
 
-/** `auth status --json` must show a claude.ai login with a subscription; setup skips the login when it does. */
+/**
+ * `auth status --json` must show a claude.ai login with a subscription, or the token of `claude setup-token` from the
+ * runner's environment file (authMethod oauth_token, which names no plan); setup skips the login when it does.
+ */
 export async function claudeLoginStatus(
   config: RunnerConfig,
   paths: RunnerPaths,
@@ -112,6 +119,7 @@ export async function claudeLoginStatus(
     // Logged-out Claude exits 1 but still prints structured status.
     if (auth.loggedIn !== true) return failure('not logged in to Claude');
     if (result.exitCode !== 0) return failure(commandFailure('claude', 'auth status', result));
+    if (auth.authMethod === 'oauth_token') return { ok: true, plan: null };
     if (auth.authMethod !== 'claude.ai') {
       return failure('a Console (API) login; agflow needs a Claude subscription login');
     }
@@ -151,7 +159,8 @@ async function login(
   paths: RunnerPaths,
   options: VendorLoginOptions,
 ): Promise<void> {
-  const args = vendor === 'claude' ? ['auth', 'login', '--claudeai'] : ['login'];
+  const args =
+    vendor === 'claude' ? ['auth', 'login', '--claudeai'] : options.deviceAuth ? ['login', '--device-auth'] : ['login'];
   const result = await run(vendor, args, config, paths, options, true);
   if (result.exitCode !== 0 || result.timedOut) throw new Error(commandFailure(vendor, 'login', result));
   const status = await (vendor === 'claude' ? claudeLoginStatus : codexLoginStatus)(config, paths, options);
@@ -163,7 +172,10 @@ export function loginClaude(config: RunnerConfig, paths: RunnerPaths, options: V
   return login('claude', config, paths, options);
 }
 
-/** Setup step 5: the owner signs in on the terminal, then the status must name ChatGPT. */
+/**
+ * Setup step 5: the owner signs in on the terminal, or with deviceAuth enters the code it shows in any browser; then
+ * the status must name ChatGPT.
+ */
 export function loginCodex(config: RunnerConfig, paths: RunnerPaths, options: VendorLoginOptions = {}): Promise<void> {
   return login('codex', config, paths, options);
 }

@@ -24,6 +24,7 @@ import { removeAgentTools } from '@agflow/runner/src/run-dir';
 import { plistPath } from '@agflow/runner/src/service/launchd';
 import { acquireRunnerLock, readLockOwner } from '@agflow/runner/src/service/lock';
 import { stopRunner } from '@agflow/runner/src/service/stop';
+import { SYSTEMD_UNIT, unitPath } from '@agflow/runner/src/service/systemd';
 import { defaultExec, type Exec } from '@agflow/runner/src/service/system';
 import { VENDOR_PINS } from '@agflow/runner/src/vendor/pins';
 import { waitFor } from '@agflow/runner/test/fixture';
@@ -215,6 +216,35 @@ test('running uninstall hands off, logs out with pinned binaries, retires open a
   expect(await new HubClient({ baseUrl: s.hub.url, token: s.hub.token }).retireRunner(s.config.runnerKey)).toEqual({
     ok: true,
   });
+});
+
+test('on Linux uninstall stops, disables and removes the systemd unit, and leaves launchd alone', async () => {
+  const s = await fixture(true);
+  const machineIdFile = join(tempDir('agf-machine-'), 'machine-id');
+  writeFileSync(machineIdFile, `${MACHINE}\n`);
+  mkdirSync(dirname(unitPath(s.home)), { recursive: true });
+  writeFileSync(unitPath(s.home), 'installed');
+  const systemctl: string[][] = [];
+  const exec: Exec = async (argv, options) => {
+    if (argv[0] !== 'systemctl') return s.deps.exec!(argv, options);
+    systemctl.push(argv);
+    return { exitCode: 0, stdout: '', stderr: '', timedOut: false };
+  };
+  const service = await s.start();
+  await waitFor(() => service.runner?.status().link === 'online');
+  expect(await s.run(false, { exec, machinePlatform: 'linux', machineIdFile })).toBe(0);
+  expect(await service.exited).toMatchObject({ code: 0, clean: true });
+  expect(existsSync(unitPath(s.home))).toBe(false);
+  expect(systemctl).toEqual([
+    ['systemctl', '--user', 'disable', '--now', SYSTEMD_UNIT],
+    ['systemctl', '--user', 'disable', '--now', SYSTEMD_UNIT],
+    ['systemctl', '--user', 'daemon-reload'],
+  ]);
+  expect(s.out.join('')).toContain(`removed ${unitPath(s.home)}`);
+  expect(findRunnerByKey(s.hub.ctx, s.config.runnerKey)?.retired_at).not.toBeNull();
+  s.loggedOut();
+  expect(s.commands.some((argv) => argv[0] === 'launchctl' || argv[0] === 'ioreg')).toBe(false);
+  expect(readFileSync(s.plist, 'utf8')).toBe('installed');
 });
 
 test('purge after stopping a running attempt finds its work pushed and its events acknowledged', async () => {

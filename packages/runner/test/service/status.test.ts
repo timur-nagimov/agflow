@@ -17,7 +17,9 @@ import {
   offlineStatus,
   parseLaunchdDisabled,
   type RunnerStatusReport,
+  SYSTEMD_DISABLED_WARNING,
 } from '../../src/service/status';
+import { unitPath } from '../../src/service/systemd';
 import { waitFor } from '../fixture';
 import { startRunnerAttempt } from '../hub-fixture';
 import { afterThisTest, cleanupRunnerSetups, tempDir } from '../runner-setup';
@@ -185,7 +187,7 @@ test('offline status reads installed plist, finished exit, last 20 lines and Log
   const exec = recordingExec([
     { argv: ['launchctl', 'print-disabled', 'gui/501'], result: { stdout: disabledOutput('disabled') } },
   ]);
-  const report = await offlineStatus({ paths: s.paths, home, uid: 501, exec });
+  const report = await offlineStatus({ paths: s.paths, home, uid: 501, exec, platform: 'darwin' });
   expect(report).toMatchObject({
     running: false,
     bestEffort: true,
@@ -209,7 +211,12 @@ test('offline status distinguishes an unanswered lock holder from an abandoned r
   runs.start({ pid: process.pid, mode: 'service' });
   const lock = await acquireRunnerLock(s.paths, { mode: 'service' });
   afterThisTest(() => lock.release());
-  const options = { paths: s.paths, home: tempDir('agf-home-'), exec: recordingExec([], { exitCode: 1 }) };
+  const options = {
+    paths: s.paths,
+    home: tempDir('agf-home-'),
+    exec: recordingExec([], { exitCode: 1 }),
+    platform: 'darwin' as const,
+  };
   expect(await offlineStatus(options)).toMatchObject({
     disabled: null,
     plistInstalled: false,
@@ -222,6 +229,27 @@ test('offline status distinguishes an unanswered lock holder from an abandoned r
     lockHolder: null,
     lastExit: { at: 1_000, clean: false, reason: 'exited without a clean shutdown' },
   });
+});
+
+test('offline status on Linux reads the systemd unit and its enabled state, never launchd', async () => {
+  const s = await setupTestService();
+  const home = tempDir('agf-home-');
+  const exec = recordingExec([
+    { argv: ['systemctl', '--user', 'is-enabled', 'agflow-runner.service'], result: { stdout: 'disabled\n', exitCode: 1 } },
+  ]);
+  const options = { paths: s.paths, home, uid: 501, exec, platform: 'linux' as const };
+  expect(await offlineStatus(options)).toMatchObject({ service: 'systemd', plistInstalled: false, disabled: true });
+  mkdirSync(dirname(unitPath(home)), { recursive: true });
+  writeFileSync(unitPath(home), 'installed');
+  const report = await offlineStatus(options);
+  expect(report).toMatchObject({ service: 'systemd', plistInstalled: true, disabled: true });
+  expect(report.warnings).toEqual([SYSTEMD_DISABLED_WARNING]);
+  const text = formatStatus(report);
+  expect(text).toMatch(/^Unit\s+installed$/m);
+  expect(text).toMatch(/^systemd\s+disabled$/m);
+  expect(text).toContain('agflow runner install');
+  expect(exec.calls.every((call) => call.argv[0] === 'systemctl')).toBe(true);
+  expect(await offlineStatus({ ...options, launchd: false })).toMatchObject({ plistInstalled: false, disabled: null });
 });
 
 test('GET /status lists a retained failed-push clone only while it exists', async () => {

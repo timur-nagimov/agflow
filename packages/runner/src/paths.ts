@@ -11,6 +11,11 @@ export interface RunnerPaths {
   /** Runner state; agents read only their own Claude project directory in it (design 7.6). */
   runner: string;
   config: string;
+  /**
+   * runner.env (mode 0600): secrets runner.json never holds. A runner with no browser (Linux) keeps the token of
+   * `claude setup-token` there as CLAUDE_CODE_OAUTH_TOKEN.
+   */
+  envFile: string;
   db: string;
   lock: string;
   socket: string;
@@ -72,6 +77,7 @@ export function runnerPaths(home: string = agflowHome()): RunnerPaths {
     home,
     runner,
     config: join(runner, 'runner.json'),
+    envFile: join(runner, 'runner.env'),
     db: join(runner, 'runner.db'),
     lock: join(runner, 'runner.lock'),
     socket: join(runner, 'runner.sock'),

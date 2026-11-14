@@ -174,6 +174,44 @@ export function programPaths(agflow: AgflowCommand): string[] {
   return paths;
 }
 
+/** The service's environment: the captured PATH and connectivity, and AGFLOW_HOME and AGFLOW_CONFIG_DIR when set. */
+export function serviceEnvironment(config: RunnerConfig, paths: RunnerPaths, env: Env): Record<string, string> {
+  const environment: Record<string, string> = { PATH: config.capturedPath, NODE_USE_SYSTEM_CA: '1' };
+  for (const key of CONNECTIVITY_VARS) {
+    const value = config.connectivity[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  if (env.AGFLOW_HOME !== undefined) environment.AGFLOW_HOME = paths.home;
+  if (env.AGFLOW_CONFIG_DIR !== undefined) environment.AGFLOW_CONFIG_DIR = resolve(env.AGFLOW_CONFIG_DIR);
+  return environment;
+}
+
+/**
+ * Waits until the old service has released runner.lock. A foreground runner keeps it: the new service then waits
+ * behind it, which is only warned about. An unknown owner can be a service still writing its identity; it is waited
+ * out rather than raced.
+ */
+export async function waitForServiceLock(
+  paths: RunnerPaths,
+  wait: { deadline: number; pollMs: number; waitMs: number },
+  warn: (line: string) => void,
+): Promise<void> {
+  let owner = readLockOwner(paths);
+  while (owner !== null) {
+    if (owner.mode === 'foreground') {
+      warn(`warning: the service waits for the foreground runner (pid ${owner.pid ?? 'unknown'}) to stop`);
+      return;
+    }
+    if (performance.now() >= wait.deadline) {
+      throw new Error(
+        `runner.lock is still held by pid ${owner.pid ?? 'unknown'} after ${wait.waitMs} ms; install aborted`,
+      );
+    }
+    await delay(Math.min(wait.pollMs, Math.max(0, wait.deadline - performance.now())));
+    owner = readLockOwner(paths);
+  }
+}
+
 export async function installService(
   options: InstallOptions,
 ): Promise<{ plistPath: string; target: string; warnings: string[] }> {
@@ -220,17 +258,10 @@ export async function installService(
     }
   }
 
-  const environment: Record<string, string> = { PATH: config.capturedPath, NODE_USE_SYSTEM_CA: '1' };
-  for (const key of CONNECTIVITY_VARS) {
-    const value = config.connectivity[key];
-    if (value !== undefined) environment[key] = value;
-  }
-  if (env.AGFLOW_HOME !== undefined) environment.AGFLOW_HOME = paths.home;
-  if (env.AGFLOW_CONFIG_DIR !== undefined) environment.AGFLOW_CONFIG_DIR = resolve(env.AGFLOW_CONFIG_DIR);
   const plist = renderPlist({
     label,
     programArguments: [...program, 'runner', 'start', '--service'],
-    environment,
+    environment: serviceEnvironment(config, paths, env),
     ...launchdLogPaths(paths),
   });
   mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
@@ -246,19 +277,7 @@ export async function installService(
 
   await bootoutService({ ...options, label, uid });
   const deadline = performance.now() + waitMs;
-  let owner = readLockOwner(paths);
-  while (owner !== null) {
-    if (owner.mode === 'foreground') {
-      warn(`warning: the service waits for the foreground runner (pid ${owner.pid ?? 'unknown'}) to stop`);
-      break;
-    }
-    // An unknown owner can be a service still writing its identity; wait rather than racing its teardown.
-    if (performance.now() >= deadline) {
-      throw new Error(`runner.lock is still held by pid ${owner.pid ?? 'unknown'} after ${waitMs} ms; install aborted`);
-    }
-    await delay(Math.min(pollMs, Math.max(0, deadline - performance.now())));
-    owner = readLockOwner(paths);
-  }
+  await waitForServiceLock(paths, { deadline, pollMs, waitMs }, warn);
   // The lock is free once the old process exits, which can precede launchd removing the job (or a bootout that timed
   // out); bootstrap fails with an input/output error while the label is still loaded.
   while (await serviceLoaded({ ...options, label, uid })) {

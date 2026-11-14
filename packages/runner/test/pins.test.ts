@@ -6,8 +6,7 @@ import { parseVendorVersion, VENDOR_PINS, vendorBinary, vendorPlatform } from '.
 const repoRoot = join(import.meta.dir, '..', '..', '..');
 
 describe('VENDOR_PINS', () => {
-  test('pins both vendors for darwin-arm64 only', () => {
-    // M2c adds integrity fields to these entries, so only the pinned versions and packages are checked.
+  test('pins both vendors for the Macs and for Linux cloud runners', () => {
     expect(VENDOR_PINS['darwin-arm64']).toMatchObject({
       claude: {
         version: '2.1.285',
@@ -17,8 +16,49 @@ describe('VENDOR_PINS', () => {
       },
       codex: { version: '0.159.2', package: '@openai/codex', packageVersion: '0.159.2-darwin-arm64' },
     });
-    expect(VENDOR_PINS['linux-x64']).toBeUndefined();
-    expect(Object.keys(VENDOR_PINS)).toEqual(['darwin-arm64']);
+    expect(Object.keys(VENDOR_PINS)).toEqual(['darwin-arm64', 'linux-x64', 'linux-arm64']);
+    expect(VENDOR_PINS['darwin-x64']).toBeUndefined();
+  });
+
+  test('every platform pins the same versions, from its own platform package and tree', () => {
+    const triples: Record<string, string> = {
+      'darwin-arm64': 'aarch64-apple-darwin',
+      'linux-x64': 'x86_64-unknown-linux-musl',
+      'linux-arm64': 'aarch64-unknown-linux-musl',
+    };
+    for (const [platform, pins] of Object.entries(VENDOR_PINS)) {
+      expect(pins).toEqual({
+        claude: {
+          version: '2.1.285',
+          sdkVersion: '0.3.285',
+          package: `@anthropic-ai/claude-agent-sdk-${platform}`,
+          packageVersion: '0.3.285',
+          integrity: expect.stringMatching(/^sha512-[A-Za-z0-9+/]{86}==$/),
+          sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        },
+        codex: {
+          version: '0.159.2',
+          package: '@openai/codex',
+          packageVersion: `0.159.2-${platform}`,
+          integrity: expect.stringMatching(/^sha512-[A-Za-z0-9+/]{86}==$/),
+          tree: `vendor/${triples[platform]}`,
+        },
+      });
+    }
+    const all = Object.values(VENDOR_PINS).flatMap((pins) => [pins!.claude, pins!.codex]);
+    expect(new Set(all.map((pin) => pin.integrity)).size).toBe(all.length);
+  });
+
+  test("each Claude pin is the SDK's own build for its platform", () => {
+    const sdk = Bun.resolveSync('@anthropic-ai/claude-agent-sdk/package.json', join(repoRoot, 'packages/runner'));
+    const manifest = JSON.parse(readFileSync(join(dirname(sdk), 'manifest.json'), 'utf8'));
+    const lock = readFileSync(join(repoRoot, 'bun.lock'), 'utf8');
+    for (const [platform, pins] of Object.entries(VENDOR_PINS)) {
+      const pin = pins!.claude;
+      expect(pin.sha256).toBe(manifest.platforms[platform].checksum);
+      const entry = lock.split('\n').find((line) => line.includes(`"${pin.package}@${pin.packageVersion}"`));
+      expect(entry?.match(/"sha512-[^"]+"/)?.[0]).toBe(JSON.stringify(pin.integrity));
+    }
   });
 
   test('vendorPlatform names the platform the pins are keyed by', () => {

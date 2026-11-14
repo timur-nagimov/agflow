@@ -24,6 +24,7 @@ import {
   buildQueryOptions,
   CLAUDE_BRIEF_HOOK_TIMEOUT_S,
   CLAUDE_BUILTIN_TOOLS,
+  CLAUDE_LINUX_SHELL,
   CLAUDE_SHELL,
   claudeBinary,
   claudeEmptyDir,
@@ -75,6 +76,7 @@ function deps(overrides: Partial<ClaudeOptionDeps> = {}): ClaudeOptionDeps {
     spawnClaudeCodeProcess: spawn,
     compaction: { preCompact, postCompact },
     newSessionId: () => SESSION,
+    platform: 'darwin',
     ...overrides,
   };
 }
@@ -379,6 +381,20 @@ describe('buildQueryOptions', () => {
     expect(() => buildQueryOptions(wrongTmp, deps())).toThrow(/CLAUDE_CODE_TMPDIR/);
     const { HOME: _home, ...homeless } = given.env;
     expect(() => buildQueryOptions(launch({ env: homeless }), deps())).toThrow(/HOME/);
+  });
+
+  test("on Linux the CLI's shells are /bin/bash, whatever the owner's SHELL or the launch says", () => {
+    expect(CLAUDE_LINUX_SHELL).toBe('/bin/bash');
+    const given = launch();
+    for (const shell of [undefined, '/bin/bash', '/usr/bin/zsh', '/usr/bin/fish']) {
+      const { SHELL: _shell, ...rest } = given.env;
+      const env = { ...rest, ...(shell === undefined ? {} : { SHELL: shell }), CLAUDE_CODE_SHELL: '/bin/zsh' };
+      expect(buildQueryOptions(launch({ env }), deps({ platform: 'linux' })).env).toEqual({
+        ...env,
+        ZDOTDIR: EMPTY,
+        CLAUDE_CODE_SHELL: '/bin/bash',
+      });
+    }
   });
 
   test("the binary is the one for launch.cliVersion, and the spawn hook is the adapter's", () => {

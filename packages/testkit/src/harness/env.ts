@@ -13,7 +13,7 @@ type Env = Record<string, string | undefined>;
 
 const VENDORS: readonly Vendor[] = VendorSchema.options;
 
-/** The one platform M2 pins vendor binaries for, so the one the e2e suite runs on. */
+/** The platform the e2e suite runs on: `bun run e2e` needs a Mac (it runs under caffeinate). */
 export const E2E_PLATFORM = 'darwin-arm64';
 
 /**
@@ -84,7 +84,7 @@ async function checkPrereqs(options: RequireE2eOptions): Promise<E2ePrereqs> {
   const vendors = e2eVendors(env);
   const missing: string[] = [];
   if (platform !== E2E_PLATFORM) {
-    missing.push(`a Mac on Apple silicon (${E2E_PLATFORM}), the only platform with vendor pins; this is ${platform}`);
+    missing.push(`a Mac on Apple silicon (${E2E_PLATFORM}), the only platform the e2e suite runs on; this is ${platform}`);
   }
   const binaries: Partial<Record<Vendor, string>> = {};
   if (vendors.includes('claude')) {

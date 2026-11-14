@@ -380,8 +380,8 @@ describe('vendor installer', () => {
 
   test('unsupported platforms fail before writing or requesting anything', async () => {
     const f = await fixture();
-    await expect(ensurePinnedVendors(f.paths, { platform: 'linux-x64', env: f.env })).rejects.toThrow(
-      'unsupported platform linux-x64',
+    await expect(ensurePinnedVendors(f.paths, { platform: 'win32-x64', env: f.env })).rejects.toThrow(
+      'unsupported platform win32-x64',
     );
     expect(existsSync(f.paths.home)).toBe(false);
     expect(f.server.requests).toEqual([]);
@@ -412,7 +412,7 @@ describe('vendor installer', () => {
   test('main reports an installation failure with a nonzero exit code', async () => {
     const f = await fixture();
     const errors: string[] = [];
-    expect(await vendorInstallMain([], f.env, { platform: 'linux-x64', error: (line) => errors.push(line) })).toBe(1);
-    expect(errors).toEqual(['unsupported platform linux-x64']);
+    expect(await vendorInstallMain([], f.env, { platform: 'win32-x64', error: (line) => errors.push(line) })).toBe(1);
+    expect(errors).toEqual(['unsupported platform win32-x64']);
   });
 });

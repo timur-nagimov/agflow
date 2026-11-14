@@ -90,13 +90,19 @@ export type ClaudeAccountFacts = Pick<RunnerVendor, 'ready' | 'problem' | 'accou
 
 /**
  * The account initializationResult() reports: ready with a subscription and no API key. Under skipAuthChecks it is
- * test mode's identity instead (X-21), whatever the scripted server's key looks like.
+ * test mode's identity instead (X-21), whatever the scripted server's key looks like. A runner with no browser signs in
+ * with the token of `claude setup-token` (CLAUDE_CODE_OAUTH_TOKEN, given as oauthToken), which names neither the
+ * account nor the plan: it is ready, and the token keys the quota (claudeTokenAccountId).
  */
 export function checkAccount(
   account: AccountInfo | null | undefined,
-  options: { skipAuthChecks?: boolean } = {},
+  options: { skipAuthChecks?: boolean; oauthToken?: string } = {},
 ): ClaudeAccountFacts {
   if (options.skipAuthChecks) return { ready: true, problem: TEST_MODE, accountId: TEST_ACCOUNT_ID, plan: TEST_MODE };
+  if (account?.tokenSource === 'CLAUDE_CODE_OAUTH_TOKEN' && !account.apiKeySource) {
+    const accountId = options.oauthToken ? claudeTokenAccountId(options.oauthToken) : null;
+    return { ready: true, problem: null, accountId, plan: null };
+  }
   const accountId = account ? claudeAccountId(account) : null;
   const type = account?.subscriptionType;
   const plan = type ? (PLANS[type] ?? (type.startsWith('Claude') ? type : `Claude ${type}`)) : null;
@@ -111,6 +117,11 @@ export function claudeAccountId(account: Pick<AccountInfo, 'email' | 'organizati
   const identity = account.email || account.organization;
   if (!identity) return null;
   return createHash('sha256').update(identity).digest('hex').slice(0, 16);
+}
+
+/** A setup-token login's account id: the first 16 hex of sha256 of the token, which tells nothing of the token. */
+export function claudeTokenAccountId(token: string): string {
+  return createHash('sha256').update(token).digest('hex').slice(0, 16);
 }
 
 /**

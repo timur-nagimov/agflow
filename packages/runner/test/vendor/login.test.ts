@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CONNECTIVITY_VARS, RunnerConfigSchema, vendorHomes } from '../../src/config';
@@ -121,6 +121,17 @@ describe('vendorCliEnv', () => {
     expect(vendorCliEnv('claude', config, paths, base).CLAUDE_CONFIG_DIR).toBe(homes.claude);
     expect(vendorCliEnv('codex', config, paths, base).CODEX_HOME).toBe(homes.codex);
   });
+
+  test("Claude takes a setup-token from the runner's environment file, never from the caller", () => {
+    const { config, paths, base } = fixture();
+    mkdirSync(paths.runner, { recursive: true });
+    writeFileSync(paths.envFile, '# from claude setup-token\nOTHER=x\nCLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-file"\n');
+    expect(base.CLAUDE_CODE_OAUTH_TOKEN).toBe('secret');
+    const claude = vendorCliEnv('claude', config, paths, base);
+    expect(claude.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-file');
+    expect(claude.OTHER).toBeUndefined();
+    expect(vendorCliEnv('codex', config, paths, base).CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  });
 });
 
 describe('vendor logins', () => {
@@ -182,6 +193,24 @@ describe('vendor logins', () => {
     },
     20_000,
   );
+
+  test("a setup-token login is a subscription login whose status names no plan", async () => {
+    const { config, paths, options } = fixture();
+    fakeVendorCli(paths, 'claude', version, [
+      { argv: claudeStatus, result: { stdout: JSON.stringify({ loggedIn: true, authMethod: 'oauth_token' }) } },
+    ]);
+    expect(await claudeLoginStatus(config, paths, options)).toEqual({ ok: true, plan: null });
+  }, 20_000);
+
+  test('Codex signs in with a device code on a machine with no browser', async () => {
+    const { config, paths, options } = fixture();
+    const fake = fakeVendorCli(paths, 'codex', version, [
+      { argv: ['login', '--device-auth'], result: {} },
+      { argv: codexStatus, result: { stdout: 'Logged in using ChatGPT\n' } },
+    ]);
+    await loginCodex(config, paths, { ...options, deviceAuth: true });
+    expect(fake.calls().map((call) => call.argv)).toEqual([['login', '--device-auth'], codexStatus]);
+  }, 20_000);
 
   test.each([
     [{ loggedIn: false, authMethod: 'none' }, 1, 'not logged in'],
@@ -271,9 +300,9 @@ describe('vendor logins', () => {
 
   test('reports unsupported platforms with the installer wording', async () => {
     const { config, paths, base } = fixture();
-    expect(await claudeLoginStatus(config, paths, { base, platform: 'linux-x64' })).toEqual({
+    expect(await claudeLoginStatus(config, paths, { base, platform: 'win32-x64' })).toEqual({
       ok: false,
-      reason: 'unsupported platform linux-x64',
+      reason: 'unsupported platform win32-x64',
     });
   }, 20_000);
 

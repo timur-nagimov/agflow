@@ -1,10 +1,11 @@
-// Claude's preflight (design 8.1, 6.1, 6.10, 7.6, 15.1, X-5, X-29): the pin's platform and binary, then a zero-model
-// handshake whose only input is the local /clear command, run with the full session options in a scratch clone and
-// base checkout, with a bridge whose hub URL refuses connections. On the same query it reads the account, the
-// untyped getSettings() and the experimental usage call. It fails closed and gives facts only, with the quota and the
-// weakened items; the runtime adds models, ceilings, allowPaidUsage, preflightAt and degraded.
+// Claude's preflight (design 8.1, 6.1, 6.10, 7.6, 15.1, X-5, X-29): the pin's platform and binary, on Linux what its
+// sandbox (bubblewrap) needs, then a zero-model handshake whose only input is the local /clear command, run with the
+// full session options in a scratch clone and base checkout, with a bridge whose hub URL refuses connections. On the
+// same query it reads the account, the untyped getSettings() and the experimental usage call. It fails closed and
+// gives facts only, with the quota and the weakened items; the runtime adds models, ceilings, allowPaidUsage,
+// preflightAt and degraded.
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Vendor, VendorQuota } from '@agflow/core';
@@ -72,6 +73,8 @@ export interface ClaudePreflightInput {
   timeoutMs?: number;
   /** TMP_CLAUDE_DENYWRITE_ENFORCED by default. */
   tmpClaudeDenyWriteEnforced?: boolean;
+  /** Linux only: the sysctl file linuxSandboxProblem reads, USERNS_SYSCTL by default. */
+  usernsSysctl?: string;
   /** The runner's environment, for buildAgentEnv's user variables and test mode; process.env by default. */
   env?: Record<string, string | undefined>;
   now?: () => number;
@@ -113,6 +116,10 @@ export async function claudePreflight(input: ClaudePreflightInput): Promise<Clau
     env: { PATH: input.config.capturedPath },
   });
   if (!version.ok) return notReady(version.problem, version.version);
+  if (input.platform.startsWith('linux-')) {
+    const problem = linuxSandboxProblem(input.config.capturedPath, { usernsSysctl: input.usernsSysctl });
+    if (problem !== null) return notReady(problem, pin.version);
+  }
 
   const facts = { ...base, cliVersion: pin.version };
   if (profileOf(input.config).name === 'auto') {
@@ -121,6 +128,41 @@ export async function claudePreflight(input: ClaudePreflightInput): Promise<Clau
     if (auto.facts.ready) return outcome(input, facts, auto, [...weakened, CLAUDE_WEAKENED_AUTO]);
   }
   return outcome(input, facts, await handshake(input, pin.version, false), weakened);
+}
+
+/** What the Claude sandbox runs on Linux: bubblewrap, socat for its network proxy and ripgrep for its deny paths. */
+export const LINUX_SANDBOX_TOOLS: readonly string[] = Object.freeze(['bwrap', 'socat', 'rg']);
+
+/** Where Ubuntu (24.04 and later) turns on the restriction that strips bubblewrap's namespaces of their rights. */
+export const USERNS_SYSCTL = '/proc/sys/kernel/apparmor_restrict_unprivileged_userns';
+
+/**
+ * What keeps the Claude sandbox from running on Linux, or null: a tool missing from the captured PATH, which the CLI
+ * looks it up in, or Ubuntu's restriction on user namespaces. The handshake runs no command, so it would not tell.
+ */
+export function linuxSandboxProblem(
+  capturedPath: string,
+  options: { which?: (command: string, path: string) => string | null; usernsSysctl?: string } = {},
+): string | null {
+  const which = options.which ?? ((command: string, path: string) => Bun.which(command, { PATH: path }));
+  const missing = LINUX_SANDBOX_TOOLS.filter((tool) => which(tool, capturedPath) === null);
+  if (missing.length > 0) {
+    return (
+      `the Claude sandbox needs ${missing.join(', ')} on the PATH: ` +
+      'install them with sudo apt-get install bubblewrap socat ripgrep, then run agflow runner setup again'
+    );
+  }
+  let restricted = '';
+  try {
+    restricted = readFileSync(options.usernsSysctl ?? USERNS_SYSCTL, 'utf8').trim();
+  } catch {
+    // No such sysctl: nothing restricts the namespaces.
+  }
+  if (restricted !== '1') return null;
+  return (
+    'Ubuntu keeps bubblewrap from building the Claude sandbox: run ' +
+    'sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 and keep it in /etc/sysctl.d (docs/linux-runner.md)'
+  );
 }
 
 interface HandshakeResult {
@@ -294,7 +336,10 @@ function judge(
   auto: boolean,
   found: { account: AccountInfo | undefined; settings: unknown; usage: unknown; init: SDKSystemMessage | null },
 ): HandshakeResult {
-  const account = checkAccount(found.account, { skipAuthChecks: input.skipAuthChecks });
+  const account = checkAccount(found.account, {
+    skipAuthChecks: input.skipAuthChecks,
+    oauthToken: launch.env.CLAUDE_CODE_OAUTH_TOKEN,
+  });
   const problems: string[] = [];
   if (!account.ready && account.problem !== null) problems.push(account.problem);
   if (found.init === null) {

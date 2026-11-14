@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadRunnerConfig, saveRunnerConfig } from '@agflow/runner/src/config';
 import { runnerPaths } from '@agflow/runner/src/paths';
@@ -8,6 +8,7 @@ import { startControlServer } from '@agflow/runner/src/service/control';
 import { type RunnerService, startRunnerService } from '@agflow/runner/src/service/host';
 import { installRefusal, plistPath } from '@agflow/runner/src/service/launchd';
 import { acquireRunnerLock } from '@agflow/runner/src/service/lock';
+import { unitPath } from '@agflow/runner/src/service/systemd';
 import { defaultExec, type Exec } from '@agflow/runner/src/service/system';
 import { type PlatformPins, VENDOR_PINS, vendorBinary } from '@agflow/runner/src/vendor/pins';
 import { fixtureCliVersion } from '@agflow/runner/test/fixture';
@@ -49,7 +50,7 @@ interface VendorCall {
   env: Record<string, string>;
 }
 
-async function fixture(options: { failCheck?: boolean; noBootstrap?: boolean } = {}) {
+async function fixture(options: { failCheck?: boolean; noBootstrap?: boolean; linux?: boolean } = {}) {
   const root = realpathSync(mkdtempSync('/tmp/agf-su-'));
   afterThisTest(() => rmSync(root, { recursive: true, force: true }));
   const paths = runnerPaths(join(root, 'agflow'));
@@ -71,13 +72,18 @@ if (argv[0] === '--version') {
 }
 const home = vendor === 'claude' ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME;
 const marker = home + '/signed-in';
-if (JSON.stringify(argv) === JSON.stringify(vendor === 'claude' ? ['auth', 'login', '--claudeai'] : ['login'])) {
+const logins = vendor === 'claude' ? [['auth', 'login', '--claudeai']] : [['login'], ['login', '--device-auth']];
+if (logins.some((login) => JSON.stringify(argv) === JSON.stringify(login))) {
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(marker, 'ok');
   process.exit(0);
 }
 if (JSON.stringify(argv) !== JSON.stringify(vendor === 'claude' ? ['auth', 'status', '--json'] : ['login', 'status'])) {
   process.exit(99);
+}
+if (vendor === 'claude' && process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  console.log(JSON.stringify({ loggedIn: true, authMethod: 'oauth_token' }));
+  process.exit(0);
 }
 const ok = fs.existsSync(marker);
 console.log(vendor === 'claude' ? JSON.stringify({ loggedIn: ok, authMethod: 'claude.ai', subscriptionType: 'max' })
@@ -167,12 +173,36 @@ process.exit(ok ? 0 : 1);
       }
       return ok;
     }
+    if (argv[0] === 'loginctl') return ok;
+    if (argv[0] === 'systemctl') {
+      if (argv[2] === 'stop' && service) {
+        await service.stop('systemctl stop');
+        await service.exited;
+        service = undefined;
+      }
+      if (argv[2] === 'start') {
+        service = await startRunnerService({
+          ...fakeServiceOperations(),
+          paths,
+          configDir: dir,
+          mode: 'service',
+          agflow: { command: process.execPath, args: [] },
+          machineId: async () => machineId,
+          adapters: fakeServiceAdapters(),
+          cliVersion: fixtureCliVersion,
+          terminal: () => {},
+        });
+      }
+      return ok;
+    }
     if (argv[0] === 'tar' || argv[0]!.startsWith(paths.vendor + '/')) return defaultExec(argv, commandOptions);
     throw new Error(`unexpected command: ${argv.join(' ')}`);
   };
   const out: string[] = [];
   const err: string[] = [];
   const io = { out: (text: string) => void out.push(text), err: (text: string) => void err.push(text) };
+  const machineIdFile = join(root, 'machine-id');
+  writeFileSync(machineIdFile, `${machineId}\n`);
   const deps: Partial<RunnerSetupDeps> = {
     dir,
     paths,
@@ -180,7 +210,8 @@ process.exit(ok ? 0 : 1);
     exec,
     pins,
     platform: 'darwin-arm64',
-    machinePlatform: 'darwin',
+    machinePlatform: options.linux ? 'linux' : 'darwin',
+    machineIdFile,
     home,
     uid: 501,
     socketTimeoutMs: 5_000,
@@ -202,8 +233,8 @@ process.exit(ok ? 0 : 1);
           .map((line) => JSON.parse(line))
       : [];
   const logins = () =>
-    vendorCalls().filter((call) => call.argv.join(' ') === 'auth login --claudeai' || call.argv.join(' ') === 'login');
-  return { root, paths, dir, home, hub, pins, registry, env, calls, out, err, io, deps, run, logins };
+    vendorCalls().filter((call) => ['auth login --claudeai', 'login', 'login --device-auth'].includes(call.argv.join(' ')));
+  return { root, paths, dir, home, hub, pins, registry, env, calls, out, err, io, deps, run, logins, vendorCalls };
 }
 
 function answers(...values: string[]): Prompt {
@@ -326,6 +357,52 @@ test('--no-service stops after login with the foreground start instruction', asy
   expect(await f.run()).toBe(0);
   expect(f.logins()).toHaveLength(2);
   expect(f.out.join('')).toContain('agflow runner start');
+  expect(f.calls.some((call) => call.argv[0] === 'launchctl')).toBe(false);
+});
+
+test('on Linux Codex signs in with a device code, Claude with a token from the Mac, and systemd runs the service', async () => {
+  const f = await fixture({ linux: true });
+  expect(await f.run(['--yes'])).toBe(1);
+  const first = f.out.join('');
+  expect(first).toContain('claude: not logged in to Claude; this machine has no browser');
+  expect(first).toContain('on your Mac run: claude setup-token');
+  expect(first).toContain(`printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' "$t" > ${f.paths.envFile})`);
+  expect(first).toContain('codex: sign in with the code below');
+  expect(first).toContain('run agflow runner setup again once the token is in place');
+  expect(f.logins().map((call) => call.argv.join(' '))).toEqual(['login --device-auth']);
+  expect(f.calls.filter((call) => call.options?.interactive)).toHaveLength(1);
+  expect(f.calls.some((call) => ['systemctl', 'loginctl', 'launchctl'].includes(call.argv[0]!))).toBe(false);
+  expect(loadRunnerConfig(f.paths.config).machineId).toBe(machineId);
+
+  // The owner puts the token from claude setup-token in the runner's environment file.
+  writeFileSync(f.paths.envFile, 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-setup\n', { mode: 0o644 });
+  f.out.length = 0;
+  expect(await f.run(['--yes'])).toBe(0);
+  expect(statSync(f.paths.envFile).mode & 0o777).toBe(0o600);
+  const second = f.out.join('');
+  expect(second).toContain('claude: signed in\n');
+  expect(second).toContain('codex: signed in\n');
+  expect(f.logins()).toHaveLength(1);
+  const status = f.vendorCalls().filter((call) => call.vendor === 'claude' && call.argv[0] === 'auth').at(-1)!;
+  expect(status.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-setup');
+  expect(readFileSync(unitPath(f.home), 'utf8')).toMatch(/^ExecStart=\S+ .* runner start --service$/m);
+  expect(
+    f.calls.map((call) => call.argv).filter((argv) => argv[0] === 'systemctl' || argv[0] === 'loginctl'),
+  ).toEqual([
+    ['loginctl', 'enable-linger', expect.any(String)],
+    ['systemctl', '--user', 'daemon-reload'],
+    ['systemctl', '--user', 'stop', 'agflow-runner.service'],
+    ['systemctl', '--user', 'enable', 'agflow-runner.service'],
+    ['systemctl', '--user', 'start', 'agflow-runner.service'],
+  ]);
+  expect(second).toContain(`installed ${unitPath(f.home)}; the runner starts as agflow-runner.service`);
+  expect(
+    second
+      .split('\n')
+      .filter((line) => /^(ok|warn|FAIL) /.test(line))
+      .map((line) => line.replace(/^(ok|warn|FAIL) /, '').split(':')[0]),
+  ).toEqual(checkNames);
+  expect(second).toContain('ok sleep: a Linux runner does not sleep');
   expect(f.calls.some((call) => call.argv[0] === 'launchctl')).toBe(false);
 });
 

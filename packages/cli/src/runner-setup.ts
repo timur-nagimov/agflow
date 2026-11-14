@@ -1,5 +1,5 @@
-// Laptop setup (design 7.1): verify sign-in before writes, then reuse the runner's config, pins, logins and service.
-import { existsSync } from 'node:fs';
+// Runner setup (design 7.1): verify sign-in before writes, then reuse the runner's config, pins, logins and service.
+import { chmodSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface, type Interface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -18,6 +18,7 @@ import {
   readMachineId,
 } from '@agflow/runner/src/service/machine';
 import { createRunnerConfig } from '@agflow/runner/src/service/runner-json';
+import { installSystemdService } from '@agflow/runner/src/service/systemd';
 import { defaultExec, type Exec } from '@agflow/runner/src/service/system';
 import { ensurePinnedVendors } from '@agflow/runner/src/vendor/install';
 import { claudeLoginStatus, codexLoginStatus, loginClaude, loginCodex } from '@agflow/runner/src/vendor/login';
@@ -27,7 +28,7 @@ import { loadCredentials } from './credentials';
 import { type FetchFn, HubClient, HubClientError } from './hub-client';
 import type { Io } from './io';
 import { configDir } from './paths';
-import { type SelfCommand, selfCommand } from './self';
+import { type SelfCommand, selfCommand, shellQuote } from './self';
 
 export interface Prompt {
   ask(question: string, fallback: string): Promise<string>;
@@ -61,7 +62,10 @@ export interface RunnerSetupDeps {
   pins: PlatformPins;
   /** The vendor platform key, including for login verification. */
   platform: string;
+  /** The OS: Linux has no browser for the logins and runs the runner as a systemd unit. */
   machinePlatform: NodeJS.Platform;
+  /** Linux's machine id file, /etc/machine-id by default. */
+  machineIdFile: string;
   home: string;
   uid: number;
   agflow: SelfCommand;
@@ -74,11 +78,11 @@ async function configure(
   paths: RunnerPaths,
   env: RunnerSetupDeps['env'],
   exec: Exec,
-  platform: NodeJS.Platform,
+  machine: { platform: NodeJS.Platform; machineIdFile?: string },
   prompt: Prompt,
   log: (line: string) => void,
 ): Promise<RunnerConfig> {
-  const machineId = await readMachineId({ exec, platform });
+  const machineId = await readMachineId({ exec, ...machine });
   let lock: RunnerLock;
   try {
     lock = await acquireRunnerLock(paths, { mode: 'foreground', wait: false });
@@ -131,6 +135,20 @@ async function configure(
   }
 }
 
+/**
+ * What the owner does on a machine with no browser (Linux) that has no Claude login: makes a token with `claude
+ * setup-token` on a Mac, then puts it in the runner's environment file, readable by its owner alone.
+ */
+export function claudeTokenSteps(paths: Pick<RunnerPaths, 'envFile'>, reason: string): string[] {
+  const save = `printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' "$t" > ${shellQuote(paths.envFile)}`;
+  return [
+    `claude: ${reason}; this machine has no browser, so Claude signs in with a token made on your Mac:`,
+    '  1. on your Mac run: claude setup-token',
+    '  2. here run this and paste the token when it asks:',
+    `     (umask 077; read -rs -p 'Token: ' t; echo; ${save})`,
+  ];
+}
+
 async function serviceChecks(paths: RunnerPaths, socketTimeoutMs: number, checksTimeoutMs: number, pollMs: number) {
   for (const [name, value] of Object.entries({ socketTimeoutMs, checksTimeoutMs, pollMs })) {
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be positive`);
@@ -174,6 +192,9 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
   const log = (line: string) => io.out(`${line}\n`);
   log(`signed in to ${credentials.hubUrl} as ${user}`);
   const exec = deps.exec ?? defaultExec;
+  const machinePlatform = deps.machinePlatform ?? process.platform;
+  // A Linux runner is a cloud machine: no browser for the logins, and systemd instead of launchd.
+  const linux = machinePlatform === 'linux';
   const terminal = args.flags.yes !== true && !deps.prompt ? terminalPrompt() : undefined;
   let config: RunnerConfig;
   try {
@@ -181,7 +202,7 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
       paths,
       env,
       exec,
-      deps.machinePlatform ?? process.platform,
+      { platform: machinePlatform, machineIdFile: deps.machineIdFile },
       args.flags.yes === true ? { ask: async (_question, fallback) => fallback } : (deps.prompt ?? terminal!),
       log,
     );
@@ -193,15 +214,31 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
   const pinOptions = { env, exec, platform, pins, log };
   log('installing the pinned Claude and Codex binaries; the first setup downloads about 550 MB');
   await ensurePinnedVendors(paths, pinOptions);
+  // The Claude token's file holds a secret: only its owner reads it.
+  if (existsSync(paths.envFile)) chmodSync(paths.envFile, 0o600);
+  let claudeToken = false;
   for (const vendor of ['claude', 'codex'] as const) {
-    const options = { version: pins?.[vendor].version, platform, exec, base: env };
+    const options = { version: pins?.[vendor].version, platform, exec, base: env, deviceAuth: linux };
     const status = await (vendor === 'claude' ? claudeLoginStatus : codexLoginStatus)(config, paths, options);
-    if (status.ok && args.flags.relogin !== true) {
+    // On Linux Claude signs in with a token made on a Mac, which setup can neither make nor make again.
+    const token = linux && vendor === 'claude';
+    if (token && !status.ok) {
+      claudeToken = true;
+      for (const line of claudeTokenSteps(paths, status.reason)) log(line);
+    } else if (status.ok && (args.flags.relogin !== true || token)) {
       log(`${vendor}: signed in${status.plan ? ` (${status.plan})` : ''}`);
     } else {
-      log(`${vendor}: login opens now in the runner's own home`);
+      log(
+        linux
+          ? `${vendor}: sign in with the code below, in a browser on any machine`
+          : `${vendor}: login opens now in the runner's own home`,
+      );
       await (vendor === 'claude' ? loginClaude : loginCodex)(config, paths, options);
     }
+  }
+  if (claudeToken) {
+    log('run agflow runner setup again once the token is in place');
+    return 1;
   }
   if (args.flags['no-service'] === true) {
     log('setup is done; run agflow runner start');
@@ -213,17 +250,22 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
     log('run agflow runner setup --no-service and then agflow runner start to run a test runner in the foreground');
     return 1;
   }
-  const installed = await installService({
+  const service = {
     paths,
     agflow: deps.agflow ?? selfCommand(),
     env,
     exec,
-    uid: deps.uid,
     home: deps.home ?? homedir(),
     log,
-    installPins: (paths) => ensurePinnedVendors(paths, pinOptions),
-  });
-  log(`installed ${installed.plistPath}; the runner starts as ${installed.target}`);
+    installPins: (paths: RunnerPaths) => ensurePinnedVendors(paths, pinOptions),
+  };
+  if (linux) {
+    const installed = await installSystemdService(service);
+    log(`installed ${installed.unitPath}; the runner starts as ${installed.target}`);
+  } else {
+    const installed = await installService({ ...service, uid: deps.uid });
+    log(`installed ${installed.plistPath}; the runner starts as ${installed.target}`);
+  }
   const results = await serviceChecks(
     paths,
     deps.socketTimeoutMs ?? 120_000,
