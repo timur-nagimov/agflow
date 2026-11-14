@@ -1,3 +1,4 @@
+import { withoutTestProcessEnv } from '@agflow/testkit/src/process-cleanup';
 // The registry's Codex adapter, exercised through real child-process shims and temporary transcripts and vaults.
 import { afterEach, describe, expect, test } from 'bun:test';
 import { TEST_ACCOUNT_ID } from '@agflow/core';
@@ -152,7 +153,7 @@ describe('CodexAdapter', () => {
       'account/rateLimits/read',
     ]);
     expect(run!.argv.slice(-2)).toEqual(['-c', 'model_provider="scripted"']);
-    expect(run!.env).toEqual({
+    expect(withoutTestProcessEnv(run!.env)).toEqual({
       ...base,
       CODEX_HOME: f.options.codexHome,
       HOME: f.options.userHome,
@@ -253,7 +254,7 @@ describe('CodexAdapter', () => {
       'turn/start',
     ]);
     expect(run!.argv.slice(-2)).toEqual(['-c', 'model_provider="scripted"']);
-    expect(run!.env).toEqual({
+    expect(withoutTestProcessEnv(run!.env)).toEqual({
       PATH: '/usr/bin:/bin',
       LANG: 'C',
       AGFLOW_AGENT_TOKEN: 'test-token',
@@ -291,7 +292,7 @@ describe('CodexAdapter', () => {
     ]);
     expect(run!.requests[0]!.method).toBe('initialize');
     expect(run!.argv.slice(-2)).toEqual(['-c', 'model_provider="scripted"']);
-    expect(run!.env).toEqual({
+    expect(withoutTestProcessEnv(run!.env)).toEqual({
       ...base,
       CODEX_HOME: f.options.codexHome,
       HOME: f.options.userHome,

@@ -1,6 +1,7 @@
 // The scripted Anthropic Messages API (design 15.1, X-20). The real claude reaches it through ANTHROPIC_BASE_URL, so
 // adapter tests, the recorder and M2g's cluster run real CLI turns with zero model use. It has the shape both scripted
 // servers share: { url, requests, setHandler }, with parsed requests and a harmless default answer.
+import { registerTestCleanup } from '../process-cleanup';
 import { type AnthropicRequest, parseAnthropicRequest } from './request';
 import { type AnthropicReply, type ErrorReply, fail, type MessageReply, reply, scriptedId } from './replies';
 import { encodeMessage, encodeSse } from './sse';
@@ -144,7 +145,7 @@ export async function startScriptedAnthropic(options: ScriptedAnthropicOptions =
     },
   });
 
-  return {
+  const handle: ScriptedAnthropic = {
     url: `http://127.0.0.1:${server.port}`,
     port: server.port as number,
     requests,
@@ -160,4 +161,6 @@ export async function startScriptedAnthropic(options: ScriptedAnthropicOptions =
       await server.stop(true);
     },
   };
+  registerTestCleanup(() => handle.close());
+  return handle;
 }

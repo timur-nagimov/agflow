@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import Anthropic from '@anthropic-ai/sdk';
+import { cleanupTestProcesses } from '../src/process-cleanup';
 import {
   AUXILIARY_TEXT,
   agflowTool,
@@ -255,6 +256,26 @@ describe('startScriptedAnthropic', () => {
     await arrived.promise;
     await Bun.sleep(0);
     await server.close();
+    expect(await pending).not.toContain('unreachable');
+    expect(await post(server, SESSION_A, 'y').catch(() => 'refused')).toBe('refused');
+  });
+
+  test('the cleanup backstop releases held requests without an explicit close', async () => {
+    const arrived = Promise.withResolvers<void>();
+    const server = await startScriptedAnthropic({
+      handler: () => {
+        arrived.resolve();
+        return hold('never', reply('unreachable'));
+      },
+    });
+    const pending = post(server, SESSION_A, 'x', { stream: true }).then(
+      (response) => response.text(),
+      () => 'failed',
+    );
+    // One macrotask after the request arrived, its reply is waiting on the gate that close() must end.
+    await arrived.promise;
+    await Bun.sleep(0);
+    await cleanupTestProcesses();
     expect(await pending).not.toContain('unreachable');
     expect(await post(server, SESSION_A, 'y').catch(() => 'refused')).toBe('refused');
   });
