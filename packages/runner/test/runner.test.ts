@@ -158,6 +158,24 @@ describe('createRunner', () => {
     expect(vendors.claude).toMatchObject({ ready: true, managedPolicy: false, approvalsReservedToOwner: false });
   });
 
+  test("a Claude preflight that throws keeps managedPolicy false, as Claude's always is, and closes approvals", async () => {
+    const s = await setup();
+    const claude = new FakeAdapter({ vendor: 'claude', skipAuthChecks: true, script: { turns: [[]] } });
+    claude.preflight = async () => {
+      throw new Error('the CLI did not start');
+    };
+    await s.start({ adapters: [claude] });
+    const [hello] = await s.hub.waitFor(() => hellos(s.hub).length > 0 && hellos(s.hub));
+    expect(s.hub.invalid).toEqual([]);
+    // Design 8.1: Claude's managedPolicy is always false, since its preflight reads no managed configuration.
+    expect(hello?.vendors.find((vendor) => vendor.vendor === 'claude')).toMatchObject({
+      ready: false,
+      problem: 'the preflight failed: the CLI did not start',
+      managedPolicy: false,
+      approvalsReservedToOwner: true,
+    });
+  });
+
   test("the project's name and repo come from GET /api/status and are cached for the next start", async () => {
     const s = await setup();
     const first = await s.start();
