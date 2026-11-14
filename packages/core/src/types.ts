@@ -535,6 +535,22 @@ export interface SubmissionRecord {
   error: string | null;
   requestedAt: number;
   decidedAt: number | null;
+  /** The runner's check of the submission; absent when the runner reported none, as for a refusal before the check. */
+  check?: SubmissionCheck;
+}
+
+/**
+ * The runner's own run of the project's check at submission: the "check" command of .agflow/config.json on main, run
+ * in the clone once main is merged in. none: no check ran, because main's config names none or the runner cannot run
+ * one; the tail then says why.
+ */
+export interface SubmissionCheck {
+  status: 'passed' | 'failed' | 'none';
+  /** The command as the config gives it; null when it gives none. */
+  command: string | null;
+  durationMs: number;
+  /** The end of the command's output, at most 4 KB. */
+  tail: string;
 }
 
 export interface LeadSeat {
@@ -580,4 +596,6 @@ export interface FetchSubmissionRequest {
   status: 'pending' | 'ok' | 'failed';
   error: string | null;
   note?: string;
+  /** The runner's check of the submission, when it reported one. */
+  check?: SubmissionCheck;
 }

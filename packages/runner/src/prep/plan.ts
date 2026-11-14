@@ -24,7 +24,7 @@ import { deniedReadPaths, type DeniedPathsInput, type PermissionProfile } from '
 import { runDirOf } from '../run-dir';
 import { type PrepConfig, PrepConfigSchema } from './config';
 
-const WhenPath = PrepConfigSchema.shape.dependencies.element.shape.when.element;
+const WhenPath = PrepConfigSchema.shape.dependencies.unwrap().element.shape.when.element;
 const SAFE_NAME = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 // Agents control when-files; a sparse multi-gigabyte lockfile must not stall the runner's event loop.
 const MAX_WHEN_FILE_BYTES = 64 * 1024 * 1024;

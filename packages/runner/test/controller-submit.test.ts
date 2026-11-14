@@ -160,7 +160,9 @@ describe('AttemptController: submissions', () => {
     const { f, controller } = await workedOn(COMMITTED);
     const head = await cloneHead(f);
     const result = await controller.submit(submission());
-    const outcome = { submissionId: 'S-1', ok: true, headSha: head, remoteHead: head, error: null, detail: null };
+    // The project has no check, so none ran.
+    const check = { status: 'none', command: null, durationMs: 0, tail: '' } as const;
+    const outcome = { submissionId: 'S-1', ok: true, headSha: head, remoteHead: head, error: null, detail: null, check };
     expect(result).toEqual({ ok: true, outcome });
     expect(f.events('attempt.submitted').map((event) => [event.fence, event.data])).toEqual([[FENCE, outcome]]);
     expect(await originRef(f, `refs/heads/${BRANCH}`)).toBe(head);

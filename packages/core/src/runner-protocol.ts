@@ -17,11 +17,13 @@ import type {
   Runner,
   RunnerVendor,
   StopCause,
+  SubmissionCheck,
   Vendor,
   VendorQuota,
 } from './types';
 
-export const PROTOCOL_VERSION = 2;
+/** Protocol 3 adds merge_task, and the check that attempt.submitted reports with its new codes. */
+export const PROTOCOL_VERSION = 3;
 
 /** The WebSocket close codes the hub ends a runner's link with. */
 export const CLOSE_CODES = {
@@ -261,7 +263,24 @@ export type RunnerCommand =
   | { kind: 'refresh_vault'; taskId: string; refs: string[] } // with a late-work message to the current holder
   | { kind: 'preflight'; vendor: Vendor } // after the hub sets a not-ready mark
   | { kind: 'delete_refs'; refs: { ref: string; expectedSha: string }[] }
-  | { kind: 'update_settings'; settings: Partial<Omit<RunnerSettings, 'version'>>; version: number; answers?: SettingsAnswer };
+  | { kind: 'update_settings'; settings: Partial<Omit<RunnerSettings, 'version'>>; version: number; answers?: SettingsAnswer }
+  | {
+      /**
+       * Merges an accepted task's submitted head into main in the runner's vault and pushes main, leased on the main it
+       * merged. The result's data is a MergeTaskResult; a push that cannot reach the remote fails with error remote.
+       */
+      kind: 'merge_task';
+      taskId: string;
+      /** For the merge commit's message, "Merge <task id>: <title>". */
+      title: string;
+      /** The task branch, without refs/heads/. */
+      branch: string;
+      /** The accepted head, which may be abbreviated as M1's records hold it. */
+      headSha: string;
+    };
+
+/** merge_task's result data: merged, with main's new sha, or a conflict, with the files it is in. */
+export type MergeTaskResult = { status: 'merged'; sha: string } | { status: 'conflict'; files: string[] };
 
 /** An exact answer, scoped to the runner.db that emitted the edit. */
 export interface SettingsAnswer {
@@ -649,10 +668,25 @@ export const RunnerCommandSchema = schemaFor<RunnerCommand>()(
       version: PositiveInt,
       answers: z.strictObject({ seq: PositiveInt, outboxEpoch: Name, refused: z.literal(true).optional() }).optional(),
     }),
+    z.strictObject({
+      kind: z.literal('merge_task'),
+      taskId: TaskIdSchema,
+      title: Name,
+      branch: BranchSchema,
+      headSha: CommitShaSchema,
+    }),
   ]),
 );
 
-/** The 17 command kinds of protocol 1, in the order of design 6.3. */
+/** How the hub reads merge_task's result data: the runner reports main's new sha in full. */
+export const MergeTaskResultSchema = schemaFor<MergeTaskResult>()(
+  z.discriminatedUnion('status', [
+    z.strictObject({ status: z.literal('merged'), sha: FullShaSchema }),
+    z.strictObject({ status: z.literal('conflict'), files: z.array(Name) }),
+  ]),
+);
+
+/** The 17 command kinds of protocol 1, in the order of design 6.3, then protocol 3's merge_task. */
 export const RUNNER_COMMAND_KINDS = [
   'start_attempt',
   'resume_attempt',
@@ -671,6 +705,7 @@ export const RUNNER_COMMAND_KINDS = [
   'preflight',
   'delete_refs',
   'update_settings',
+  'merge_task',
 ] as const satisfies readonly RunnerCommandKind[];
 
 /** The oldest protocol that understands each command kind. The hub never sends a command to an older runner. */
@@ -692,6 +727,7 @@ export const COMMAND_MIN_PROTOCOL: Readonly<Record<RunnerCommandKind, number>> =
   preflight: 1,
   delete_refs: 1,
   update_settings: 1,
+  merge_task: 3,
 };
 
 const HelloSchema = z
@@ -817,6 +853,18 @@ export const ApprovalDetailSchema = schemaFor<Approval['detail']>()(
 /** attempt.wip.logStat: git log --stat of the WIP since main, clipped by the runner; handoff notes quote it. */
 const LOG_STAT_MAX = 4_000;
 
+/** The longest tail of a submission's check: 4 KB. The runner clips it by bytes, which never gives more characters. */
+export const CHECK_TAIL_MAX = 4_096;
+
+export const SubmissionCheckSchema = schemaFor<SubmissionCheck>()(
+  z.strictObject({
+    status: z.enum(['passed', 'failed', 'none']),
+    command: Name.nullable(),
+    durationMs: NonNegativeInt,
+    tail: z.string().max(CHECK_TAIL_MAX),
+  }),
+);
+
 // The event table of design 6.3, in its order: one schema per type. Runners read shas from git, so every sha an
 // event reports is full.
 const EVENT_SCHEMAS = [
@@ -867,6 +915,8 @@ const EVENT_SCHEMAS = [
     remoteHead: FullShaSchema.nullable(),
     error: z.enum(SUBMIT_ERRORS).nullable(),
     detail: z.string().nullable(),
+    // Protocol 3: the project's check, once the runner got as far as main's config; null for a refusal before it.
+    check: SubmissionCheckSchema.nullable().optional(),
   })
     // The hub records a success and fails a refusal, so an outcome must not contradict itself.
     .refine(({ data }) => data.ok === (data.error === null), {

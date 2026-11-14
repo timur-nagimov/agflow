@@ -1,5 +1,6 @@
 // The project's dependency-preparation config (design 7.7): `.agflow/config.json`, a people-only file, read from the
-// vault at the restore base (X-16) and never from the clone, whose working tree the agent controls.
+// vault at the restore base (X-16) and never from the clone, whose working tree the agent controls. Its check, the
+// shell command a submission must pass, is read the same way at main.
 import { z } from 'zod';
 import { runGit } from '../git/run';
 import type { Vault } from '../git/vault';
@@ -31,7 +32,13 @@ export const PrepConfigSchema = z.strictObject({
       when: z.array(WhenPath),
       scripts: z.boolean().default(false),
     }),
-  ),
+  ).default([]),
+  // A shell command, run with /bin/sh -c in the clone at each submission; absent means no check.
+  check: z
+    .string()
+    .min(1)
+    .refine((command) => !command.includes('\0'), { error: 'the check must not contain NUL' })
+    .optional(),
 });
 
 export type PrepConfig = z.output<typeof PrepConfigSchema>;

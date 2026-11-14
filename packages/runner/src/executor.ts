@@ -7,7 +7,7 @@
 // - Ordering: an attempt's lifecycle and git commands go to its controller, whose serial queue runs them in arrival
 //   order, which is the hub's seq order; deliver, interrupt and decide_approval act on the live session at once.
 //   Different attempts run concurrently; the runner's own commands (refresh_vault, preflight, delete_refs,
-//   update_settings) run one at a time.
+//   update_settings, merge_task) run one at a time.
 // - welcome.stop is applied before any command that follows the welcome: each attempt named there is marked ended at
 //   once, a live process is stopped without a handoff turn (its new work goes to a late-work ref), and later commands
 //   for it answer attempt_ended, except those that outlive an attempt: cleanup_attempt, upload_transcript and
@@ -29,6 +29,7 @@ import type { PreflightResult, VendorAdapter } from './adapters/types';
 import type { AttemptController } from './attempt/controller';
 import { type ClockSource, systemClock } from './clock';
 import type { RunnerConfig } from './config';
+import { mergeTaskBranch } from './git/merge';
 import { deleteRefsFenced } from './git/push';
 import type { GitEnvironment } from './git/run';
 import type { Vault } from './git/vault';
@@ -52,6 +53,7 @@ export const RESTARTABLE_COMMANDS: ReadonlySet<RunnerCommandKind> = new Set<Runn
   'update_settings',
   'preflight',
   'prepare_dependencies',
+  'merge_task',
 ]);
 
 /** The commands that outlive their attempt: the hub keeps them when it ends one, and the runner runs them then too. */
@@ -462,6 +464,21 @@ export class CommandExecutor {
       }
       case 'update_settings':
         return this.settingsEcho(commandId, command, execution);
+      case 'merge_task': {
+        // Merges the accepted head into main in the vault and pushes main with the owner's git credentials.
+        const outcome = await mergeTaskBranch({
+          vault,
+          local: this.options.local,
+          remote: await this.options.remote(),
+          taskId: command.taskId,
+          title: command.title,
+          branch: command.branch,
+          headSha: command.headSha,
+          wipRefPrefix: this.options.wipRefPrefix(),
+          identity: this.options.config().commitIdentity,
+        });
+        return outcome.status === 'failed' ? { ok: false, error: outcome.detail } : { ok: true, data: outcome };
+      }
       default:
         return { ok: false, error: 'unsupported' };
     }
