@@ -1,7 +1,9 @@
 // The attempt controller (design 13): one per attempt, owning everything about it that is not vendor-specific. Its
 // lifecycle and git work runs on the attempt's serial queue, one job at a time. A start is admitted first (X-3):
 // a draining runner, a full capacity, a vendor that is not ready and the health seam each refuse it with one of
-// core's START_REFUSALS, reported as attempt.failed_to_start with refused set, and nothing starts. An admitted
+// core's START_REFUSALS, reported as attempt.failed_to_start with refused set, and nothing starts. The capacity counts
+// what the hub counts (takesSlot): workers, but not one held after its submission or waiting for its quota; a lead
+// takes no slot and meets no capacity check. A resume is no start and meets none either. An admitted
 // start then prepares the clone (workspace.ts) and a worker's dependencies, in phase preparing, through the seam,
 // and verifies the clone's project config last. Any failure after admission, a clone that cannot be prepared or a
 // failed preparation say, releases what the start took and is one attempt.failed_to_start with refused null (X-40),
@@ -33,6 +35,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  type AgentRole,
   type AttemptFacts,
   type AttemptPhase,
   type AttemptSpec,
@@ -147,7 +150,7 @@ export interface ControllerDeps {
   preparer: DependencyPreparer;
   notifier: Notifier;
   logger: Logger;
-  /** The attempts that hold a capacity slot now (holdsSlot: a live process or a start under way), this one excluded. */
+  /** The attempts that take a capacity slot now (takesSlot), this one excluded. */
   liveAttempts(): number;
   /** Whether the vendor's last preflight found it ready. */
   vendorReady(vendor: Vendor): boolean;
@@ -309,6 +312,10 @@ export class AttemptController {
   /** Stops, holds and resumes that arrived so far; a submission's retries end when it moves. */
   private stopsArrived = 0;
   private readonly stopListeners = new Set<() => void>();
+  /** The role of the last start or resume: a lead takes no capacity slot. */
+  private role: AgentRole | null = null;
+  /** hold_attempt arrived at the current fence: the hub counts the attempt holding, so it takes no slot. */
+  private held = false;
 
   constructor(
     readonly attemptId: string,
@@ -341,11 +348,22 @@ export class AttemptController {
   }
 
   /**
-   * Whether the attempt holds a capacity slot: from the moment its start passes the core's checks, through its live
-   * process, until its exit. The runtime counts these for every other controller's admission.
+   * Whether a start, a live process or its exit work holds the attempt: from the moment its start passes the core's
+   * checks, through its live process, until its exit. The runner's own stops stop these.
    */
   get holdsSlot(): boolean {
     return this.currentPhase !== null;
+  }
+
+  /**
+   * Whether the attempt takes one of the runner's capacity slots, as the hub counts them (design 6.6): a worker that
+   * holdsSlot, unless its turn policy waits for its quota, which the hub hears as attempt.quota, or hold_attempt
+   * arrived, which the hub sends as it records the submission and frees the slot. A lead takes none. The runtime
+   * counts these for every other start's admission.
+   */
+  get takesSlot(): boolean {
+    const waiting = this.live?.policy.waitingForQuota ?? false;
+    return this.holdsSlot && this.role !== 'lead' && !this.held && !waiting;
   }
 
   /** The clone the last start prepared; null before one. */
@@ -464,7 +482,11 @@ export class AttemptController {
    * and session kept.
    */
   hold(command: { fence: Fence }): Promise<StopOutcome> {
-    if (this.isCurrentFence(command.fence)) this.stopArriving();
+    if (this.isCurrentFence(command.fence)) {
+      // The hub freed the slot as it recorded the submission: the next start finds it free here too.
+      this.held = true;
+      this.stopArriving();
+    }
     return this.enqueue(async () => {
       const live = this.liveAt(command.fence);
       if (!('pump' in live)) return live;
@@ -496,7 +518,11 @@ export class AttemptController {
    * and a live process is done already.
    */
   resume(command: ResumeInput): Promise<ResumeOutcome> {
-    if (this.currentFence === null || compareFence(command.fence, this.currentFence) > 0) this.stopArriving();
+    if (this.currentFence === null || compareFence(command.fence, this.currentFence) > 0) {
+      // The hub counts a resumed attempt from the moment it sends the resume, so it takes a slot again here too.
+      this.held = false;
+      this.stopArriving();
+    }
     return this.enqueue(async () => {
       const record = this.deps.store.get(this.attemptId);
       const current = this.currentFence ?? record?.fence ?? null;
@@ -513,6 +539,7 @@ export class AttemptController {
       }
       const spec = resumedSpec(record.spec, command);
       this.currentFence = spec.fence;
+      this.role = spec.role;
       this.currentPhase = 'starting';
       const { agentToken: _token, ...stored } = spec;
       this.current = stored;
@@ -2092,11 +2119,14 @@ export class AttemptController {
     return { started: false, refused: null, error: clipped };
   }
 
-  /** The core's checks in order, then the health seam's; null admits the start. */
+  /**
+   * The core's checks in order, then the health seam's; null admits the start. A lead takes no slot, so it meets no
+   * capacity check: the runner runs its capacity of workers beside it.
+   */
   private async admit(spec: AttemptSpec): Promise<{ code: StartRefusal; error: string } | null> {
     const config = this.deps.config();
     if (config.draining) return { code: 'draining', error: 'the runner is draining and takes no new attempts' };
-    if (this.deps.liveAttempts() >= config.capacity) {
+    if (spec.role !== 'lead' && this.deps.liveAttempts() >= config.capacity) {
       return { code: 'at_capacity', error: `the runner is at its capacity of ${config.capacity} attempts` };
     }
     if (!this.deps.adapters.has(spec.vendor) || !this.deps.vendorReady(spec.vendor)) {
@@ -2105,6 +2135,7 @@ export class AttemptController {
     // The slot is taken before the seam is asked, with no await since the capacity check, so a start of another
     // attempt admitted meanwhile counts it; a refusal gives it back.
     const previous = this.currentPhase;
+    this.role = spec.role;
     this.currentPhase = 'starting';
     let code: StartRefusal | null;
     try {

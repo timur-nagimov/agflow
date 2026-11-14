@@ -8,7 +8,7 @@ import {
   usableVendors,
 } from '@agflow/core';
 import { updateAttempt } from '../src/attempt-store';
-import { startRunnerAttempt } from '../src/attempts';
+import { requestStop, startRunnerAttempt } from '../src/attempts';
 import { type HubContext, tx } from '../src/context';
 import { placementSnapshot } from '../src/placement';
 import { upsertAccountQuota } from '../src/quota';
@@ -87,8 +87,8 @@ describe('placementSnapshot', () => {
       acceptingUntil: null,
       startRefusal: null,
       capacity: 2,
-      // The worker and the lead; the holding and the ended attempts take no slot.
-      openAttempts: 2,
+      // The worker; the lead, the holding and the ended attempts take no slot.
+      openAttempts: 1,
       power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
       vendors: [
         {
@@ -194,16 +194,24 @@ describe("core's placement rules over the snapshot", () => {
     expect(refusals().find(([id]) => id === r4)?.[1]).toEqual([]);
   });
 
-  test('freeSlots counts open attempts, a lead included', () => {
+  test('freeSlots counts the workers that take a slot: a lead, a holding attempt and a wait take none', () => {
     const { ctx, r1, worker } = setup();
-    const snapshot = placementSnapshot(ctx);
-    const runner = snapshot.runners.find((slot) => slot.id === r1);
-    expect(runner && freeSlots(runner)).toBe(0);
-    expect(candidateRunners(snapshot).refused).toContainEqual({ runnerId: r1, vendor: null, refusal: 'full' });
+    const free = () => {
+      const snapshot = placementSnapshot(ctx);
+      const runner = snapshot.runners.find((slot) => slot.id === r1);
+      const candidate = candidateRunners(snapshot).candidates.some((slot) => slot.id === r1);
+      return { slots: runner && freeSlots(runner), candidate };
+    };
+    // The worker and the lead leave one slot.
+    expect(free()).toEqual({ slots: 1, candidate: true });
+    const second = addRunnerAttempt(ctx, { runnerId: r1 });
+    expect(free()).toEqual({ slots: 0, candidate: false });
+    // A wait for quota frees its slot; asked to stop, it takes it again until it ends.
+    updateAttempt(ctx, second.attempt.id, { status: 'quota_wait' });
+    expect(free()).toEqual({ slots: 1, candidate: true });
+    requestStop(ctx, { attemptId: second.attempt.id, cause: 'quota', reason: 'out of quota', by: 'system' });
+    expect(free()).toEqual({ slots: 0, candidate: false });
     updateAttempt(ctx, worker.attempt.id, { status: 'ended', endReason: 'crashed', leaseExpiresAt: null });
-    const after = placementSnapshot(ctx);
-    const freed = after.runners.find((slot) => slot.id === r1);
-    expect(freed && freeSlots(freed)).toBe(1);
-    expect(candidateRunners(after).candidates.map((slot) => slot.id)).toContain(r1);
+    expect(free()).toEqual({ slots: 1, candidate: true });
   });
 });

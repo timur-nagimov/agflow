@@ -97,12 +97,22 @@ export interface RunnerRow {
   last_seen_at: number;
   created_at: number;
   retired_at: number | null;
-  /** Its starting, running and quota_wait attempts, a lead's included: the ones that take a slot. */
+  /** Its attempts that take a slot (TAKES_SLOT_SQL). */
   active_attempts: number;
 }
 
+/**
+ * SQL that holds for an attempt that takes a slot of its runner and of the project's workers (design 6.6): a worker
+ * starting or running, or one in quota_wait that is asked to stop, whose slot is kept for its successor until it
+ * ends. A lead, a holding attempt and a worker waiting for its quota take none. The runner's admission counts no more
+ * (AttemptController.takesSlot), so a start the hub sends into a free slot finds it free there.
+ */
+export const TAKES_SLOT_SQL =
+  "attempts.role = 'worker' AND (attempts.status IN ('starting', 'running') OR " +
+  "(attempts.status = 'quota_wait' AND attempts.stop_requested IS NOT NULL))";
+
 const RUNNER_SELECT = `SELECT runners.*, (SELECT COUNT(*) FROM attempts WHERE attempts.runner_id = runners.id
-  AND attempts.status IN ('starting', 'running', 'quota_wait')) AS active_attempts FROM runners`;
+  AND ${TAKES_SLOT_SQL}) AS active_attempts FROM runners`;
 
 export const runnerInfo = (row: Pick<RunnerRow, 'info'>): RunnerInfo => JSON.parse(row.info) as RunnerInfo;
 export const vendorHolds = (row: Pick<RunnerRow, 'vendor_holds'>): VendorHolds =>

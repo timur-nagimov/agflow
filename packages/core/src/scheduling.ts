@@ -7,7 +7,7 @@ import type { VendorRequirement } from './ladder';
 import { pathsOverlap } from './paths';
 import { liveChatOnly } from './protected-paths';
 import type { StartRefusal } from './runner-protocol';
-import type { AccountQuota, FailureClass, Runner, RunnerState, Task, Vendor } from './types';
+import type { AccountQuota, AgentRole, FailureClass, Runner, RunnerState, Task, Vendor } from './types';
 
 /**
  * Why placement passes over a runner, then over a vendor on it, in the order they are checked:
@@ -16,7 +16,7 @@ import type { AccountQuota, FailureClass, Runner, RunnerState, Task, Vendor } fr
  * - git: it cannot fetch or push (git.ready is false);
  * - accepting: its last heartbeat asked for no new attempt before acceptingUntil (waking, low battery, low disk);
  * - refused_start: it refused a start since its last heartbeat (X-3);
- * - full: its starting, running and quota_wait attempts fill its capacity;
+ * - full: the workers that take a slot fill its capacity (a worker's placement only: a lead takes no slot);
  * - not_ready: the vendor is not ready there, by the runner's report or by a hub mark;
  * - degraded: continuous vendor errors marked the vendor degraded there;
  * - exhausted: the vendor's account has no quota left until its reset;
@@ -70,7 +70,11 @@ export interface RunnerSlot {
   /** A start it refused since its last heartbeat, which the next heartbeat clears (X-3). */
   startRefusal: { code: StartRefusal; at: number } | null;
   capacity: number;
-  /** Its starting, running and quota_wait attempts, a lead's included. */
+  /**
+   * Its workers that take a slot: starting or running, or in quota_wait and asked to stop, whose slot is kept for its
+   * successor. A lead, a holding attempt and a worker waiting for its quota take none; the runner's admission counts
+   * no more.
+   */
   openAttempts: number;
   /** Its power source, for the runner preference. */
   power: Runner['power'];
@@ -111,29 +115,33 @@ export function freeSlots(runner: Pick<RunnerSlot, 'capacity' | 'openAttempts'>)
   return Math.max(0, runner.capacity - runner.openAttempts);
 }
 
-function runnerRefusal(snapshot: PlacementSnapshot, runner: RunnerSlot): PlacementRefusal | null {
+function runnerRefusal(snapshot: PlacementSnapshot, runner: RunnerSlot, role: AgentRole): PlacementRefusal | null {
   if (runner.state !== 'online') return 'offline';
   if (runner.draining) return 'draining';
   if (!runner.gitReady) return 'git';
   if (runner.acceptingUntil !== null && snapshot.now < runner.acceptingUntil) return 'accepting';
   if (runner.startRefusal !== null) return 'refused_start';
-  if (freeSlots(runner) < 1) return 'full';
+  if (role === 'worker' && freeSlots(runner) < 1) return 'full';
   return null;
 }
 
 /**
- * The runners that may take an attempt now (design 6.6, step 5): online, not draining, git ready, past the
- * acceptingUntil of their last heartbeat, without a refused start since that heartbeat, and with a free slot. Every
- * other runner comes with its first refusal. Vendors are usableVendors' to judge.
+ * The runners that may take an attempt of the role now (design 6.6, step 5): online, not draining, git ready, past
+ * the acceptingUntil of their last heartbeat, without a refused start since that heartbeat, and, for a worker, with a
+ * free slot. A lead takes no slot, so a runner runs its capacity of workers beside it. Every other runner comes with
+ * its first refusal. Vendors are usableVendors' to judge.
  */
-export function candidateRunners(snapshot: PlacementSnapshot): {
+export function candidateRunners(
+  snapshot: PlacementSnapshot,
+  role: AgentRole = 'worker',
+): {
   candidates: RunnerSlot[];
   refused: RefusedPlacement[];
 } {
   const candidates: RunnerSlot[] = [];
   const refused: RefusedPlacement[] = [];
   for (const runner of snapshot.runners) {
-    const refusal = runnerRefusal(snapshot, runner);
+    const refusal = runnerRefusal(snapshot, runner, role);
     if (refusal === null) candidates.push(runner);
     else refused.push({ runnerId: runner.id, vendor: null, refusal });
   }
@@ -241,6 +249,8 @@ export interface TaskCandidate extends Pick<Task, CandidateFields | 'nextDispatc
   requirement: VendorRequirement | null;
   /** The runner its next attempt should not use (runnerToAvoid). */
   avoidRunner: string | null;
+  /** When it became ready: its last change (Task.updatedAt), which for a ready task is its move to ready. */
+  readySince: number;
 }
 
 export interface DispatchContext {
@@ -280,8 +290,9 @@ export function orderReady<T extends Pick<TaskCandidate, 'priority' | 'createdAt
 // ---------------------------------------------------------------------------
 
 /**
- * How many more workers may start (design 6.6, step 4): running workers (starting, running and quota_wait) stay below
- * project.worker_target, or maxWorkers without one. Leads and live chats do not count.
+ * How many more workers may start (design 6.6, step 4): running workers (the ones that take a slot, as
+ * RunnerSlot.openAttempts counts them) stay below project.worker_target, or maxWorkers without one. Leads, live chats
+ * and workers waiting for their quota do not count.
  */
 export function workerSlotsFree(input: {
   workerTarget: number | null;
@@ -294,6 +305,9 @@ export function workerSlotsFree(input: {
 /** Both vendors, in the order that settles a tie. */
 const VENDORS: readonly Vendor[] = ['claude', 'codex'];
 
+/** How long a task's vendorHint holds it when no runner can take the hinted vendor: then the other vendor may. */
+export const HINT_WAIT_MS = 60_000;
+
 export interface VendorPreferenceInput {
   requirement: VendorRequirement | null;
   vendorHint: Vendor | null;
@@ -302,25 +316,28 @@ export interface VendorPreferenceInput {
   now: number;
   /** The vendors some online runner offers: ready, with no not-ready mark. A step-3 requirement binds only to these. */
   offered: readonly Vendor[];
-  /** The lowest account utilization of each vendor usable now, 0..1; a vendor usable nowhere has none. */
-  utilization: Partial<Record<Vendor, number>>;
+  /** When the task became ready (TaskCandidate.readySince). */
+  readySince: number;
 }
 
 /**
- * The vendors a task may use, most preferred first (design 6.6, step 5). The ladder's requirement binds first: step 2
- * to the same vendor, step 3 to the other while a runner offers it. Otherwise vendorHint, then the project's
- * preference until it expires, then the lower account utilization; a vendor usable nowhere now comes last.
+ * The vendors a task may use now, in tiers tried in order (design 6.6, step 5): placement takes the best account of
+ * the first tier that has a usable one. The ladder's requirement binds first: step 2 to the same vendor, step 3 to the
+ * other while a runner offers it. Otherwise vendorHint comes first, and the other vendor only once the task has been
+ * ready for HINT_WAIT_MS; then the project's preference until it expires, with the other vendor after it. With no
+ * preference both vendors make one tier, so the accounts decide.
  */
-export function preferredVendors(input: VendorPreferenceInput): Vendor[] {
-  const { requirement } = input;
+export function preferredVendors(input: VendorPreferenceInput): Vendor[][] {
+  const { requirement, vendorHint } = input;
   if (requirement !== null && (requirement.step === 2 || input.offered.includes(requirement.vendor))) {
-    return [requirement.vendor];
+    return [[requirement.vendor]];
   }
-  const level = (vendor: Vendor) => input.utilization[vendor] ?? Number.POSITIVE_INFINITY;
-  const byUtilization = [...VENDORS].sort((a, b) => level(a) - level(b));
+  const others = (vendor: Vendor): Vendor[] => VENDORS.filter((other) => other !== vendor);
+  if (vendorHint !== null) {
+    return input.now - input.readySince >= HINT_WAIT_MS ? [[vendorHint], others(vendorHint)] : [[vendorHint]];
+  }
   const pref = input.projectPref !== null && input.now < input.projectPref.until ? input.projectPref.vendor : null;
-  const first = [input.vendorHint, pref].filter((vendor): vendor is Vendor => vendor !== null);
-  return [...new Set([...first, ...byUtilization])];
+  return pref === null ? [[...VENDORS]] : [[pref], others(pref)];
 }
 
 /** An ended attempt of the task, as the runner preference reads it. */
@@ -388,9 +405,9 @@ interface Option {
   usable: UsableVendor;
 }
 
-/** Every usable vendor on every candidate runner, and every refusal met on the way. */
-function options(snapshot: PlacementSnapshot): { options: Option[]; refused: RefusedPlacement[] } {
-  const { candidates, refused } = candidateRunners(snapshot);
+/** Every usable vendor on every candidate runner for the role, and every refusal met on the way. */
+function options(snapshot: PlacementSnapshot, role: AgentRole): { options: Option[]; refused: RefusedPlacement[] } {
+  const { candidates, refused } = candidateRunners(snapshot, role);
   const found: Option[] = [];
   for (const runner of candidates) {
     const vendors = usableVendors(snapshot, runner);
@@ -406,9 +423,37 @@ const toPlacement = (option: Option): Placement => ({
   account: option.usable.account,
 });
 
-/** An account's utilization for the vendor preference: its more used window, 0 when unknown. */
-const accountLevel = (account: AccountView | null): number =>
-  Math.max(account?.quota.windows.fiveHour ?? 0, account?.quota.windows.weekly ?? 0);
+/**
+ * How used an account is, for the account preference: the larger of its two windows, read as the ceilings read them
+ * (utilization), so a window whose report has lapsed counts as 0. An option with no account report has no use.
+ */
+function accountUse(snapshot: PlacementSnapshot, account: AccountView | null): number {
+  if (account === null) return 0;
+  const { fiveHour, weekly } = utilization(account, reportHolds(snapshot, account));
+  return Math.max(fiveHour, weekly);
+}
+
+/**
+ * Options in placement order (design 6.6, step 5): not on the runner to avoid; then on the account (owner and vendor)
+ * with the fewest open attempts, then on the least used one (accountUse); then in runner order (orderRunners), and
+ * Claude before Codex on one runner. An option with no account report has no open attempts. A new array.
+ */
+function orderOptions(snapshot: PlacementSnapshot, found: readonly Option[], avoid: string | null): Option[] {
+  const runners = orderRunners([...new Set(found.map((option) => option.runner))], avoid);
+  const avoided = (option: Option): number => (option.runner.id === avoid ? 1 : 0);
+  const open = (option: Option): number => option.usable.account?.openAttempts ?? 0;
+  const use = (option: Option): number => accountUse(snapshot, option.usable.account);
+  const runner = (option: Option): number => runners.indexOf(option.runner);
+  const vendor = (option: Option): number => VENDORS.indexOf(option.usable.slot.vendor);
+  return [...found].sort(
+    (a, b) =>
+      avoided(a) - avoided(b) ||
+      open(a) - open(b) ||
+      use(a) - use(b) ||
+      runner(a) - runner(b) ||
+      vendor(a) - vendor(b),
+  );
+}
 
 /** The vendors an online runner offers: ready, with no not-ready mark, whether or not it has room now. */
 function offeredVendors(snapshot: PlacementSnapshot): Vendor[] {
@@ -421,44 +466,39 @@ function offeredVendors(snapshot: PlacementSnapshot): Vendor[] {
 }
 
 /**
- * Places a ready task (design 6.6, step 5): the most preferred vendor (preferredVendors) usable on some candidate
- * runner, on the best of those runners (orderRunners, avoiding task.avoidRunner). With no placement, refused names
- * every runner and vendor passed over, owner_away included, which the scheduler tells the lead about.
+ * Places a ready task (design 6.6, step 5): the first tier of vendors (preferredVendors) usable on some candidate
+ * runner, on its best option (orderOptions, avoiding task.avoidRunner). Without a preference that is the account with
+ * the fewest open attempts, so a tick's placements spread over every account at once. With no placement, refused
+ * names every runner and vendor passed over, owner_away included, which the scheduler tells the lead about.
  */
 export function place(
   snapshot: PlacementSnapshot,
-  task: Pick<TaskCandidate, 'vendorHint' | 'requirement' | 'avoidRunner'>,
+  task: Pick<TaskCandidate, 'vendorHint' | 'requirement' | 'avoidRunner' | 'readySince'>,
   project: { projectPref: VendorPreferenceInput['projectPref'] },
 ): PlaceResult {
-  const found = options(snapshot);
-  const utilization: Partial<Record<Vendor, number>> = {};
-  for (const { usable } of found.options) {
-    const { vendor } = usable.slot;
-    utilization[vendor] = Math.min(utilization[vendor] ?? Number.POSITIVE_INFINITY, accountLevel(usable.account));
-  }
-  const vendors = preferredVendors({
+  const found = options(snapshot, 'worker');
+  const tiers = preferredVendors({
     requirement: task.requirement,
     vendorHint: task.vendorHint,
     projectPref: project.projectPref,
     now: snapshot.now,
     offered: offeredVendors(snapshot),
-    utilization,
+    readySince: task.readySince,
   });
-  for (const vendor of vendors) {
-    const onVendor = found.options.filter((option) => option.usable.slot.vendor === vendor);
-    const [best] = orderRunners(onVendor.map((option) => option.runner), task.avoidRunner);
-    const chosen = onVendor.find((option) => option.runner === best);
-    if (chosen) return { placement: toPlacement(chosen), refused: found.refused };
+  for (const vendors of tiers) {
+    const onTier = found.options.filter((option) => vendors.includes(option.usable.slot.vendor));
+    const [best] = orderOptions(snapshot, onTier, task.avoidRunner);
+    if (best) return { placement: toPlacement(best), refused: found.refused };
   }
   return { placement: null, refused: found.refused };
 }
 
 /**
  * Places a runner lead (design 6.11): Claude before Codex, then, when rotating, the runner the lead ran on, then
- * runners on AC power, the most free slots and the lowest id.
+ * runners on AC power, the most free slots and the lowest id. A lead takes no slot, so a full runner may take it.
  */
 export function placeLead(snapshot: PlacementSnapshot, rotation: { rotatingFrom: string | null }): PlaceResult {
-  const found = options(snapshot);
+  const found = options(snapshot, 'lead');
   const same = (option: Option): number => (option.runner.id === rotation.rotatingFrom ? 0 : 1);
   const claude = (option: Option): number => (option.usable.slot.vendor === 'claude' ? 0 : 1);
   const [best] = [...found.options].sort(

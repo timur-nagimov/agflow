@@ -109,14 +109,15 @@ describe('attempt.exited after a stop request', () => {
     for (const cause of ['quota', 'vendor_error', 'context'] as const) {
       signatures.push((await replaceFor(cause)).failureSignature);
     }
-    expect(signatures).toEqual(['replaced: quota', 'replaced: vendor_error', 'replaced: context']);
+    // A quota replacement is no failure, so it has none.
+    expect(signatures).toEqual([null, 'replaced: vendor_error', 'replaced: context']);
     expect(getTask(ctx, task.id).status).toBe('ready');
-    await replaceFor('quota');
+    await replaceFor('vendor_error');
     expect(getTask(ctx, task.id).status).toBe('ready');
-    await replaceFor('quota');
+    await replaceFor('vendor_error');
     expect(getTask(ctx, task.id)).toMatchObject({ status: 'blocked', blockedKind: 'replan' });
     const [notice] = listMessages(ctx, {}).filter((message) => message.to === 'lead');
-    expect(notice?.body).toContain('> replaced: quota');
+    expect(notice?.body).toContain('> replaced: vendor_error');
   });
 
   test('a stop that times out gets the same signature', async () => {

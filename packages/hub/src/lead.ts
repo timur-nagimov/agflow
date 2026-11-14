@@ -8,9 +8,12 @@ import {
   type AttemptEndReason,
   type LeadNote,
   type Message,
+  type PlacementSnapshot,
   type Project,
   type RunnerState,
+  type StopCause,
   type TaskStatus,
+  type Vendor,
   placeLead,
 } from '@agflow/core';
 import { getAttempt, listAttempts } from './attempt-store';
@@ -30,7 +33,7 @@ import {
   updateHubState,
 } from './hub-state';
 import { insertMessage } from './messages';
-import { placementSnapshot } from './placement';
+import { placementSnapshot, withoutAccountOf } from './placement';
 import { getProject, storeRunnerLeads } from './project';
 import { findRunnerRow } from './runners';
 import { listTasks } from './task-store';
@@ -38,21 +41,30 @@ import { listTasks } from './task-store';
 /** The endings after which the next lead avoids the runner the last one ran on (design 6.11, Failover). */
 const FAILOVER_ENDINGS: readonly AttemptEndReason[] = ['lost', 'crashed'];
 
-/** How the newest runner lead attempt ended, and where it ran; null while it is open or before the first. */
-function lastLeadEnding(ctx: HubContext): { endReason: AttemptEndReason; runnerId: string | null } | null {
+/**
+ * How the newest runner lead attempt ended, where it ran, on which vendor, and the cause of the stop asked of it; null
+ * while it is open or before the first.
+ */
+function lastLeadEnding(ctx: HubContext): {
+  endReason: AttemptEndReason;
+  runnerId: string | null;
+  vendor: Vendor;
+  cause: StopCause | null;
+} | null {
   const [last] = listAttempts(ctx, { role: 'lead', limit: 1 });
-  return last && last.status === 'ended' && last.endReason !== null
-    ? { endReason: last.endReason, runnerId: last.runnerId }
-    : null;
+  if (!last || last.status !== 'ended' || last.endReason === null) return null;
+  const cause = last.stopRequested?.cause ?? null;
+  return { endReason: last.endReason, runnerId: last.runnerId, vendor: last.vendor, cause };
 }
 
 /**
  * Step 2 of a tick (design 6.11, Starting a runner lead): with the seat empty and runner leads on, a lead attempt
  * starts on the runner core's placeLead prefers (Claude, then AC power, then the most free slots), and takes the seat,
- * demoting any other lead row, in startRunnerAttempt's transaction. After a lead ended lost or crashed, another runner
- * is preferred, and the same one is used only when no other can take it; after a rotation, the same runner is
- * preferred. Its brief quotes the newest lead handoff. The tick skips this step while the project is paused. Returns
- * the attempt, or null when none started.
+ * demoting any other lead row, in startRunnerAttempt's transaction. A lead takes no slot, so a full runner may take
+ * it. After a lead ended lost or crashed, another runner is preferred, and after one was replaced for its quota,
+ * another account; the same is used only when no other can take it. After a rotation, the same runner is preferred.
+ * Its brief quotes the newest lead handoff. The tick skips this step while the project is paused. Returns the attempt,
+ * or null when none started.
  */
 export function ensureLead(ctx: HubContext): Attempt | null {
   if (!getProject(ctx).runnerLeads || seatHolderId(ctx) !== null) return null;
@@ -60,8 +72,10 @@ export function ensureLead(ctx: HubContext): Attempt | null {
   const last = lastLeadEnding(ctx);
   const avoid = last && FAILOVER_ENDINGS.includes(last.endReason) ? last.runnerId : null;
   const rotatingFrom = last?.endReason === 'rotated' ? last.runnerId : null;
-  const others = { ...snapshot, runners: snapshot.runners.filter((runner) => runner.id !== avoid) };
-  const elsewhere = avoid === null ? null : placeLead(others, { rotatingFrom: null }).placement;
+  let others: PlacementSnapshot | null = null;
+  if (avoid !== null) others = { ...snapshot, runners: snapshot.runners.filter((runner) => runner.id !== avoid) };
+  else if (last?.cause === 'quota' && last.endReason === 'replaced') others = withoutAccountOf(snapshot, last);
+  const elsewhere = others === null ? null : placeLead(others, { rotatingFrom: null }).placement;
   const placement = elsewhere ?? placeLead(snapshot, { rotatingFrom }).placement;
   if (!placement) return null;
   return startRunnerAttempt(ctx, { runnerId: placement.runnerId, taskId: null, role: 'lead', vendor: placement.vendor })

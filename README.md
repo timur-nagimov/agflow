@@ -189,7 +189,7 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_APPROVAL_MINUTES` | `15` | Time to answer an approval |
 | `AGFLOW_LEAD_REVIEW_MINUTES` | `45` | Lead review deadline |
 | `AGFLOW_LIVE_LEAD_GRACE_MINUTES` | `120` | Live lead absence grace |
-| `AGFLOW_QUOTA_WAIT_MINUTES` | `45` | Maximum quota wait before replacement |
+| `AGFLOW_QUOTA_WAIT_MINUTES` | `45` | Maximum quota wait before a worker is replaced on another account; a lead is replaced at once |
 | `AGFLOW_QUOTA_UNKNOWN_MINUTES` | `30` | Wait when the quota reset time is unknown |
 | `AGFLOW_ACTIVE_BUDGET_MINUTES` | `240` | Active-time budget per attempt |
 | `AGFLOW_SUBMIT_TIMEOUT_MINUTES` | `15` | Runner submission timeout |

@@ -30,7 +30,6 @@ import {
   endingClass,
   failureSignature,
   formatFence,
-  freeSlots,
   infraBackoffMs,
   isTaskBranch,
   ladderStep,
@@ -837,13 +836,14 @@ const attemptsOf = (ctx: HubContext, taskId: string): Attempt[] =>
   listAttempts(ctx, { task: taskId }).sort((a, b) => a.number - b.number);
 
 /**
- * A runner's own stop and a refused start say nothing about the task, so the backoff passes over them, and live-chat
- * attempts are never on the ladder (design 6.4).
+ * A runner's own stop, a refused start and a quota replacement say nothing about the task, so the backoff passes over
+ * them, and live-chat attempts are never on the ladder (design 6.4).
  */
 const passedOver = (attempt: Attempt): boolean =>
   attempt.runnerId === null ||
   (attempt.endReason === 'stopped' && attempt.failureClass === 'infra') ||
-  (attempt.endReason === 'failed_to_start' && attempt.failureClass === null);
+  (attempt.endReason === 'failed_to_start' && attempt.failureClass === null) ||
+  (attempt.endReason === 'replaced' && attempt.stopRequested?.cause === 'quota');
 
 /** The task's consecutive infra endings, newest back: the infra backoff's index (design 6.9). */
 function consecutiveInfra(attempts: readonly Attempt[]): number {
@@ -959,14 +959,15 @@ export function ladderRequirement(ctx: HubContext, taskId: string): LadderRequir
 
 /**
  * Whether a rejection can go back to its author (design 6.9, step 1): the author's attempt is holding and resumable, on
- * an online runner with a free slot where its vendor is usable, by core's freeSlots and usableVendors over the
- * placement snapshot (X-46), and no other task holds paths that overlap the task's. Review rounds are the ladder's.
+ * an online runner where its vendor is usable, by core's usableVendors over the placement snapshot (X-46), and no
+ * other task holds paths that overlap the task's. It needs no free slot: a resume is no start, and its runner takes it
+ * even when full, for as long as the review round lasts. Review rounds are the ladder's.
  */
 export function authorCanResume(ctx: HubContext, task: Task, attempt: Attempt): boolean {
   if (attempt.status !== 'holding' || !attempt.resumable || attempt.runnerId === null) return false;
   const snapshot = placementSnapshot(ctx);
   const runner = snapshot.runners.find((slot) => slot.id === attempt.runnerId);
-  if (!runner || runner.state !== 'online' || freeSlots(runner) < 1) return false;
+  if (!runner || runner.state !== 'online') return false;
   if (!usableVendors(snapshot, runner).usable.some(({ slot }) => slot.vendor === attempt.vendor)) return false;
   return overlappingPathHolder(ctx, task) === null;
 }

@@ -29,7 +29,7 @@ import { createTestHub } from './http-helpers';
 const MINUTE = 60_000;
 
 /**
- * A test context with runner leads off: a runner lead would take a runner slot in every tick, and the lead seat is
+ * A test context with runner leads off: a runner lead would start in the first tick, and the lead seat is
  * lead-runner.test.ts's to test.
  */
 function schedulerContext(overrides: Parameters<typeof createTestContext>[0] = {}) {
@@ -530,7 +530,8 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     const { ctx, held } = replaceable();
     const lead = addRunnerLead(ctx);
     updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
-    addRunner(ctx, { vendors: ['claude'] });
+    // Another account for the lead: bob's.
+    addRunner(ctx, { owner: 'bob', vendors: ['claude'] });
     setPaused(ctx, true, 'user:alice');
     expect(replaceQuotaWaits(ctx)).toEqual([]);
     expect([getAttempt(ctx, held.attempt.id).stopRequested, getAttempt(ctx, lead.attempt.id).stopRequested]).toEqual([
@@ -546,7 +547,7 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     const { ctx, clock, held } = replaceable();
     const lead = addRunnerLead(ctx);
     updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
-    addRunner(ctx, { vendors: ['claude'] });
+    addRunner(ctx, { owner: 'bob', vendors: ['claude'] });
     updateHubState(ctx, { dispatchPausedUntil: ctx.now() + 60 * MINUTE });
     expect(replaceQuotaWaits(ctx)).toEqual([lead.attempt.id]);
     expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
@@ -559,7 +560,7 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     tx(ctx, () => setWorkerTarget(ctx, 0));
     expect(replaceQuotaWaits(ctx)).toEqual([]);
     expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
-    // The successor takes the slot the wait frees.
+    // The wait takes no worker slot, so the one the target allows is free for its successor.
     tx(ctx, () => setWorkerTarget(ctx, 1));
     expect(replaceQuotaWaits(ctx)).toEqual([held.attempt.id]);
   });
@@ -577,13 +578,15 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     expect(getAttempt(ctx, newer.attempt.id).stopRequested).toBeNull();
   });
 
-  test('a lead is replaced once another runner has room, and only with runner leads on', () => {
+  test('a lead is replaced at once, whatever its reset, when another account can take the seat, leads on', () => {
     const { ctx } = createTestContext();
     const lead = addRunnerLead(ctx);
-    updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
-    // Its runner is full: the lead and a worker.
-    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    // A reset a minute away: a lead does not wait for it.
+    updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: ctx.now() + MINUTE });
+    // Another runner of alice's is on the account the lead waits on.
     addRunner(ctx);
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    addRunner(ctx, { owner: 'bob' });
     ctx.db.run('UPDATE project SET runner_leads = 0 WHERE id = 1');
     expect(replaceQuotaWaits(ctx)).toEqual([]);
     ctx.db.run('UPDATE project SET runner_leads = 1 WHERE id = 1');

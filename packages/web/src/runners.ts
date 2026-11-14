@@ -86,7 +86,7 @@ export function acceptingText(runner: Pick<Runner, 'acceptingUntil'>, now: numbe
 // Slots, power, disk, keep-awake and git
 // ---------------------------------------------------------------------------
 
-/** activeAttempts counts starting, running and quota_wait attempts, a lead's included: placement's openAttempts. */
+/** activeAttempts counts the workers that take a slot, placement's openAttempts: a lead and a quota wait take none. */
 export function slotsText(runner: Pick<Runner, 'capacity' | 'activeAttempts'>): string {
   const free = freeSlots({ capacity: runner.capacity, openAttempts: runner.activeAttempts });
   return `${free} of ${runner.capacity} slot${runner.capacity === 1 ? '' : 's'} free`;
