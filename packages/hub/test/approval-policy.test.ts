@@ -1688,6 +1688,7 @@ describe('the second review: the package managers read their options as settings
   test('the inert options, and the words a script is handed, keep the work approved', () => {
     expectAll([
       ['npm ci --no-audit --prefer-offline', 'approve', 'declared-deps'],
+      ['npm ci --color=always --audit=false', 'approve', 'declared-deps'],
       ['npm ci --omit=dev', 'approve', 'declared-deps'],
       ['npm install --save-dev', 'approve', 'declared-deps'],
       ['npm run lint --workspaces --if-present', 'approve', 'dev-tool'],

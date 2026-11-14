@@ -2693,7 +2693,8 @@ function packageSetting(part: Part): Word | null {
       continue;
     }
     const name = text.split('=')[0];
-    if (PM_INERT_OPTIONS.has(text)) continue;
+    // An inert switch given a value (--color=always, --audit=false) names nothing either.
+    if (PM_INERT_OPTIONS.has(name)) continue;
     if (PM_ALL_VALUED.has(name)) {
       if (!text.includes('=') && !(args[at + 1]?.text.startsWith('-') ?? true)) at += 1;
       continue;
