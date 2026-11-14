@@ -276,6 +276,16 @@ describe('the unattended options', () => {
       expect(() => loadConfig({ ...base, AGFLOW_LEAD_APPROVALS: value })).toThrow('AGFLOW_LEAD_APPROVALS must be 0 or 1');
     }
   });
+
+  test('AGFLOW_AUTO_APPROVALS is off unless it is 1, and anything but 0 or 1 refuses to start', () => {
+    expect(loadConfig(base).config.autoApprovals).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_AUTO_APPROVALS: '' }).config.autoApprovals).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_AUTO_APPROVALS: '0' }).config.autoApprovals).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_AUTO_APPROVALS: '1' }).config.autoApprovals).toBe(true);
+    for (const value of ['yes', 'true', '2', ' 1', 'on']) {
+      expect(() => loadConfig({ ...base, AGFLOW_AUTO_APPROVALS: value })).toThrow('AGFLOW_AUTO_APPROVALS must be 0 or 1');
+    }
+  });
 });
 
 describe('makeConfig', () => {

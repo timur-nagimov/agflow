@@ -6,7 +6,11 @@
 //
 // With AGFLOW_LEAD_APPROVALS on (design 5, Unattended options), the runner agent holding the lead seat may answer too,
 // through its agent token: it declines any request that is not its own, and approves only those of a runner whose
-// vendor reports no managed device policy. The runner is told nothing new: it gets the same decide_approval.
+// vendor leaves approvals to an agent. With AGFLOW_AUTO_APPROVALS on, the hub answers first, by the rules of
+// approval-policy.ts, which read the shape of what is asked and never its prose: what they approve or decline is
+// decided as the request is stored, as policy:<rule>, and only what they leave undecided reaches the lead or the
+// owner. Those rules are the floor under the lead too, with either setting: no agent approves what they decline.
+// The runner is told nothing new by any of this: it gets the same decide_approval.
 import {
   type Approval,
   type Attempt,
@@ -15,6 +19,7 @@ import {
   type RunnerEventData,
   quoteLines,
 } from '@agflow/core';
+import { type ApprovalJudgement, judgeApproval } from './approval-policy';
 import { appendAttemptLog, attemptSubject, findAttempt } from './attempt-store';
 import { enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
@@ -104,14 +109,19 @@ function leadFor(ctx: HubContext, asking: Pick<Approval, 'agentId' | 'attemptId'
 }
 
 /**
- * Whether the lead may approve the request, read from the runner's row now (design 6.10, Managed devices). A managed
- * device policy means the device's administrator requires the owner's own approval, so the lead never approves there.
+ * Whether the device leaves this request's approval to an agent, read from the runner's row now (design 6.10, Managed
+ * devices). Both agents that may approve ask here and nowhere else, so the two can never drift: the lead with
+ * AGFLOW_LEAD_APPROVALS, and the hub's own rules with AGFLOW_AUTO_APPROVALS. A device policy that regulates who
+ * answers approvals means the device's administrator requires the owner's own approval, so no agent approves there.
+ * Managed configuration that says nothing about approvals reserves nothing, and is not read here.
+ *
  * It fails closed: only a runner the hub knows, not retired, still running the attempt, whose one entry for the
- * attempt's vendor is ready and says managedPolicy false, allows it. Ready is the runner's own report, without the
- * hub's marks: a runner whose preflight threw reports the vendor not ready with managedPolicy false, having read no
- * policy, so a false beside a vendor that is not ready confirms nothing.
+ * attempt's vendor is ready and says approvalsReservedToOwner false, allows it. Anything else reserves the request to
+ * the owner -- true, and the absent field of a runner too old to report it alike. Ready still matters: it is the
+ * runner's own report, without the hub's marks, and a vendor whose preflight threw reports nothing it read, so a
+ * false beside a vendor that is not ready confirms nothing.
  */
-function leadMayApprove(ctx: HubContext, approval: Approval): boolean {
+function agentMayApprove(ctx: HubContext, approval: Approval): boolean {
   const attempt = findAttempt(ctx, approval.attemptId);
   const runner = findRunnerRow(ctx, approval.runnerId);
   if (!attempt || !runner || runner.retired_at !== null || attempt.runnerId !== runner.id) return false;
@@ -122,10 +132,10 @@ function leadMayApprove(ctx: HubContext, approval: Approval): boolean {
     return false;
   }
   if (!Array.isArray(vendors)) return false;
-  const entries = (vendors as ({ vendor?: unknown; ready?: unknown; managedPolicy?: unknown } | null)[]).filter(
-    (entry) => entry?.vendor === attempt.vendor,
-  );
-  return entries.length === 1 && entries[0]?.ready === true && entries[0].managedPolicy === false;
+  const entries = (
+    vendors as ({ vendor?: unknown; ready?: unknown; approvalsReservedToOwner?: unknown } | null)[]
+  ).filter((entry) => entry?.vendor === attempt.vendor);
+  return entries.length === 1 && entries[0]?.ready === true && entries[0].approvalsReservedToOwner === false;
 }
 
 /** The data every approval event carries (design 6.17), on the subject of its attempt's events. */
@@ -177,6 +187,33 @@ function sendDecision(
 }
 
 /**
+ * The hub's own answer to a request (design 6.10, Rules; AGFLOW_AUTO_APPROVALS), in the caller's transaction: the
+ * decision is stored under the rule that produced it, the asking agent is told the rule's reason, the attempt's log
+ * keeps a line of it and the runner is sent the decision as a person's is. No owner-away mark is touched and no
+ * owner-away mark is cleared: nobody was asked and nobody answered.
+ */
+function decideByRule(
+  ctx: HubContext,
+  emit: Emit,
+  approval: Approval,
+  decision: 'approve' | 'decline',
+  judged: ApprovalJudgement,
+): void {
+  const by = `policy:${judged.rule}`;
+  const decided = settle(ctx, approval, decision === 'approve' ? 'approved' : 'declined', by);
+  if (!decided) return;
+  sendDecision(ctx, decided, decision, judged.reason);
+  appendAttemptLog(ctx, decided.attemptId, 'note', `approval ${decided.id} ${decided.status} by rule ${judged.rule}`);
+  const { subject, data } = approvalEvent(decided);
+  emit({
+    type: 'approval.decided',
+    actor: by,
+    subject,
+    data: { ...data, decision, rule: judged.rule, reason: judged.reason },
+  });
+}
+
+/**
  * approval.requested at the attempt's current fence (design 6.10): the request is stored for the runner's owner, as
  * the hub received it, and expires approvalMs later. A second request with an id the hub already has is logged on the
  * attempt and changes nothing.
@@ -221,6 +258,17 @@ export function onApprovalRequested(
   const approval = findApproval(ctx, approvalId) as Approval;
   const { subject, data } = approvalEvent(approval);
   emit({ type: 'approval.requested', actor: `runner:${runnerId}`, subject, data: { ...data, kind } });
+  // The rules answer first, where they are on and they recognise the request (design 6.10, Rules): an answer the hub
+  // gave itself leaves the lead nothing to answer, so no notice goes out for it. A decline needs no permission from
+  // anyone, declining being always safe; an approval needs the device to leave approvals to an agent, and where it
+  // does not, the request waits for the owner rather than being refused an approval the rules allow.
+  if (ctx.config.autoApprovals) {
+    const judged = judgeApproval(approval, { cloneRoot: approval.detail.cloneRoot ?? null });
+    if (judged.verdict === 'decline') return decideByRule(ctx, emit, approval, 'decline', judged);
+    if (judged.verdict === 'approve' && agentMayApprove(ctx, approval)) {
+      return decideByRule(ctx, emit, approval, 'approve', judged);
+    }
+  }
   // The lead that may answer is told once, in the transaction that stores the request.
   const lead = leadFor(ctx, approval);
   if (lead) {
@@ -228,7 +276,7 @@ export function onApprovalRequested(
       from: 'system',
       to: `agent:${lead.agentId}`,
       taskId: approval.taskId,
-      body: leadNotice(approval, attempt, leadMayApprove(ctx, approval)),
+      body: leadNotice(approval, attempt, agentMayApprove(ctx, approval)),
     });
     ctx.db.query('UPDATE approvals SET lead_notified_at = $now WHERE id = $id').run({ id: approvalId, now });
   }
@@ -255,8 +303,8 @@ function leadNotice(approval: Approval, attempt: Attempt, mayApprove: boolean): 
       `then runs outside the sandbox on ${approval.owner}'s machine, with network access and write access to their ` +
       `files, so approve only what the task needs and you understand. decide_approval("${id}", "decline", reason) ` +
       'refuses it; the reason goes to the asking agent, so say what to do instead.'
-    : 'You may only decline it: the hub cannot confirm that this runner is free of a managed device policy, and on ' +
-      `a managed device the administrator requires the owner's own approval. decide_approval("${id}", "decline", ` +
+    : 'You may only decline it: the hub cannot confirm that this runner leaves its approvals to an agent, and a ' +
+      `device whose policy reserves them requires the owner's own approval. decide_approval("${id}", "decline", ` +
       'reason) refuses it; the reason goes to the asking agent, so say what to do instead. Or leave it to ' +
       `${approval.owner}, who answers in the browser.`;
   return (
@@ -353,10 +401,21 @@ const approvalManaged = (approval: Approval) =>
   new HubError(
     403,
     'approval_managed',
-    `approval ${approval.id} is not yours to approve: the hub cannot confirm that runner ${approval.runnerId} is free ` +
-      "of a managed device policy, and on a managed device the administrator requires the owner's own approval. " +
+    `approval ${approval.id} is not yours to approve: the hub cannot confirm that runner ${approval.runnerId} leaves ` +
+      "this vendor's approvals to an agent, and a device whose policy reserves them requires the owner's own " +
+      'approval. ' +
       'You may decline it with a reason that tells the agent what to do instead, or leave it to its owner, ' +
       `${approval.owner}.`,
+  );
+
+/** 403 for a lead approving what the hub's rules decline: the rules are the floor under any agent's judgement. */
+const approvalRefusedByRule = (approval: Approval, judged: ApprovalJudgement) =>
+  new HubError(
+    403,
+    'approval_refused_by_rule',
+    `approval ${approval.id} is refused by the hub's rule ${judged.rule}: ${judged.reason}. No agent approves it, ` +
+      'whatever the request says about itself. Decline it instead, with a reason that tells the asking agent what to ' +
+      `do, or leave it to its owner, ${approval.owner}, whose own answer the rules do not bind.`,
   );
 
 const approvalReasonRequired = (id: string) =>
@@ -369,9 +428,12 @@ const approvalReasonRequired = (id: string) =>
 
 /**
  * POST /api/approvals/:id with the lead's agent token (design 6.10, Who may answer; AGFLOW_LEAD_APPROVALS). The lead
- * declines any pending request that is not its own, with a reason the asking agent reads, and approves only one whose
- * runner reports no managed device policy for the attempt's vendor. The owner may answer first; the first answer wins.
- * The decision goes to the runner as the owner's does. Owner-away marks stay: the owner did not act.
+ * declines any pending request that is not its own, with a reason the asking agent reads. It approves only one whose
+ * runner leaves that vendor's approvals to an agent and whose shape the hub's rules do not decline: the rules are the
+ * floor under the lead's judgement, whatever the lead believes the request says, and they bind no person in a
+ * browser. Declining is always safe, so no rule and no device stands in the way of it. The owner may answer first;
+ * the first answer wins. The decision goes to the runner as the owner's does. Owner-away marks stay: the owner did
+ * not act.
  */
 export function decideApprovalAsLead(
   ctx: HubContext,
@@ -391,7 +453,11 @@ export function decideApprovalAsLead(
     if (approval.status !== 'pending') throw conflict(`approval ${id} is ${approval.status}`);
     const given = reason?.trim() ? reason : null;
     if (decision === 'decline' && given === null) throw approvalReasonRequired(id);
-    if (decision === 'approve' && !leadMayApprove(ctx, approval)) throw approvalManaged(approval);
+    if (decision === 'approve') {
+      if (!agentMayApprove(ctx, approval)) throw approvalManaged(approval);
+      const judged = judgeApproval(approval, { cloneRoot: approval.detail.cloneRoot ?? null });
+      if (judged.verdict === 'decline') throw approvalRefusedByRule(approval, judged);
+    }
     const by = `agent:${lead.agentId}`;
     const decided = settle(ctx, approval, decision === 'approve' ? 'approved' : 'declined', by);
     if (!decided) throw conflict(`approval ${id} is ${approval.status}`);
@@ -420,7 +486,7 @@ export function listLeadApprovals(ctx: HubContext, lead: AnsweringLead): LeadApp
     .all({ attemptId: lead.attemptId, agentId: lead.agentId }) as ApprovalRow[];
   return rows.map((row) => {
     const approval = rowToApproval(row);
-    return { ...approval, leadMayApprove: leadMayApprove(ctx, approval) };
+    return { ...approval, leadMayApprove: agentMayApprove(ctx, approval) };
   });
 }
 

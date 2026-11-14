@@ -147,6 +147,12 @@ export interface HubConfig extends HubRunnerSettings {
    * no managed device policy. Off by default: only the owner answers, in a browser.
    */
   leadApprovals?: boolean | undefined;
+  /**
+   * AGFLOW_AUTO_APPROVALS: the hub answers an approval request by rule the moment it stores it (approval-policy.ts),
+   * approving and declining what the rules recognise and leaving the rest to the lead or the owner. Off by default.
+   * Whatever it is, the rules are the floor under AGFLOW_LEAD_APPROVALS: no agent approves what they decline.
+   */
+  autoApprovals?: boolean | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */
