@@ -469,7 +469,7 @@ class Model {
       config: () => life.config,
       saveConfig: (config) => this.save(life, config),
       outbox: life.outbox,
-      vault: {} as Vault,
+      vault: () => ({}) as Vault,
       local: {} as GitEnvironment,
       remote: unused as unknown as () => Promise<GitEnvironment>,
       wipRefPrefix: () => 'refs/agflow/',

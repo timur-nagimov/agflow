@@ -110,19 +110,28 @@ export function markRestored(
 ): void {
   db.transaction(() => {
     db.query('UPDATE project SET epoch = $epoch WHERE id = 1').run({ epoch: input.epoch });
-    const advance = db.query('UPDATE counters SET value = value + $by WHERE name = $name');
-    for (const name of ADVANCED_COUNTERS) advance.run({ by: COUNTER_ADVANCE, name });
-    const own = lastIds(db);
-    const margin = input.replacedIds ? COUNTER_ADVANCE : UNKNOWN_IDS_ADVANCE;
-    for (const table of SEQUENCED_TABLES) {
-      const seq = Math.max(own[table], input.replacedIds?.[table] ?? 0) + margin;
-      db.query('DELETE FROM sqlite_sequence WHERE name = $table').run({ table });
-      db.query('INSERT INTO sqlite_sequence (name, seq) VALUES ($table, $seq)').run({ table, seq });
-    }
+    advanceIds(db, input.replacedIds);
     db.run('UPDATE tasks SET branch_head = NULL');
     db.query('UPDATE hub_state SET restored_at = $now WHERE id = 1').run({ now: input.now });
     insertEvent(db, input.now, { type: 'system.restored', actor: 'system', data: { epoch: input.epoch } });
   })();
+}
+
+/**
+ * The id counters advanced by COUNTER_ADVANCE, and the event and message ids moved past the newest of this database
+ * and of replacedIds: by COUNTER_ADVANCE, or by UNKNOWN_IDS_ADVANCE when those are unknown (null). A project reset
+ * (reset.ts) replaces no database, so it passes none newer than this one's.
+ */
+export function advanceIds(db: Database, replacedIds: LastIds | null | undefined): void {
+  const advance = db.query('UPDATE counters SET value = value + $by WHERE name = $name');
+  for (const name of ADVANCED_COUNTERS) advance.run({ by: COUNTER_ADVANCE, name });
+  const own = lastIds(db);
+  const margin = replacedIds ? COUNTER_ADVANCE : UNKNOWN_IDS_ADVANCE;
+  for (const table of SEQUENCED_TABLES) {
+    const seq = Math.max(own[table], replacedIds?.[table] ?? 0) + margin;
+    db.query('DELETE FROM sqlite_sequence WHERE name = $table').run({ table });
+    db.query('INSERT INTO sqlite_sequence (name, seq) VALUES ($table, $seq)').run({ table, seq });
+  }
 }
 
 /**

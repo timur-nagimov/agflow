@@ -71,7 +71,8 @@ export interface CommandExecutorOptions {
   /** Writes runner.json and makes config() give the new settings. */
   saveConfig(config: RunnerConfig): void;
   outbox: Outbox;
-  vault: Vault;
+  /** The project's vault, which a welcome that names another project replaces. */
+  vault(): Vault;
   local: GitEnvironment;
   /** The remote environment of the vault's pushes. */
   remote(): Promise<GitEnvironment>;
@@ -434,7 +435,8 @@ export class CommandExecutor {
     command: RunnerCommand,
     execution: Execution,
   ): Promise<CommandResult | Waits | null> {
-    const { vault, outbox } = this.options;
+    const { outbox } = this.options;
+    const vault = this.options.vault();
     switch (command.kind) {
       case 'refresh_vault':
         // Report the fetched heads so fetch_submission can verify the submitted commit before review.

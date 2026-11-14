@@ -1,13 +1,23 @@
-// The operator's routes: the few people's controls an operator script needs to run a project without a browser. They
-// exist only when AGFLOW_OPERATOR_TOKEN is set, and that token lives only in the hub's server environment, never on a
-// laptop where agents run: a person's CLI token, which runners hold, still cannot do any of this.
+// The operator's routes: the few people's controls an operator script, or agflow start, needs to run a project without
+// a browser. They exist only when AGFLOW_OPERATOR_TOKEN is set. The token stays on the server, or in the owner's
+// Keychain for agflow start, apart from the CLI login: a person's CLI token, which runners hold, still cannot do any of
+// this.
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { MarkMergedInputSchema, NoteInputSchema, SendMessageInputSchema, UpdateGoalInputSchema } from '@agflow/core';
+import {
+  MarkMergedInputSchema,
+  NoteInputSchema,
+  type OperatorProject,
+  ProjectResetInputSchema,
+  SendMessageInputSchema,
+  UpdateGoalInputSchema,
+} from '@agflow/core';
 import type { Context } from 'hono';
 import type { HubContext } from '../context';
 import { unauthorized } from '../errors';
 import { updateGoal } from '../goal';
 import { sendMessage } from '../messages';
+import { getProject } from '../project';
+import { resetProject } from '../reset';
 import { markMerged, unblockTask } from '../tasks';
 import type { App, AppEnv } from './app';
 import { readBody } from './util';
@@ -58,5 +68,20 @@ export function mountOperatorRoutes(app: App, ctx: HubContext): void {
       standingRule: input.standingRule,
     });
     return c.json({ message }, 201);
+  });
+
+  // agflow start reads the main branch before it seeds the repository: attempts start from that branch only.
+  app.get('/api/operator/project', (c) => {
+    operator(c);
+    const answer: OperatorProject = { project: getProject(ctx), mainBranch: ctx.config.mainBranch };
+    return c.json(answer);
+  });
+
+  // A new project in place of the current one (agflow start): reset.ts says what goes and what stays.
+  app.post('/api/operator/project/reset', async (c) => {
+    const who = operator(c);
+    const input = await readBody(c, ProjectResetInputSchema);
+    const deadlineAt = input.deadline === null ? null : Date.parse(input.deadline);
+    return c.json(resetProject(ctx, { ...input, deadlineAt }, who));
   });
 }

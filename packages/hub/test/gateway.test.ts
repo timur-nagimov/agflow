@@ -62,6 +62,7 @@ describe('hello and welcome', () => {
       wipRefPrefix: 'refs/agflow/',
       stop: [],
       timings: { heartbeatMs: 10_000, deadLinkMs: 30_000, handoffMs: 120_000, wipGraceMs: ctx.config.wipGraceMs },
+      project: { name: 'demo', repo: 'https://github.com/acme/demo' },
     });
     expect(HubMessageSchema.parse(runner.welcome)).toEqual(runner.welcome as HubMessage);
     expect(gateway.connectionOf('R-1')).toBe(runner.transport?.connection ?? null);

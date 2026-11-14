@@ -32,6 +32,12 @@ export const PrepConfigSchema = z.strictObject({
       scripts: z.boolean().default(false),
     }),
   ),
+  // A shell command, run with /bin/sh -c in the clone at each submission; absent means no check.
+  check: z
+    .string()
+    .min(1)
+    .refine((command) => !command.includes('\0'), { error: 'the check must not contain NUL' })
+    .optional(),
 });
 
 export type PrepConfig = z.output<typeof PrepConfigSchema>;

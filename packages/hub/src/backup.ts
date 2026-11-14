@@ -39,8 +39,19 @@ export function backupDatabase(ctx: HubContext, dir: string, kind: BackupKind): 
   const started = performance.now();
   mkdirSync(dir, { recursive: true });
   const file = join(dir, snapshotName(kind, ctx.now()));
-  // The snapshot only gets its name once complete. A leftover from an interrupted backup would make VACUUM INTO fail.
-  const tmp = join(dir, `agflow-${kind}.tmp`);
+  vacuumInto(ctx, join(dir, `agflow-${kind}.tmp`), file);
+  const snapshots = readdirSync(dir)
+    .filter((name) => SNAPSHOT[kind].test(name))
+    .sort();
+  for (const name of snapshots.slice(0, Math.max(0, snapshots.length - KEEP[kind]))) rmSync(join(dir, name));
+  return { file, durationMs: Math.round(performance.now() - started) };
+}
+
+/**
+ * A consistent copy of the database with VACUUM INTO. The copy only gets its name once complete; a leftover from an
+ * interrupted copy would make VACUUM INTO fail, so it goes first.
+ */
+function vacuumInto(ctx: HubContext, tmp: string, file: string): void {
   rmSync(tmp, { force: true });
   try {
     ctx.db.query('VACUUM INTO $file').run({ file: tmp });
@@ -49,11 +60,19 @@ export function backupDatabase(ctx: HubContext, dir: string, kind: BackupKind): 
     rmSync(tmp, { force: true });
     throw error;
   }
-  const snapshots = readdirSync(dir)
-    .filter((name) => SNAPSHOT[kind].test(name))
-    .sort();
-  for (const name of snapshots.slice(0, Math.max(0, snapshots.length - KEEP[kind]))) rmSync(join(dir, name));
-  return { file, durationMs: Math.round(performance.now() - started) };
+}
+
+/**
+ * Before a project reset: a copy of the whole database at agflow-archive-<project>-<time>.db, named after the project
+ * it holds. Archives are never pruned. Returns the file.
+ */
+export function archiveDatabase(ctx: HubContext, dir: string, project: string): string {
+  mkdirSync(dir, { recursive: true });
+  const slug = project.replace(/[^A-Za-z0-9_-]+/g, '-').slice(0, 60).replace(/^-+|-+$/g, '') || 'project';
+  const time = new Date(ctx.now()).toISOString().replace(/[:.]/g, '-');
+  const file = join(dir, `agflow-archive-${slug}-${time}.db`);
+  vacuumInto(ctx, join(dir, 'agflow-archive.tmp'), file);
+  return file;
 }
 
 /** Writes a snapshot and logs where and how long it took; a failure is logged, and the hub goes on. */
