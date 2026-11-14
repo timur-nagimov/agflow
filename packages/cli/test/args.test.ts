@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { UsageError, choiceFlag, parseArgs, stringFlag } from '../src/args';
+import { UsageError, choiceFlag, listFlag, parseArgs, stringFlag } from '../src/args';
 
 describe('parseArgs', () => {
   test('splits positionals and flags', () => {
@@ -11,6 +11,15 @@ describe('parseArgs', () => {
 
   test('a flag followed by another flag is boolean', () => {
     expect(parseArgs(['--dry-run', '--hub', 'http://x']).flags).toEqual({ 'dry-run': true, hub: 'http://x' });
+  });
+
+  test('a flag given more than once keeps every value; stringFlag reads the last', () => {
+    const args = parseArgs(['start', '--spec', 'a.md', '--spec=b.pdf', '--spec', 'https://x/c', '--repo', 'o/r']);
+    expect(args.flags).toEqual({ spec: ['a.md', 'b.pdf', 'https://x/c'], repo: 'o/r' });
+    expect(listFlag(args, 'spec')).toEqual(['a.md', 'b.pdf', 'https://x/c']);
+    expect(listFlag(args, 'repo')).toEqual(['o/r']);
+    expect(listFlag(args, 'collaborator')).toEqual([]);
+    expect(stringFlag(args, 'spec')).toBe('https://x/c');
   });
 });
 

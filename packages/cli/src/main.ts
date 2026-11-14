@@ -6,7 +6,9 @@ import { type Io, stdio } from './io';
 import { joinCommand, leaveCommand } from './join';
 import { loginCommand, logoutCommand, statusCommand } from './login';
 import { mcpCommand } from './mcp/server';
+import { OPERATOR_TOKEN_HELP, operatorTokenCommand } from './operator-token';
 import { RUNNER_HELP, runnerCommand } from './runner-command';
+import { START_HELP, startCommand } from './start';
 
 export const HELP = `agflow ${AGFLOW_VERSION}
 
@@ -20,6 +22,8 @@ Usage:
 
 Runners:
 ${RUNNER_HELP}
+Projects:
+${START_HELP}${OPERATOR_TOKEN_HELP}
 Run by Claude Code and Codex, not by people:
   agflow mcp --vendor claude|codex
   agflow mcp --vendor claude|codex --runner
@@ -38,6 +42,8 @@ const commands: Record<string, Command> = {
   hook: hookCommand,
   mcp: mcpCommand,
   runner: runnerCommand,
+  start: (args, io) => startCommand(args, io),
+  'operator-token': (args, io) => operatorTokenCommand(args, io),
 };
 
 export async function main(argv: string[], io: Io = stdio): Promise<number> {
