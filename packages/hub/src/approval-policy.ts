@@ -514,7 +514,8 @@ function readWord(src: string, from: number): { word: Word; at: number } {
  */
 function expands(text: string, marks: string): boolean {
   const open = (at: number): boolean => marks[at] === 'u';
-  // Brace lists, by their outermost pair.
+  // Brace lists, by their outermost pair. A "{" nothing closes is a plain character, and the shell looks on for the
+  // next one: {/{..,..} expands its second pair.
   for (let at = 0; at < text.length; at += 1) {
     if (text[at] !== '{' || !open(at)) continue;
     let depth = 0;
@@ -530,7 +531,7 @@ function expands(text: string, marks: string): boolean {
         }
       }
     }
-    if (close < 0) break;
+    if (close < 0) continue;
     const inner = text.slice(at + 1, close);
     const commas = [...inner].flatMap((char, index) => (char === ',' && open(at + 1 + index) ? [index] : []));
     const sequence = /^(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?$/.test(inner);

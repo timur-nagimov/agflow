@@ -1570,6 +1570,9 @@ describe('the second review: what the shell makes of a word before a program see
       ['tee -a {..,..}/{..,..}/{..,..}/.zshrc', 'undecided', 'unknown-path'],
       ['tee -a .{,.}/.{,.}/.{,.}/.zshrc', 'undecided', 'unknown-path'],
       ['tee -a ..{,}/..{,}/..{,}/.zshrc', 'undecided', 'unknown-path'],
+      // A "{" nothing closes is passed over, and the pair after it still expands.
+      ['tee -a {/{..,..}/{..,..}/{..,..}/{..,..}/.zshrc', 'undecided', 'unknown-path'],
+      ['tee -a x{y{..,..}/.zshrc', 'undecided', 'unknown-path'],
       ['tee -a .?/.?/.?/.zshrc', 'undecided', 'unknown-path'],
       ['tee -a .*/.*/.*/.zshrc', 'undecided', 'unknown-path'],
       ['tee -a .[.]/.[.]/.[.]/.zshrc', 'undecided', 'unknown-path'],
