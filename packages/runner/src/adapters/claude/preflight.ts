@@ -1,9 +1,9 @@
-// Claude's preflight (design 8.1, 6.1, 6.10, 7.6, 15.1, X-5, X-29): the pin's platform and binary, on Linux what its
-// sandbox (bubblewrap) needs, then a zero-model handshake whose only input is the local /clear command, run with the
-// full session options in a scratch clone and base checkout, with a bridge whose hub URL refuses connections. On the
-// same query it reads the account, the untyped getSettings() and the experimental usage call. It fails closed and
-// gives facts only, with the quota and the weakened items; the runtime adds models, ceilings, allowPaidUsage,
-// preflightAt and degraded.
+// Claude's preflight (design 8.1, 6.1, 6.10, 7.6, 15.1, X-5, X-29): the pin's platform and binary, a runner.env token
+// the API refused, on Linux what its sandbox (bubblewrap) needs, then a zero-model handshake whose only input is the
+// local /clear command, run with the full session options in a scratch clone and base checkout, with a bridge whose
+// hub URL refuses connections. On the same query it reads the account, the untyped getSettings() and the experimental
+// usage call. It fails closed and gives facts only, with the quota and the weakened items; the runtime adds models,
+// ceilings, allowPaidUsage, preflightAt and degraded.
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,7 +18,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { bridgeOf } from '../../attempt/launch';
 import type { RunnerConfig } from '../../config';
-import { buildAgentEnv } from '../../env';
+import { buildAgentEnv, readRunnerEnvFile } from '../../env';
 import { makeAttemptTmpDir, type RunnerPaths } from '../../paths';
 import { boundedWait } from '../../processes';
 import { profileOf } from '../../profile';
@@ -38,6 +38,11 @@ export const CLAUDE_WEAKENED_AUTO = 'auto';
 
 /** The weakened item of a pin whose sandbox does not enforce the denyWrite of the shared /tmp/claude (8.1, X-29). */
 export const CLAUDE_WEAKENED_TMP = '/tmp/claude';
+
+/** The problem of a runner.env token the API refused: only a new token makes Claude ready again. */
+export const CLAUDE_TOKEN_REFUSED =
+  'the API refused the Claude token in runner.env: make a new one with claude setup-token on your Mac, ' +
+  'then paste it into agflow runner setup --relogin';
 
 /**
  * The hub URL of the handshake's bridge: nothing listens on the discard port, so the connection is refused at once
@@ -75,6 +80,8 @@ export interface ClaudePreflightInput {
   tmpClaudeDenyWriteEnforced?: boolean;
   /** Linux only: the sysctl file linuxSandboxProblem reads, USERNS_SYSCTL by default. */
   usernsSysctl?: string;
+  /** A runner.env token the API refused in a session: not ready (CLAUDE_TOKEN_REFUSED) while runner.env holds it. */
+  refusedToken?: string | null;
   /** The runner's environment, for buildAgentEnv's user variables and test mode; process.env by default. */
   env?: Record<string, string | undefined>;
   now?: () => number;
@@ -116,6 +123,10 @@ export async function claudePreflight(input: ClaudePreflightInput): Promise<Clau
     env: { PATH: input.config.capturedPath },
   });
   if (!version.ok) return notReady(version.problem, version.version);
+  // The handshake makes no model call, so it would pass with a token the API refuses.
+  if (input.refusedToken && readRunnerEnvFile(input.paths).CLAUDE_CODE_OAUTH_TOKEN === input.refusedToken) {
+    return notReady(CLAUDE_TOKEN_REFUSED, pin.version);
+  }
   if (input.platform.startsWith('linux-')) {
     const problem = linuxSandboxProblem(input.config.capturedPath, { usernsSysctl: input.usernsSysctl });
     if (problem !== null) return notReady(problem, pin.version);

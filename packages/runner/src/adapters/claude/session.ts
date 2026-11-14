@@ -39,6 +39,8 @@ export interface ClaudeSessionInput {
   quota?: QuotaBook;
   /** The first-turn check (8.1): the problems of the session's first system/init, none when it matches. */
   checkInit?(init: SDKSystemMessage): string[];
+  /** Told when a turn ends because the API refused the login (errorKind auth). */
+  onAuthError?(): void;
 }
 
 /** The session's first system/init and what the first-turn check found in it. */
@@ -59,6 +61,7 @@ export class ClaudeSession implements AgentSession {
   private readonly mapper: ClaudeEventMapper;
   private readonly query: Query;
   private readonly checkInit: (init: SDKSystemMessage) => string[];
+  private readonly onAuthError: () => void;
   private readonly exit = Promise.withResolvers<ExitInfo>();
   private readonly first = Promise.withResolvers<FirstInit | null>();
   private proc: SpawnedClaude | null = null;
@@ -77,6 +80,7 @@ export class ClaudeSession implements AgentSession {
   constructor(input: ClaudeSessionInput) {
     this.mapper = new ClaudeEventMapper({ accountId: input.accountId ?? null, quota: input.quota });
     this.checkInit = input.checkInit ?? (() => []);
+    this.onAuthError = input.onAuthError ?? (() => {});
     this.events = this.queue;
     this.exited = this.exit.promise;
     this.firstInit = this.first.promise;
@@ -179,6 +183,7 @@ export class ClaudeSession implements AgentSession {
   private emit(event: AgentEvent): void {
     if (this.queue.ended) return;
     if (event.type === 'turn_started') this.firstTurnPending = false;
+    if (event.type === 'turn_ended' && event.errorKind === 'auth') this.onAuthError();
     this.queue.push(event);
   }
 

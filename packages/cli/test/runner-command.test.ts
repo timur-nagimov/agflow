@@ -621,6 +621,8 @@ test('on Linux stop disables an installed systemd unit and restart restarts it',
   const deps = { env: {}, exec, home, platform: 'linux' as const };
   expect(await runnerCommand(parseArgs(['runner', 'stop']), io, deps)).toBe(0);
   expect(out.join('')).toContain('no runner was running; the systemd unit was stopped and disabled');
+  // Not the foreground start, which ends with the SSH session.
+  expect(out.join('')).toContain('\nrun agflow runner install to bring it back\n');
   expect(await runnerCommand(parseArgs(['runner', 'restart']), io, deps)).toBe(0);
   expect(out.join('')).toContain('the runner restarted under systemd');
   expect(exec.calls.map((call) => call.argv)).toEqual([

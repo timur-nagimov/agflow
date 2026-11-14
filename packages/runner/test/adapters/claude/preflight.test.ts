@@ -33,6 +33,7 @@ import { claudeAccountId } from '../../../src/adapters/claude/checks';
 import { claudeBinary, claudeEmptyDir } from '../../../src/adapters/claude/options';
 import { CLAUDE_CLI_VERSION } from '../../../src/adapters/claude/pin';
 import {
+  CLAUDE_TOKEN_REFUSED,
   CLAUDE_WEAKENED_AUTO,
   CLAUDE_WEAKENED_TMP,
   claudePreflight,
@@ -484,6 +485,32 @@ describe('preflight: the auto profile and weakened items', () => {
         }
         expect(found).toEqual({ type: 'quota', accountId, quota });
       }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    'a session the API refused with the token of runner.env keeps Claude not ready until runner.env holds another',
+    async () => {
+      const fixture = setup(loadRecording('preflight-ok'));
+      const adapter = fixture.adapter();
+      const token = 'sk-ant-oat01-refused';
+      writeFileSync(fixture.paths.envFile, `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+      const launch = turnLaunch(fixture, { recording: 'auth-expired', profile: standardProfile });
+      const session = await adapter.start({ ...launch, env: { ...launch.env, CLAUDE_CODE_OAUTH_TOKEN: token } });
+      sessions.push(session);
+      let ended: AgentEvent | null = null;
+      for await (const event of session.events) {
+        ended = event;
+        if (event.type === 'turn_ended') break;
+      }
+      expect(ended).toMatchObject({ type: 'turn_ended', outcome: 'failed', errorKind: 'auth' });
+      // The handshake makes no model call, so it would pass: none runs.
+      const refused = await adapter.preflight();
+      expect(refused.facts).toMatchObject({ ready: false, problem: CLAUDE_TOKEN_REFUSED });
+      expect(await argvs(fixture.log)).toEqual([]);
+      writeFileSync(fixture.paths.envFile, 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-new\n');
+      expect((await adapter.preflight()).facts).toMatchObject({ ready: true, problem: null });
     },
     TIMEOUT,
   );

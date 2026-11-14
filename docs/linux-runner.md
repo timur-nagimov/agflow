@@ -63,14 +63,15 @@ so:
 
 - **Codex** signs in with a device code. Setup runs `codex login --device-auth` in the runner's own Codex home: open
   the link it shows on your Mac and enter the code.
-- **Claude** signs in with a token made on your Mac. Run `claude setup-token` there and copy the token it prints. On
-  the VM, run the command setup printed and paste the token: it saves it as `CLAUDE_CODE_OAUTH_TOKEN` in
-  `~/.agflow/runner/runner.env`, readable by you alone. Setup then stops, as it has no Claude login yet.
+- **Claude** signs in with a token made on your Mac. Run `claude setup-token` there and copy the token it prints.
+  Setup asks for it on the VM: paste it, then press Enter on an empty line. The screen shows none of it. A terminal
+  may break the long token over two lines, and a copy keeps the break, so setup joins the lines. It checks that the
+  token starts as such a token does, `sk-ant-oat`, and saves it as `CLAUDE_CODE_OAUTH_TOKEN` in
+  `~/.agflow/runner/runner.env`, readable by you alone. `--yes` asks for nothing, so with it setup stops here.
 
-Run setup again. It finds both logins, installs and starts the service, and runs the checks inside it:
+Setup then installs and starts the service and runs the checks inside it. See how the runner is doing with:
 
 ```bash
-agflow runner setup
 agflow runner status
 ```
 
@@ -87,15 +88,19 @@ The service is a systemd user unit, `~/.config/systemd/user/agflow-runner.servic
 | `agflow runner uninstall` | Stop, log out, retire the runner on the hub and remove the unit. |
 
 The unit restarts the runner 30 seconds after a crash. A clean exit, a stop or a refusal that needs a person, does not
-restart it: the same rule as the LaunchAgent on a Mac. `systemctl --user status agflow-runner` shows its state. The
+restart it: the same rule as the LaunchAgent on a Mac. When memory runs out and the kernel kills a process, an agent's
+build say, the runner and the other agents go on. `systemctl --user status agflow-runner` shows its state. The
 runner's own log is `~/.agflow/runner/logs/runner.log`; what it prints before that log opens goes to `launchd.out.log`
 and `launchd.err.log` beside it, the same files as on a Mac.
 
-To upgrade, replace the binary and install again:
+To upgrade, download the new binary beside the old one, move it over the old one and install again. The running
+service holds the old file, so a download straight into it fails with "Text file busy":
 
 ```bash
-sudo curl --fail --location --output /usr/local/bin/agflow \
+sudo curl --fail --location --output /usr/local/bin/agflow.new \
   https://github.com/timur-nagimov/agflow/releases/latest/download/agflow-linux-x64
+sudo chmod 755 /usr/local/bin/agflow.new
+sudo mv /usr/local/bin/agflow.new /usr/local/bin/agflow
 agflow runner install
 ```
 
@@ -114,8 +119,9 @@ agflow runner install
 - **Logins.** Nothing reads a Keychain. Codex keeps its login in the runner's Codex home, Claude's is the token in
   `runner.env`. The token names no plan, so the hub shows the Claude plan as unknown. Neither does it name the account,
   so the runner reports a hash of the token as the account: the hub counts this runner's Claude quota apart from the
-  Macs', though the subscription is the same. A token lasts a year; for a new one, replace the line in `runner.env`.
-  The next Claude start uses it, with no restart.
+  Macs', though the subscription is the same. A token lasts a year. Once the API refuses it, the runner's Claude stays
+  not ready, and the hub's Runners card says why, until `runner.env` holds another token: make a new one and paste it
+  into `agflow runner setup --relogin`, which signs Codex in again too and restarts the service.
 - **Service.** A systemd user unit with lingering instead of a LaunchAgent; there are no Login Items to allow.
 - **Machine id.** The runner is bound to `/etc/machine-id` instead of the Mac's hardware id. A copy of `~/.agflow` on
   another machine is refused, as on a Mac.

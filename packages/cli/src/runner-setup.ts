@@ -1,7 +1,8 @@
 // Runner setup (design 7.1): verify sign-in before writes, then reuse the runner's config, pins, logins and service.
-import { chmodSync, existsSync } from 'node:fs';
+import { chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface, type Interface } from 'node:readline/promises';
+import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { editLocalSettings, loadRunnerConfig, type RunnerConfig, saveRunnerConfig } from '@agflow/runner/src/config';
 import { agflowHome, type RunnerPaths, runnerPaths } from '@agflow/runner/src/paths';
@@ -28,7 +29,7 @@ import { loadCredentials } from './credentials';
 import { type FetchFn, HubClient, HubClientError } from './hub-client';
 import type { Io } from './io';
 import { configDir } from './paths';
-import { type SelfCommand, selfCommand, shellQuote } from './self';
+import { type SelfCommand, selfCommand } from './self';
 
 export interface Prompt {
   ask(question: string, fallback: string): Promise<string>;
@@ -52,6 +53,32 @@ export function terminalPrompt(): Prompt & { close(): void } {
   };
 }
 
+/**
+ * Reads a secret without showing it: the lines up to an empty one or the end of the input, joined. A terminal wraps a
+ * long token over lines, and a copy of it keeps the breaks.
+ */
+export async function readSecret(
+  question: string,
+  input: NodeJS.ReadableStream & { isTTY?: boolean } = process.stdin,
+  output: NodeJS.WritableStream = process.stderr,
+): Promise<string> {
+  output.write(question);
+  // The reader shows what is typed on its own output, which goes nowhere.
+  const nowhere = new Writable({ write: (_chunk, _encoding, done) => done() });
+  const reader = createInterface({ input, output: nowhere, terminal: input.isTTY === true });
+  const lines: string[] = [];
+  try {
+    for await (const line of reader) {
+      if (line.trim() === '') break;
+      lines.push(line);
+    }
+  } finally {
+    reader.close();
+  }
+  output.write('\n');
+  return lines.join('\n');
+}
+
 export interface RunnerSetupDeps {
   dir: string;
   paths: RunnerPaths;
@@ -59,6 +86,8 @@ export interface RunnerSetupDeps {
   fetch: FetchFn;
   exec: Exec;
   prompt: Prompt;
+  /** Reads the Claude token on Linux; readSecret by default. */
+  secret: (question: string) => Promise<string>;
   pins: PlatformPins;
   /** The vendor platform key, including for login verification. */
   platform: string;
@@ -135,18 +164,37 @@ async function configure(
   }
 }
 
+/** How every token of `claude setup-token` starts. */
+export const CLAUDE_TOKEN_PREFIX = 'sk-ant-oat';
+
 /**
- * What the owner does on a machine with no browser (Linux) that has no Claude login: makes a token with `claude
- * setup-token` on a Mac, then puts it in the runner's environment file, readable by its owner alone.
+ * What the owner does on a machine with no browser (Linux) for a Claude login: makes a token with `claude setup-token`
+ * on a Mac, then pastes it into setup, which --yes keeps from asking.
  */
-export function claudeTokenSteps(paths: Pick<RunnerPaths, 'envFile'>, reason: string): string[] {
-  const save = `printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' "$t" > ${shellQuote(paths.envFile)}`;
+export function claudeTokenSteps(reason: string, ask: boolean): string[] {
   return [
     `claude: ${reason}; this machine has no browser, so Claude signs in with a token made on your Mac:`,
     '  1. on your Mac run: claude setup-token',
-    '  2. here run this and paste the token when it asks:',
-    `     (umask 077; read -rs -p 'Token: ' t; echo; ${save})`,
+    ask
+      ? '  2. paste the token here, then press Enter on an empty line'
+      : '  2. run agflow runner setup here without --yes, and paste the token when it asks',
   ];
+}
+
+/**
+ * Saves a pasted token of `claude setup-token` as CLAUDE_CODE_OAUTH_TOKEN in the runner's environment file, readable by
+ * its owner alone. All whitespace goes, which joins the lines of a wrapped token; the rest must start as such a token.
+ */
+export function saveClaudeToken(paths: Pick<RunnerPaths, 'envFile'>, pasted: string): void {
+  const token = pasted.replace(/\s+/g, '');
+  if (!token.startsWith(CLAUDE_TOKEN_PREFIX)) {
+    throw new Error(
+      `that is not a token of claude setup-token, which starts with ${CLAUDE_TOKEN_PREFIX}; ` +
+        'run agflow runner setup again and paste the whole token',
+    );
+  }
+  writeFileSync(paths.envFile, `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`, { mode: 0o600 });
+  chmodSync(paths.envFile, 0o600);
 }
 
 async function serviceChecks(paths: RunnerPaths, socketTimeoutMs: number, checksTimeoutMs: number, pollMs: number) {
@@ -216,17 +264,25 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
   await ensurePinnedVendors(paths, pinOptions);
   // The Claude token's file holds a secret: only its owner reads it.
   if (existsSync(paths.envFile)) chmodSync(paths.envFile, 0o600);
+  const ask = args.flags.yes !== true;
   let claudeToken = false;
   for (const vendor of ['claude', 'codex'] as const) {
     const options = { version: pins?.[vendor].version, platform, exec, base: env, deviceAuth: linux };
     const status = await (vendor === 'claude' ? claudeLoginStatus : codexLoginStatus)(config, paths, options);
-    // On Linux Claude signs in with a token made on a Mac, which setup can neither make nor make again.
+    // On Linux Claude signs in with a token made on a Mac, which setup asks for; --yes asks for nothing.
     const token = linux && vendor === 'claude';
-    if (token && !status.ok) {
-      claudeToken = true;
-      for (const line of claudeTokenSteps(paths, status.reason)) log(line);
-    } else if (status.ok && (args.flags.relogin !== true || token)) {
+    if (status.ok && (args.flags.relogin !== true || (token && !ask))) {
       log(`${vendor}: signed in${status.plan ? ` (${status.plan})` : ''}`);
+    } else if (token) {
+      for (const line of claudeTokenSteps(status.ok ? '--relogin asks for a new token' : status.reason, ask)) log(line);
+      if (ask) {
+        saveClaudeToken(paths, await (deps.secret ?? readSecret)('Token: '));
+        const saved = await claudeLoginStatus(config, paths, options);
+        if (!saved.ok) throw new Error(`claude: ${saved.reason}`);
+        log('claude: signed in');
+      } else {
+        claudeToken = true;
+      }
     } else {
       log(
         linux
@@ -236,10 +292,7 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
       await (vendor === 'claude' ? loginClaude : loginCodex)(config, paths, options);
     }
   }
-  if (claudeToken) {
-    log('run agflow runner setup again once the token is in place');
-    return 1;
-  }
+  if (claudeToken) return 1;
   if (args.flags['no-service'] === true) {
     log('setup is done; run agflow runner start');
     return 0;

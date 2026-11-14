@@ -72,7 +72,7 @@ describe('the systemd unit', () => {
     expect(unitPath()).toBe(join(homedir(), '.config/systemd/user/agflow-runner.service'));
   });
 
-  test('runs the service, restarts it only after a crash, and quotes what systemd would expand', () => {
+  test('runs the service, restarts it after a crash only, outlives an out-of-memory kill, quotes for systemd', () => {
     const text = renderUnit({
       execStart: ['/opt/agflow', 'runner', 'start', '--service'],
       environment: { Z: '100%', A: 'first', QUOTED: 'a "b" \\c', HOME_VAR: '$HOME' },
@@ -94,6 +94,7 @@ describe('the systemd unit', () => {
         'RestartSec=30',
         'KillMode=mixed',
         'TimeoutStopSec=60',
+        'OOMPolicy=continue',
         'LimitNOFILE=65536',
         'StandardOutput=append:/h/logs/launchd.out.log',
         'StandardError=append:/h/logs/launchd.err.log',

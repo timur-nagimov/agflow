@@ -83,6 +83,9 @@ export function renderUnit(input: UnitInput): string {
     // SIGTERM goes to the runner alone, which suspends its agents; whatever is left is killed once it has exited.
     'KillMode=mixed',
     'TimeoutStopSec=60',
+    // When the kernel runs out of memory and kills one process, an agent's build say, the runner and the other agents
+    // go on, as on a Mac; systemd's default would stop the whole unit.
+    'OOMPolicy=continue',
     'LimitNOFILE=65536',
     `StandardOutput=append:${plainValue(input.stdout)}`,
     `StandardError=append:${plainValue(input.stderr)}`,

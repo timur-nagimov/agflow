@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, setDefaultTimeout, test } from 'bun:test
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { PassThrough, Writable } from 'node:stream';
 import { loadRunnerConfig, saveRunnerConfig } from '@agflow/runner/src/config';
 import { runnerPaths } from '@agflow/runner/src/paths';
 import { startControlServer } from '@agflow/runner/src/service/control';
@@ -26,7 +27,7 @@ import { parseArgs } from '../src/args';
 import { deleteCredentials, saveCredentials } from '../src/credentials';
 import { HubClient } from '../src/hub-client';
 import { runnerCommand } from '../src/runner-command';
-import { type Prompt, runnerSetup, type RunnerSetupDeps } from '../src/runner-setup';
+import { type Prompt, readSecret, runnerSetup, type RunnerSetupDeps } from '../src/runner-setup';
 import { shellQuote } from '../src/self';
 
 setDefaultTimeout(60_000);
@@ -366,9 +367,10 @@ test('on Linux Codex signs in with a device code, Claude with a token from the M
   const first = f.out.join('');
   expect(first).toContain('claude: not logged in to Claude; this machine has no browser');
   expect(first).toContain('on your Mac run: claude setup-token');
-  expect(first).toContain(`printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\\n' "$t" > ${f.paths.envFile})`);
+  // --yes asks for nothing, the token included.
+  expect(first).toContain('run agflow runner setup here without --yes, and paste the token when it asks');
   expect(first).toContain('codex: sign in with the code below');
-  expect(first).toContain('run agflow runner setup again once the token is in place');
+  expect(existsSync(f.paths.envFile)).toBe(false);
   expect(f.logins().map((call) => call.argv.join(' '))).toEqual(['login --device-auth']);
   expect(f.calls.filter((call) => call.options?.interactive)).toHaveLength(1);
   expect(f.calls.some((call) => ['systemctl', 'loginctl', 'launchctl'].includes(call.argv[0]!))).toBe(false);
@@ -404,6 +406,56 @@ test('on Linux Codex signs in with a device code, Claude with a token from the M
   ).toEqual(checkNames);
   expect(second).toContain('ok sleep: a Linux runner does not sleep');
   expect(f.calls.some((call) => call.argv[0] === 'launchctl')).toBe(false);
+});
+
+test('on Linux setup asks for the Claude token, joins a wrapped paste, and refuses a paste of no token', async () => {
+  const f = await fixture({ linux: true });
+  const questions: string[] = [];
+  const paste = (text: string) => async (question: string) => {
+    questions.push(question);
+    return text;
+  };
+  // A terminal 80 columns wide breaks the token, and a copy of it keeps the break.
+  const token = `sk-ant-oat01-${'A'.repeat(67)}${'B'.repeat(28)}`;
+  const wrapped = `${token.slice(0, 80)}\n${token.slice(80)}\n`;
+  expect(await f.run(['--no-service'], { prompt: answers(), secret: paste(wrapped) })).toBe(0);
+  expect(questions).toEqual(['Token: ']);
+  expect(f.out.join('')).toContain('paste the token here, then press Enter on an empty line');
+  expect(f.out.join('')).toContain('claude: signed in\n');
+  expect(readFileSync(f.paths.envFile, 'utf8')).toBe(`CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+  expect(statSync(f.paths.envFile).mode & 0o777).toBe(0o600);
+  const status = f.vendorCalls().filter((call) => call.vendor === 'claude' && call.argv[0] === 'auth').at(-1)!;
+  expect(status.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(token);
+  expect(f.out.join('')).not.toContain(token.slice(13));
+
+  // A rerun keeps the token; --relogin asks for a new one, and a paste that is no such token leaves the old one.
+  await f.run(['--no-service'], { prompt: answers(), secret: paste('unused') });
+  expect(questions).toHaveLength(1);
+  await expect(
+    f.run(['--no-service', '--relogin'], { prompt: answers(), secret: paste('Your OAuth token (valid for 1 year)') }),
+  ).rejects.toThrow('that is not a token of claude setup-token, which starts with sk-ant-oat');
+  expect(questions).toHaveLength(2);
+  expect(readFileSync(f.paths.envFile, 'utf8')).toBe(`CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+});
+
+test('the token reader joins the lines up to an empty one or the end, and writes none of them', async () => {
+  for (const [text, read] of [
+    ['sk-ant-oat01-AAAA\nBBBB\n\nlater\n', 'sk-ant-oat01-AAAA\nBBBB'],
+    ['sk-ant-oat01-AAAA\r\nBBBB', 'sk-ant-oat01-AAAA\nBBBB'],
+    ['', ''],
+  ]) {
+    const input = new PassThrough();
+    input.end(text);
+    const written: string[] = [];
+    const output = new Writable({
+      write: (chunk, _encoding, done) => {
+        written.push(String(chunk));
+        done();
+      },
+    });
+    expect(await readSecret('Token: ', input, output)).toBe(read!);
+    expect(written.join('')).toBe('Token: \n');
+  }
 });
 
 test('test mode refuses service installation and explains the foreground flow', async () => {

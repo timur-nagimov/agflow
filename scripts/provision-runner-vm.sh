@@ -119,8 +119,8 @@ Next, on the VM (ssh $user@$ip), following docs/linux-runner.md:
   give git access to the project's repository (an SSH key or a token; see docs/linux-runner.md)
   agflow login --hub https://YOUR-HUB
   agflow runner setup
+    Claude: on your Mac run claude setup-token, and paste the token when setup asks for it.
     Codex: setup shows a link and a code; open the link in a browser on your Mac and enter the code.
-    Claude: on your Mac run claude setup-token, then run here the command setup prints and paste the token.
-  agflow runner setup      (again, once the token is saved: it installs and starts the systemd unit)
+    Setup then installs and starts the systemd unit.
   agflow runner status
 EOF

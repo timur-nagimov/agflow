@@ -6,7 +6,8 @@
 // A resume runs in the same clone with the same options (8.4). A session that never ran a turn has no conversation to
 // resume, so a fresh one takes its place without a resume being spawned, and any resume the CLI refuses fails the
 // start once the process is gone (7.4): one launch spawns one process. Preflight runs the zero-model handshake (8.1);
-// what it learns, the account and whether auto mode is offered, the later starts use.
+// what it learns, the account and whether auto mode is offered, the later starts use. A runner.env token the API
+// refused in a session keeps preflight not ready until runner.env holds another.
 import type { Vendor } from '@agflow/core';
 import type { RunnerConfig } from '../../config';
 import type { RunnerPaths } from '../../paths';
@@ -63,6 +64,11 @@ export class ClaudeAdapter implements VendorAdapter {
   protected autoOffered = false;
   /** The account the last preflight saw; the sessions' quota events name it. */
   protected accountId: string | null = null;
+  /**
+   * The token of runner.env (claude setup-token) the API refused in a session. Every session would fail the same way,
+   * so preflight is not ready while runner.env holds it, and the hub places no more work here. A restart forgets it.
+   */
+  protected refusedToken: string | null = null;
 
   constructor(protected readonly options: ClaudeAdapterOptions) {}
 
@@ -78,6 +84,7 @@ export class ClaudeAdapter implements VendorAdapter {
       skipAuthChecks: this.options.skipAuthChecks === true,
       env: this.options.env,
       timeoutMs: this.options.preflightTimeoutMs,
+      refusedToken: this.refusedToken,
     });
     this.autoOffered = autoOffered;
     this.accountId = result.facts.accountId;
@@ -162,6 +169,9 @@ export class ClaudeAdapter implements VendorAdapter {
       accountId: this.accountId,
       quota: this.quota,
       checkInit: (init) => checkSystemInit(init, expected),
+      onAuthError: () => {
+        if (launch.env.CLAUDE_CODE_OAUTH_TOKEN) this.refusedToken = launch.env.CLAUDE_CODE_OAUTH_TOKEN;
+      },
     });
   }
 

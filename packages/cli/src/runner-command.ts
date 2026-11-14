@@ -147,7 +147,8 @@ export async function runnerCommand(
             ? 'the installed LaunchAgent was not loaded and is now disabled'
             : 'no LaunchAgent was loaded';
       io.out(`${result.wasRunning ? 'the runner stopped' : 'no runner was running'}; ${service}\n`);
-      io.out('run agflow runner install or agflow runner start to bring it back\n');
+      // A foreground runner on a cloud machine ends with the SSH session that started it.
+      io.out(`run agflow runner install${linux ? '' : ' or agflow runner start'} to bring it back\n`);
       return 0;
     },
     restart: async (args, io) => {
