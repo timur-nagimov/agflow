@@ -13,7 +13,14 @@
 // - Descendants: every tool start, and every 5 s while a tool runs, snapshots the agent's descendants and records
 //   their groups, so a tool's group can be stopped even after its parent is gone.
 import { randomUUID } from 'node:crypto';
-import { type Approval, APPROVALS_ROUTE, type AttemptPhase, type AttemptSpec, type InjectedMessage } from '@agflow/core';
+import {
+  APPROVAL_CLIPPED_MARK,
+  type Approval,
+  APPROVALS_ROUTE,
+  type AttemptPhase,
+  type AttemptSpec,
+  type InjectedMessage,
+} from '@agflow/core';
 import type { AgentEvent, AgentSession, VendorAdapter } from '../adapters/types';
 import type { AttemptStore } from '../attempt-store';
 import type { Logger } from '../log';
@@ -34,7 +41,7 @@ export const APPROVAL_SUMMARY_MAX = 4_000;
  * outbox's 1 MB however the agent's text escapes. A manifest diff after an install easily passes 1 MB.
  */
 export const APPROVAL_DETAIL_FIELD_MAX_BYTES = 64 * 1024;
-const CLIPPED = '\n[clipped]';
+const CLIPPED = APPROVAL_CLIPPED_MARK;
 /**
  * The decline reason, and the activity note, of an approval request the outbox refused: nobody can decide it, so the
  * agent hears why instead of waiting for an answer that never comes.
