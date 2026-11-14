@@ -192,11 +192,28 @@ after a change. The rules behind the last two are in the
   off and restarting ends every grant, and the hub's journal names the tasks. An agent that was asked to stop
   fetches nothing more.
 - **`AGFLOW_LEAD_APPROVALS=1`.** Removes: the runner owner answering each Codex approval request in a browser. The
-  agent holding the lead seat may decline other agents' requests, with a reason, and approve them when the device's
-  Codex policy is not managed. A request nobody answered in time is then declined without marking the owner away. The
-  owner can still answer first. Risk: an approved command runs outside the sandbox, with network access and write
-  access to all the owner's files, on the lead's judgement instead of the owner's, and a lead can be misled by the
-  text of a request.
+  agent holding the lead seat may decline other agents' requests, with a reason, and approve them unless the device's
+  Codex policy reserves approvals to its owner or the hub's rules decline them. A request nobody answered in time is
+  then declined without marking the owner away. The owner can still answer first. Risk: an approved command runs
+  outside the sandbox, with network access and write access to all the owner's files, on the lead's judgement instead
+  of the owner's, and a lead can be misled by the text of a request.
+
+  A managed device policy no longer blocks this by itself. agflow reads what the policy regulates: one that restricts
+  who may answer approvals (`allowed_approvals_reviewers`, `allowed_approval_policies`), or one the runner could not
+  read, reserves approvals to the owner; one that restricts sandbox modes, remote control, computer use or an external
+  browser restricts those and says nothing about approvals. The Runners card shows both facts.
+- **`AGFLOW_AUTO_APPROVALS=1`.** Removes: anyone, person or agent, reading each request before it is answered. The hub
+  judges every approval request as it arrives, from the parsed shape of the command or the paths of the file change,
+  and answers at once. Approved: installing dependencies a manifest in the clone already declares, and ordinary build,
+  test and file tools run with the clone as the working directory. Declined with the rule's reason: anything naming a
+  secret (`~/.ssh`, `~/.aws`, `~/.gnupg`, registry and container credentials, `.env` files, private keys, the
+  keychain, the vendors' and agflow's own directories), privilege and device commands, the owner's containers, a
+  download piped into an interpreter, history-rewriting git, and any path outside the attempt's clone beyond a short
+  list of read-only system and cache directories. Everything else is left undecided and waits for the lead or the
+  owner. Each decision is recorded as `policy:<rule>` in the attempt's log and the event. The rules bind the lead too:
+  it may not approve what they decline. Risk: a rule cannot read intent, and inside the clone the task's own code is
+  the trust boundary — an approved test command runs the repository's tests, and a declared dependency runs its own
+  install scripts. Turn it on for projects you would run unattended anyway.
 
 ### What agents fetched
 
