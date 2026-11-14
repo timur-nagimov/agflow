@@ -141,6 +141,26 @@ describe('list_approvals', () => {
     expect(bridge.hubCalls).toEqual([{ method: 'GET', path: '/api/approvals', body: null, authorization: 'Bearer agt_lead-token' }]);
   });
 
+  test("the hub's rules stand on agflow's own line, and where they refuse an approval the lead may only decline", async () => {
+    const approvals = [
+      approval({ leadMayApprove: true, rules: { verdict: 'undecided', rule: 'unrecognised', reason: '"x" is not a tool these rules know', refusesApproval: false } }),
+      approval({ id: OTHER, leadMayApprove: false, rules: { verdict: 'decline', rule: 'secret-path', reason: 'declined: it reads\na credential', refusesApproval: true } }),
+      approval({ id: nthId(3), leadMayApprove: false, rules: { verdict: 'undecided', rule: 'unknown-clone', reason: 'no clone', refusesApproval: true } }),
+    ];
+    const bridge = await fakeBridge(() => ({ json: { approvals } }));
+    const text = (await bridge.call('list_approvals')).text;
+    const own = text.split('\n').filter((line) => line.startsWith('you may:') || line.startsWith("the hub's rules:"));
+    expect(own).toEqual([
+      'you may: approve or decline it',
+      `the hub's rules: they leave it undecided, by rule unrecognised: "x" is not a tool these rules know`,
+      "you may: decline only: the hub's rules decline it, so no agent approves it",
+      // The reason is the hub's, on one line: a line break in it cannot start a line of its own.
+      expect.stringMatching(/^the hub's rules: they decline it, by rule secret-path: declined: it reads.a credential$/),
+      "you may: decline only: the hub's rules leave it to its owner alone, so no agent approves it",
+      "the hub's rules: they leave it undecided, by rule unknown-clone: no clone",
+    ]);
+  });
+
   test('an approval without leadMayApprove is decline only, and one without a task or detail still prints', async () => {
     const bridge = await fakeBridge(() => ({ json: { approvals: [approval({ taskId: null, detail: {}, kind: 'other', expiresAt: Date.now() - 1_000 })] } }));
     const { text } = await bridge.call('list_approvals');

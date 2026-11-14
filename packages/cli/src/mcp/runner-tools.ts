@@ -369,6 +369,15 @@ const ListedApprovalSchema = z.object({
   expiresAt: z.number(),
   // Absent or null is false: decline only.
   leadMayApprove: z.boolean().nullish(),
+  // The hub's rules on the request; an older hub sends none.
+  rules: z
+    .object({
+      verdict: z.enum(['approve', 'decline', 'undecided']),
+      rule: z.string().min(1).max(100),
+      reason: z.string(),
+      refusesApproval: z.boolean(),
+    })
+    .nullish(),
 });
 type ListedApproval = z.output<typeof ListedApprovalSchema>;
 
@@ -410,6 +419,9 @@ function clipBytes(text: string, maxBytes: number): { shown: string; hidden: num
   return { shown: text.slice(0, end), hidden: text.length - end };
 }
 
+/** The rules' verdict as the lead reads it. */
+const RULES_SAY = { approve: 'they would approve it', decline: 'they decline it', undecided: 'they leave it undecided' } as const;
+
 /**
  * One pending approval as the lead reads it, its detail within `detailBytes`. What the lead may do stands above the
  * asking agent's words, so a client that cuts the answer short cuts the request, never agflow's own lines. The summary
@@ -421,7 +433,9 @@ function clipBytes(text: string, maxBytes: number): { shown: string; hidden: num
  *
  * Decline only is said as the hub means it: the hub cannot confirm that the asking computer leaves approvals to an
  * agent. A device policy that reserves them is one reason; a vendor that is not ready, a policy the runner could not
- * read, a runner too old to say, retired, or no longer running the attempt are others.
+ * read, a runner too old to say, retired, or no longer running the attempt are others. Or the hub's rules refuse any
+ * agent's approval of it: they decline it, or leave it to its owner alone. The rules' verdict is the hub's own line,
+ * though its reason may quote a few words of the request, as the hub quotes them.
  */
 function approvalBlock(approval: ListedApproval, now: number, detailBytes: number): string {
   const fields = APPROVAL_DETAIL_FIELDS.flatMap((field) => {
@@ -449,7 +463,11 @@ function approvalBlock(approval: ListedApproval, now: number, detailBytes: numbe
     `expires in: ${minutes > 0 ? `about ${minutes} min` : 'less than a minute'}`,
     approval.leadMayApprove === true
       ? 'you may: approve or decline it'
-      : 'you may: decline only: the hub cannot confirm that this computer leaves approvals to an agent, so its owner approves',
+      : approval.rules?.refusesApproval === true
+        ? `you may: decline only: the hub's rules ${approval.rules.verdict === 'decline' ? 'decline it' : 'leave it to its owner alone'}, so no agent approves it`
+        : 'you may: decline only: the hub cannot confirm that this computer leaves approvals to an agent, so its owner approves',
+    approval.rules &&
+      `the hub's rules: ${RULES_SAY[approval.rules.verdict]}, by rule ${oneLine(approval.rules.rule, 100)}: ${oneLine(approval.rules.reason, 600)}`,
     clone === ''
       ? "The attempt's clone on that computer: not reported, so no path in this request is known to be inside it"
       : `The attempt's clone on that computer: ${clone}`,

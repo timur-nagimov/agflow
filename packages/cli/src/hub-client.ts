@@ -11,6 +11,7 @@ import type {
   Agent,
   AgentRole,
   Approval,
+  ApprovalRulesView,
   Attempt,
   FetchSubmissionRequest,
   GoalNote,
@@ -71,8 +72,14 @@ export type RunnerSubmitBody = z.input<typeof RunnerSubmitInputSchema>;
 export type StaffingBody = z.input<typeof StaffingInputSchema>;
 export type AgentStopBody = z.input<typeof AgentStopInputSchema>;
 
-/** An approval as GET /api/approvals lists it for the lead (design 6.10): the lead may approve it, or only decline it. */
-export type LeadApproval = Approval & { leadMayApprove?: boolean | undefined };
+/**
+ * An approval as GET /api/approvals lists it for the lead (design 6.10): the lead may approve it, or only decline it,
+ * and what the hub's rules make of it. An older hub sends neither the rules nor, older still, the permission.
+ */
+export type LeadApproval = Approval & {
+  leadMayApprove?: boolean | undefined;
+  rules?: ApprovalRulesView | undefined;
+};
 
 /** The lead's answer to an approval; a decline carries the reason the asking agent sees. */
 export interface ApprovalDecisionBody {
