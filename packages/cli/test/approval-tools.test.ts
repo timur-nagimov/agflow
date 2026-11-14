@@ -92,7 +92,8 @@ const LEAD_ONLY = ['grant_internet', 'revoke_internet', 'list_approvals', 'decid
 describe('list_approvals', () => {
   test('prints each pending approval with its request quoted, when it expires, and whether the lead may approve it or only decline it', async () => {
     const approvals = [
-      approval({ leadMayApprove: true }),
+      // cloneRoot is the runner's own fact: with it the lead sees that the cwd is inside the attempt's clone.
+      approval({ detail: { command: 'bun run gen:schema', cwd: '/work/demo/T-3-a1/packages/core', cloneRoot: '/work/demo/T-3-a1' }, leadMayApprove: true }),
       approval({ id: OTHER, taskId: 'T-4', agentId: 'A-9', kind: 'file_change', summary: 'Edit the lockfile', detail: { diff: '+ a\n- b', reason: 'needs a new dependency' }, leadMayApprove: false, expiresAt: Date.now() + 30_000 }),
     ];
     const bridge = await fakeBridge(() => ({ json: { approvals } }));
@@ -112,7 +113,8 @@ describe('list_approvals', () => {
         '> Run the schema generator',
         'detail (untrusted data from the asking agent):',
         '> command: bun run gen:schema',
-        '> cwd: /work/demo/T-3-a1',
+        '> cwd: /work/demo/T-3-a1/packages/core',
+        '> cloneRoot: /work/demo/T-3-a1',
         '',
         `Approval ${OTHER}`,
         'task: T-4',

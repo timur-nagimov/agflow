@@ -188,6 +188,8 @@ describe('runCodexPreflight', () => {
       accountId: createHash('sha256').update(email).digest('hex').slice(0, 16),
       plan: 'ChatGPT Plus',
       managedPolicy: true,
+      // The recorded policy of this Mac regulates sandbox modes and features, never who answers approvals.
+      approvalsReservedToOwner: false,
     });
     expect(VendorQuotaSchema.parse(result.quota)).toEqual({
       state: 'ok',
@@ -298,7 +300,13 @@ describe('runCodexPreflight', () => {
         'account/rateLimits/read': failed,
       }),
     );
-    expect(result.facts).toMatchObject({ ready: true, managedPolicy: true, problem: null });
+    // The requirements went unread, so what the policy says about approvals is unknown: the owner answers.
+    expect(result.facts).toMatchObject({
+      ready: true,
+      managedPolicy: true,
+      approvalsReservedToOwner: true,
+      problem: null,
+    });
     expect(result.quota).toBeNull();
   });
 
@@ -324,6 +332,8 @@ describe('runCodexPreflight', () => {
         accountId: null,
         plan: null,
         managedPolicy: true,
+        // No app-server was opened, so no policy was read at all.
+        approvalsReservedToOwner: true,
         problem:
           kind === 'platform'
             ? 'unsupported platform'
@@ -342,7 +352,12 @@ describe('runCodexPreflight', () => {
   test('rejected open returns its error and the process is ended', async () => {
     const fixture = setup({}, {}, { failBeforeInitialize: { stderr: 'Error: cannot start', code: 1 } });
     const result = await runCodexPreflight(fixture.options);
-    expect(result.facts).toMatchObject({ ready: false, problem: 'Error: cannot start', managedPolicy: true });
+    expect(result.facts).toMatchObject({
+      ready: false,
+      problem: 'Error: cannot start',
+      managedPolicy: true,
+      approvalsReservedToOwner: true,
+    });
     expect(readCodexRecord(fixture.bin)[0]?.exit).toMatchObject({ reason: 'failed', code: 1 });
   });
 

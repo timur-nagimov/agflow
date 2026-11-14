@@ -312,6 +312,8 @@ async function preflightOf(adapter: VendorAdapter): Promise<Preflight> {
       accountId: null,
       plan: null,
       managedPolicy: false,
+      // The preflight read no policy at all, so what it says about approvals is unknown (design 6.10).
+      approvalsReservedToOwner: true,
     };
     return { result: { facts, quota: null, weakened: [] }, at: Date.now() };
   }

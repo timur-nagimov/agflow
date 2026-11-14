@@ -162,13 +162,17 @@ export interface VendorView {
   /** The runner's own pinned binary, with the owner's install when it differs. */
   version: string;
   plan: string | null;
-  /** On a managed device: why so much there needs the owner. */
+  /** On a managed device: that the device has managed configuration for this vendor. */
   managed: string | null;
+  /** Who may answer this vendor's approval requests, when the device policy has an answer (6.10). */
+  approvals: string | null;
   degraded: string | null;
   ownerAway: string | null;
 }
 
 export function vendorView(vendor: RunnerVendor, account: AccountQuota | null): VendorView {
+  // A runner that reports no such fact is read as reserved, as the hub reads it (6.10).
+  const reserved = vendor.approvalsReservedToOwner !== false;
   const runnerVersion = vendor.cliVersion ?? 'not installed';
   const ownerVersion =
     vendor.ownerCliVersion && vendor.ownerCliVersion !== vendor.cliVersion
@@ -182,10 +186,13 @@ export function vendorView(vendor: RunnerVendor, account: AccountQuota | null): 
     tone: !vendor.ready ? 'trouble' : vendor.degraded ? 'wait' : 'done',
     version: `${runnerVersion}${ownerVersion}`,
     plan: vendor.plan,
-    // The runner never answers approvals itself, so a managed policy changes nothing but who gets asked (6.10).
-    managed: vendor.managedPolicy
-      ? 'A managed device policy applies: commands outside the sandbox need the owner to approve them'
-      : null,
+    // Managed configuration and who answers approvals are two facts: a managed device need not reserve them (6.10).
+    managed: vendor.managedPolicy ? 'The device has managed configuration for this vendor' : null,
+    approvals: reserved
+      ? 'The device policy reserves approvals: only the owner may approve a request from this vendor'
+      : vendor.managedPolicy
+        ? 'That configuration leaves approvals open: the lead may answer requests from this vendor'
+        : null,
     degraded: vendor.degraded
       ? 'Degraded after an hour of vendor errors: placement prefers the other vendor for now'
       : null,

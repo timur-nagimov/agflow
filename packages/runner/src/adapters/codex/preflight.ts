@@ -80,6 +80,8 @@ export async function runCodexPreflight(options: CodexPreflightOptions): Promise
       accountId: null,
       plan: null,
       managedPolicy: true,
+      // Both stay true until the policy is read: an unread policy is an unknown one (design 6.10).
+      approvalsReservedToOwner: true,
     },
     quota: null,
     weakened: [],
@@ -154,6 +156,7 @@ export async function runCodexPreflight(options: CodexPreflightOptions): Promise
       facts.accountId = identity.accountId;
       facts.plan = identity.plan;
       facts.managedPolicy = policy.managedPolicy;
+      facts.approvalsReservedToOwner = policy.approvalsReservedToOwner;
       facts.problem = policy.problem ?? identity.problem ?? mcpProblem ?? skillsProblem;
       facts.ready = facts.problem === null;
       if (facts.ready && skipAuthChecks) facts.problem = 'test mode';

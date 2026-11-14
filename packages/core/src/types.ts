@@ -444,7 +444,13 @@ export interface RunnerVendor {
   accountId: string | null;
   /** 'Claude Max', 'ChatGPT Plus' */
   plan: string | null;
+  /** The device has managed configuration for this vendor; it says nothing about who answers approvals. */
   managedPolicy: boolean;
+  /**
+   * The device policy regulates who may answer approvals, or could not be read (design 6.10). Absent from an older
+   * runner's report, which the hub reads as reserved: a policy it has not heard of fails closed.
+   */
+  approvalsReservedToOwner?: boolean;
   models: { lead: string; worker: string };
   /** A copy of the runner's settings, for display; 0..1. */
   ceilings: { fiveHour: number; weekly: number };
@@ -495,7 +501,16 @@ export interface Approval {
   agentId: string;
   kind: 'command' | 'file_change' | 'other';
   summary: string;
-  detail: { command?: string; cwd?: string; reason?: string; diff?: string; manifestDiff?: string; grantRoot?: string };
+  /** cloneRoot is the attempt's clone on the runner: the hub knows no paths of its own to judge a cwd against. */
+  detail: {
+    command?: string;
+    cwd?: string;
+    reason?: string;
+    diff?: string;
+    manifestDiff?: string;
+    grantRoot?: string;
+    cloneRoot?: string;
+  };
   status: 'pending' | 'approved' | 'declined' | 'expired' | 'void';
   decidedBy: string | null;
   createdAt: number;

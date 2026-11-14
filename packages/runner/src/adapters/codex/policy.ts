@@ -49,11 +49,14 @@ const PLAN_NAMES = {
   unknown: 'ChatGPT (unknown plan)',
 } satisfies Record<PlanType, string>;
 
-/** null for a call that failed. */
+/**
+ * null for a call that failed. managedPolicy says only that the device has managed configuration; whether that
+ * configuration regulates who answers approvals is the separate fact approvalsReservedToOwner (design 6.10).
+ */
 export function classifyCodexPolicy(input: {
   requirements: ConfigRequirementsReadResponse | null;
   config: ConfigReadResponse | null;
-}): { managedPolicy: boolean; problem: string | null } {
+}): { managedPolicy: boolean; approvalsReservedToOwner: boolean; problem: string | null } {
   // 0.159.2 sends this field even though its generated ConfigRequirements omits it.
   const requirements: (ConfigRequirements & { allowedApprovalsReviewers?: ApprovalsReviewer[] | null }) | null =
     input.requirements?.requirements ?? null;
@@ -63,6 +66,12 @@ export function classifyCodexPolicy(input: {
     requirements !== null ||
     input.config.layers === null ||
     input.config.layers.some((layer) => managedLayer(layer.name.type));
+  // Only a policy that speaks about reviewers or approval policies reserves approvals to the owner; a policy that
+  // could not be read reserves them too, since what it says is unknown. Managed layers alone say nothing here.
+  const approvalsReservedToOwner =
+    input.requirements === null ||
+    requirements?.allowedApprovalsReviewers != null ||
+    (requirements?.allowedApprovalPolicies != null && !requirements.allowedApprovalPolicies.includes('on-request'));
   // A managed layer outranks the thread's web_search override, and no later check sees web search.
   const webSearch = input.config?.config.web_search ?? null;
   const webSearchOrigin = input.config?.origins.web_search?.name.type;
@@ -87,7 +96,7 @@ export function classifyCodexPolicy(input: {
   ) {
     problem = 'managed policy turns on web search';
   }
-  return { managedPolicy, problem };
+  return { managedPolicy, approvalsReservedToOwner, problem };
 }
 
 export function codexAccountIdentity(account: GetAccountResponse['account']): {
