@@ -172,31 +172,41 @@ export interface VendorView {
 
 /**
  * The device's managed configuration for the vendor, a fact apart from who answers approvals (6.10). A runner reports
- * it true for a policy it could not read too, so the note says so unless the policy was read: a false about approvals
- * comes only from requirements the runner read. No note says the device has none, since a false may be a fact never
- * read: Claude's preflight reads no policy, and an older runner's preflight that threw said false.
+ * it true for configuration it could not read too, its requirements or the rest of it, so the note always says so. No
+ * note says the device has none, since a false may be a fact never read: Claude's preflight reads no policy, and an
+ * older runner's preflight that threw said false.
  */
 function managedNote(vendor: RunnerVendor): string | null {
-  if (!vendor.managedPolicy) return null;
-  return vendor.approvalsReservedToOwner === false
-    ? 'The device has managed configuration for this vendor'
-    : 'The device has managed configuration for this vendor, or the runner could not read its policy';
+  return vendor.managedPolicy
+    ? 'The device has managed configuration for this vendor, or the runner could not read all of its configuration'
+    : null;
 }
 
 /**
+ * The problem the hub's runner view gives a vendor the runner itself reports ready, once the hub has marked it not ready
+ * (hub/src/runners.ts, vendorsOf): two failed starts, or an auth error. The hub still reads the runner's own report
+ * when it asks whether an agent may approve, so for that question such a vendor is ready.
+ */
+const HUB_MARKED_NOT_READY = 'marked not ready by the hub until a preflight passes';
+
+/**
  * Who may answer the vendor's approval requests, as the hub reads the runner's report (6.10). True and a missing field
- * both reserve them to the owner, and the note says which it is. False is the runner's word that the managed
- * configuration it read leaves them open, which the hub honours only from a vendor that is ready: a vendor that is not
- * gets no note about approvals at all, and a vendor without managed configuration has none to leave them open.
+ * both reserve them to the owner, and the note says which it is. False is the runner's word that nothing it read
+ * reserves them, which the hub honours from a vendor the runner reports ready, whether or not the hub has marked it
+ * not ready since, on a managed device or not: there an agent may answer, and the note says so. A false makes no note
+ * for a vendor the runner itself reports not ready, which the hub does not honour, nor for Claude, which raises no
+ * approvals.
  */
 function approvalsNote(vendor: RunnerVendor): string | null {
   switch (vendor.approvalsReservedToOwner) {
     case true:
       return 'The device policy reserves approvals to the owner, or the runner could not read it: only the owner may approve';
-    case false:
-      return vendor.ready && vendor.managedPolicy
-        ? 'The managed configuration leaves approvals open, so an agent may answer requests from this vendor'
+    case false: {
+      const reportedReady = vendor.ready || vendor.problem === HUB_MARKED_NOT_READY;
+      return reportedReady && vendor.vendor !== 'claude'
+        ? 'Nothing the runner read reserves approvals, so an agent may answer requests from this vendor'
         : null;
+    }
     default:
       return 'This runner does not report who may answer approvals, so only the owner may approve';
   }
