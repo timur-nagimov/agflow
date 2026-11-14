@@ -6,10 +6,9 @@ on:
   pull_request:
 
 jobs:
-  test:
+  checks:
     runs-on: ubuntu-latest
-    # A full run takes about 10 minutes; a hang fails here instead of after GitHub's 6 hours.
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -18,4 +17,24 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run build:web
-      - run: bun test
+
+  test:
+    name: test (${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    # A shard takes about a minute; a hang fails here instead of after GitHub's 6 hours.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: bun install --frozen-lockfile
+      # Some tests serve or check the built web app.
+      - run: bun run build:web
+      - run: bun scripts/test-shard.ts "$SHARD" 8
+        env:
+          SHARD: ${{ matrix.shard }}
