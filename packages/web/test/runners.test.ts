@@ -270,7 +270,7 @@ describe('vendors', () => {
     };
 
     test('reserved: the policy says so, or it could not be read, and the note says it is either', () => {
-      // A policy read that regulates who answers, on a vendor that is ready or not.
+      // A policy that regulates who answers, or requirements the runner could not read: the report is the same.
       expect(notes({ managedPolicy: true, approvalsReservedToOwner: true })).toEqual({
         managed: MANAGED_OR_UNREAD,
         approvals: RESERVED,
