@@ -501,16 +501,7 @@ export interface Approval {
   agentId: string;
   kind: 'command' | 'file_change' | 'other';
   summary: string;
-  /** cloneRoot is the attempt's clone on the runner: the hub knows no paths of its own to judge a cwd against. */
-  detail: {
-    command?: string;
-    cwd?: string;
-    reason?: string;
-    diff?: string;
-    manifestDiff?: string;
-    grantRoot?: string;
-    cloneRoot?: string;
-  };
+  detail: { command?: string; cwd?: string; reason?: string; diff?: string; manifestDiff?: string; grantRoot?: string };
   status: 'pending' | 'approved' | 'declined' | 'expired' | 'void';
   decidedBy: string | null;
   createdAt: number;
@@ -518,25 +509,13 @@ export interface Approval {
   decidedAt: number | null;
 }
 
-/** The hub's rules on a pending request, as the lead is shown them (design 6.10, Rules). */
-export interface ApprovalRulesView {
-  verdict: 'approve' | 'decline' | 'undecided';
-  /** The rule that fired, as a stable kebab-case id. */
-  rule: string;
-  /** The rule's one sentence, in the hub's words; it may quote a few words of the request. */
-  reason: string;
-  /** The rules refuse any agent's approval of the request: they decline it, or leave it to its owner alone. */
-  refusesApproval: boolean;
-}
-
 /**
  * A pending approval as GET /api/approvals lists it for the agent holding the lead seat (design 6.10, Who may answer).
- * leadMayApprove is false where the hub cannot confirm that the runner leaves this vendor's approvals to an agent, and
- * where its rules refuse an agent's approval: the lead may only decline that one, or leave it to the owner.
+ * leadMayApprove is false where the hub cannot confirm that the runner leaves this vendor's approvals to an agent: the
+ * lead may only decline that one, or leave it to the owner.
  */
 export interface LeadApproval extends Approval {
   leadMayApprove: boolean;
-  rules: ApprovalRulesView;
 }
 
 export interface SubmissionRecord {

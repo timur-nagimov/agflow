@@ -1,6 +1,5 @@
 import type { Database } from 'bun:sqlite';
 import { DEFAULT_INFRA_BACKOFF_MS, DEFAULT_WIP_REF_PREFIX } from '@agflow/core';
-import { judgeApproval } from './approval-policy';
 import { openDb } from './db';
 import { type Emit, EventBus, insertEvent } from './events';
 import { FetchLimiter } from './fetch-limits';
@@ -144,14 +143,14 @@ export interface HubConfig extends HubRunnerSettings {
   agentFetch?: boolean | undefined;
   /**
    * AGFLOW_LEAD_APPROVALS: the agent holding the lead seat may answer the approvals of other agents' attempts with its
-   * agent token (design 6.10, Who may answer): decline any of them, approve only those of a runner whose vendor reports
-   * no managed device policy. Off by default: only the owner answers, in a browser.
+   * agent token (design 6.10, Who may answer): decline any of them, approve those of a runner whose device leaves the
+   * vendor's approvals to an agent. Off by default: only the owner answers, in a browser.
    */
   leadApprovals?: boolean | undefined;
   /**
-   * AGFLOW_AUTO_APPROVALS: the hub answers an approval request by rule the moment it stores it (approval-policy.ts),
-   * approving and declining what the rules recognise and leaving the rest to the lead or the owner. Off by default.
-   * Whatever it is, the rules are the floor under AGFLOW_LEAD_APPROVALS: no agent approves what they decline.
+   * AGFLOW_AUTO_APPROVALS: the hub approves every approval request the moment it stores it, wherever the runner's
+   * device leaves the vendor's approvals to an agent; a request from a device that reserves them waits for the owner.
+   * Off by default.
    */
   autoApprovals?: boolean | undefined;
 }
@@ -190,8 +189,6 @@ export interface HubContext {
   fetch: FetchFn;
   link: RunnerLink;
   agentFetch: AgentFetchRuntime;
-  /** The rules approval requests are judged by (approval-policy.ts); tests replace them to see what a failure does. */
-  judgeApproval: typeof judgeApproval;
 }
 
 export interface ContextOptions {
@@ -201,7 +198,6 @@ export interface ContextOptions {
   fetch?: FetchFn | undefined;
   link?: RunnerLink | undefined;
   agentFetch?: Partial<AgentFetchRuntime> | undefined;
-  judgeApproval?: typeof judgeApproval | undefined;
 }
 
 /**
@@ -233,7 +229,6 @@ export function createContext(options: ContextOptions): HubContext {
       limits: {},
       ...options.agentFetch,
     },
-    judgeApproval: options.judgeApproval ?? judgeApproval,
   };
 }
 

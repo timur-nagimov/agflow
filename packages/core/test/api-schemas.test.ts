@@ -552,9 +552,6 @@ describe('responses', () => {
   });
 
   // Each route's answer: a fixture of its core type in the route's wrapper.
-  // The hub's rules on a request, as the lead's listing carries them.
-  const rules = { verdict: 'undecided', rule: 'unrecognised', reason: 'the rules know no such tool', refusesApproval: false } as const;
-  const refused = { verdict: 'decline', rule: 'secret-path', reason: 'declined: it reads a credential', refusesApproval: true } as const;
   const answers: Array<[string, z.ZodType, object]> = [
     ['RunnersResponseSchema', RunnersResponseSchema, { runners: [runner, quietRunner], accounts: [account] }],
     ['RunnerResponseSchema', RunnerResponseSchema, { runner: { ...runner, capacity: 4, settingsVersion: 5 } }],
@@ -566,7 +563,7 @@ describe('responses', () => {
     [
       'LeadApprovalsResponseSchema',
       LeadApprovalsResponseSchema,
-      { approvals: [{ ...approval, leadMayApprove: false, rules: refused }, { ...approval, leadMayApprove: true, rules }] },
+      { approvals: [{ ...approval, leadMayApprove: false }, { ...approval, leadMayApprove: true }] },
     ],
     ['StaffingResponseSchema', StaffingResponseSchema, { running: 2, target: 4 }],
     ['SubmissionResponseSchema', SubmissionResponseSchema, { submission }],
@@ -599,16 +596,11 @@ describe('responses', () => {
     expect(parses(ApprovalSchema, { ...approval, status: 'open' })).toBe(false);
     // The lead's listing says of each approval whether the lead may approve it; a person's listing never does.
     expectTypeOf<z.output<typeof LeadApprovalSchema>>().toEqualTypeOf<LeadApproval>();
-    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true, rules })).toBe(true);
+    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true })).toBe(true);
     expect(parses(LeadApprovalSchema, approval)).toBe(false);
-    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true })).toBe(false);
-    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: 'yes', rules })).toBe(false);
-    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true, rules, taskId: 'T-41' })).toBe(false);
+    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: 'yes' })).toBe(false);
+    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true, taskId: 'T-41' })).toBe(false);
     expect(parses(ApprovalSchema, { ...approval, leadMayApprove: true })).toBe(false);
-    // And it carries the rules' verdict, which is strict as well.
-    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true, rules: { ...rules, verdict: 'maybe' } })).toBe(false);
-    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true, rules: { ...rules, bogus: 1 } })).toBe(false);
-    expect(parses(LeadApprovalSchema, { ...approval, leadMayApprove: true, rules: without(rules, 'refusesApproval') })).toBe(false);
     expect(parses(AttemptLogEntrySchema, { ...logEntry, kind: 'warning' })).toBe(false);
     expect(parses(AccountQuotaSchema, { ...account, accountId: null })).toBe(false);
     expect(parses(PrepareRequestSchema, { ...prepareRequest, id: 'P-1' })).toBe(false);

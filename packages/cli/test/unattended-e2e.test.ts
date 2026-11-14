@@ -86,10 +86,7 @@ function requestApproval(hub: HubFixture, asking: RunnerAgent, detail: RunnerEve
   return approvalId;
 }
 
-/**
- * Makes the runner's stored vendor reports say that the device policy reserves approvals to the owner. Managed
- * configuration alone decides nothing (design 6.10, Managed devices): only this fact keeps the lead to declining.
- */
+/** Makes the runner's stored vendor reports say that the device policy reserves approvals to the owner. */
 function reserveApprovals(hub: HubFixture, runnerId: string): void {
   const row = hub.ctx.db.query('SELECT info FROM runners WHERE id = $id').get({ id: runnerId }) as { info: string };
   const info = JSON.parse(row.info) as { vendors: Record<string, unknown>[] };
@@ -150,10 +147,9 @@ describe('internet through the hub, end to end', () => {
 });
 
 describe('approvals answered by the lead, end to end', () => {
-  // As a current runner relays it: with the clone of the attempt, which the hub's rules check every path against.
-  const detail = { command: 'curl https://example.com', cwd: '/clone', cloneRoot: '/clone', reason: 'needs the network' };
+  const detail = { command: 'curl https://example.com', cwd: '/clone', reason: 'needs the network' };
 
-  test('the lead lists a request and approves it where no managed policy applies', async () => {
+  test('the lead lists a request and approves it where the device leaves approvals to an agent', async () => {
     const { hub } = unattendedHub();
     const lead = hub.runnerAgent({ role: 'lead' });
     const codex = hub.runnerAgent({ vendor: 'codex', owner: 'bob' });

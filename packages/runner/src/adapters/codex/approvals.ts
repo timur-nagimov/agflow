@@ -1,5 +1,4 @@
 // Approval display and answers (design 6.10, 9.3). No policy decisions or request identity live here.
-import { approvalTruncatedMark } from '@agflow/core';
 import { z } from 'zod';
 import type { AgentEvent } from '../types';
 import type { CodexServerRequestMethod, ResultOf } from './methods';
@@ -24,7 +23,7 @@ export function clipText(text: string, max = TEXT_MAX): string {
   if (bytes.length <= max) return text;
   let end = max;
   while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
-  return `${bytes.subarray(0, end).toString('utf8')}${approvalTruncatedMark(bytes.length)}`;
+  return `${bytes.subarray(0, end).toString('utf8')}\n[truncated: ${bytes.length} bytes in total]`;
 }
 
 /** The owner's notification shows the summary: its first line, clipped, with an ellipsis when anything was cut. */

@@ -171,7 +171,7 @@ it is marked merged, so the hub releases dependent tasks after their dependencie
 
 By default a person merges accepted work, brings outside data into the repository and answers every approval request.
 Four opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
-after a change. The rules behind the last two are in the
+after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
 - **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal, marking tasks
@@ -193,7 +193,7 @@ after a change. The rules behind the last two are in the
   fetches nothing more.
 - **`AGFLOW_LEAD_APPROVALS=1`.** Removes: the runner owner answering each Codex approval request in a browser. The
   agent holding the lead seat may decline other agents' requests, with a reason, and approve them unless the device's
-  Codex policy reserves approvals to its owner or the hub's rules decline them. A request nobody answered in time is
+  Codex policy reserves approvals to its owner. A request nobody answered in time is
   then declined without marking the owner away. The owner can still answer first. Risk: an approved command runs
   outside the sandbox, with network access and write access to all the owner's files, on the lead's judgement instead
   of the owner's, and a lead can be misled by the text of a request.
@@ -203,22 +203,11 @@ after a change. The rules behind the last two are in the
   read, reserves approvals to the owner; one that restricts sandbox modes, remote control, computer use or an external
   browser restricts those and says nothing about approvals. The Runners card shows both facts.
 - **`AGFLOW_AUTO_APPROVALS=1`.** Removes: anyone, person or agent, reading each request before it is answered. The hub
-  judges every approval request as it arrives, from the parsed shape of the command or the paths of the file change,
-  and answers at once. Approved: installing dependencies a manifest in the clone already declares, and ordinary build,
-  test and file tools run with the clone as the working directory. Declined with the rule's reason: anything naming a
-  secret (`~/.ssh`, `~/.aws`, `~/.gnupg`, registry and container credentials, `.env` files, private keys, the
-  keychain, the vendors' and agflow's own directories), privilege and device commands, the owner's containers, a
-  download piped into an interpreter, history-rewriting git, and any path outside the attempt's clone beyond a short
-  list of read-only system and cache directories. Everything else is left undecided and waits for the lead or the
-  owner. Each decision is recorded as `policy:<rule>` in the attempt's log and the event. The rules bind the lead too:
-  it may not approve what they decline, nor a request they cannot judge whole (one that names no clone, one the
-  runner had to cut short), which only its owner approves. A request is never judged on the part it shows, and a word
-  whose value the shell decides (`$1`, `{..,..}`, `.*`, zsh's `$PWD:h`) counts as unknown.
-  Risk: a rule cannot read intent, and the clone is the boundary the rules hold. They refuse what reaches outside it
-  and every re-spelling of what they refuse, but inside it the agent's own files are trusted: an approved test command
-  runs the repository's tests, a declared dependency runs its own install scripts, and an agent that writes code into
-  the clone can then ask to run it. Containment is read from the text of the request, so a symbolic link the agent
-  made inside the clone counts as inside. Turn it on for projects you would run unattended anyway.
+  approves every approval request the moment it arrives, recorded as `hub:auto-approvals` in the attempt's log and the
+  event. Only a request from a runner whose device policy reserves approvals to its owner waits for the owner. Risk:
+  every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
+  owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
+  removing the line and restarting the hub.
 
 ### What agents fetched
 

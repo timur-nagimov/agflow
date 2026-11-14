@@ -811,7 +811,6 @@ export const ApprovalDetailSchema = schemaFor<Approval['detail']>()(
     diff: z.string().optional(),
     manifestDiff: z.string().optional(),
     grantRoot: z.string().optional(),
-    cloneRoot: z.string().optional(),
   }),
 );
 

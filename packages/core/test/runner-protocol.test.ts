@@ -937,9 +937,6 @@ describe('runner events', () => {
     const fileChange = { kind: 'file_change', detail: { diff: '+ token', grantRoot: '/work/app' } } as const;
     expect(parses(withData('approval.requested', fileChange))).toBe(true);
     expect(parses(withData('approval.requested', { detail: {} }))).toBe(true);
-    // The runner's own cloneRoot, which the hub judges the cwd against.
-    const inClone = { detail: { command: 'ls', cwd: '/work/T-3-a1/packages', cloneRoot: '/work/T-3-a1' } } as const;
-    expect(parses(withData('approval.requested', inClone))).toBe(true);
     expect(parses(withData('approval.requested', { detail: { command: 'ls', env: 'x' } as never }))).toBe(false);
     expect(parses(withData('approval.requested', { kind: 'network' as never }))).toBe(false);
     expect(parses(withData('approval.requested', { approvalId: 'approval-1' }))).toBe(false);

@@ -44,7 +44,6 @@ import {
 import type {
   AccountQuota,
   Approval,
-  ApprovalRulesView,
   Attempt,
   AttemptEndReason,
   AttemptLogEntry,
@@ -275,22 +274,9 @@ export const ApprovalSchema = schemaFor<Approval>()(
   ApprovalFields.refine((approval) => namesTask(approval.attemptId, approval.taskId), APPROVAL_TASK),
 );
 
-/** The hub's rules on a pending request, as the lead is shown them. */
-export const ApprovalRulesViewSchema = schemaFor<ApprovalRulesView>()(
-  z.strictObject({
-    verdict: z.enum(['approve', 'decline', 'undecided']),
-    rule: z.string().min(1).max(100),
-    reason: z.string().max(2000),
-    refusesApproval: z.boolean(),
-  }),
-);
-
-/**
- * An approval in the lead's listing (design 6.10, Who may answer): the approval, whether the lead may approve it, and
- * the hub's rules on it.
- */
+/** An approval in the lead's listing (design 6.10, Who may answer): the approval, and whether the lead may approve it. */
 export const LeadApprovalSchema = schemaFor<LeadApproval>()(
-  ApprovalFields.extend({ leadMayApprove: z.boolean(), rules: ApprovalRulesViewSchema }).refine(
+  ApprovalFields.extend({ leadMayApprove: z.boolean() }).refine(
     (approval) => namesTask(approval.attemptId, approval.taskId),
     APPROVAL_TASK,
   ),
