@@ -7,6 +7,7 @@
 // and the tick's placement snapshot is updated after each start, so a runner's slots and an account's probing start
 // are not handed out twice. Retention and remote-ref cleanup are not the tick's: they run on a daily timer (X-39).
 import {
+  type AgentRole,
   type Attempt,
   type EndedAttemptView,
   type Placement,
@@ -35,23 +36,22 @@ import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
 import { markOwnerAwayTold, probeUnknownResets } from './quota';
 import { type ClockCheck, checkClock } from './recovery';
+import { TAKES_SLOT_SQL } from './runners';
 import { expireSubmissions } from './submissions';
 import { type StallDecisions, judgeStalls } from './supervisor';
 import { expireHandbacks } from './takeover';
 import { getTask, isPathHolder, listTasks, unmetDependencies } from './task-store';
 import { sweepLeases } from './tasks';
 
-/** Statuses of a runner worker that take one of the project's worker slots (design 6.6, step 4). */
-const SLOT_STATUSES = "('starting', 'running', 'quota_wait')";
-
-/** Runner workers starting, running or in quota_wait. Leads and live chats do not count. */
+/**
+ * Runner workers that take one of the project's worker slots (design 6.6, step 4), as they take one of their runner's
+ * (TAKES_SLOT_SQL): starting or running, or in quota_wait and asked to stop. Leads, live chats and workers waiting for
+ * their quota do not count.
+ */
 export function runningWorkers(ctx: HubContext): number {
   return (
     ctx.db
-      .query(
-        `SELECT COUNT(*) AS n FROM attempts
-         WHERE role = 'worker' AND runner_id IS NOT NULL AND status IN ${SLOT_STATUSES}`,
-      )
+      .query(`SELECT COUNT(*) AS n FROM attempts WHERE runner_id IS NOT NULL AND ${TAKES_SLOT_SQL}`)
       .get() as { n: number }
   ).n;
 }
@@ -104,6 +104,8 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
     openAttempt: current !== undefined && current.status !== 'ended',
     dispatchHoldUntil: columns.holdUntil,
     counted: countedAttempts(attempts, columns.floor),
+    // listAttempts answers newest first. A quota replacement's wait was for the vendor already.
+    readySince: attempts[0]?.stopRequested?.cause === 'quota' ? 0 : task.updatedAt,
   };
 }
 
@@ -120,10 +122,10 @@ export function readySet(ctx: HubContext): TaskCandidate[] {
   return orderReady(ready.filter((candidate) => isDispatchable(candidate, context)));
 }
 
-/** Counts a placement in the snapshot: a slot less on its runner, an open attempt more on its account. */
-function recordPlacement(snapshot: PlacementSnapshot, placement: Placement): void {
+/** Counts a placement in the snapshot: an open attempt more on its account, and a worker's slot less on its runner. */
+function recordPlacement(snapshot: PlacementSnapshot, placement: Placement, role: AgentRole): void {
   const runner = snapshot.runners.find((slot) => slot.id === placement.runnerId);
-  if (runner) runner.openAttempts += 1;
+  if (runner && role === 'worker') runner.openAttempts += 1;
   if (placement.account) placement.account.openAttempts += 1;
 }
 
@@ -226,7 +228,7 @@ export function dispatch(ctx: HubContext): DispatchResult {
       });
       result.started.push(attempt);
       started.push(task);
-      recordPlacement(snapshot, placement);
+      recordPlacement(snapshot, placement, 'worker');
       free -= 1;
     } catch (error) {
       console.error(`starting ${task.id} on ${placement.runnerId} failed`, error);
@@ -251,14 +253,18 @@ const isProbe = (placement: Placement): boolean =>
   placement.account?.quota.state === 'exhausted' && placement.account.quota.resetsAt === null;
 
 /**
- * The quota_wait replacement (design 6.10): an attempt waiting for a reset more than quotaWaitMaxMs away, or unknown,
- * is replaced (cause quota: class infra, no handoff turn), but only while its successor can start now: a placement
- * with quota exists for its task, or for a lead, and is not an account's probing start, which would only wait in turn.
- * A worker's successor needs the slot the wait frees to be within the worker target, and no churn pause holding worker
- * dispatch (design 6.15); a lead's needs runner leads on. While the project is paused nothing starts, so nothing is
- * replaced and the agents in quota_wait resume at their reset (design 6.6, Pause). Otherwise it keeps waiting, and the runner retries its turn every quotaUnknownMs. The
- * oldest wait goes first, and each replacement holds its placement in the snapshot, so two waits do not count on one
- * free slot. Returns the attempts it asked to stop.
+ * The quota_wait replacement (design 6.10). A worker waiting for a reset more than quotaWaitMaxMs away, or unknown, is
+ * replaced (cause quota: no handoff turn, and no failure: no backoff, no failure signature), but only while its
+ * successor can start now: a placement for its task exists with quota, and is not an account's probing start, which
+ * would only wait in turn; and the worker target and the churn guard let a worker start (design 6.15). The account the
+ * attempt waits on offers no placement: its exhaustion, or the limit of the attempt's role (setLimited), keeps it off,
+ * for this check and for dispatch alike. A wait holds no slot, so that placement counts the wait's own slot as free;
+ * once asked to stop, the wait holds its slot again until it ends, so dispatch keeps it for the successor. A lead is
+ * replaced at once, whatever its reset, while runner leads are on and another account can take the seat.
+ * While the project is paused nothing starts, so nothing is replaced and the agents in quota_wait resume at their
+ * reset (design 6.6, Pause). Otherwise a wait goes on: the runner resumes it at its reset, or retries its turn every
+ * quotaUnknownMs. The oldest wait goes first, and each replacement holds its placement in the snapshot, so two waits
+ * do not count on one free slot. Returns the attempts it asked to stop.
  */
 export function replaceQuotaWaits(ctx: HubContext): string[] {
   const project = getProject(ctx);
@@ -268,24 +274,25 @@ export function replaceQuotaWaits(ctx: HubContext): string[] {
     (attempt) =>
       attempt.runnerId !== null &&
       attempt.stopRequested === null &&
-      (attempt.quotaResetsAt === null || attempt.quotaResetsAt > cutoff),
+      (attempt.role === 'lead' || attempt.quotaResetsAt === null || attempt.quotaResetsAt > cutoff),
   );
   if (due.length === 0) return [];
   const snapshot = placementSnapshot(ctx);
   const { workerTarget, vendorPref } = getStaffing(ctx);
-  // The wait holds a slot; its successor takes that slot, so it may start only when the slot is within the target,
-  // and no worker starts while the churn guard holds dispatch.
-  const workerRoom =
-    !churnPaused(ctx) &&
-    workerSlotsFree({ workerTarget, maxWorkers: ctx.config.maxWorkers, runningWorkers: runningWorkers(ctx) - 1 }) > 0;
+  // Each successor needs a worker slot within the target, and no worker starts while the churn guard holds dispatch.
+  let workerRoom = churnPaused(ctx)
+    ? 0
+    : workerSlotsFree({ workerTarget, maxWorkers: ctx.config.maxWorkers, runningWorkers: runningWorkers(ctx) });
   const replaced: string[] = [];
   // listAttempts answers newest first.
   for (const attempt of due.reverse()) {
     try {
       const task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
-      if (task ? !workerRoom : !project.runnerLeads) continue;
-      const { placement } = task
-        ? place(snapshot, placementPrefs(ctx, task, listAttempts(ctx, { task: task.id })), { projectPref: vendorPref })
+      if (task ? workerRoom === 0 : !project.runnerLeads) continue;
+      // The task waited in quota_wait already, so its vendorHint holds it back no longer.
+      const prefs = task && { ...placementPrefs(ctx, task, listAttempts(ctx, { task: task.id })), readySince: 0 };
+      const { placement } = prefs
+        ? place(snapshot, prefs, { projectPref: vendorPref })
         : placeLead(snapshot, { rotatingFrom: null });
       if (!placement || isProbe(placement)) continue;
       requestStop(ctx, {
@@ -294,7 +301,8 @@ export function replaceQuotaWaits(ctx: HubContext): string[] {
         reason: `the ${attempt.vendor} quota is exhausted and ${resetWords(ctx, attempt.quotaResetsAt)}`,
         by: 'system',
       });
-      recordPlacement(snapshot, placement);
+      recordPlacement(snapshot, placement, attempt.role);
+      if (task) workerRoom -= 1;
       replaced.push(attempt.id);
     } catch (error) {
       console.error(`replacing attempt ${attempt.id} in quota_wait failed`, error);
@@ -380,9 +388,9 @@ export interface TickResult {
  * One scheduler tick (design 6.6): the clock check, reconcile, the lead seat, then dispatch. Within the recovery
  * window after downtime the tick stops after the clock check: no lease expires, no stall is judged and nothing
  * starts, while runners reconnect and replay (design 6.14); agents' bridge calls work meanwhile. The lead starts
- * before dispatch, so that dispatch sees the slot it takes. A paused project skips the lead seat and dispatch (steps
- * 2 to 6); the agents already running go on under every stall, budget and lease rule. While the churn guard holds
- * dispatch (churnPaused), the lead seat step still runs and no worker starts.
+ * before dispatch, so that dispatch sees the account it draws on; it takes no slot. A paused project skips the lead
+ * seat and dispatch (steps 2 to 6); the agents already running go on under every stall, budget and lease rule. While
+ * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts.
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
@@ -410,11 +418,13 @@ const freesOrReadies = (event: { type: string; data: Record<string, unknown> }):
   event.type === 'task.released' ||
   event.type === 'attempt.ended' ||
   event.type === 'attempt.holding' ||
+  event.type === 'attempt.quota_wait' ||
   (event.type === 'task.created' && event.data.status === 'ready');
 
 /**
  * The scheduler's timer (design 6.6; X-26): once started, a tick every tickMs, and one more, debounced, right after
- * a task gets ready (created, made ready, unblocked or released) or a worker slot frees (an attempt ends or holds).
+ * a task gets ready (created, made ready, unblocked or released) or a worker slot frees (an attempt ends, holds or
+ * waits for its quota).
  * tick() runs one tick now, started or not. startHub creates it started for 'auto' and stopped for 'manual'.
  */
 export class Scheduler {

@@ -11,6 +11,7 @@ import { getHubState, insertLeadNote, seatHolderId } from '../src/hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue, wakeHoldingLead } from '../src/lead';
 import { listMessages, markDelivered, sendMessage } from '../src/messages';
 import { setPaused } from '../src/project';
+import { setLimited } from '../src/runners';
 import { runTick } from '../src/scheduler';
 import { startHub } from '../src/server';
 import { getTask } from '../src/task-store';
@@ -141,15 +142,18 @@ describe('starting a runner lead', () => {
     expect(startOn(ctx, claude).attempt).toMatchObject({ attemptId: lead.id, role: 'lead' });
   });
 
-  test('the lead starts before dispatch, which sees the slot it takes', () => {
+  test('the lead takes no slot: a runner with two slots runs it and two workers', () => {
     const { ctx } = createTestContext();
     const runnerId = addRunner(ctx);
-    const [first, second] = createTasks(ctx, [newTask({ title: 'One' }), newTask({ title: 'Two' })], 'user:alice');
-    // The runner has two slots: the lead's and one worker's.
+    const titles = [newTask({ title: 'One' }), newTask({ title: 'Two' }), newTask({ title: 'Three' })];
+    const [first, second, third] = createTasks(ctx, titles, 'user:alice');
     const result = runTick(ctx);
     expect(result.lead).toMatchObject({ role: 'lead', runnerId });
-    expect(result.started.map((attempt) => [attempt.taskId, attempt.runnerId])).toEqual([[first?.id, runnerId]]);
-    expect(getTask(ctx, second?.id as string).status).toBe('ready');
+    expect(result.started.map((attempt) => [attempt.taskId, attempt.runnerId])).toEqual([
+      [first?.id, runnerId],
+      [second?.id, runnerId],
+    ]);
+    expect(getTask(ctx, third?.id as string).status).toBe('ready');
   });
 
   test('none while the project is paused, or with runner leads off', () => {
@@ -168,8 +172,9 @@ describe('starting a runner lead', () => {
   test('a runner lead holds the seat while starting, running, quota_wait or holding', () => {
     const { ctx, lead } = runningLead();
     addRunner(ctx);
+    // The lead's limit keeps leads off alice's account, on the other runner too, so its wait is not replaced.
+    setLimited(ctx, lead.runnerId as string, { vendor: 'claude', role: 'lead', resetsAt: ctx.now() + MINUTE });
     for (const status of ['starting', 'running', 'quota_wait', 'holding'] as const) {
-      // A reset a minute away: the lead waits for it rather than being replaced.
       updateAttempt(ctx, lead.id, { status, quotaResetsAt: status === 'quota_wait' ? ctx.now() + MINUTE : null });
       expect([status, seatHolderId(ctx)]).toEqual([status, lead.agentId]);
       const result = runTick(ctx);

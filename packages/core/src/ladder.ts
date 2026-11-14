@@ -249,7 +249,7 @@ export interface LadderInput {
   maxAttempts: number;
   /**
    * For a rejection: whether its author can take the work back, which the hub decides (the author's attempt is
-   * holding and resumable, on an online runner with a free slot and its vendor usable there, and no path overlaps),
+   * holding and resumable, on an online runner with its vendor usable there, full or not, and no path overlaps),
    * and the attempt's review rounds so far.
    */
   rejection?: { authorCanResume: boolean; reviewRounds: number };
@@ -317,17 +317,21 @@ export function infraBackoffMs(consecutive: number, schedule: readonly number[] 
   return wait;
 }
 
-/** Infra endings delay the task's next dispatch, except the runner's own stops (design 6.4). */
+/**
+ * Infra endings delay the task's next dispatch, except the runner's own stops (design 6.4) and a quota replacement,
+ * which is no failure: its successor starts on an account with quota at once.
+ */
 export function backoffApplies(trigger: EndingTrigger): boolean {
-  return endingClass(trigger) === 'infra' && trigger !== 'runner_stop';
+  return endingClass(trigger) === 'infra' && trigger !== 'runner_stop' && trigger !== 'quota';
 }
 
 /**
- * Infra endings record a failure signature, except lost attempts and the runner's own stops. Suspends end nothing and
- * refused starts have no class, so neither gets one (design 6.9).
+ * Infra endings record a failure signature, except lost attempts, the runner's own stops and quota replacements, so
+ * running out of quota never blocks a task for a re-plan. Suspends end nothing and refused starts have no class, so
+ * neither gets one (design 6.9).
  */
 export function signatureApplies(trigger: EndingTrigger): boolean {
-  return endingClass(trigger) === 'infra' && trigger !== 'lost' && trigger !== 'runner_stop';
+  return endingClass(trigger) === 'infra' && trigger !== 'lost' && trigger !== 'runner_stop' && trigger !== 'quota';
 }
 
 /** How much of the normalised error a failure signature keeps. */

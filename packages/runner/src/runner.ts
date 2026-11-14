@@ -694,7 +694,7 @@ class Runtime {
       notifier: options.notifier ?? silentNotifier,
       logger: this.logger,
       liveAttempts: () =>
-        [...this.controllers.values()].filter((other) => other.attemptId !== attemptId && other.holdsSlot).length,
+        [...this.controllers.values()].filter((other) => other.attemptId !== attemptId && other.takesSlot).length,
       vendorReady: (vendor) => this.preflights.get(vendor)?.result.facts.ready === true,
       wipRefPrefix: () => this.wipRefPrefix(),
       tmpRoot: options.tmpRoot ?? '/tmp',
