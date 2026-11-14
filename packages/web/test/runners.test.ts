@@ -257,20 +257,132 @@ describe('vendors', () => {
     expect(vendorView(vendor({ cliVersion: null, ownerCliVersion: null }), null).version).toBe('not installed');
   });
 
-  test('managed configuration and reserved approvals are two notes, and a degraded vendor is marked', () => {
-    const open = vendorView(vendor({ vendor: 'codex', managedPolicy: true }), null);
-    expect(open.managed).toBe('The device has managed configuration for this vendor');
-    expect(open.approvals).toBe('That configuration leaves approvals open: the lead may answer requests from this vendor');
-    const reserved = vendorView(vendor({ vendor: 'codex', managedPolicy: true, approvalsReservedToOwner: true }), null);
-    expect(reserved.approvals).toBe(
-      'The device policy reserves approvals: only the owner may approve a request from this vendor',
-    );
-    // An older runner reports no such fact: read as reserved, as the hub reads it.
-    const older = vendorView(vendor({ approvalsReservedToOwner: undefined }), null);
-    expect(older.managed).toBeNull();
-    expect(older.approvals).toBe(
-      'The device policy reserves approvals: only the owner may approve a request from this vendor',
-    );
+  describe('managed configuration and who may answer approvals are two notes, each saying only what the runner read', () => {
+    const MANAGED =
+      'The device has managed configuration for this vendor, or the runner could not read all of its configuration';
+    const RESERVED =
+      'The device policy reserves approvals to the owner, or the runner could not read it: only the owner may approve';
+    const UNREPORTED = 'This runner does not report who may answer approvals, so only the owner may approve';
+    const OPEN = 'Nothing the runner read reserves approvals, so an agent may answer requests from this vendor';
+    // What GET /api/runners gives a vendor the runner reports ready once the hub has marked it not ready.
+    const MARKED = { ready: false, problem: 'marked not ready by the hub until a preflight passes' };
+    const notes = (overrides: Partial<RunnerVendor>) => {
+      const view = vendorView(vendor({ vendor: 'codex', ...overrides }), null);
+      return { managed: view.managed, approvals: view.approvals };
+    };
+
+    test('reserved: the policy says so, or it could not be read, and the note says it is either', () => {
+      // A policy that regulates who answers, or requirements the runner could not read: the report is the same.
+      expect(notes({ managedPolicy: true, approvalsReservedToOwner: true })).toEqual({
+        managed: MANAGED,
+        approvals: RESERVED,
+      });
+      // A preflight that threw, as the runner now reports it: nothing read, both facts closed.
+      expect(
+        notes({ ready: false, problem: 'the preflight failed: boom', managedPolicy: true, approvalsReservedToOwner: true }),
+      ).toEqual({ managed: MANAGED, approvals: RESERVED });
+      // The same from a runner that still says managedPolicy false there: still no claim that the device has none.
+      expect(notes({ ready: false, managedPolicy: false, approvalsReservedToOwner: true })).toEqual({
+        managed: null,
+        approvals: RESERVED,
+      });
+    });
+
+    test('not reported: a runner too old to know says nothing, and the owner answers, as the hub has it', () => {
+      for (const ready of [true, false]) {
+        expect(notes({ ready, managedPolicy: false, approvalsReservedToOwner: undefined })).toEqual({
+          managed: null,
+          approvals: UNREPORTED,
+        });
+        expect(notes({ ready, managedPolicy: true, approvalsReservedToOwner: undefined })).toEqual({
+          managed: MANAGED,
+          approvals: UNREPORTED,
+        });
+      }
+      const { approvalsReservedToOwner: _absent, ...older } = vendor({ vendor: 'codex' });
+      expect(vendorView(older, null).approvals).toBe(UNREPORTED);
+    });
+
+    test('open: wherever the runner reports the vendor ready and nothing it read reserves approvals, an agent may answer', () => {
+      expect(notes({ managedPolicy: true, approvalsReservedToOwner: false })).toEqual({ managed: MANAGED, approvals: OPEN });
+      // The review's case (b), an unmanaged laptop: the hub lets the lead approve there too, so the card says so.
+      expect(notes({ managedPolicy: false, approvalsReservedToOwner: false })).toEqual({ managed: null, approvals: OPEN });
+      // Claude raises no approvals, so there is nothing for anyone to answer, and nothing to say.
+      expect(vendorView(vendor(), null)).toMatchObject({ managed: null, approvals: null });
+      expect(vendorView(vendor({ managedPolicy: true }), null)).toMatchObject({ managed: MANAGED, approvals: null });
+    });
+
+    test("open on configuration the runner could not read all of: neither note claims managed configuration it never read", () => {
+      // The review's input: requirements null, and config/read failed or gave no layers. The runner reports managed
+      // configuration it never read, beside approvals nothing it read reserves.
+      const view = notes({ managedPolicy: true, approvalsReservedToOwner: false });
+      expect(view).toEqual({ managed: MANAGED, approvals: OPEN });
+      expect(view.managed).toEndWith('or the runner could not read all of its configuration');
+      expect(view.approvals).not.toContain('managed');
+    });
+
+    test('marked not ready by the hub: the hub still reads the runner\'s own report, so an agent may still answer', () => {
+      // The review's case (a): the runner reports codex ready and open, and the hub marked it not ready since.
+      expect(notes({ ...MARKED, managedPolicy: true, approvalsReservedToOwner: false })).toEqual({
+        managed: MANAGED,
+        approvals: OPEN,
+      });
+      expect(notes({ ...MARKED, managedPolicy: false, approvalsReservedToOwner: false })).toEqual({ managed: null, approvals: OPEN });
+      // The mark changes nothing where the runner's report reserves approvals.
+      expect(notes({ ...MARKED, managedPolicy: true, approvalsReservedToOwner: true })).toEqual({
+        managed: MANAGED,
+        approvals: RESERVED,
+      });
+    });
+
+    test('open but not ready by the runner\'s own report: no claim about approvals at all, since the hub honours none', () => {
+      expect(notes({ ready: false, problem: 'not logged in', managedPolicy: true, approvalsReservedToOwner: false })).toEqual({
+        managed: MANAGED,
+        approvals: null,
+      });
+      expect(notes({ ready: false, problem: 'not logged in', managedPolicy: false, approvalsReservedToOwner: false })).toEqual({
+        managed: null,
+        approvals: null,
+      });
+    });
+
+    test('in every case: no note says the device has no managed configuration, and an agent answers just where the hub lets one', () => {
+      const states: [string, Partial<RunnerVendor>][] = [
+        ['ready', { ready: true, problem: null }],
+        ['not ready', { ready: false, problem: 'not logged in' }],
+        ['marked by the hub', MARKED],
+      ];
+      for (const [state, readiness] of states) {
+        for (const managedPolicy of [true, false]) {
+          for (const approvalsReservedToOwner of [true, false, undefined]) {
+            const facts = { state, managedPolicy, approvalsReservedToOwner };
+            const view = vendorView(vendor({ vendor: 'codex', ...readiness, managedPolicy, approvalsReservedToOwner }), null);
+            const said = [view.managed, view.approvals].filter((note): note is string => note !== null);
+            expect({ facts, said: said.filter((note) => /\bno managed|not managed|unmanaged/i.test(note)) }).toEqual({
+              facts,
+              said: [],
+            });
+            // Managed configuration is never stated without the runner's not having read all of it.
+            expect({ facts, said: said.filter((note) => /managed configuration/i.test(note) && !note.includes('could not read')) }).toEqual({
+              facts,
+              said: [],
+            });
+            // As the hub's agentMayApprove: the runner's own ready, and false.
+            expect({ facts, agent: view.approvals === OPEN }).toEqual({
+              facts,
+              agent: state !== 'not ready' && approvalsReservedToOwner === false,
+            });
+            expect({ facts, owner: view.approvals?.endsWith('only the owner may approve') ?? false }).toEqual({
+              facts,
+              owner: approvalsReservedToOwner !== false,
+            });
+          }
+        }
+      }
+    });
+  });
+
+  test('a degraded vendor is marked', () => {
     const degraded = vendorView(vendor({ degraded: true }), null);
     expect(degraded.tone).toBe('wait');
     expect(degraded.degraded).toBe('Degraded after an hour of vendor errors: placement prefers the other vendor for now');

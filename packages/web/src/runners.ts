@@ -162,17 +162,57 @@ export interface VendorView {
   /** The runner's own pinned binary, with the owner's install when it differs. */
   version: string;
   plan: string | null;
-  /** On a managed device: that the device has managed configuration for this vendor. */
+  /** That the device has managed configuration for this vendor, as far as the runner read it (managedNote). */
   managed: string | null;
-  /** Who may answer this vendor's approval requests, when the device policy has an answer (6.10). */
+  /** Who may answer this vendor's approval requests, as far as the runner's report says (approvalsNote). */
   approvals: string | null;
   degraded: string | null;
   ownerAway: string | null;
 }
 
+/**
+ * The device's managed configuration for the vendor, a fact apart from who answers approvals (6.10). A runner reports
+ * it true for configuration it could not read too, its requirements or the rest of it, so the note always says so. No
+ * note says the device has none, since a false may be a fact never read: Claude's preflight reads no policy, and an
+ * older runner's preflight that threw said false.
+ */
+function managedNote(vendor: RunnerVendor): string | null {
+  return vendor.managedPolicy
+    ? 'The device has managed configuration for this vendor, or the runner could not read all of its configuration'
+    : null;
+}
+
+/**
+ * The problem the hub's runner view gives a vendor the runner itself reports ready, once the hub has marked it not ready
+ * (hub/src/runners.ts, vendorsOf): two failed starts, or an auth error. The hub still reads the runner's own report
+ * when it asks whether an agent may approve, so for that question such a vendor is ready.
+ */
+const HUB_MARKED_NOT_READY = 'marked not ready by the hub until a preflight passes';
+
+/**
+ * Who may answer the vendor's approval requests, as the hub reads the runner's report (6.10). True and a missing field
+ * both reserve them to the owner, and the note says which it is. False is the runner's word that nothing it read
+ * reserves them, which the hub honours from a vendor the runner reports ready, whether or not the hub has marked it
+ * not ready since, on a managed device or not: there an agent may answer, and the note says so. A false makes no note
+ * for a vendor the runner itself reports not ready, which the hub does not honour, nor for Claude, which raises no
+ * approvals.
+ */
+function approvalsNote(vendor: RunnerVendor): string | null {
+  switch (vendor.approvalsReservedToOwner) {
+    case true:
+      return 'The device policy reserves approvals to the owner, or the runner could not read it: only the owner may approve';
+    case false: {
+      const reportedReady = vendor.ready || vendor.problem === HUB_MARKED_NOT_READY;
+      return reportedReady && vendor.vendor !== 'claude'
+        ? 'Nothing the runner read reserves approvals, so an agent may answer requests from this vendor'
+        : null;
+    }
+    default:
+      return 'This runner does not report who may answer approvals, so only the owner may approve';
+  }
+}
+
 export function vendorView(vendor: RunnerVendor, account: AccountQuota | null): VendorView {
-  // A runner that reports no such fact is read as reserved, as the hub reads it (6.10).
-  const reserved = vendor.approvalsReservedToOwner !== false;
   const runnerVersion = vendor.cliVersion ?? 'not installed';
   const ownerVersion =
     vendor.ownerCliVersion && vendor.ownerCliVersion !== vendor.cliVersion
@@ -186,13 +226,8 @@ export function vendorView(vendor: RunnerVendor, account: AccountQuota | null): 
     tone: !vendor.ready ? 'trouble' : vendor.degraded ? 'wait' : 'done',
     version: `${runnerVersion}${ownerVersion}`,
     plan: vendor.plan,
-    // Managed configuration and who answers approvals are two facts: a managed device need not reserve them (6.10).
-    managed: vendor.managedPolicy ? 'The device has managed configuration for this vendor' : null,
-    approvals: reserved
-      ? 'The device policy reserves approvals: only the owner may approve a request from this vendor'
-      : vendor.managedPolicy
-        ? 'That configuration leaves approvals open: the lead may answer requests from this vendor'
-        : null,
+    managed: managedNote(vendor),
+    approvals: approvalsNote(vendor),
     degraded: vendor.degraded
       ? 'Degraded after an hour of vendor errors: placement prefers the other vendor for now'
       : null,

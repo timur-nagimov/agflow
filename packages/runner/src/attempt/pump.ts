@@ -10,9 +10,13 @@
 //   hub has no other way to learn; every text is clipped to fit the outbox, and the owner gets one notification keyed
 //   by that UUID. A withdrawn request is approval.voided; decide_approval answers at once whether it applied.
 //   A request the outbox refuses all the same is declined to the agent with the reason, so it never waits in vain.
+//   A request goes only while the clone's path still names the directory the pump started with: one that is gone, a
+//   link, or another directory (its device and inode changed) leaves no path known to be inside the clone, so the
+//   request is declined to the agent at once, relayed to nobody, and the attempt's activity says why.
 // - Descendants: every tool start, and every 5 s while a tool runs, snapshots the agent's descendants and records
 //   their groups, so a tool's group can be stopped even after its parent is gone.
 import { randomUUID } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import {
   APPROVAL_CLIPPED_MARK,
   type Approval,
@@ -48,6 +52,13 @@ const CLIPPED = APPROVAL_CLIPPED_MARK;
  */
 export const APPROVAL_NOT_FORWARDED =
   'agflow declined this approval request: it was too large to forward for a decision. Ask for a smaller step.';
+/**
+ * The decline reason of an approval request from a clone that is not the directory the pump started with: no path in
+ * it is known to be inside the clone, so nobody is asked to judge it. The activity note adds what the runner found.
+ */
+export const APPROVAL_CLONE_MOVED =
+  "agflow declined this approval request: the attempt's clone is not the directory the attempt started in, so agflow " +
+  'forwards no request from it.';
 
 type AttemptEvent = Extract<NewEvent, { attemptId: string }>;
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -82,6 +93,28 @@ export function clipApprovalDetail(detail: Approval['detail']): Approval['detail
 /** The line deliver.more adds (X-4). */
 export function moreMessagesLine(more: number): string {
   return `${more} more agflow messages are waiting: call check_inbox`;
+}
+
+/** Which directory a path names: its device and inode, exact as bigints. */
+interface DirectoryIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+/**
+ * The directory at the clone's path, never followed if it is a link, or why the path names none: it is gone, a link,
+ * not a directory, or cannot be read.
+ */
+function cloneDirectory(clone: string): DirectoryIdentity | string {
+  try {
+    const stat = lstatSync(clone, { bigint: true, throwIfNoEntry: false });
+    if (stat === undefined) return 'the clone is gone';
+    if (stat.isSymbolicLink()) return 'the clone is a symbolic link';
+    if (!stat.isDirectory()) return 'the clone is not a directory';
+    return { dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    return `the clone cannot be read: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 export interface EventPumpOptions {
@@ -119,10 +152,13 @@ export class EventPump {
   private snapshotting: Promise<void> = Promise.resolve();
   private firstOutputSent = false;
   private handoffCount = 0;
+  /** The directory the clone's path named when the pump started, or why it named none. */
+  private readonly cloneAtStart: DirectoryIdentity | string;
 
   constructor(options: EventPumpOptions) {
     this.options = options;
     this.firstOutputSent = options.firstOutputReported ?? false;
+    this.cloneAtStart = cloneDirectory(options.clone);
   }
 
   /**
@@ -307,11 +343,29 @@ export class EventPump {
     }
     // Withdrawn while it was enriched: nothing to relay.
     if (!this.approvals.has(approvalId)) return;
+    // The clone's path must still name the directory the pump started with, checked here with nothing awaited before
+    // the report: an agent that once wrote outside its workspace could have put a link or another directory there, and
+    // every path under it would look contained. Relayed without cloneRoot, the request would meet no rule at the hub,
+    // not even one that declines it by its shape alone, and an agent the device lets answer could approve it. So it
+    // goes to nobody: it is declined at once, as one the outbox refuses, and the activity says what the runner found.
+    const moved = this.cloneMoved();
+    if (moved !== null) {
+      logger.warn('an approval request is declined: the clone is not the directory the pump started with', {
+        attemptId: spec.attemptId,
+        clone: this.options.clone,
+        why: moved,
+      });
+      this.forget(approvalId);
+      await this.options.session.answerApproval(event.approvalId, 'decline', APPROVAL_CLONE_MOVED).catch(() => false);
+      this.activity('note', `${APPROVAL_CLONE_MOVED} The runner found: ${moved}.`);
+      return;
+    }
     // The agent and the adapter write these: clipped, so the event always fits the outbox.
     const summary = clip(event.summary, APPROVAL_SUMMARY_MAX);
     // The runner's own fact, added after any enrichment, so neither the agent nor the adapter writes it: the hub
     // knows no path of this laptop, and judges a cwd against this one (design 6.10).
-    const relayed = clipApprovalDetail({ ...detail, cloneRoot: this.options.clone });
+    const { cloneRoot: _notTheRunners, ...asked } = detail;
+    const relayed = clipApprovalDetail({ ...asked, cloneRoot: this.options.clone });
     try {
       this.options.report({
         type: 'approval.requested',
@@ -338,6 +392,19 @@ export class EventPump {
     } catch (error) {
       logger.warn('cannot post the approval notification', { attemptId: spec.attemptId, error: String(error) });
     }
+  }
+
+  /**
+   * Why the clone's path no longer names the directory it named when the pump started, or null while it does. A path
+   * that named none at the start never does.
+   */
+  private cloneMoved(): string | null {
+    const start = this.cloneAtStart;
+    if (typeof start === 'string') return `when the pump started, ${start}`;
+    const now = cloneDirectory(this.options.clone);
+    if (typeof now === 'string') return now;
+    if (now.dev === start.dev && now.ino === start.ino) return null;
+    return 'the clone is another directory than the one the pump started with';
   }
 
   private voidApproval(vendorId: string): void {
