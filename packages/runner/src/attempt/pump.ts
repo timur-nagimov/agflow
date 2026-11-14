@@ -6,8 +6,9 @@
 //   vendor's delivered and acknowledged events back to hub message ids. Message 0 (hub text) and the one line
 //   about deliver.more are never reported (X-4).
 // - Approvals (X-9): each vendor request gets a runner-minted UUID, held in memory with the vendor's id, and becomes
-//   approval.requested with the fence and the adapter's enriched detail, its texts clipped to fit the outbox; the
-//   owner gets one notification keyed by that UUID. A withdrawn request is approval.voided; decide_approval answers at once whether it applied.
+//   approval.requested with the fence, the adapter's enriched detail and the attempt's clone as cloneRoot, which the
+//   hub has no other way to learn; every text is clipped to fit the outbox, and the owner gets one notification keyed
+//   by that UUID. A withdrawn request is approval.voided; decide_approval answers at once whether it applied.
 //   A request the outbox refuses all the same is declined to the agent with the reason, so it never waits in vain.
 // - Descendants: every tool start, and every 5 s while a tool runs, snapshots the agent's descendants and records
 //   their groups, so a tool's group can be stopped even after its parent is gone.
@@ -29,7 +30,7 @@ export const DESCENDANT_SNAPSHOT_MS = 5_000;
 /** The longest approval summary: 4,000 characters. */
 export const APPROVAL_SUMMARY_MAX = 4_000;
 /**
- * The most bytes one approval detail field takes in the event's JSON: 64 KB, so the six fields stay far below the
+ * The most bytes one approval detail field takes in the event's JSON: 64 KB, so the seven fields stay far below the
  * outbox's 1 MB however the agent's text escapes. A manifest diff after an install easily passes 1 MB.
  */
 export const APPROVAL_DETAIL_FIELD_MAX_BYTES = 64 * 1024;
@@ -301,10 +302,13 @@ export class EventPump {
     if (!this.approvals.has(approvalId)) return;
     // The agent and the adapter write these: clipped, so the event always fits the outbox.
     const summary = clip(event.summary, APPROVAL_SUMMARY_MAX);
+    // The runner's own fact, added after any enrichment, so neither the agent nor the adapter writes it: the hub
+    // knows no path of this laptop, and judges a cwd against this one (design 6.10).
+    const relayed = clipApprovalDetail({ ...detail, cloneRoot: this.options.clone });
     try {
       this.options.report({
         type: 'approval.requested',
-        data: { approvalId, kind: event.kind, summary, detail: clipApprovalDetail(detail) },
+        data: { approvalId, kind: event.kind, summary, detail: relayed },
       });
     } catch (error) {
       // The outbox refused it all the same: declined at once, so the agent goes on.

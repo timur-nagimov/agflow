@@ -379,7 +379,7 @@ const DecidedAnswerSchema = z.object({
 });
 
 /** A request's parts in the order they are printed: the short ones first, the diffs last. */
-const APPROVAL_DETAIL_FIELDS = ['command', 'cwd', 'reason', 'grantRoot', 'diff', 'manifestDiff'] as const;
+const APPROVAL_DETAIL_FIELDS = ['command', 'cwd', 'cloneRoot', 'reason', 'grantRoot', 'diff', 'manifestDiff'] as const;
 
 /** How many approvals one listing prints, the oldest ones; the rest are counted, and listed once these are answered. */
 const APPROVALS_LISTED_MAX = 8;

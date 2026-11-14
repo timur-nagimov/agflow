@@ -177,6 +177,7 @@ export class FakeAdapter implements VendorAdapter {
       accountId: null,
       plan: null,
       managedPolicy: false,
+      approvalsReservedToOwner: false,
       ...this.options.facts,
     };
     const facts = this.options.skipAuthChecks

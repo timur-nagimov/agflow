@@ -348,6 +348,7 @@ function vendor(name: Vendor, overrides: Partial<RunnerVendor> = {}): RunnerVend
     accountId: null,
     plan: claude ? 'Claude Max' : 'ChatGPT Pro',
     managedPolicy: false,
+    approvalsReservedToOwner: false,
     models: claude
       ? { lead: 'claude-opus-5-5', worker: 'claude-sonnet-5-5' }
       : { lead: 'gpt-6.1-sol', worker: 'gpt-6.1-sol' },

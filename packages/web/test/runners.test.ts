@@ -46,6 +46,7 @@ function vendor(overrides: Partial<RunnerVendor> = {}): RunnerVendor {
     accountId: 'a1b2c3d4e5f60718',
     plan: 'Claude Max',
     managedPolicy: false,
+    approvalsReservedToOwner: false,
     models: { lead: 'claude-opus', worker: 'claude-sonnet' },
     ceilings: { fiveHour: 0.85, weekly: 0.85 },
     allowPaidUsage: false,
@@ -232,6 +233,7 @@ describe('vendors', () => {
       version: '2.1.285',
       plan: 'Claude Max',
       managed: null,
+      approvals: null,
       degraded: null,
       ownerAway: null,
     });
@@ -255,10 +257,19 @@ describe('vendors', () => {
     expect(vendorView(vendor({ cliVersion: null, ownerCliVersion: null }), null).version).toBe('not installed');
   });
 
-  test('a managed policy is explained and a degraded vendor is marked', () => {
-    const managed = vendorView(vendor({ vendor: 'codex', managedPolicy: true }), null);
-    expect(managed.managed).toBe(
-      'A managed device policy applies: commands outside the sandbox need the owner to approve them',
+  test('managed configuration and reserved approvals are two notes, and a degraded vendor is marked', () => {
+    const open = vendorView(vendor({ vendor: 'codex', managedPolicy: true }), null);
+    expect(open.managed).toBe('The device has managed configuration for this vendor');
+    expect(open.approvals).toBe('That configuration leaves approvals open: the lead may answer requests from this vendor');
+    const reserved = vendorView(vendor({ vendor: 'codex', managedPolicy: true, approvalsReservedToOwner: true }), null);
+    expect(reserved.approvals).toBe(
+      'The device policy reserves approvals: only the owner may approve a request from this vendor',
+    );
+    // An older runner reports no such fact: read as reserved, as the hub reads it.
+    const older = vendorView(vendor({ approvalsReservedToOwner: undefined }), null);
+    expect(older.managed).toBeNull();
+    expect(older.approvals).toBe(
+      'The device policy reserves approvals: only the owner may approve a request from this vendor',
     );
     const degraded = vendorView(vendor({ degraded: true }), null);
     expect(degraded.tone).toBe('wait');

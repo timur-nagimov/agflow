@@ -67,6 +67,7 @@ const vendor: RunnerVendor = {
   accountId: TEST_ACCOUNT_ID,
   plan: 'Claude Max',
   managedPolicy: false,
+  approvalsReservedToOwner: false,
   models: { lead: 'claude-opus-5-5', worker: 'claude-sonnet-5-5' },
   ceilings: { fiveHour: 0.85, weekly: 0.85 },
   allowPaidUsage: false,
@@ -521,6 +522,14 @@ describe('value schemas', () => {
     expect(AccountQuotaReportSchema.safeParse({ vendor: 'claude', accountId: null, quota }).success).toBe(false);
   });
 
+  test('a vendor report without approvalsReservedToOwner parses, so an older runner is still heard', () => {
+    const { approvalsReservedToOwner: _reserved, ...older } = vendor;
+    expect(RunnerVendorSchema.safeParse(older).data).toEqual(older);
+    expect(RunnerVendorSchema.safeParse({ ...vendor, approvalsReservedToOwner: true }).success).toBe(true);
+    // Absence is the only way to leave it unsaid: null is not a boolean.
+    expect(RunnerVendorSchema.safeParse({ ...vendor, approvalsReservedToOwner: null }).success).toBe(false);
+  });
+
   test('AttemptFacts ages are non-negative integers and contextUsed is 0..1 or null', () => {
     const ages = ['eventAgeMs', 'fsAgeMs', 'turns', 'turnsWithoutProgress', 'repeatedCalls', 'continuations'] as const;
     for (const key of [...ages, 'vendorErrorMs', 'activeMs'] as const) {
@@ -928,6 +937,9 @@ describe('runner events', () => {
     const fileChange = { kind: 'file_change', detail: { diff: '+ token', grantRoot: '/work/app' } } as const;
     expect(parses(withData('approval.requested', fileChange))).toBe(true);
     expect(parses(withData('approval.requested', { detail: {} }))).toBe(true);
+    // The runner's own cloneRoot, which the hub judges the cwd against.
+    const inClone = { detail: { command: 'ls', cwd: '/work/T-3-a1/packages', cloneRoot: '/work/T-3-a1' } } as const;
+    expect(parses(withData('approval.requested', inClone))).toBe(true);
     expect(parses(withData('approval.requested', { detail: { command: 'ls', env: 'x' } as never }))).toBe(false);
     expect(parses(withData('approval.requested', { kind: 'network' as never }))).toBe(false);
     expect(parses(withData('approval.requested', { approvalId: 'approval-1' }))).toBe(false);

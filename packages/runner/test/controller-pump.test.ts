@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import type { InjectedMessage } from '@agflow/core';
 import { FakeAdapter, type FakeAdapterOptions, type FakeScript, type TranscriptLine } from '@agflow/testkit';
@@ -168,7 +168,7 @@ describe('AttemptController: the event pump', () => {
     });
   });
 
-  test('an approval request is relayed with the fence and the enriched detail, and the owner notified once', async () => {
+  test('an approval request is relayed with the fence, the enriched detail and the clone root, and the owner notified once', async () => {
     const notifications: Notification[] = [];
     const { f } = await setup(
       {
@@ -184,7 +184,8 @@ describe('AttemptController: the event pump', () => {
           ],
         ],
       },
-      { enrichDetail: { manifestDiff: '+ "left-pad": "1.3.0"' } },
+      // The adapter's own cloneRoot is overwritten: the clone root is the runner's fact, not the vendor's (6.10).
+      { enrichDetail: { manifestDiff: '+ "left-pad": "1.3.0"', cloneRoot: '/not/the/clone' } },
     );
     const controller = f.controller('T-4-a1', { notifier: { notify: (note) => void notifications.push(note) } });
     await controller.start(f.spec());
@@ -199,7 +200,12 @@ describe('AttemptController: the event pump', () => {
       approvalId,
       kind: 'command',
       summary: 'npm install left-pad',
-      detail: { command: 'npm install left-pad', cwd: '/work', manifestDiff: '+ "left-pad": "1.3.0"' },
+      detail: {
+        command: 'npm install left-pad',
+        cwd: '/work',
+        manifestDiff: '+ "left-pad": "1.3.0"',
+        cloneRoot: realpathSync(f.paths.clone(FIXTURE_PROJECT, 'T-4-a1')),
+      },
     });
     await waitFor(() => controller.phase === 'waiting_approval');
     expect(notifications).toEqual([
