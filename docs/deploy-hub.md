@@ -211,7 +211,9 @@ after a change. The rules behind the last two are in the
   download piped into an interpreter, history-rewriting git, and any path outside the attempt's clone beyond a short
   list of read-only system and cache directories. Everything else is left undecided and waits for the lead or the
   owner. Each decision is recorded as `policy:<rule>` in the attempt's log and the event. The rules bind the lead too:
-  it may not approve what they decline. A request the runner had to cut short is never judged on the part it shows.
+  it may not approve what they decline, nor a request they cannot judge whole (one that names no clone, one the
+  runner had to cut short), which only its owner approves. A request is never judged on the part it shows, and a word
+  whose value the shell decides (`$1`, `{..,..}`, `.*`, zsh's `$PWD:h`) counts as unknown.
   Risk: a rule cannot read intent, and the clone is the boundary the rules hold. They refuse what reaches outside it
   and every re-spelling of what they refuse, but inside it the agent's own files are trusted: an approved test command
   runs the repository's tests, a declared dependency runs its own install scripts, and an agent that writes code into
