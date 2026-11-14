@@ -211,9 +211,12 @@ after a change. The rules behind the last two are in the
   download piped into an interpreter, history-rewriting git, and any path outside the attempt's clone beyond a short
   list of read-only system and cache directories. Everything else is left undecided and waits for the lead or the
   owner. Each decision is recorded as `policy:<rule>` in the attempt's log and the event. The rules bind the lead too:
-  it may not approve what they decline. Risk: a rule cannot read intent, and inside the clone the task's own code is
-  the trust boundary — an approved test command runs the repository's tests, and a declared dependency runs its own
-  install scripts. Turn it on for projects you would run unattended anyway.
+  it may not approve what they decline. A request the runner had to cut short is never judged on the part it shows.
+  Risk: a rule cannot read intent, and the clone is the boundary the rules hold. They refuse what reaches outside it
+  and every re-spelling of what they refuse, but inside it the agent's own files are trusted: an approved test command
+  runs the repository's tests, a declared dependency runs its own install scripts, and an agent that writes code into
+  the clone can then ask to run it. Containment is read from the text of the request, so a symbolic link the agent
+  made inside the clone counts as inside. Turn it on for projects you would run unattended anyway.
 
 ### What agents fetched
 
