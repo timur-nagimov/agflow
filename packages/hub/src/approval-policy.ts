@@ -54,6 +54,11 @@ const worst = (a: ApprovalJudgement, b: ApprovalJudgement): ApprovalJudgement =>
 /** Text someone else wrote, inside a reason: one line, clipped and quoted, so it cannot read as an instruction. */
 const show = (text: string): string => `"${oneLine(clip(text, 80))}"`;
 
+/** The declines that rest on the shape of a request alone, not on where the clone is. */
+const SHAPE_RULES = new Set([
+  'hidden-command', 'secret-path', 'privilege', 'containers', 'fetch-and-run', 'git-danger', 'destructive',
+]);
+
 /** The fields of a request a verdict rests on. The free text is never read, so a cut summary or reason is no matter. */
 const JUDGED_FIELDS = ['command', 'cwd', 'diff', 'grantRoot'] as const;
 
@@ -63,8 +68,18 @@ const JUDGED_FIELDS = ['command', 'cwd', 'diff', 'grantRoot'] as const;
  */
 export function judgeApproval(approval: Request, options: { cloneRoot: string | null }): ApprovalJudgement {
   const clone = cloneOf(options.cloneRoot);
-  // 1. Fail closed: no clone root, no containment check.
+  // 1. Fail closed: no clone root, no containment check. What the rules decline by its shape alone (a sudo, a
+  // download run by a shell, a credential) is declined all the same: it is judged with every path counted inside,
+  // which keeps every such decline and makes no containment claim.
   if (clone === null) {
+    const anywhere: Clone = { text: '/', root: [], home: null };
+    const shaped =
+      approval.kind === 'command'
+        ? judgeCommand(approval.detail, anywhere)
+        : approval.kind === 'file_change'
+          ? judgeFileChange(approval.detail, anywhere)
+          : null;
+    if (shaped?.verdict === 'decline' && SHAPE_RULES.has(shaped.rule)) return shaped;
     return undecided(
       'unknown-clone',
       'the hub does not know which clone this attempt works in, so no path can be checked for containment; the owner answers this one',
@@ -284,9 +299,17 @@ class HiddenText extends Error {}
 class Unreadable extends Error {}
 
 const WORD_END = new Set([' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>']);
-/** Longest first, so ">>" is never read as ">". */
-const REDIRECT_OPS = ['&>>', '&>', '<<<', '<<-', '<<', '>>', '>|', '>&', '<>', '<&', '<', '>'];
-const WRITING_OPS = new Set(['&>>', '&>', '>>', '>|', '>', '<>']);
+/**
+ * Longest first, so ">>" is never read as ">". zsh adds the forms that clobber (">!", ">>|") and those that send
+ * both streams to a file (">>&", ">&|"); each writes the word after it, as ">" does.
+ */
+const REDIRECT_OPS = [
+  '>>&!', '>>&|', '&>>', '>>&', '>>!', '>>|', '>&!', '>&|', '&>', '<<<', '<<-', '<<', '>>', '>|', '>!', '>&', '<>',
+  '<&', '<', '>',
+];
+const WRITING_OPS = new Set([
+  '&>>', '&>', '>>', '>|', '>', '<>', '>>&!', '>>&|', '>>&', '>>!', '>>|', '>&!', '>&|', '>!',
+]);
 
 /** What a redirection does, by its operator and its target: `>&file` writes the file, `>&2` only duplicates. */
 function redirectKind(op: string, target: Word): Redirect['kind'] {
@@ -336,6 +359,10 @@ function tokenise(command: string): Tokenised {
         at = line < 0 ? command.length : line;
         continue;
       }
+      // A parenthesis that opens straight after a word is no subshell: it is zsh's =(…) and its glob qualifiers
+      // (*(e:…:) runs code), bash's extended patterns @(…), a function or an array, none of which this lexer reads.
+      const glued = c === '(' && at > 0 && !/[\s;&|()<>]/.test(command[at - 1]);
+      if (glued) throw new Unreadable('a parenthesis inside a word');
       if (c === '\n' || c === ';' || c === '(' || c === ')') {
         at += 1;
         end(false);
@@ -387,11 +414,17 @@ function tokenise(command: string): Tokenised {
 function readWord(src: string, from: number): { word: Word; at: number } {
   let at = from;
   let text = '';
+  /** For every character of `text`, whether the shell sees it unquoted ('u'), where it may be a pattern. */
+  let marks = '';
   let unresolved = false;
   let home = false;
   let user: string | undefined;
   /** Nothing of the word has been read yet, so "~" and "$HOME" still root it at the home directory. */
   const fresh = (): boolean => text === '' && !home && !unresolved;
+  const quoted = (part: string): void => {
+    text += part;
+    marks += 'q'.repeat(part.length);
+  };
   while (at < src.length) {
     const c = src[at];
     if (WORD_END.has(c)) break;
@@ -399,13 +432,13 @@ function readWord(src: string, from: number): { word: Word; at: number } {
       const next = src[at + 1];
       if (next === undefined) throw new Unreadable('a trailing backslash');
       at += 2;
-      if (next !== '\n') text += next;
+      if (next !== '\n') quoted(next);
       continue;
     }
     if (c === "'") {
       const close = src.indexOf("'", at + 1);
       if (close < 0) throw new Unreadable('an unterminated single quote');
-      text += src.slice(at + 1, close);
+      quoted(src.slice(at + 1, close));
       at = close + 1;
       continue;
     }
@@ -417,19 +450,19 @@ function readWord(src: string, from: number): { word: Word; at: number } {
           const next = src[at + 1];
           if (next === undefined) throw new Unreadable('a trailing backslash');
           at += 2;
-          if (next !== '\n') text += '$`"\\'.includes(next) ? next : `\\${next}`;
+          if (next !== '\n') quoted('$`"\\'.includes(next) ? next : `\\${next}`);
           continue;
         }
         if (inner === '`') throw new HiddenText('a backtick substitution');
         if (inner === '$') {
-          const read = readDollar(src, at, fresh());
+          const read = readDollar(src, at, fresh(), true);
           at = read.at;
-          text += read.text;
+          quoted(read.text);
           unresolved ||= read.unresolved;
           home ||= read.home;
           continue;
         }
-        text += inner;
+        quoted(inner);
         at += 1;
       }
       if (at >= src.length) throw new Unreadable('an unterminated double quote');
@@ -438,9 +471,9 @@ function readWord(src: string, from: number): { word: Word; at: number } {
     }
     if (c === '`') throw new HiddenText('a backtick substitution');
     if (c === '$') {
-      const read = readDollar(src, at, fresh());
+      const read = readDollar(src, at, fresh(), false);
       at = read.at;
-      text += read.text;
+      quoted(read.text);
       unresolved ||= read.unresolved;
       home ||= read.home;
       continue;
@@ -462,10 +495,71 @@ function readWord(src: string, from: number): { word: Word; at: number } {
         continue;
       }
     }
+    // zsh replaces a word that starts with "=" by the path of the program of that name: cp x =npm overwrites npm.
+    if (c === '=' && fresh() && src[at + 1] !== undefined && !WORD_END.has(src[at + 1])) unresolved = true;
     text += c;
+    marks += 'u';
     at += 1;
   }
+  if (!unresolved && expands(text, marks)) unresolved = true;
   return { word: { text, source: src.slice(from, at), unresolved, home, ...(user === undefined ? {} : { user }) }, at };
+}
+
+/**
+ * Whether the shell would make the word into other words, or into names it finds on disk, that can lie where its
+ * text does not say: a brace list that is not a list of plain names ({..,..} is ".. ..", .{,.} is ". .."), a
+ * pattern in a segment that starts with a dot (".?" and ".*" match ".."), and a word that starts with a pattern,
+ * which can match a file the agent named like an option (-o/Users/me/.zshrc). A pattern anywhere else names files
+ * inside the directory it is read from.
+ */
+function expands(text: string, marks: string): boolean {
+  const open = (at: number): boolean => marks[at] === 'u';
+  // Brace lists, by their outermost pair.
+  for (let at = 0; at < text.length; at += 1) {
+    if (text[at] !== '{' || !open(at)) continue;
+    let depth = 0;
+    let close = -1;
+    for (let scan = at; scan < text.length; scan += 1) {
+      if (!open(scan)) continue;
+      if (text[scan] === '{') depth += 1;
+      else if (text[scan] === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          close = scan;
+          break;
+        }
+      }
+    }
+    if (close < 0) break;
+    const inner = text.slice(at + 1, close);
+    const commas = [...inner].flatMap((char, index) => (char === ',' && open(at + 1 + index) ? [index] : []));
+    const sequence = /^(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?$/.test(inner);
+    if (commas.length > 0) {
+      const items = [...commas, inner.length].map((end, index, all) =>
+        inner.slice(index === 0 ? 0 : all[index - 1] + 1, end),
+      );
+      if (!items.every((item) => /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/.test(item) && !item.includes('..'))) return true;
+    } else if (inner.includes('..') && !sequence) {
+      return true;
+    }
+    at = close;
+  }
+  // Patterns: an unquoted * or ?, and an unquoted [ that a ] closes within its segment.
+  const end = (from: number): number => (text.indexOf('/', from) < 0 ? text.length : text.indexOf('/', from));
+  const glob = (at: number): boolean => {
+    if (!open(at)) return false;
+    if (text[at] === '*' || text[at] === '?') return true;
+    if (text[at] !== '[') return false;
+    for (let scan = at + 1; scan < end(at); scan += 1) if (text[scan] === ']' && open(scan)) return true;
+    return false;
+  };
+  if (text !== '' && glob(0)) return true;
+  let from = 0;
+  for (const segment of text.split('/')) {
+    if (segment.startsWith('.') && [...segment].some((_, index) => glob(from + index))) return true;
+    from += segment.length + 1;
+  }
+  return false;
 }
 
 interface Expansion {
@@ -476,11 +570,12 @@ interface Expansion {
 }
 
 /**
- * An expansion that starts with "$". `rooting` says whether it still stands at the start of its word. The quoting
- * forms $'…' and $"…" are left as they were written, so a program named $'\x67it' is not recognised as git and its
+ * An expansion that starts with "$". `rooting` says whether it still stands at the start of its word, `quoted`
+ * whether it stands inside double quotes. Whatever only the shell knows the value of marks the word unresolved:
+ * the forms $'…' and $"…" stay as they were written, so a program named $'\x67it' is not recognised as git and its
  * request waits for the owner rather than being approved.
  */
-function readDollar(src: string, at: number, rooting: boolean): Expansion {
+function readDollar(src: string, at: number, rooting: boolean, quoted: boolean): Expansion {
   if (src.startsWith('$((', at)) {
     const close = src.indexOf('))', at);
     if (close < 0) throw new Unreadable('an unterminated arithmetic expansion');
@@ -495,9 +590,21 @@ function readDollar(src: string, at: number, rooting: boolean): Expansion {
       if (close < 0) throw new Unreadable('an unterminated parameter expansion');
       return { text: src.slice(at, close + 1), at: close + 1, unresolved: true, home: false };
     }
+    // The positional parameters, $@, $* and $! stand for what the command sets, or for nothing at all, and
+    // ".$1." is ".." when $1 is empty; zsh adds $=name, $~name, $^name and $+name. Unquoted, $'…' and $"…" are
+    // quotes the shell decodes ($'\x2e' is ".") and $[…] is arithmetic. $?, $#, $$ and $- always stand for a
+    // number or a few option letters, so they stay as written.
+    const next = src[at + 1] ?? '';
+    if (/[0-9@*!=~^+]/.test(next)) return { text: `$${next}`, at: at + 2, unresolved: true, home: false };
+    if (!quoted && /['"[]/.test(next)) return { text: '$', at: at + 1, unresolved: true, home: false };
     return { text: '$', at: at + 1, unresolved: false, home: false };
   }
   const next = at + found[0].length;
+  // zsh reads a subscript or a modifier straight after a name: $PWD[1,9] and $PWD:h:h are parts of the path, and
+  // may lie outside the clone. The rules follow neither.
+  if (src[next] === '[' || (src[next] === ':' && /[A-Za-z&]/.test(src[next + 1] ?? ''))) {
+    return { text: found[0], at: next, unresolved: true, home: false };
+  }
   const slash = src[next] === '/';
   // $HOME and $PWD are the two variables whose value the rules know: the home the clone sits in, and the working
   // directory a relative path is read from anyway. Both only at the start of a word, where they root a path.
@@ -1160,11 +1267,6 @@ function forcesPush(rest: readonly Word[]): boolean {
 
 /** What a git command would give away: the pushing and the history the runner owns, or the laptop settings. */
 function gitDanger(git: GitCall): ApprovalJudgement | null {
-  const decline = (reason: string): ApprovalJudgement =>
-    declined(
-      'git-danger',
-      `declined: ${reason}; the runner owns the pushing and the history, so change files and leave the rest to it`,
-    );
   const setting = git.settings.find(gitProgramKey);
   if (setting !== undefined) {
     return declined(
@@ -1172,6 +1274,32 @@ function gitDanger(git: GitCall): ApprovalJudgement | null {
       `declined: git -c ${show(setting)} hands git a program to run, or a place to fetch and push from, for this command; run it without the setting`,
     );
   }
+  const verdict = gitSubcommandDanger(git);
+  if (verdict?.verdict === 'decline') return verdict;
+  const address = repositoryAddress(git);
+  if (address !== null) {
+    return undecided(
+      'unrecognised',
+      `git ${show(git.subcommand)} reaches the repository at ${show(address.source)}, which is no remote of the clone, and with the credentials of the owner; push and fetch with the remotes the clone has, or say why the task needs it`,
+    );
+  }
+  const unknown = git.settings.find((key) => !gitInertKey(key));
+  if (verdict === null && unknown !== undefined) {
+    return undecided(
+      'unrecognised',
+      `git -c ${show(unknown)} is not a setting these rules know to be inert, and a setting can say where git pushes or what it trusts; run the command without it, or say why the task needs it`,
+    );
+  }
+  return verdict;
+}
+
+/** The verdict a git subcommand earns by itself. */
+function gitSubcommandDanger(git: GitCall): ApprovalJudgement | null {
+  const decline = (reason: string): ApprovalJudgement =>
+    declined(
+      'git-danger',
+      `declined: ${reason}; the runner owns the pushing and the history, so change files and leave the rest to it`,
+    );
   const rest = texts(git.rest);
   const first = rest.find((text) => !text.startsWith('-')) ?? '';
   switch (git.subcommand) {
@@ -1207,6 +1335,49 @@ function gitDanger(git: GitCall): ApprovalJudgement | null {
     default:
       return null;
   }
+}
+
+/** The git subcommands whose first word that is no option names the repository they reach. */
+const GIT_REACHES = new Set(['push', 'fetch', 'pull', 'ls-remote', 'clone']);
+/** Their options that take a value in the next word, so that the value is not read as the repository. */
+const GIT_REACH_VALUED = new Set([
+  '-o', '--push-option', '--server-option', '--receive-pack', '--upload-pack', '--exec', '--depth', '--deepen',
+  '--shallow-since', '--shallow-exclude', '-j', '--jobs', '--negotiation-tip', '--refmap', '-s', '--strategy', '-X',
+  '--strategy-option', '--origin', '-b', '--branch', '-u', '--reference', '--reference-if-able', '--separate-git-dir',
+  '-c', '--config', '--template', '--filter', '--bundle-uri', '--sort',
+]);
+
+/**
+ * The repository a git command names by its address instead of by a remote of the clone: a URL, or the host:path
+ * git reads as ssh (a ":" with no "/" before it). Pushing there sends the work of the clone to that host with the
+ * keys of the owner, and fetching from it brings in whatever the host says. --repo of git push, --remote of git
+ * archive and the repository of git submodule add count as well.
+ */
+function repositoryAddress(git: GitCall): Word | null {
+  const addressed = (word: Word | undefined): word is Word =>
+    word !== undefined && (isUrl(word.text) || /^[^/]*:/.test(word.text));
+  const rest = git.rest;
+  for (let at = 0; at < rest.length; at += 1) {
+    const text = rest[at].text;
+    const named = text.match(/^--(?:repo|remote)=(.*)$/);
+    if (named !== null && addressed({ ...rest[at], text: named[1] })) return rest[at];
+    if ((text === '--repo' || text === '--remote') && addressed(rest[at + 1])) return rest[at + 1];
+  }
+  if (git.subcommand === 'submodule') {
+    const given = positionals(rest);
+    return given[0]?.text === 'add' && addressed(given[1]) ? given[1] : null;
+  }
+  if (!GIT_REACHES.has(git.subcommand)) return null;
+  for (let at = 0; at < rest.length; at += 1) {
+    const text = rest[at].text;
+    if (text === '--') return addressed(rest[at + 1]) ? rest[at + 1] : null;
+    if (text.startsWith('-')) {
+      if (GIT_REACH_VALUED.has(text) || text === '--repo') at += 1;
+      continue;
+    }
+    return addressed(rest[at]) ? rest[at] : null;
+  }
+  return null;
 }
 
 /** The keys git clone sets with -c and --config in the clone it makes. */
@@ -1289,8 +1460,8 @@ type Kind = 'reader' | 'writer' | 'executing' | 'unknown';
 /** The programs that read what they are given and run none of it (their options that would run something aside). */
 const READERS = new Set([
   'cat', 'head', 'tail', 'less', 'more', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'ls', 'stat', 'file', 'diff', 'cmp',
-  'jq', 'yq', 'sort', 'uniq', 'cut', 'tr', 'echo', 'printf', 'basename', 'dirname', 'pwd', 'which', 'test', 'true',
-  'false', 'date', 'sleep', 'cd', 'find', 'fd', 'sed', 'tar', 'unzip', 'zip', 'gzip', 'gunzip',
+  'jq', 'yq', 'sort', 'uniq', 'cut', 'tr', 'echo', 'printf', 'basename', 'dirname', 'pwd', 'which', 'test', '[',
+  'true', 'false', 'date', 'sleep', 'cd', 'find', 'fd', 'sed', 'tar', 'unzip', 'zip', 'gzip', 'gunzip',
 ]);
 /** Programs whose arguments are places they change, not places they read. */
 const WRITE_PROGRAMS = new Set(['rm', 'rmdir', 'truncate', 'mkdir', 'shred', 'srm', 'tee', 'chmod', 'touch']);
@@ -2435,14 +2606,107 @@ const PM_DEPENDS = new Set(['config', 'c', 'audit', 'cache']);
 const PM_VERBS = new Set([...PM_SAFE, ...PM_FETCH, ...PM_CREDENTIALS, ...PM_SHELLS, ...PM_DEPENDS]);
 
 /**
- * The subcommand of a JavaScript package manager and what follows it. Script names (yarn build) and option values
- * (npm --loglevel silent install) stand among the words too, so the first word that is a subcommand the rules know
- * is the one; an unknown word is passed over.
+ * Whether a JavaScript package manager would fetch, publish, open a shell or change its settings. Script names
+ * (yarn build) and option values (npm --loglevel silent install) stand among the words too, and a value can be a
+ * word that looks like a safe subcommand (npm --omit test install x installs x), so every word before "--" that is
+ * no option is read as the subcommand it might be, and any one that would reach out counts. Only the name of the
+ * script that run is given is a name and nothing else (bun run x runs the script x), and run is found where the
+ * package manager finds its subcommand: past the options and their values.
  */
-function pmVerb(args: readonly Word[]): { verb: string; after: string[] } | null {
-  const given = beforeDashes(args).filter((text) => !text.startsWith('-'));
-  const at = given.findIndex((verb) => PM_VERBS.has(verb));
-  return at < 0 ? null : { verb: given[at], after: given.slice(at + 1) };
+function pmReaches(args: readonly Word[], valued: ReadonlySet<string>): boolean {
+  const words = beforeDashes(args);
+  let at = 0;
+  while (at < words.length && words[at].startsWith('-')) {
+    at += valued.has(words[at]) && !(words[at + 1]?.startsWith('-') ?? true) ? 2 : 1;
+  }
+  const given = words.flatMap((text, index) => (text.startsWith('-') ? [] : [{ text, index }]));
+  const script = RUNS_NAMED_SCRIPT.has(words[at] ?? '') ? given.find(({ index }) => index > at)?.index : undefined;
+  return given.some(({ text: verb, index }, position) => {
+    if (index === script) return false;
+    const after = given.slice(position + 1).map(({ text }) => text);
+    if (PM_FETCH.has(verb) || PM_CREDENTIALS.has(verb) || PM_SHELLS.has(verb)) return true;
+    if (verb === 'config' || verb === 'c') return ['set', 'delete', 'rm', 'edit', 'fix'].includes(after[0] ?? '');
+    if (verb === 'audit') return after.includes('fix');
+    return verb === 'cache' && after[0] === 'add';
+  });
+}
+
+/**
+ * npm, pnpm and yarn read the options they are given as settings of their own configuration, and a setting can name
+ * a program to run (browser, editor, shell, git, node-gyp), code to load (node-options), a registry, a certificate
+ * or another configuration file: npm docs --browser='<command>' runs the command. The options below steer none of
+ * that, or are read by a rule of their own (-g by the one for global installs); any other one leaves the request to
+ * the owner.
+ */
+const PM_INERT_OPTIONS = new Set([
+  '-g', '--global', '-s', '--silent', '-q', '--quiet', '--verbose', '-d', '--json', '--parseable', '--long', '--if-present',
+  '--workspaces', '-ws', '--ws', '--include-workspace-root', '--no-audit', '--audit', '--no-fund', '--fund',
+  '--prefer-offline', '--prefer-online', '--offline', '--save', '-S', '--no-save', '--save-dev', '-D',
+  '--save-optional', '-O', '--save-peer', '--save-exact', '-E', '--save-prod', '-P', '--legacy-peer-deps',
+  '--strict-peer-deps', '--ignore-scripts', '--production', '--prod', '--dev', '--no-optional', '--force', '-f',
+  '--dry-run', '--frozen-lockfile', '--no-frozen-lockfile', '--prefer-frozen-lockfile', '--immutable',
+  '--immutable-cache', '--check-cache', '--pure-lockfile', '--no-lockfile', '--lockfile-only', '--package-lock-only',
+  '--no-package-lock', '--fix-lockfile', '-r', '--recursive', '--parallel', '--stream', '--sequential',
+  '--aggregate-output', '--no-bail', '--bail', '--color', '--no-color', '--no-progress', '--global-style',
+  '--shamefully-hoist', '--resolution-only', '--inline-builds', '--check-files', '--non-interactive', '--exact',
+  '--tilde', '--caret', '--top-level', '--no-update-notifier', '--foreground-scripts', '--prefer-dedupe', '--all',
+  '-A', '--topological', '--topological-dev', '-i', '--interlaced', '--since', '-v', '--version', '-h', '--help',
+  '--no-sort', '--reverse', '--fail-if-no-match', '--report-summary',
+]);
+/** The inert options that take a value, in the next word when it is not given after "=". */
+const PM_INERT_VALUED = new Set([
+  '--omit', '--include', '--depth', '--reporter', '--workspace-concurrency', '--network-concurrency',
+  '--child-concurrency', '--install-strategy', '--mode', '--resume-from', '--audit-level', '--sort', '--test-pattern',
+  '--changed-files-ignore-pattern', '-j', '--jobs',
+]);
+const PM_ALL_VALUED = new Set([...PM_VALUED, ...PM_INERT_VALUED]);
+/** The subcommands of pnpm and yarn that hand every word after them to a script: pnpm test --watch. */
+const RUNS_SCRIPT = new Set(['test', 't', 'tst', 'start', 'stop', 'restart']);
+/** And those that hand the words after the name of the script: pnpm run dev --port 3000. */
+const RUNS_NAMED_SCRIPT = new Set(['run', 'run-script', 'rum', 'urn']);
+
+/**
+ * The first option of npm, pnpm, yarn or npx that is neither inert nor one rule 8 already places; null when there
+ * is none. npm reads options up to "--" wherever they stand; pnpm and yarn hand the words after a script's name to
+ * the script, and npx those after the tool's name to the tool. A value that looks like an option is read as one:
+ * pnpm's -w takes no value, so in `pnpm -w --node-options=… test` the setting is pnpm's own.
+ */
+function packageSetting(part: Part): Word | null {
+  const scripts = part.name === 'pnpm' || part.name === 'yarn';
+  if (!scripts && part.name !== 'npm' && part.name !== 'npx') return null;
+  const args = part.args;
+  let verb: string | null = null;
+  for (let at = 0; at < args.length; at += 1) {
+    const word = args[at];
+    const text = word.text;
+    if (text === '--') return null;
+    if (!text.startsWith('-') || text === '-') {
+      if (part.name === 'npx') return null;
+      if (!scripts) continue;
+      if (verb === null) {
+        verb = text;
+        if (RUNS_SCRIPT.has(text) || !PM_VERBS.has(text)) return null;
+      } else if (RUNS_NAMED_SCRIPT.has(verb)) {
+        return null;
+      }
+      continue;
+    }
+    const name = text.split('=')[0];
+    if (PM_INERT_OPTIONS.has(text)) continue;
+    if (PM_ALL_VALUED.has(name)) {
+      if (!text.includes('=') && !(args[at + 1]?.text.startsWith('-') ?? true)) at += 1;
+      continue;
+    }
+    return word;
+  }
+  return null;
+}
+
+/** npm runs no script by its bare name, so a subcommand of npm that the rules do not know is one they cannot judge. */
+function unknownNpmVerb(part: Part): Word | null {
+  if (part.name !== 'npm') return null;
+  const verb = part.args[subcommandAt(part.args, PM_ALL_VALUED)];
+  return verb !== undefined && !verb.text.startsWith('-') && !PM_VERBS.has(verb.text) ? verb : null;
 }
 
 const GLOBAL_FLAGS = ['-g', '--global', '--location=global'];
@@ -2496,15 +2760,26 @@ function withinClone(word: Word, ctx: Context): boolean {
   return ctx.dirs.every((dir) => place(resolve(word, dir, ctx.clone), ctx.clone) === 'inside');
 }
 
-/** The options of pip that take their value in the next word. */
-const PIP_VALUED = new Set([
-  '-r', '--requirement', '-e', '--editable', '-c', '--constraint', '-i', '--index-url', '--extra-index-url',
-  '--find-links', '-t', '--target', '--prefix', '--python', '--cache-dir',
+/** The options of pip install that change neither where it installs from nor where it installs to. */
+const PIP_INERT = new Set([
+  '-q', '--quiet', '-v', '--verbose', '-U', '--upgrade', '--no-deps', '--no-cache-dir', '--disable-pip-version-check',
+  '--no-color', '--no-input', '--force-reinstall', '-I', '--ignore-installed', '--prefer-binary', '--require-hashes',
+  '--dry-run', '--no-warn-script-location', '--no-warn-conflicts', '--no-compile', '--compile', '--pre', '--isolated',
+  '--require-virtualenv', '--no-build-isolation', '--use-pep517', '--no-use-pep517', '--check-build-dependencies',
+  '--no-clean',
+]);
+/** The inert ones that take a value, in the next word when it is not given after "=". */
+const PIP_INERT_VALUED = new Set([
+  '--upgrade-strategy', '--progress-bar', '--root-user-action', '--only-binary', '--no-binary', '--exists-action',
+  '--timeout', '--retries',
 ]);
 
 /**
- * The two declared forms of pip: -r a requirements file of the clone, and -e . for the project itself. The
- * manifest is the clone's own, read from wherever the command may run: one anywhere else declares nothing here.
+ * The two declared forms of pip: -r a requirements file of the clone, and -e . for the project itself, with a
+ * constraints file of the clone beside them if need be. The manifest is the clone's own, read from wherever the
+ * command may run: one anywhere else declares nothing here. Every other option has to be one that changes nothing
+ * about where pip installs from or to, because the rest name an index (-i, attached as -ihttps://… too), a place
+ * outside the clone (--user, --target), or what builds a package.
  */
 function installsFromClone(args: readonly Word[], ctx: Context): boolean {
   let declared = false;
@@ -2513,25 +2788,33 @@ function installsFromClone(args: readonly Word[], ctx: Context): boolean {
   const manifest = (word: Word | undefined): boolean =>
     word !== undefined && word.text !== '' && !isUrl(word.text) && withinClone(word, ctx);
   while (at < args.length) {
-    const text = args[at].text;
-    const inlined = text.match(/^--(?:requirement|editable)=(.*)$/);
-    if (text === '-r' || text === '--requirement' || text === '-e' || text === '--editable') {
-      if (!manifest(args[at + 1])) return false;
-      declared = true;
-      at += 2;
-      continue;
-    }
-    if (inlined !== null) {
-      if (!manifest({ ...args[at], text: inlined[1] })) return false;
-      declared = true;
-      at += 1;
-      continue;
-    }
-    if (text.startsWith('-')) at += PIP_VALUED.has(text) ? 2 : 1;
-    else {
+    const word = args[at];
+    const text = word.text;
+    if (!text.startsWith('-') || text === '-') {
       given += 1;
       at += 1;
+      continue;
     }
+    // A manifest, with its value in the next word, after "=", or attached as getopt allows: -rrequirements.txt.
+    const long = text.match(/^(--(?:requirement|constraint|editable))(?:=(.*))?$/);
+    const short = long === null ? text.match(/^(-[rce])(.*)$/) : null;
+    if (long !== null || short !== null) {
+      const flag = long?.[1] ?? short?.[1] ?? '';
+      const inline = long !== null ? long[2] : short?.[2] || undefined;
+      if (!manifest(inline === undefined ? args[at + 1] : { ...word, text: inline })) return false;
+      if (flag !== '-c' && flag !== '--constraint') declared = true;
+      at += inline === undefined ? 2 : 1;
+      continue;
+    }
+    if (PIP_INERT.has(text) || /^-[qvUI]+$/.test(text)) {
+      at += 1;
+      continue;
+    }
+    if (PIP_INERT_VALUED.has(text.split('=')[0])) {
+      at += text.includes('=') ? 1 : 2;
+      continue;
+    }
+    return false;
   }
   // Only "install" itself may stand among the positional words: anything else is a package being added.
   return declared && given === 1;
@@ -2552,7 +2835,7 @@ const DEV_TOOLS = new Set([
   'cut', 'tr', 'diff', 'patch', 'file', 'stat', 'mkdir', 'touch', 'cp', 'mv', 'rm', 'ln', 'chmod', 'tar', 'unzip',
   'zip', 'gzip', 'jq', 'yq',
   // The shell builtins and the small tools a command line is held together with.
-  'echo', 'printf', 'true', 'false', 'test', 'env', 'pwd', 'cd', 'which', 'basename', 'dirname', 'xargs', 'tee',
+  'echo', 'printf', 'true', 'false', 'test', '[', 'env', 'pwd', 'cd', 'which', 'basename', 'dirname', 'xargs', 'tee',
   'date', 'sleep',
   // Every git subcommand rule 7 did not take.
   'git',
@@ -2572,15 +2855,8 @@ function reachesRegistry(call: Call): boolean {
     case 'pnpm':
     case 'yarn':
     case 'bun': {
-      if (installsGlobally(call.args)) return true;
-      const found = pmVerb(call.args);
-      if (found === null) return false;
-      const { verb, after } = found;
-      if (PM_FETCH.has(verb) || PM_CREDENTIALS.has(verb) || PM_SHELLS.has(verb)) return true;
-      if (verb === 'config' || verb === 'c') return ['set', 'delete', 'rm', 'edit', 'fix'].includes(after[0] ?? '');
-      if (verb === 'audit') return after.includes('fix');
-      if (verb === 'cache') return after[0] === 'add';
-      return false;
+      const valued = call.program === 'bun' ? new Set([...BUN_VALUED, ...PM_ALL_VALUED]) : PM_ALL_VALUED;
+      return installsGlobally(call.args) || pmReaches(call.args, valued);
     }
     case 'pip':
     case 'pip3':
@@ -3116,8 +3392,11 @@ function judgeSegment(segment: Segment, ctx: Context): ApprovalJudgement {
   }
   // A word that is a site, or whose value after an "=" is one (--registry=https://…); an assignment's value is read
   // in all its parts, because a program splits it.
+  // A short option takes its value attached too: pip's -ihttps://… names an index.
   const site = (text: string): boolean =>
-    isUrl(text) || (text.includes('=') && isUrl(text.slice(text.indexOf('=') + 1)));
+    isUrl(text) ||
+    (text.includes('=') && isUrl(text.slice(text.indexOf('=') + 1))) ||
+    (/^-[A-Za-z]/.test(text) && text.includes('://'));
   const url =
     words.find((word) => site(word.text)) ??
     call.assignments.find((word) => valuePieces(assignmentOf(word).value).some(isUrl));
@@ -3135,6 +3414,22 @@ function judgeSegment(segment: Segment, ctx: Context): ApprovalJudgement {
     );
   }
   if (call.hidden !== null) return call.hidden;
+  for (const part of call.parts) {
+    const setting = packageSetting(part);
+    if (setting !== null) {
+      return undecided(
+        'environment',
+        `${show(setting.source)} is a setting of ${show(part.name)}'s own configuration, and a setting can name a program to run, code to load or a registry; these rules know only the options that steer none of that, so run the command without it, or say why the task needs it`,
+      );
+    }
+    const verb = unknownNpmVerb(part);
+    if (verb !== null) {
+      return undecided(
+        'unrecognised',
+        `npm ${show(verb.source)} is not a subcommand these rules know; run the work with npm ci, npm test or npm run, or say why the task needs it`,
+      );
+    }
+  }
   for (const [at, part] of call.parts.entries()) {
     const unseen = runsUnseen(part, segment, at === call.parts.length - 1);
     if (unseen !== null) {
