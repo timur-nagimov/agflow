@@ -94,6 +94,29 @@ If activation or server readiness fails, the script restores the previous symlin
 
 After deployment open the UI, sign in as each allowed user, check live Timeline updates, and connect one Mac runner. Check the Caddy certificate and runner reconnect after a hub restart. These are deployment acceptance checks, separate from the local regression suite.
 
+### Upgrading to schema version 4
+
+This release moves the database from schema version 3 to 4. Version 4 adds two columns: the project's deadline
+(`project.deadline_at`) and the runner's check result of a submission (`submissions.check_result`). The hub migrates
+the database in place the first time it starts. The previous release cannot open a version 4 database: it stops at
+start with "database schema version 4 is newer than this hub supports (3)".
+
+The way back to the previous release keeps everything except the deadline and the check results. Stop the hub and
+take out what version 4 added:
+
+```bash
+sudo systemctl stop agflow-hub
+sudo -u agflow sqlite3 /var/lib/agflow/data/agflow.db <<'SQL'
+BEGIN;
+ALTER TABLE submissions DROP COLUMN check_result;
+ALTER TABLE project DROP COLUMN deadline_at;
+DELETE FROM schema_migrations WHERE version = 4;
+COMMIT;
+SQL
+```
+
+Then start the previous release. Deploying this release again later migrates the database to version 4 again.
+
 ### Upgrading to schema version 3
 
 This release moves the database from schema version 2 to 3. Version 3 adds two tables: the internet grants

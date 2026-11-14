@@ -382,6 +382,14 @@ CREATE TABLE agent_fetches (
 CREATE INDEX agent_fetches_attempt ON agent_fetches (attempt_id, id);
 `;
 
+// Hackathon throughput. project.deadline_at: when the project must be done (epoch ms, NULL for none), which the lead
+// plans against. submissions.check_result: the runner's own run of the project's check command at submission, as
+// JSON {status, command, durationMs, tail}; NULL where no check ran.
+const SCHEMA_V4 = `
+ALTER TABLE project ADD COLUMN deadline_at INTEGER;
+ALTER TABLE submissions ADD COLUMN check_result TEXT;
+`;
+
 /** M1's lead seat: the lead chat seen within the last 15 minutes. Only the migration to schema version 2 reads it. */
 export const M1_LEAD_STALE_MS = 15 * 60_000;
 
@@ -404,6 +412,7 @@ const MIGRATIONS: readonly ((db: Database, now: number) => void)[] = [
     seedHubState(db, now);
   },
   (db) => db.run(SCHEMA_V3),
+  (db) => db.run(SCHEMA_V4),
 ];
 
 export function openDb(path: string, now: number): Database {
