@@ -8,6 +8,7 @@ export type Route =
   | { view: 'attempt'; id: string }
   | { view: 'agents' }
   | { view: 'runners' }
+  | { view: 'load' }
   /** At core's APPROVALS_ROUTE, which runner notifications print; route.test.ts compares the two (X-48). */
   | { view: 'approvals' }
   | { view: 'messages'; to?: string }
@@ -23,6 +24,7 @@ export const NAV: { view: NavView; label: string }[] = [
   { view: 'agents', label: 'Agents' },
   { view: 'runners', label: 'Runners' },
   { view: 'approvals', label: 'Approvals' },
+  { view: 'load', label: 'Load' },
   { view: 'messages', label: 'Messages' },
   { view: 'timeline', label: 'Timeline' },
   { view: 'knowledge', label: 'Knowledge' },
@@ -45,6 +47,7 @@ export function parseRoute(hash: string): Route {
     case 'goal':
     case 'agents':
     case 'runners':
+    case 'load':
     case 'approvals':
     case 'knowledge':
       return { view };

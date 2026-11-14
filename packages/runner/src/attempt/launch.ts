@@ -24,9 +24,15 @@ export function pinnedCliVersion(vendor: Vendor, platform: string = vendorPlatfo
   return pins[vendor].version;
 }
 
-/** spec.model, or runner.json's models[vendor][role] when the hub left it to the runner. */
-export function resolveModel(spec: Pick<AttemptSpec, 'model' | 'vendor' | 'role'>, config: RunnerConfig): string {
-  return spec.model ?? config.models[spec.vendor][spec.role];
+/**
+ * spec.model, or runner.json's models[vendor][role] when the hub left it to the runner; a strong task gets the vendor's
+ * lead model whatever its role.
+ */
+export function resolveModel(
+  spec: Pick<AttemptSpec, 'model' | 'vendor' | 'role' | 'tier'>,
+  config: RunnerConfig,
+): string {
+  return spec.model ?? config.models[spec.vendor][spec.tier === 'strong' ? 'lead' : spec.role];
 }
 
 /**
@@ -108,6 +114,7 @@ export function buildLaunch(input: LaunchInput): AgentLaunch {
     attemptId: spec.attemptId,
     role: spec.role,
     model: resolveModel(spec, config),
+    tier: spec.tier ?? 'standard',
     cliVersion: input.cliVersion,
     clone: workspace.clone,
     baseCheckout: workspace.baseCheckout?.path ?? null,

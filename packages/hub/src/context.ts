@@ -153,6 +153,11 @@ export interface HubConfig extends HubRunnerSettings {
    * Off by default.
    */
   autoApprovals?: boolean | undefined;
+  /**
+   * AGFLOW_DEMO_CHECK_EVERY: after every this many tasks merged, or accepted while nothing marks tasks merged, the hub
+   * creates a demo-check task (demo-check.ts). loadConfig makes it 5; 0, or a config built without it, turns it off.
+   */
+  demoCheckEvery?: number | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */

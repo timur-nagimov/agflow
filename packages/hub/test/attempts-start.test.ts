@@ -254,6 +254,21 @@ describe('the attempt spec', () => {
     expect(command.command.attempt.brief).toContain('## Handoff from the previous attempt');
   });
 
+  test("a strong task's start names its tier; a standard task's names none", () => {
+    const { ctx, runnerId, task } = setup();
+    const [strong] = createTasks(ctx, [newTask({ title: 'Design the storage', tier: 'strong' })], 'user:alice');
+    if (!strong) throw new Error('no task');
+    // The spec as it goes out, which a runner's own schema reads.
+    const specOf = (taskId: string) => {
+      const { command } = startRunnerAttempt(ctx, { runnerId, taskId, role: 'worker', vendor: 'codex' });
+      const wire = toWireCommand(ctx, command).command;
+      if (wire.kind !== 'start_attempt') throw new Error('not a start');
+      return AttemptSpecSchema.parse(wire.attempt);
+    };
+    expect(specOf(strong.id).tier).toBe('strong');
+    expect('tier' in specOf(task.id)).toBe(false);
+  });
+
   test('the stored payload has no token; each wire command mints one for the attempt and its fence', () => {
     const { ctx, runnerId, task } = setup();
     const { attempt, command } = startRunnerAttempt(ctx, { runnerId, taskId: task.id, role: 'worker', vendor: 'claude' });

@@ -93,6 +93,14 @@ export const VendorHintSchema = VendorSchema.nullable().describe(
   'the vendor the scheduler should prefer for this task: claude or codex; null for no preference',
 );
 
+/** TaskContract.tier: a strong task runs on the runner's lead model, with a higher reasoning effort. */
+export const TaskTierSchema = z
+  .enum(['standard', 'strong'])
+  .describe(
+    'standard (the default) or strong: a strong task runs on the stronger model with more reasoning; mark tasks ' +
+      'that need deep reasoning (architecture, hard algorithms, cross-cutting changes) strong',
+  );
+
 const contractFields = {
   title: z.string().min(1).max(200).refine(isSingleLine, SINGLE_LINE),
   kind: TaskKindSchema,
@@ -106,6 +114,8 @@ const contractFields = {
   priority: z.number().int().min(0).max(9).describe(PRIORITY_HELP),
   // Optional with no default, so a task created without one stores none.
   vendorHint: VendorHintSchema.optional(),
+  // The same: a task without a tier is standard.
+  tier: TaskTierSchema.optional(),
 };
 
 export const NewTaskSchema = z.strictObject({

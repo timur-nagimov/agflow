@@ -4,7 +4,7 @@
 // apart.
 import { z } from 'zod';
 import { isValidWipRefPrefix, parseAttemptId } from './naming';
-import { BranchSchema, CommitShaSchema, RoleSchema, TaskIdSchema, VendorSchema } from './schemas';
+import { BranchSchema, CommitShaSchema, RoleSchema, TaskIdSchema, TaskTierSchema, VendorSchema } from './schemas';
 import { SUBMIT_ERRORS } from './submit-errors';
 import type {
   AgentRole,
@@ -17,11 +17,13 @@ import type {
   Runner,
   RunnerVendor,
   StopCause,
+  TaskTier,
   Vendor,
   VendorQuota,
 } from './types';
 
-export const PROTOCOL_VERSION = 2;
+/** Protocol 2 added settings answers; protocol 3 the attempt spec's tier. */
+export const PROTOCOL_VERSION = 3;
 
 /** The WebSocket close codes the hub ends a runner's link with. */
 export const CLOSE_CODES = {
@@ -290,6 +292,12 @@ export interface AttemptSpec {
   vendor: Vendor;
   /** Null: the runner's models[vendor][role]. */
   model: string | null;
+  /**
+   * The task's tier (protocol 3); absent: standard. A strong task runs on the runner's lead model for its vendor, with a
+   * higher reasoning effort where the vendor's CLI takes one. The hub sends it only for a strong task, and never to an
+   * older runner, whose schema would refuse the start.
+   */
+  tier?: TaskTier;
   fence: Fence;
   agentToken: string;
   hubUrl: string;
@@ -548,6 +556,7 @@ export const AttemptSpecSchema = schemaFor<AttemptSpec>()(
       role: RoleSchema,
       vendor: VendorSchema,
       model: Name.nullable(),
+      tier: TaskTierSchema.optional(),
       fence: FenceSchema,
       agentToken: AgentTokenSchema,
       hubUrl: z.url({ protocol: /^https?$/, error: 'expected the hub URL, http or https' }),

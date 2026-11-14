@@ -191,6 +191,8 @@ export function buildAttemptSpec(
     role: attempt.role,
     vendor: attempt.vendor,
     model,
+    // Only a strong task names its tier: a start without one is standard to every runner, the older ones included.
+    ...(task?.tier === 'strong' ? { tier: 'strong' as const } : {}),
     fence: attempt.fence,
     hubUrl: ctx.config.publicUrl,
     repo: { url: getProject(ctx).repo, mainBranch: ctx.config.mainBranch },

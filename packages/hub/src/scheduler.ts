@@ -16,18 +16,20 @@ import {
   type TaskCandidate,
   type Vendor,
   countedAttempts,
-  isDispatchable,
   orderReady,
   pathsOverlap,
   place,
   placeLead,
+  placementWords,
   runnerToAvoid,
+  whyNotDispatchable,
   workerSlotsFree,
 } from '@agflow/core';
 import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
+import { ensureDemoCheck } from './demo-check';
 import { churnPaused, inRecovery } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { insertMessage } from './messages';
@@ -35,6 +37,7 @@ import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
 import { markOwnerAwayTold, probeUnknownResets } from './quota';
 import { type ClockCheck, checkClock } from './recovery';
+import { findRunnerRows } from './runners';
 import { expireSubmissions } from './submissions';
 import { type StallDecisions, judgeStalls } from './supervisor';
 import { expireHandbacks } from './takeover';
@@ -107,8 +110,11 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
   };
 }
 
-/** The ready set in dispatch order (design 6.6, step 3): by priority, then age. */
-export function readySet(ctx: HubContext): TaskCandidate[] {
+/**
+ * The ready set in dispatch order (design 6.6, step 3): by priority, then age. Each ready task left out goes into
+ * waiting, when given, with why.
+ */
+export function readySet(ctx: HubContext, waiting?: Map<string, string>): TaskCandidate[] {
   const tasks = listTasks(ctx);
   const columns = dispatchColumns(ctx);
   const pathHolders = tasks.filter(isPathHolder);
@@ -117,7 +123,13 @@ export function readySet(ctx: HubContext): TaskCandidate[] {
     const stored = columns.get(task.id);
     return task.status === 'ready' && stored ? [candidateOf(ctx, task, stored)] : [];
   });
-  return orderReady(ready.filter((candidate) => isDispatchable(candidate, context)));
+  return orderReady(
+    ready.filter((candidate) => {
+      const why = whyNotDispatchable(candidate, context);
+      if (why !== null) waiting?.set(candidate.id, why);
+      return why === null;
+    }),
+  );
 }
 
 /** Counts a placement in the snapshot: a slot less on its runner, an open attempt more on its account. */
@@ -182,6 +194,15 @@ export interface DispatchResult {
   started: Attempt[];
   /** Ready tasks that no runner could take now. */
   unplaced: string[];
+  /** Every ready task that did not start, with why in one line; the board shows it (withWaitReason). */
+  waiting: Map<string, string>;
+}
+
+/** Why a task in the ready set waits once every worker slot is taken (design 6.6, step 4). */
+function slotWords(ctx: HubContext, workerTarget: number | null): string {
+  return workerTarget === null
+    ? `it waits for a worker slot: AGFLOW_MAX_WORKERS is ${ctx.config.maxWorkers}`
+    : `it waits for a worker slot: the worker target is ${workerTarget}`;
 }
 
 /**
@@ -189,7 +210,8 @@ export interface DispatchResult {
  * ready task in order is placed by core's place over the snapshot, then claimed and started in its own transaction
  * (startRunnerAttempt). A start that fails is logged and leaves the others standing. The path holders are read once,
  * before the loop, so a task whose paths overlap one started in this tick waits for the next. Ready work that waits
- * because an owner is away is reported to the lead once per away period.
+ * because an owner is away is reported to the lead once per away period. Why each ready task did not start is kept
+ * for the board until the next tick.
  */
 export function dispatch(ctx: HubContext): DispatchResult {
   const staffing = getStaffing(ctx);
@@ -198,22 +220,28 @@ export function dispatch(ctx: HubContext): DispatchResult {
     maxWorkers: ctx.config.maxWorkers,
     runningWorkers: runningWorkers(ctx),
   });
-  const result: DispatchResult = { started: [], unplaced: [] };
+  const result: DispatchResult = { started: [], unplaced: [], waiting: new Map() };
+  memoryOf(ctx).waiting = result.waiting;
+  const ready = readySet(ctx, result.waiting);
+  // A task in the ready set waits for a slot, unless the loop below starts it or finds another reason.
+  for (const task of ready) result.waiting.set(task.id, slotWords(ctx, staffing.workerTarget));
   if (free === 0) return result;
-  const ready = readySet(ctx);
   if (ready.length === 0) return result;
   const snapshot = placementSnapshot(ctx);
   const away: AwayRefusal[] = [];
   const started: Pick<Task, 'id' | 'ownedPaths'>[] = [];
   for (const task of ready) {
     if (free === 0) break;
-    if (started.some((one) => pathsOverlap(task.ownedPaths, one.ownedPaths))) {
+    const overlapping = started.find((one) => pathsOverlap(task.ownedPaths, one.ownedPaths));
+    if (overlapping) {
       result.unplaced.push(task.id);
+      result.waiting.set(task.id, `its owned paths overlap those of ${overlapping.id}, which just started`);
       continue;
     }
     const { placement, refused } = place(snapshot, task, { projectPref: staffing.vendorPref });
     if (!placement) {
       result.unplaced.push(task.id);
+      result.waiting.set(task.id, placementWords(task, refused));
       away.push(...awayRefusals(snapshot, task.id, refused));
       continue;
     }
@@ -225,11 +253,13 @@ export function dispatch(ctx: HubContext): DispatchResult {
         vendor: placement.vendor,
       });
       result.started.push(attempt);
+      result.waiting.delete(task.id);
       started.push(task);
       recordPlacement(snapshot, placement);
       free -= 1;
     } catch (error) {
       console.error(`starting ${task.id} on ${placement.runnerId} failed`, error);
+      result.waiting.set(task.id, `its start on ${placement.runnerId} failed; the next tick tries again`);
     }
   }
   if (away.length > 0) tellLeadOwnerAway(ctx, away);
@@ -385,6 +415,8 @@ export interface TickResult {
  * dispatch (churnPaused), the lead seat step still runs and no worker starts.
  */
 export function runTick(ctx: HubContext): TickResult {
+  // The wait reasons are this tick's: one that dispatches nothing leaves none.
+  memoryOf(ctx).waiting = new Map();
   const clock = checkClock(ctx);
   if (inRecovery(ctx)) return { clock, recovering: true, reconciled: null, lead: null, started: [] };
   const reconciled = reconcile(ctx);
@@ -392,6 +424,8 @@ export function runTick(ctx: HubContext): TickResult {
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
   // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).
   if (churnPaused(ctx)) return { clock, recovering: false, reconciled, lead, started: [] };
+  // Before dispatch, so that a new demo check can start in this tick.
+  duty('the demo check', () => ensureDemoCheck(ctx), null);
   return { clock, recovering: false, reconciled, lead, started: dispatch(ctx).started };
 }
 
@@ -433,9 +467,11 @@ export class Scheduler {
     return this.interval !== null;
   }
 
-  /** Runs one tick now. */
+  /** Runs one tick now, then samples the free slots for the Load page. */
   tick(): TickResult {
-    return runTick(this.ctx);
+    const result = runTick(this.ctx);
+    duty('the slot sample', () => sampleSlots(this.ctx), undefined);
+    return result;
   }
 
   /** Begins the timer and the extra ticks after events; nothing when it runs already. */
@@ -488,4 +524,76 @@ export function requestAgents(ctx: HubContext, request: StaffingRequest): { runn
     if (request.vendor) setVendorPreference(ctx, request.vendor);
     return { running: runningWorkers(ctx), target };
   });
+}
+
+// ---------------------------------------------------------------------------
+// What the scheduler keeps between ticks: why ready tasks wait, and how many slots stood free
+// ---------------------------------------------------------------------------
+
+const HOUR = 60 * 60_000;
+
+/** The free slots after one tick. */
+interface SlotSample {
+  at: number;
+  idle: number;
+}
+
+/** Kept in memory only: a hub that restarts begins both afresh. */
+interface TickMemory {
+  /** Why each ready task did not start in the last tick (dispatch). */
+  waiting: Map<string, string>;
+  /** The last hour's samples, oldest first. */
+  samples: SlotSample[];
+}
+
+const memories = new WeakMap<HubContext, TickMemory>();
+
+function memoryOf(ctx: HubContext): TickMemory {
+  let memory = memories.get(ctx);
+  if (!memory) {
+    memory = { waiting: new Map(), samples: [] };
+    memories.set(ctx, memory);
+  }
+  return memory;
+}
+
+/** The task with its waitReason: why the last tick did not start it, while it is still ready; null otherwise. */
+export function withWaitReason(ctx: HubContext, task: Task): Task {
+  const reason = task.status === 'ready' ? memories.get(ctx)?.waiting.get(task.id) : undefined;
+  return { ...task, waitReason: reason ?? null };
+}
+
+/** The slots of the online runners that are not draining: all, the ones attempts take (a lead's too), the free ones. */
+export function runnerSlots(ctx: HubContext): { capacity: number; busy: number; idle: number } {
+  const slots = { capacity: 0, busy: 0, idle: 0 };
+  for (const row of findRunnerRows(ctx)) {
+    if (row.state !== 'online' || row.draining === 1) continue;
+    slots.capacity += row.capacity;
+    slots.busy += row.active_attempts;
+    slots.idle += Math.max(0, row.capacity - row.active_attempts);
+  }
+  return slots;
+}
+
+/** Keeps a sample of the free slots now, and drops the samples older than an hour. */
+export function sampleSlots(ctx: HubContext): void {
+  const now = ctx.now();
+  const memory = memoryOf(ctx);
+  memory.samples = memory.samples.filter((sample) => sample.at > now - HOUR);
+  memory.samples.push({ at: now, idle: runnerSlots(ctx).idle });
+}
+
+/**
+ * Free slot minutes in the hour before now, to a tenth: each sample's free slots until the next sample, the last one's
+ * until now, each for at most tickMs, so a stretch without ticks counts as one tick.
+ */
+export function idleSlotMinutes(ctx: HubContext): number {
+  const now = ctx.now();
+  const samples = memoryOf(ctx).samples.filter((sample) => sample.at > now - HOUR);
+  let slotMs = 0;
+  samples.forEach((sample, index) => {
+    const next = samples[index + 1]?.at ?? now;
+    slotMs += sample.idle * Math.min(Math.max(0, next - sample.at), ctx.config.tickMs);
+  });
+  return Math.round(slotMs / 6_000) / 10;
 }

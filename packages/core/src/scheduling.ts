@@ -40,6 +40,22 @@ export const PLACEMENT_REFUSALS = [
 ] as const;
 export type PlacementRefusal = (typeof PLACEMENT_REFUSALS)[number];
 
+/** Each refusal in a few words, for the board's wait reasons and the Load page. */
+export const PLACEMENT_REFUSAL_WORDS: Readonly<Record<PlacementRefusal, string>> = {
+  offline: 'offline',
+  draining: 'draining',
+  git: 'git not ready',
+  accepting: 'not taking work yet',
+  refused_start: 'refused a start',
+  full: 'full',
+  not_ready: 'not ready',
+  degraded: 'degraded',
+  exhausted: 'quota used up',
+  paid_usage: 'would use paid usage',
+  owner_away: 'owner away',
+  ceiling: 'at its quota ceiling',
+};
+
 /** A vendor on a runner, as placement sees it. */
 export interface VendorSlot {
   vendor: Vendor;
@@ -251,23 +267,38 @@ export interface DispatchContext {
   pathHolders: readonly Pick<Task, 'id' | 'ownedPaths'>[];
 }
 
+/** Whole minutes from now until a time, at least 1, for a reason people read. */
+const minutesUntil = (at: number, now: number): number => Math.max(1, Math.ceil((at - now) / 60_000));
+
 /**
- * Whether a task is in the ready set (design 6.6, step 3): ready with its dependencies done; no open attempt; no path
- * a runner agent may not change (such a task stays ready for live chats); no overlap with a path holder;
- * next_dispatch_at and dispatch_hold_until come; and counted attempts below the ladder's limit.
+ * Why a task is not in the ready set (design 6.6, step 3), in one line for the board; null when it is. The ready set
+ * holds a task that is ready with its dependencies done; with no open attempt; with no path a runner agent may not
+ * change (such a task stays ready for live chats); with no overlap with a path holder; whose next_dispatch_at and
+ * dispatch_hold_until have come; and with counted attempts below the ladder's limit. The first rule it fails is why.
  */
-export function isDispatchable(task: TaskCandidate, context: DispatchContext): boolean {
+export function whyNotDispatchable(task: TaskCandidate, context: DispatchContext): string | null {
   const { now } = context;
-  return (
-    task.status === 'ready' &&
-    task.dependenciesDone &&
-    !task.openAttempt &&
-    !liveChatOnly(task) &&
-    !context.pathHolders.some((holder) => holder.id !== task.id && pathsOverlap(task.ownedPaths, holder.ownedPaths)) &&
-    (task.nextDispatchAt === null || task.nextDispatchAt <= now) &&
-    (task.dispatchHoldUntil === null || task.dispatchHoldUntil <= now) &&
-    task.counted < context.maxAttempts
+  if (task.status !== 'ready') return `it is ${task.status}`;
+  if (!task.dependenciesDone) return 'it waits for its dependencies';
+  if (task.openAttempt) return 'its last attempt is still stopping';
+  if (liveChatOnly(task)) return 'it owns paths runner agents may not change, so it waits for a live chat';
+  const holder = context.pathHolders.find(
+    (other) => other.id !== task.id && pathsOverlap(task.ownedPaths, other.ownedPaths),
   );
+  if (holder) return `its owned paths overlap those of ${holder.id}`;
+  if (task.nextDispatchAt !== null && task.nextDispatchAt > now) {
+    return `it waits ${minutesUntil(task.nextDispatchAt, now)} min after an infrastructure failure`;
+  }
+  if (task.dispatchHoldUntil !== null && task.dispatchHoldUntil > now) {
+    return `it waits up to ${minutesUntil(task.dispatchHoldUntil, now)} min for a runner's late work`;
+  }
+  if (task.counted >= context.maxAttempts) return `it used all ${context.maxAttempts} of its attempts`;
+  return null;
+}
+
+/** Whether a task is in the ready set (design 6.6, step 3): whyNotDispatchable has nothing against it. */
+export function isDispatchable(task: TaskCandidate, context: DispatchContext): boolean {
+  return whyNotDispatchable(task, context) === null;
 }
 
 /** The ready set in dispatch order: by priority (0 the most urgent), then age, oldest first. A new array. */
@@ -451,6 +482,26 @@ export function place(
     if (chosen) return { placement: toPlacement(chosen), refused: found.refused };
   }
   return { placement: null, refused: found.refused };
+}
+
+/**
+ * Why place found no runner for a task, in one line for the board: each runner passed over, with its own refusal or
+ * its vendors'. A usable vendor has no refusal, so when the retry ladder asks for one vendor, the line names it.
+ */
+export function placementWords(
+  task: Pick<TaskCandidate, 'requirement'>,
+  refused: readonly RefusedPlacement[],
+): string {
+  const needed = task.requirement?.vendor ?? null;
+  const head = needed === null ? 'no runner can take it' : `no runner can take it (the retry ladder asks for ${needed})`;
+  const byRunner = new Map<string, string[]>();
+  for (const one of refused) {
+    const words = PLACEMENT_REFUSAL_WORDS[one.refusal];
+    const said = byRunner.get(one.runnerId) ?? [];
+    byRunner.set(one.runnerId, [...said, one.vendor === null ? words : `${one.vendor} ${words}`]);
+  }
+  if (byRunner.size === 0) return `${head}: none offers ${needed ?? 'a vendor'}`;
+  return `${head}: ${[...byRunner].map(([runnerId, words]) => `${runnerId} ${words.join(', ')}`).join('; ')}`;
 }
 
 /**

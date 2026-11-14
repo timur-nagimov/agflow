@@ -422,6 +422,12 @@ describe('buildQueryOptions', () => {
     }
     expect(buildQueryOptions(launch(), deps()).model).toBe('claude-sonnet-5-5');
   });
+
+  test("a strong task asks for the xhigh effort; a standard one keeps the CLI's own", () => {
+    expect(buildQueryOptions(launch({ model: 'claude-opus-5-5', tier: 'strong' }), deps()).effort).toBe('xhigh');
+    expect(buildQueryOptions(launch({ tier: 'standard' }), deps())).not.toHaveProperty('effort');
+    expect(buildQueryOptions(launch(), deps())).not.toHaveProperty('effort');
+  });
 });
 
 describe('the empty directory', () => {

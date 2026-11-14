@@ -264,6 +264,8 @@ describe('lead brief', () => {
     expect(brief).toContain(`- ${b.id} (v1) [ready] Beta`);
     expect(brief).toContain('Recent events:');
     expect(brief).toContain('create_tasks');
+    // The guide says which tasks to mark strong.
+    expect(brief).toContain('needs deep reasoning (architecture, hard algorithms, cross-cutting changes) `tier: "strong"`');
   });
 
   test('a blocked reason is quoted, so a worker cannot forge a section in the lead brief', () => {

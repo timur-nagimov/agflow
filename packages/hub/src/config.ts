@@ -21,6 +21,15 @@ function positiveInt(env: Env, key: string, fallback: number, max = Infinity): n
   return value;
 }
 
+/** A count where 0 turns its feature off. */
+function countOf(env: Env, key: string, fallback: number): number {
+  const raw = env[key];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`${key} must be 0 or a positive integer`);
+  return value;
+}
+
 /** An opt-in switch: off when unset or empty, on only as "1". Anything else is a mistake worth stopping the start for. */
 function switchOf(env: Env, key: string): boolean {
   const raw = env[key] ?? '';
@@ -209,6 +218,7 @@ export function loadConfig(env: Env): LoadedConfig {
     agentFetch,
     leadApprovals,
     autoApprovals,
+    demoCheckEvery: countOf(env, 'AGFLOW_DEMO_CHECK_EVERY', 5),
   };
   const overrides = env.AGFLOW_TEST_CONFIG ? testOverrides(env.AGFLOW_TEST_CONFIG) : {};
   Object.assign(config, overrides);

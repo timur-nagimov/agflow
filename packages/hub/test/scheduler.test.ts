@@ -10,7 +10,7 @@ import { seatHolderId, updateHubState } from '../src/hub-state';
 import { getProject, getStaffing, setPaused, setWorkerTarget } from '../src/project';
 import { clearOwnerAway, setOwnerAway, upsertAccountQuota } from '../src/quota';
 import { recordHeartbeatInfo, recordStartRefusal } from '../src/runners';
-import { Scheduler, replaceQuotaWaits, requestAgents, runTick } from '../src/scheduler';
+import { Scheduler, replaceQuotaWaits, requestAgents, runTick, withWaitReason } from '../src/scheduler';
 import { startHub } from '../src/server';
 import { requestSubmission } from '../src/submissions';
 import { getTask, writeTask } from '../src/task-store';
@@ -181,8 +181,11 @@ describe('dispatch', () => {
     // The runner has two slots, and neither task held its paths when the tick began.
     expect(tick(ctx)).toEqual([[first, runnerId, 'claude']]);
     expect(statusOf(ctx, second as string)).toBe('ready');
+    const reason = () => withWaitReason(ctx, getTask(ctx, second as string)).waitReason;
+    expect(reason()).toBe(`its owned paths overlap those of ${first}, which just started`);
     // Now the first holds them, so the next tick does not start the second either.
     expect(tick(ctx)).toEqual([]);
+    expect(reason()).toBe(`its owned paths overlap those of ${first}`);
   });
 
   test("request_agents' vendor steers placement until vendorPrefMs has passed", () => {

@@ -553,7 +553,20 @@ describe('commands', () => {
   test('COMMAND_MIN_PROTOCOL maps all 17 kinds to 1', () => {
     expect(Object.keys(COMMAND_MIN_PROTOCOL).sort()).toEqual([...RUNNER_COMMAND_KINDS].sort());
     for (const kind of RUNNER_COMMAND_KINDS) expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, 1]);
-    expect(PROTOCOL_VERSION).toBe(2);
+    expect(PROTOCOL_VERSION).toBe(3);
+  });
+
+  test("protocol 3: an attempt spec may carry the task's tier, standard or strong, and nothing else", () => {
+    expect(PROTOCOL_VERSION).toBe(3);
+    for (const tier of ['standard', 'strong'] as const) {
+      expect(AttemptSpecSchema.parse({ ...spec, tier }).tier).toBe(tier);
+      expect(RunnerCommandSchema.safeParse({ kind: 'start_attempt', attempt: { ...spec, tier } }).success).toBe(true);
+    }
+    // Absent, as an older hub and every standard task send it.
+    expect('tier' in AttemptSpecSchema.parse(spec)).toBe(false);
+    for (const tier of ['high', 'Strong', '', null, 1]) {
+      expect([tier, AttemptSpecSchema.safeParse({ ...spec, tier }).success]).toEqual([tier, false]);
+    }
   });
 
   test('start_attempt and resume_attempt carry an agent token', () => {
@@ -1064,7 +1077,7 @@ describe('runner events', () => {
 });
 
 test('protocol 2 names exact settings answers and bounds the hello watermark to its outbox', () => {
-  expect(PROTOCOL_VERSION).toBe(2);
+  expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(2);
   const command = { kind: 'update_settings', settings: {}, version: 4,
     answers: { seq: 42, outboxEpoch: 'epoch', refused: true } } as const;
   expect(RunnerCommandSchema.parse(command)).toEqual(command);

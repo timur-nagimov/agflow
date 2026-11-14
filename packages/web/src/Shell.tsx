@@ -5,6 +5,7 @@ import { COLUMNS, type ColumnKey, columnCounts, leadBanner } from './format';
 import { useAction, useData, useRoute } from './hooks';
 import { type Hub, HubContext } from './hub';
 import { type Connection, useConnection } from './live';
+import { stripNumbers } from './load';
 import { NAV, type Route, navViewOf, routeHref } from './route';
 import { AgentsView } from './views/AgentsView';
 import { ApprovalsView } from './views/ApprovalsView';
@@ -12,6 +13,7 @@ import { AttemptView } from './views/AttemptView';
 import { BoardView } from './views/BoardView';
 import { GoalView } from './views/GoalView';
 import { KnowledgeView } from './views/KnowledgeView';
+import { LoadView } from './views/LoadView';
 import { MessagesView } from './views/MessagesView';
 import { RunnersView } from './views/RunnersView';
 import { TaskView } from './views/TaskView';
@@ -42,6 +44,13 @@ const runnersChanged = (event: HubEvent) =>
 /** A request raised, decided, expired or voided. */
 const approvalsChanged = (event: HubEvent) => event.type.startsWith('approval.');
 
+/** Work that moves, a runner or an account that changes: any of them can change the load. */
+const loadChanged = (event: HubEvent) =>
+  event.type.startsWith('task.') ||
+  event.type.startsWith('attempt.') ||
+  event.type.startsWith('runner.') ||
+  event.type.startsWith('account.');
+
 const CONNECTION: Record<Connection, { label: string; lamp: string }> = {
   connecting: { label: 'Connecting', lamp: 'tone-active' },
   live: { label: 'Live', lamp: 'tone-done pulse' },
@@ -54,12 +63,15 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const route = useRoute();
   const connection = useConnection();
   const status = useData(() => api.status(), [], { relevant: statusChanged, refreshMs: 60_000 });
-  const tasks = useData(() => api.tasks(), [], { relevant: taskChanged });
+  // A ready task's wait reason changes with the scheduler's ticks, which send no event, hence the timer.
+  const tasks = useData(() => api.tasks(), [], { relevant: taskChanged, refreshMs: 30_000 });
   // Heartbeats (power, disk, last seen) send no event, so the runners also reload on a timer.
   const runners = useData(() => api.runners(), [], { relevant: runnersChanged, refreshMs: 60_000 });
   // The timer catches an approval.* event missed while the live connection was down;
   // an expiry arrives as approval.expired.
   const approvals = useData(() => api.approvals(['pending']), [], { relevant: approvalsChanged, refreshMs: 30_000 });
+  // Slots free up and ages grow with no event, hence the timer.
+  const load = useData(() => api.load(), [], { relevant: loadChanged, refreshMs: 30_000 });
   const [peopleSeen, setPeopleSeen] = useState(() => Number(localStorage.getItem(SEEN_KEY) ?? 0));
   const markPeopleSeen = useCallback((id: number) => {
     if (id <= Number(localStorage.getItem(SEEN_KEY) ?? 0)) return;
@@ -67,9 +79,10 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     setPeopleSeen(id);
   }, []);
   const hub = useMemo<Hub>(
-    () => ({ me, status, tasks, runners, approvals, peopleSeen, markPeopleSeen }),
-    [me, status, tasks, runners, approvals, peopleSeen, markPeopleSeen],
+    () => ({ me, status, tasks, runners, approvals, load, peopleSeen, markPeopleSeen }),
+    [me, status, tasks, runners, approvals, load, peopleSeen, markPeopleSeen],
   );
+  const numbers = load.data ? stripNumbers(load.data) : null;
   const project = status.data?.project;
   const counts = tasks.data ? columnCounts(tasks.data) : null;
   const unseen = (status.data?.humansInbox ?? []).filter((message) => message.id > peopleSeen).length;
@@ -150,6 +163,27 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 Runners <b>{`${online}/${runnerList.length}`}</b> online
               </a>
             ) : null}
+            {numbers ? (
+              <>
+                <a
+                  className="readout"
+                  href={routeHref({ view: 'load' })}
+                  title="Runner workers running, of the most the scheduler starts"
+                >
+                  Workers <b>{numbers.workers}</b>
+                </a>
+                <a
+                  className="readout"
+                  href={routeHref({ view: 'load' })}
+                  title={`${numbers.dispatchable} of them can start now`}
+                >
+                  Ready <b>{numbers.ready}</b>
+                </a>
+                <a className="readout" href={routeHref({ view: 'load' })} title="Free slots on online runners now">
+                  Idle slots <b>{numbers.idle}</b>
+                </a>
+              </>
+            ) : null}
             {counts ? <Progress counts={counts} /> : null}
           </header>
           {project?.paused ? (
@@ -192,6 +226,8 @@ function View({ route }: { route: Route }) {
       return <AgentsView />;
     case 'runners':
       return <RunnersView />;
+    case 'load':
+      return <LoadView />;
     case 'approvals':
       return <ApprovalsView />;
     case 'messages':

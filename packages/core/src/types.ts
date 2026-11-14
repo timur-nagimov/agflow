@@ -1,9 +1,13 @@
+import type { PlacementRefusal } from './scheduling';
+
 export type Vendor = 'claude' | 'codex';
 export type AgentRole = 'lead' | 'worker';
 export type AgentOrigin = 'live' | 'runner';
 export type AgentStatus = 'active' | 'idle' | 'gone';
 
 export type TaskKind = 'code' | 'research' | 'review' | 'curation';
+/** How hard a task is to think through: a strong task runs on the runner's lead model, with more reasoning. */
+export type TaskTier = 'standard' | 'strong';
 export type TaskStatus =
   | 'draft'
   | 'ready'
@@ -63,6 +67,8 @@ export interface TaskContract {
   priority: number;
   /** The vendor the scheduler prefers for this task, after the ladder's vendor requirement (design 6.6, step 5). */
   vendorHint?: Vendor | null;
+  /** Absent: standard. A strong task's attempts run on the runner's lead model, with a higher reasoning effort. */
+  tier?: TaskTier;
 }
 
 export interface Submission {
@@ -104,6 +110,11 @@ export interface Task extends TaskContract {
   nextDispatchAt: number | null;
   /** The lead or a person granted the task internet access: its Claude agents may use fetch_url (design 5). */
   fetchGranted: boolean;
+  /**
+   * Why the scheduler's last tick did not start this ready task, in one line, as GET /api/tasks gives it; null when
+   * that tick said nothing about it.
+   */
+  waitReason?: string | null;
 }
 
 /** What POST /api/fetch answers: one public URL the hub downloaded for a runner agent (design 5, Unattended options). */
@@ -580,4 +591,60 @@ export interface FetchSubmissionRequest {
   status: 'pending' | 'ok' | 'failed';
   error: string | null;
   note?: string;
+}
+
+// ---------------------------------------------------------------------------
+// The load (GET /api/load)
+// ---------------------------------------------------------------------------
+
+/** One owner's account on one vendor, across the owner's runners logged in to it. */
+export interface AccountLoad {
+  owner: string;
+  vendor: Vendor;
+  /** Null when the runners do not know the account. */
+  accountId: string | null;
+  /** 'Claude Max', 'ChatGPT Plus'; null when no runner reports one. */
+  plan: string | null;
+  /** The vendor's starting, running and quota_wait attempts on those runners. */
+  busy: number;
+  /** The slots of those runners, which the owner's other vendor shares. */
+  capacity: number;
+  /** Utilization 0..1 as placement counts it; null when unknown. */
+  fiveHour: number | null;
+  weekly: number | null;
+  /** The lowest of those runners' ceilings, 0..1. */
+  ceilings: { fiveHour: number; weekly: number };
+  /** The reset of the limiting window; null when unknown. */
+  resetsAt: number | null;
+  /** 'ok' when one of those runners can take an attempt of the vendor now; otherwise placement's refusal. */
+  state: 'ok' | PlacementRefusal;
+}
+
+/** The project's numbers on the Load page. Ages and time left are as of HubLoad.now. */
+export interface ProjectLoad {
+  /** Runner workers starting, running or in quota_wait; the lead's target (null for none); AGFLOW_MAX_WORKERS. */
+  workers: { running: number; target: number | null; cap: number };
+  /** The slots of the online runners that are not draining: all, taken, and free. */
+  slots: { capacity: number; busy: number; idle: number };
+  /** Free slot minutes in the last hour, from the scheduler's samples since the hub started. */
+  idleSlotMinutes: number;
+  tasks: {
+    ready: number;
+    /** Ready tasks the scheduler may start now (design 6.6, step 3). */
+    dispatchable: number;
+    blockedOnDependencies: number;
+    submitted: { count: number; oldestAgeMs: number | null };
+    acceptedNotMerged: { count: number; oldestAgeMs: number | null };
+    mergedLastHour: number;
+  };
+  /** project.deadline_at, and the time left until it, below 0 once it has passed. */
+  deadline: { at: number | null; leftMs: number | null };
+}
+
+/** GET /api/load: how busy the accounts and the project are, for people in the web UI. */
+export interface HubLoad {
+  /** The hub's clock when it answered. */
+  now: number;
+  accounts: AccountLoad[];
+  project: ProjectLoad;
 }

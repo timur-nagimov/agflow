@@ -85,6 +85,9 @@ export function appServerEnv(input: {
   );
 }
 
+/** The reasoning effort of a strong task: above Codex's default, medium, and one every reasoning model takes. */
+export const CODEX_STRONG_EFFORT = 'high';
+
 /** What thread/start and thread/resume both receive (design 9.2). */
 export type CodexThreadOverrides = {
   cwd: string;
@@ -118,6 +121,8 @@ export type CodexThreadOverrides = {
       };
     };
     web_search: 'cached' | 'disabled';
+    /** Set for a strong task only; Codex's own default otherwise. */
+    model_reasoning_effort?: typeof CODEX_STRONG_EFFORT;
   };
 };
 
@@ -138,7 +143,10 @@ export function codexToolsNote(names: readonly string[]): string {
  * there: repository or agent content would run in the bridge, outside the sandbox, with the agent token.
  */
 export function threadOverrides(
-  launch: Pick<AgentLaunch, 'clone' | 'model' | 'brief' | 'projectConfigVerified' | 'tmpDir' | 'bridge' | 'profile'>,
+  launch: Pick<
+    AgentLaunch,
+    'clone' | 'model' | 'tier' | 'brief' | 'projectConfigVerified' | 'tmpDir' | 'bridge' | 'profile'
+  >,
   bridgeCwd: string,
 ): CodexThreadOverrides {
   const clone = realpathSync(launch.clone);
@@ -185,6 +193,7 @@ export function threadOverrides(
       },
       // Opt-in search stays cached; it does not enable network access for shell commands.
       web_search: launch.profile.webTools ? 'cached' : 'disabled',
+      ...(launch.tier === 'strong' ? { model_reasoning_effort: CODEX_STRONG_EFFORT } : {}),
     },
   } satisfies CodexThreadOverrides & ParamsOf<'thread/start'> & Omit<ParamsOf<'thread/resume'>, 'threadId'>;
 }

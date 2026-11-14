@@ -1,4 +1,4 @@
-import type { Approval, HubStatus, Task } from '@agflow/core';
+import type { Approval, HubLoad, HubStatus, Task } from '@agflow/core';
 import { createContext, useContext } from 'react';
 import type { Me, RunnerList } from './api';
 import type { Loaded } from './hooks';
@@ -12,6 +12,8 @@ export interface Hub {
   runners: Loaded<RunnerList>;
   /** The signed-in person's pending approvals; the Approvals nav item counts them. */
   approvals: Loaded<Approval[]>;
+  /** The accounts' and the project's load; the strip and the Load page read it. */
+  load: Loaded<HubLoad>;
   /** The newest message to people that this browser has shown. */
   peopleSeen: number;
   markPeopleSeen: (id: number) => void;

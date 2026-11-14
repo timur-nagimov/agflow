@@ -232,6 +232,15 @@ after a change. The details are in the
   owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
   removing the line and restarting the hub.
 
+One more setting is on by default. **`AGFLOW_DEMO_CHECK_EVERY=N`** (default 5, `0` turns it off) removes a person
+trying the product by hand from time to time. After every N tasks merged, or accepted while nothing marks tasks merged,
+the hub creates one demo-check task, created by `system`, unless one is still open. Its agent starts the product from a
+clean checkout of `main` the way `AGENTS.md` says (`scripts/demo.sh` when present), walks every flow in `SPEC.md`, saves
+a screenshot of every screen under `docs/qa/<time>/`, records each requirement in `docs/STATUS.md` as working, broken or
+missing, and lists every defect with steps to reproduce in its submission. It may change only those files and
+`scripts/demo.sh`. It runs at priority 1, preferably on the vendor that implemented fewer of the last N tasks, and the
+lead turns its defects into fix tasks. Risk: none beyond an agent's usual work; it costs one task's quota every N tasks.
+
 ### What agents fetched
 
 With `AGFLOW_AGENT_FETCH=1` the hub records every request it made for an agent, or refused by its URL and address

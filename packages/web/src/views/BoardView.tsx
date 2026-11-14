@@ -99,6 +99,12 @@ function TaskCard({ task }: { task: Task }) {
         ) : null}
       </div>
       {task.status === 'blocked' && task.blockedReason ? <p className="task-note">{task.blockedReason}</p> : null}
+      {/* Why the scheduler's last tick did not start this ready task (design 6.6), in one line. */}
+      {task.status === 'ready' && task.waitReason ? (
+        <p className="task-note task-wait" title={task.waitReason}>
+          {task.waitReason}
+        </p>
+      ) : null}
     </a>
   );
 }

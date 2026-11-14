@@ -10,6 +10,7 @@ describe('routes', () => {
     expect(parseRoute('#/task/T-12')).toEqual({ view: 'task', id: 'T-12' });
     expect(parseRoute('#/agents')).toEqual({ view: 'agents' });
     expect(parseRoute('#/runners')).toEqual({ view: 'runners' });
+    expect(parseRoute('#/load')).toEqual({ view: 'load' });
     expect(parseRoute('#/approvals')).toEqual({ view: 'approvals' });
     expect(parseRoute('#/messages')).toEqual({ view: 'messages' });
     expect(parseRoute('#/timeline')).toEqual({ view: 'timeline' });
@@ -75,6 +76,14 @@ describe('routes', () => {
     const views = NAV.map((item) => item.view);
     expect(views.indexOf('runners')).toBe(views.indexOf('agents') + 1);
     expect(NAV.find((item) => item.view === 'runners')?.label).toBe('Runners');
+  });
+
+  test('the navigation lists Load right after Approvals, and its href round-trips', () => {
+    const views = NAV.map((item) => item.view);
+    expect(views.indexOf('load')).toBe(views.indexOf('approvals') + 1);
+    expect(NAV.find((item) => item.view === 'load')?.label).toBe('Load');
+    expect(routeHref({ view: 'load' })).toBe('#/load');
+    expect(navViewOf(parseRoute('#/load'))).toBe('load');
   });
 
   test("the Approvals page is at core's APPROVALS_ROUTE, which runner notifications print", () => {

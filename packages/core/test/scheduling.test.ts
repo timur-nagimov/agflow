@@ -3,7 +3,9 @@ import { TEST_ACCOUNT_ID } from '../src/runner-protocol';
 import { vendorRequirement } from '../src/ladder';
 import {
   type AccountView,
+  type DispatchContext,
   PLACEMENT_REFUSALS,
+  PLACEMENT_REFUSAL_WORDS,
   type PlacementRefusal,
   type PlacementSnapshot,
   type RunnerSlot,
@@ -16,11 +18,13 @@ import {
   orderRunners,
   place,
   placeLead,
+  placementWords,
   preferredVendors,
   reportHolds,
   runnerToAvoid,
   usableVendors,
   utilization,
+  whyNotDispatchable,
   workerSlotsFree,
 } from '../src/scheduling';
 import type { Vendor, VendorQuota } from '../src/types';
@@ -403,6 +407,58 @@ describe('isDispatchable', () => {
       { id: 'T-3', ownedPaths: ['docs/**'] },
     ];
     expect(isDispatchable(candidate(), { ...dispatch, pathHolders: others })).toBe(true);
+  });
+});
+
+describe('whyNotDispatchable', () => {
+  const why = (overrides: Partial<TaskCandidate>, context: DispatchContext = dispatch) =>
+    whyNotDispatchable(candidate(overrides), context);
+
+  test('a task in the ready set has no reason', () => {
+    expect(why({})).toBeNull();
+    expect(why({ nextDispatchAt: NOW, dispatchHoldUntil: NOW - 1, counted: 2 })).toBeNull();
+  });
+
+  test('names the first rule the task fails, in the order the ready set checks them', () => {
+    expect(why({ status: 'claimed', dependenciesDone: false })).toBe('it is claimed');
+    expect(why({ dependenciesDone: false, openAttempt: true })).toBe('it waits for its dependencies');
+    expect(why({ openAttempt: true, counted: 3 })).toBe('its last attempt is still stopping');
+    expect(why({ ownedPaths: ['.claude/settings.json'] })).toBe(
+      'it owns paths runner agents may not change, so it waits for a live chat',
+    );
+    const holders = [{ id: 'T-2', ownedPaths: ['src/parser/lexer.ts'] }];
+    expect(why({}, { ...dispatch, pathHolders: holders })).toBe('its owned paths overlap those of T-2');
+    expect(why({ nextDispatchAt: NOW + 90_000 })).toBe('it waits 2 min after an infrastructure failure');
+    expect(why({ dispatchHoldUntil: NOW + 1 })).toBe("it waits up to 1 min for a runner's late work");
+    expect(why({ counted: 3 })).toBe('it used all 3 of its attempts');
+  });
+});
+
+describe('placementWords', () => {
+  test("names each runner passed over with its own refusal or its vendors'", () => {
+    const refused = [
+      { runnerId: 'R-1', vendor: null, refusal: 'full' },
+      { runnerId: 'R-2', vendor: 'claude', refusal: 'exhausted' },
+      { runnerId: 'R-2', vendor: 'codex', refusal: 'not_ready' },
+    ] as const;
+    expect(placementWords(candidate(), refused)).toBe(
+      'no runner can take it: R-1 full; R-2 claude quota used up, codex not ready',
+    );
+    expect(placementWords(candidate(), [])).toBe('no runner can take it: none offers a vendor');
+  });
+
+  test('names the vendor the retry ladder asks for', () => {
+    const required = candidate({ requirement: { step: 2, vendor: 'codex' } });
+    const away = [{ runnerId: 'R-1', vendor: 'codex', refusal: 'owner_away' }] as const;
+    const head = 'no runner can take it (the retry ladder asks for codex)';
+    expect(placementWords(required, away)).toBe(`${head}: R-1 codex owner away`);
+    expect(placementWords(required, [])).toBe(`${head}: none offers codex`);
+  });
+
+  test('every refusal has its words', () => {
+    for (const refusal of PLACEMENT_REFUSALS) {
+      expect([refusal, PLACEMENT_REFUSAL_WORDS[refusal].length > 0]).toEqual([refusal, true]);
+    }
   });
 });
 
