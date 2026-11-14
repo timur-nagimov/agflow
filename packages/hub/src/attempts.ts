@@ -100,6 +100,7 @@ import {
   recordFailedStart,
   recordStartRefusal,
   resetFailedStarts,
+  setLimited,
 } from './runners';
 import { failPendingSubmission, pendingSubmissionOf } from './submission-store';
 import {
@@ -1758,9 +1759,11 @@ function endOnExit(
 
 /**
  * attempt.quota (design 6.10, quota_wait; X-14). The account's quota is stored when the event names the account; a
- * null account id updates no account (X-21). An exhaustion moves a running attempt to quota_wait until its reset, and
- * state ok, which the runner reports when it resumes the waiting turn, moves it back to running. A waiting attempt
- * keeps its runner lease, renewed by heartbeats like any other.
+ * null account id updates no account (X-21), and its exhaustion, a limit of one model or paid usage the runner refuses,
+ * keeps the attempt's role off the account until the reset (setLimited), so its successor does not meet the same limit.
+ * An exhaustion moves a running attempt to quota_wait until its reset, and state ok, which the runner reports when it
+ * resumes the waiting turn, moves it back to running. A waiting attempt keeps its runner lease, renewed by heartbeats
+ * like any other.
  */
 export function onAttemptQuota(
   ctx: HubContext,
@@ -1771,6 +1774,9 @@ export function onAttemptQuota(
 ): void {
   const { vendor, accountId, quota } = data;
   if (accountId !== null) recordQuotaReports(ctx, emit, runnerId, [{ vendor, accountId, quota }]);
+  else if (quota.state === 'exhausted') {
+    setLimited(ctx, runnerId, { vendor, role: attempt.role, resetsAt: quota.resetsAt });
+  }
   if (quota.state === 'ok') {
     leaveQuotaWait(ctx, emit, attempt);
     return;

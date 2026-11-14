@@ -32,7 +32,7 @@ import { type HubContext, tx } from './context';
 import { churnPaused, inRecovery } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { insertMessage } from './messages';
-import { placementSnapshot, withoutAccountOf } from './placement';
+import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
 import { markOwnerAwayTold, probeUnknownResets } from './quota';
 import { type ClockCheck, checkClock } from './recovery';
@@ -104,7 +104,8 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
     openAttempt: current !== undefined && current.status !== 'ended',
     dispatchHoldUntil: columns.holdUntil,
     counted: countedAttempts(attempts, columns.floor),
-    readySince: task.updatedAt,
+    // listAttempts answers newest first. A quota replacement's wait was for the vendor already.
+    readySince: attempts[0]?.stopRequested?.cause === 'quota' ? 0 : task.updatedAt,
   };
 }
 
@@ -254,11 +255,12 @@ const isProbe = (placement: Placement): boolean =>
 /**
  * The quota_wait replacement (design 6.10). A worker waiting for a reset more than quotaWaitMaxMs away, or unknown, is
  * replaced (cause quota: no handoff turn, and no failure: no backoff, no failure signature), but only while its
- * successor can start now: a placement for its task exists on another account than the one it waits on, with quota,
- * and is not an account's probing start, which would only wait in turn; and the worker target and the churn guard let
- * a worker start (design 6.15). A wait holds no slot, so that placement counts the wait's own slot as free; once asked
- * to stop, the wait holds its slot again until it ends, so dispatch keeps it for the successor. A lead is replaced at
- * once, whatever its reset, while runner leads are on and another account can take the seat.
+ * successor can start now: a placement for its task exists with quota, and is not an account's probing start, which
+ * would only wait in turn; and the worker target and the churn guard let a worker start (design 6.15). The account the
+ * attempt waits on offers no placement: its exhaustion, or the limit of the attempt's role (setLimited), keeps it off,
+ * for this check and for dispatch alike. A wait holds no slot, so that placement counts the wait's own slot as free;
+ * once asked to stop, the wait holds its slot again until it ends, so dispatch keeps it for the successor. A lead is
+ * replaced at once, whatever its reset, while runner leads are on and another account can take the seat.
  * While the project is paused nothing starts, so nothing is replaced and the agents in quota_wait resume at their
  * reset (design 6.6, Pause). Otherwise a wait goes on: the runner resumes it at its reset, or retries its turn every
  * quotaUnknownMs. The oldest wait goes first, and each replacement holds its placement in the snapshot, so two waits
@@ -287,12 +289,11 @@ export function replaceQuotaWaits(ctx: HubContext): string[] {
     try {
       const task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
       if (task ? workerRoom === 0 : !project.runnerLeads) continue;
-      const elsewhere = withoutAccountOf(snapshot, attempt);
       // The task waited in quota_wait already, so its vendorHint holds it back no longer.
       const prefs = task && { ...placementPrefs(ctx, task, listAttempts(ctx, { task: task.id })), readySince: 0 };
       const { placement } = prefs
-        ? place(elsewhere, prefs, { projectPref: vendorPref })
-        : placeLead(elsewhere, { rotatingFrom: null });
+        ? place(snapshot, prefs, { projectPref: vendorPref })
+        : placeLead(snapshot, { rotatingFrom: null });
       if (!placement || isProbe(placement)) continue;
       requestStop(ctx, {
         attemptId: attempt.id,

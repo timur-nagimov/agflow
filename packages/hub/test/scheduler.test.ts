@@ -582,6 +582,7 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     const { ctx } = createTestContext();
     const lead = addRunnerLead(ctx);
     // A reset a minute away: a lead does not wait for it.
+    exhaust(ctx, 'claude', { resetsAt: ctx.now() + MINUTE });
     updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: ctx.now() + MINUTE });
     // Another runner of alice's is on the account the lead waits on.
     addRunner(ctx);

@@ -19,7 +19,7 @@ import type { AccountQuota, AgentRole, FailureClass, Runner, RunnerState, Task, 
  * - full: the workers that take a slot fill its capacity (a worker's placement only: a lead takes no slot);
  * - not_ready: the vendor is not ready there, by the runner's report or by a hub mark;
  * - degraded: continuous vendor errors marked the vendor degraded there;
- * - exhausted: the vendor's account has no quota left until its reset;
+ * - exhausted: the vendor's account has no quota left until its reset, or none for the role (limitedUntil);
  * - paid_usage: work would draw on paid usage, which the runner does not allow;
  * - owner_away: an approval of the runner's owner timed out (design 6.10);
  * - ceiling: the account's utilization reached the runner's ceiling for the vendor.
@@ -49,6 +49,11 @@ export interface VendorSlot {
   notReadySince: number | null;
   /** The hub's degraded mark after continuous vendor errors: no placement before this time. */
   degradedUntil: number | null;
+  /**
+   * The hub's marks of limit hits that left the account usable (a limit of one model, or paid usage the runner
+   * refuses), by the role that met them here: no attempt of that role on the account before this time (design 6.10).
+   */
+  limitedUntil: Partial<Record<AgentRole, number>>;
   /** The account the vendor is logged in to; null when the runner does not know it. */
   accountId: string | null;
   /** The runner's ceilings for the vendor: the account utilization, 0..1, at which it gets no new attempts there. */
@@ -187,16 +192,33 @@ export function utilization(account: AccountView | null, holds: boolean): { five
   return fiveHour >= weekly ? { fiveHour: 0, weekly } : { fiveHour, weekly: 0 };
 }
 
+/**
+ * Until when a limit hit that left the account usable keeps the role off the vendor (design 6.10): the latest mark of
+ * the role on this slot, or on the vendor of any runner of the owner logged in to the same account, as an exhaustion
+ * of the account holds on all of them. 0 for none.
+ */
+function limitedUntil(snapshot: PlacementSnapshot, runner: RunnerSlot, slot: VendorSlot, role: AgentRole): number {
+  const sameAccount = (other: RunnerSlot, each: VendorSlot): boolean =>
+    slot.accountId !== null &&
+    other.owner === runner.owner &&
+    each.vendor === slot.vendor &&
+    each.accountId === slot.accountId;
+  const shared = snapshot.runners.flatMap((other) => other.vendors.filter((each) => sameAccount(other, each)));
+  return Math.max(slot.limitedUntil[role] ?? 0, ...shared.map((each) => each.limitedUntil[role] ?? 0));
+}
+
 function vendorRefusal(
   snapshot: PlacementSnapshot,
+  runner: RunnerSlot,
   slot: VendorSlot,
   account: AccountView | null,
+  role: AgentRole,
 ): PlacementRefusal | null {
   if (!slot.ready || slot.notReadySince !== null) return 'not_ready';
   if (slot.degradedUntil !== null && snapshot.now < slot.degradedUntil) return 'degraded';
   // An exhaustion and paid usage in use lapse with their report.
   const quota = account !== null && reportHolds(snapshot, account) ? account.quota : null;
-  if (quota?.state === 'exhausted') return 'exhausted';
+  if (quota?.state === 'exhausted' || snapshot.now < limitedUntil(snapshot, runner, slot, role)) return 'exhausted';
   if (quota?.paidUsage === 'in_use' && !slot.allowPaidUsage) return 'paid_usage';
   if (account?.ownerAway) return 'owner_away';
   const { fiveHour, weekly } = utilization(account, quota !== null);
@@ -205,22 +227,24 @@ function vendorRefusal(
 }
 
 /**
- * The vendors on a runner that may take an attempt (design 6.6, step 5, and 6.10): ready, without a not-ready mark or
- * a current degraded mark; on an account that is not exhausted, draws no paid usage unless the runner allows it and
- * whose owner is not away; and below the runner's ceilings, with unknown utilization counted as 0, so a ceiling of 0
- * keeps the vendor off; once a report no longer holds, only its limiting window counts as unknown. A vendor without an
- * account id, or on an account without a quota report, meets no account rule. Every other vendor comes with its first
- * refusal. The runner itself is candidateRunners' to judge.
+ * The vendors on a runner that may take an attempt of the role (design 6.6, step 5, and 6.10): ready, without a
+ * not-ready mark or a current degraded mark; on an account that is not exhausted, nor limited for the role
+ * (limitedUntil), draws no paid usage unless the runner allows it and whose owner is not away; and below the runner's
+ * ceilings, with unknown utilization counted as 0, so a ceiling of 0 keeps the vendor off; once a report no longer
+ * holds, only its limiting window counts as unknown. A vendor without an account id, or on an account without a quota
+ * report, meets no rule of a report. Every other vendor comes with its first refusal. The runner itself is
+ * candidateRunners' to judge.
  */
 export function usableVendors(
   snapshot: PlacementSnapshot,
   runner: RunnerSlot,
+  role: AgentRole = 'worker',
 ): { usable: UsableVendor[]; refused: RefusedPlacement[] } {
   const usable: UsableVendor[] = [];
   const refused: RefusedPlacement[] = [];
   for (const slot of runner.vendors) {
     const account = accountOf(snapshot, runner, slot);
-    const refusal = vendorRefusal(snapshot, slot, account);
+    const refusal = vendorRefusal(snapshot, runner, slot, account, role);
     if (refusal === null) usable.push({ slot, account });
     else refused.push({ runnerId: runner.id, vendor: slot.vendor, refusal });
   }
@@ -249,7 +273,10 @@ export interface TaskCandidate extends Pick<Task, CandidateFields | 'nextDispatc
   requirement: VendorRequirement | null;
   /** The runner its next attempt should not use (runnerToAvoid). */
   avoidRunner: string | null;
-  /** When it became ready: its last change (Task.updatedAt), which for a ready task is its move to ready. */
+  /**
+   * When it became ready: its last change (Task.updatedAt), which for a ready task is its move to ready; 0 after a
+   * quota replacement, whose wait for the vendor counts, so its vendorHint holds it back no longer.
+   */
   readySince: number;
 }
 
@@ -410,7 +437,7 @@ function options(snapshot: PlacementSnapshot, role: AgentRole): { options: Optio
   const { candidates, refused } = candidateRunners(snapshot, role);
   const found: Option[] = [];
   for (const runner of candidates) {
-    const vendors = usableVendors(snapshot, runner);
+    const vendors = usableVendors(snapshot, runner, role);
     refused.push(...vendors.refused);
     for (const usable of vendors.usable) found.push({ runner, usable });
   }

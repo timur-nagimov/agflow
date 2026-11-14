@@ -11,6 +11,7 @@ import { getHubState, insertLeadNote, seatHolderId } from '../src/hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue, wakeHoldingLead } from '../src/lead';
 import { listMessages, markDelivered, sendMessage } from '../src/messages';
 import { setPaused } from '../src/project';
+import { setLimited } from '../src/runners';
 import { runTick } from '../src/scheduler';
 import { startHub } from '../src/server';
 import { getTask } from '../src/task-store';
@@ -171,8 +172,9 @@ describe('starting a runner lead', () => {
   test('a runner lead holds the seat while starting, running, quota_wait or holding', () => {
     const { ctx, lead } = runningLead();
     addRunner(ctx);
+    // The lead's limit keeps leads off alice's account, on the other runner too, so its wait is not replaced.
+    setLimited(ctx, lead.runnerId as string, { vendor: 'claude', role: 'lead', resetsAt: ctx.now() + MINUTE });
     for (const status of ['starting', 'running', 'quota_wait', 'holding'] as const) {
-      // The other runner is on the account the lead waits on, so the wait is not replaced.
       updateAttempt(ctx, lead.id, { status, quotaResetsAt: status === 'quota_wait' ? ctx.now() + MINUTE : null });
       expect([status, seatHolderId(ctx)]).toEqual([status, lead.agentId]);
       const result = runTick(ctx);

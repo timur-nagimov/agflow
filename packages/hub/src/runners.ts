@@ -1,6 +1,7 @@
 // The runner registry (design 6.1, 6.3): runner rows, their identity checks at hello, the state the hub derives for
 // them, and the Runner view the API and the scheduler read.
 import {
+  type AgentRole,
   CLOSE_CODES,
   PROTOCOL_VERSION,
   type ProfileSummary,
@@ -70,6 +71,8 @@ export interface VendorHold {
   failedStarts: number;
   /** Set by two failed starts or an expired login; a vendor report with a later preflightAt clears it. */
   notReadySince: number | null;
+  /** Limit hits that left the account usable (setLimited), by role. Holds written before it existed have none. */
+  limitedUntil?: Partial<Record<AgentRole, number>>;
 }
 
 export type VendorHolds = Partial<Record<Vendor, VendorHold>>;
@@ -781,6 +784,25 @@ export function applyVendorReport(ctx: HubContext, runnerId: string, vendors: Ru
 export function setDegraded(ctx: HubContext, runnerId: string, vendor: Vendor): void {
   const until = ctx.now() + ctx.config.degradedMs;
   changeHold(ctx, runnerId, vendor, (hold) => ({ ...hold, degradedUntil: until }));
+}
+
+/**
+ * A limit hit of the role that left the account usable (design 6.10): a limit of one model, or paid usage the runner
+ * refuses. No new attempt of the role on the vendor's account until the reset, or for quotaUnknownMs when it is
+ * unknown or past, as the runner's own wait does; core's usableVendors holds it on every runner of the owner logged in
+ * to the same account.
+ */
+export function setLimited(
+  ctx: HubContext,
+  runnerId: string,
+  limit: { vendor: Vendor; role: AgentRole; resetsAt: number | null },
+): void {
+  const now = ctx.now();
+  const until = limit.resetsAt !== null && limit.resetsAt > now ? limit.resetsAt : now + ctx.config.quotaUnknownMs;
+  changeHold(ctx, runnerId, limit.vendor, (hold) => ({
+    ...hold,
+    limitedUntil: { ...hold.limitedUntil, [limit.role]: until },
+  }));
 }
 
 /**

@@ -12,7 +12,7 @@ import { requestStop, startRunnerAttempt } from '../src/attempts';
 import { type HubContext, tx } from '../src/context';
 import { placementSnapshot } from '../src/placement';
 import { upsertAccountQuota } from '../src/quota';
-import { markVendorNotReady, recordStartRefusal, setDegraded } from '../src/runners';
+import { markVendorNotReady, recordStartRefusal, setDegraded, setLimited } from '../src/runners';
 import { addRunner, addRunnerAttempt, createTestContext } from './helpers';
 
 const HOUR = 60 * 60_000;
@@ -73,6 +73,8 @@ function setup() {
 describe('placementSnapshot', () => {
   test("lists each runner's slots, open attempts and vendor holds, and each account with its open attempts", () => {
     const { ctx, r1, r2, r3 } = setup();
+    // The lead met a limit of its model on R-1's Claude account.
+    setLimited(ctx, r1, { vendor: 'claude', role: 'lead', resetsAt: ctx.now() + HOUR });
     const snapshot = placementSnapshot(ctx);
     expect(snapshot.now).toBe(ctx.now());
     expect(snapshot.quotaUnknownMs).toBe(ctx.config.quotaUnknownMs);
@@ -96,6 +98,7 @@ describe('placementSnapshot', () => {
           ready: true,
           notReadySince: null,
           degradedUntil: null,
+          limitedUntil: { lead: ctx.now() + HOUR },
           accountId: TEST_ACCOUNT_ID,
           ceilings: { fiveHour: 0.85, weekly: 0.85 },
           allowPaidUsage: false,
@@ -105,6 +108,7 @@ describe('placementSnapshot', () => {
           ready: true,
           notReadySince: null,
           degradedUntil: ctx.now() + ctx.config.degradedMs,
+          limitedUntil: {},
           accountId: TEST_ACCOUNT_ID,
           ceilings: { fiveHour: 0.85, weekly: 0.85 },
           allowPaidUsage: false,

@@ -24,7 +24,7 @@ import {
   utilization,
   workerSlotsFree,
 } from '../src/scheduling';
-import type { Vendor, VendorQuota } from '../src/types';
+import type { AgentRole, Vendor, VendorQuota } from '../src/types';
 
 const NOW = 1_800_000_000_000;
 const MINUTE = 60_000;
@@ -37,6 +37,7 @@ function vendorSlot(overrides: Partial<VendorSlot> = {}): VendorSlot {
     ready: true,
     notReadySince: null,
     degradedUntil: null,
+    limitedUntil: {},
     accountId: TEST_ACCOUNT_ID,
     ceilings: { fiveHour: 0.85, weekly: 0.85 },
     allowPaidUsage: false,
@@ -206,6 +207,22 @@ describe('usable vendors', () => {
       [{ runnerId: 'R-2', vendor: 'claude', refusal: 'exhausted' }],
       [],
     ]);
+  });
+
+  test("a role's limit holds until its time on every runner of the owner on the account, not for the other", () => {
+    const runners = [
+      runner({ id: 'R-1', vendors: [vendorSlot({ limitedUntil: { worker: NOW + 1 } })] }),
+      runner({ id: 'R-2' }),
+      runner({ id: 'R-3', vendors: [vendorSlot({ accountId: CODEX_ACCOUNT })] }),
+      runner({ id: 'R-4', owner: 'bob' }),
+    ];
+    const refusals = (view: PlacementSnapshot, role: AgentRole) =>
+      runners.map((each) => usableVendors(view, each, role).refused.map((refused) => refused.refusal));
+    const view = snapshot(runners, [account()]);
+    // ann's other runner on the account is limited too; her other account and bob's are not.
+    expect(refusals(view, 'worker')).toEqual([['exhausted'], ['exhausted'], [], []]);
+    expect(refusals(view, 'lead')).toEqual([[], [], [], []]);
+    expect(refusals({ ...view, now: NOW + 1 }, 'worker')).toEqual([[], [], [], []]);
   });
 
   test('no paid usage unless the runner allows it', () => {
@@ -678,6 +695,13 @@ describe('placeLead', () => {
   test('a tie goes to the lowest runner id', () => {
     const view = snapshot([runner({ id: 'R-10' }), runner({ id: 'R-2' })], [account()]);
     expect(placeLead(view, { rotatingFrom: null }).placement?.runnerId).toBe('R-2');
+  });
+
+  test("Claude's lead limit sends the lead to Codex, while a worker may still use Claude", () => {
+    const limited = vendorSlot({ limitedUntil: { lead: NOW + HOUR } });
+    const view = snapshot([runner({ vendors: [limited, codexSlot] })], [account()]);
+    expect(placeLead(view, { rotatingFrom: null }).placement).toMatchObject({ runnerId: 'R-1', vendor: 'codex' });
+    expect(place(view, candidate({ vendorHint: 'claude' }), { projectPref: null }).placement?.vendor).toBe('claude');
   });
 
   test('a lead takes no slot: a full runner takes it', () => {

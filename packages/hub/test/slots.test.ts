@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { HINT_WAIT_MS, type RawRunnerEvent, TEST_ACCOUNT_ID, type Vendor, type VendorQuota } from '@agflow/core';
+import {
+  type Attempt,
+  HINT_WAIT_MS,
+  type RawRunnerEvent,
+  TEST_ACCOUNT_ID,
+  type Vendor,
+  type VendorQuota,
+} from '@agflow/core';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, requestStop, startRunnerAttempt } from '../src/attempts';
 import { type HubContext, tx } from '../src/context';
@@ -47,6 +54,39 @@ function report(ctx: HubContext, owner: string, runnerId: string, vendor: Vendor
 /** Ready tasks by alice; returns their ids. */
 const tasks = (ctx: HubContext, ...inputs: Parameters<typeof newTask>[0][]): string[] =>
   createTasks(ctx, inputs.map((input) => newTask(input)), 'user:alice').map((task) => task.id);
+
+let seq = 0;
+
+/**
+ * The attempt runs, and its runner reports a limit hit that names no account, as a limit of one model does: the
+ * attempt waits until resetsAt, and the account stays usable.
+ */
+function limitHit(ctx: HubContext, attempt: Attempt, resetsAt: number): void {
+  updateAttempt(ctx, attempt.id, { status: 'running' });
+  const quota: VendorQuota = {
+    state: 'exhausted',
+    resetsAt,
+    windows: { fiveHour: null, weekly: 1 },
+    paidUsage: 'disabled',
+    updatedAt: ctx.now(),
+  };
+  const hit: RawRunnerEvent = {
+    seq: ++seq,
+    at: ctx.now(),
+    type: 'attempt.quota',
+    attemptId: attempt.id,
+    fence: attempt.fence,
+    data: { vendor: attempt.vendor, accountId: null, quota },
+  };
+  const batch = { outboxEpoch: 'outbox-1', events: [hit] };
+  applyRunnerEvents(ctx, attempt.runnerId as string, batch, { restoreReplay: false });
+  expect(ctx.db.query('SELECT type, error FROM runner_event_rejects').all()).toEqual([]);
+  expect(getAttempt(ctx, attempt.id)).toMatchObject({ status: 'quota_wait', quotaResetsAt: resetsAt });
+}
+
+/** The owner and vendor an attempt runs on, by its runner's owner. */
+const seatOf = (ctx: HubContext, attempt: Attempt): string =>
+  `${getRunner(ctx, attempt.runnerId as string).owner} ${attempt.vendor}`;
 
 describe('the slots the hub counts', () => {
   test('a runner counts its starting and running workers: a lead, a holding attempt and a quota wait take none', () => {
@@ -105,16 +145,44 @@ describe('quota replacements', () => {
     expect(getTask(ctx, taskId as string).nextDispatchAt).toBe(ctx.now() + (ctx.config.infraBackoffMs[0] as number));
   });
 
-  test("a worker is replaced only onto another account than the one it waits on, which stays usable", () => {
+  test("a worker's limit of one model keeps workers off every runner of its account; another one replaces it", () => {
     const { ctx } = workersOnly();
     const held = addRunnerAttempt(ctx);
-    // A limit of one model: the attempt waits a day, and its account is not exhausted.
-    updateAttempt(ctx, held.attempt.id, { status: 'quota_wait', quotaResetsAt: ctx.now() + 24 * HOUR });
+    // The limit is the account's for workers: another runner of alice's, logged in to it, takes none either.
     addRunner(ctx);
+    limitHit(ctx, held.attempt, ctx.now() + 24 * HOUR);
     expect(replaceQuotaWaits(ctx)).toEqual([]);
+    tasks(ctx, { title: 'Other' });
+    expect(runTick(ctx).started).toEqual([]);
     addRunner(ctx, { owner: 'bob' });
     expect(replaceQuotaWaits(ctx)).toEqual([held.attempt.id]);
     expect(getAttempt(ctx, held.attempt.id).stopRequested).toMatchObject({ cause: 'quota', handoff: false });
+  });
+
+  test("a worker's limit of one model sends its successor to another account, not back to the limit", () => {
+    const { ctx } = workersOnly();
+    const alices = addRunner(ctx, { vendors: ['claude', 'codex'] });
+    const bobs = addRunner(ctx, { owner: 'bob', vendors: ['claude', 'codex'] });
+    // Bob's laptop is full.
+    for (let n = 0; n < 2; n++) addRunnerAttempt(ctx, { runnerId: bobs, owner: 'bob' });
+    const held = addRunnerAttempt(ctx, { runnerId: alices });
+    limitHit(ctx, held.attempt, ctx.now() + 24 * HOUR);
+    expect(runTick(ctx).reconciled?.quotaWaits).toEqual([held.attempt.id]);
+    endAttempt(ctx, { attemptId: held.attempt.id, trigger: 'quota' });
+    const started = runTick(ctx).started.map((attempt) => [attempt.taskId, seatOf(ctx, attempt)]);
+    expect(started).toEqual([[held.task.id, 'alice codex']]);
+  });
+
+  test('a hinted task replaced for its quota starts on the other vendor at once: it waited for its vendor', () => {
+    const { ctx } = workersOnly();
+    const runnerId = addRunner(ctx, { vendors: ['claude', 'codex'] });
+    const [taskId] = tasks(ctx, { title: 'Hinted', vendorHint: 'claude' });
+    const held = addRunnerAttempt(ctx, { runnerId, taskId });
+    limitHit(ctx, held.attempt, ctx.now() + 24 * HOUR);
+    expect(runTick(ctx).reconciled?.quotaWaits).toEqual([held.attempt.id]);
+    endAttempt(ctx, { attemptId: held.attempt.id, trigger: 'quota' });
+    const started = runTick(ctx).started.map((attempt) => [attempt.taskId, attempt.vendor]);
+    expect(started).toEqual([[taskId, 'codex']]);
   });
 
   test('a lead in quota_wait is replaced at once, and the next lead starts on another account', () => {
@@ -122,17 +190,35 @@ describe('quota replacements', () => {
     const first = addRunner(ctx);
     const lead = runTick(ctx).lead;
     if (!lead) throw new Error('no lead');
-    // Its reset is five minutes away, which a worker would wait for.
-    updateAttempt(ctx, lead.id, { status: 'quota_wait', quotaResetsAt: ctx.now() + 5 * MINUTE });
     const bobs = addRunner(ctx, { owner: 'bob' });
     // Another of alice's, roomier, which a lead would prefer, is on the account the lead waits on.
     const roomier = addRunner(ctx);
     ctx.db.query('UPDATE runners SET capacity = 8 WHERE id = $id').run({ id: roomier });
+    // Its reset is five minutes away, which a worker would wait for.
+    limitHit(ctx, lead, ctx.now() + 5 * MINUTE);
     expect(runTick(ctx).reconciled?.quotaWaits).toEqual([lead.id]);
     expect(seatHolderId(ctx)).toBe(lead.agentId);
     endAttempt(ctx, { attemptId: lead.id, trigger: 'quota' });
     expect(getAttempt(ctx, lead.id)).toMatchObject({ endReason: 'replaced', runnerId: first });
     expect(runTick(ctx).lead).toMatchObject({ role: 'lead', runnerId: bobs });
+  });
+
+  test("a lead's limit of one model keeps leads off its account: with both Claude accounts out, Codex leads", () => {
+    const { ctx } = createTestContext();
+    addRunner(ctx, { vendors: ['claude', 'codex'] });
+    addRunner(ctx, { owner: 'bob', vendors: ['claude', 'codex'] });
+    const seats: string[] = [];
+    let lead = runTick(ctx).lead;
+    for (let round = 0; round < 2 && lead; round++) {
+      seats.push(seatOf(ctx, lead));
+      // Each Claude account is past its weekly limit of the lead's model.
+      limitHit(ctx, lead, ctx.now() + 24 * HOUR);
+      expect(runTick(ctx).reconciled?.quotaWaits).toEqual([lead.id]);
+      endAttempt(ctx, { attemptId: lead.id, trigger: 'quota' });
+      lead = runTick(ctx).lead;
+    }
+    seats.push(lead ? seatOf(ctx, lead) : 'none');
+    expect(seats).toEqual(['alice claude', 'bob claude', 'alice codex']);
   });
 });
 

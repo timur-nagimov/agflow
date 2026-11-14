@@ -58,6 +58,40 @@ describe('the slots an attempt takes, as the hub counts them', () => {
     expect(controller.takesSlot).toBe(true);
   });
 
+  test("a worker frees its slot once it reports its exit, while its cleanup waits for the vault's lock", async () => {
+    const f = await createRunnerFixture({ config: { capacity: 1 }, script: { turns: [[LONG_SLEEP]] } });
+    const first = f.controller();
+    const spec = f.spec();
+    expect(await first.start(spec)).toEqual({ started: true });
+    await waitFor(() => first.phase === 'turn');
+    // Another start's fetch holds the vault's lock when the exit's cleanup asks for it.
+    let unlock = () => {};
+    const append = f.outbox.append.bind(f.outbox);
+    f.outbox.append = (event) => {
+      if (event.type === 'attempt.exited' && event.attemptId === spec.attemptId) {
+        void f.vault.withLock(() => new Promise<void>((resolve) => (unlock = resolve)));
+      }
+      return append(event);
+    };
+    const stop = { fence: spec.fence, reason: 'replaced', handoff: false, interruptFirst: false, keepClone: true };
+    const stopped = first.stop(stop);
+    const next = f.controller('T-5-a1', { liveAttempts: () => Number(first.takesSlot) });
+    const other = f.spec({ attemptId: 'T-5-a1', taskId: 'T-5', branch: 'agflow/T-5-x', wipRef: 'refs/agflow/T-5/a1' });
+    let starting: ReturnType<typeof next.start> | undefined;
+    try {
+      await waitFor(() => f.events('attempt.exited').length === 1);
+      // The hub freed the slot as it applied attempt.exited, and its next start comes right behind.
+      expect([first.holdsSlot, first.takesSlot]).toEqual([true, false]);
+      starting = next.start(other);
+      await waitFor(() => next.phase !== null || f.events('attempt.failed_to_start').length > 0);
+      expect(f.events('attempt.failed_to_start')).toEqual([]);
+    } finally {
+      unlock();
+    }
+    expect(await starting).toEqual({ started: true });
+    expect(await stopped).toMatchObject({ ok: true });
+  });
+
   test('a worker waiting for its quota takes no slot, and takes it again when the wait ends', async () => {
     const f = await createRunnerFixture({
       script: () => {

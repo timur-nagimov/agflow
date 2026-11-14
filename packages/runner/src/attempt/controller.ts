@@ -2,8 +2,8 @@
 // lifecycle and git work runs on the attempt's serial queue, one job at a time. A start is admitted first (X-3):
 // a draining runner, a full capacity, a vendor that is not ready and the health seam each refuse it with one of
 // core's START_REFUSALS, reported as attempt.failed_to_start with refused set, and nothing starts. The capacity counts
-// what the hub counts (takesSlot): workers, but not one held after its submission or waiting for its quota; a lead
-// takes no slot and meets no capacity check. A resume is no start and meets none either. An admitted
+// what the hub counts (takesSlot): workers, but not one held after its submission, waiting for its quota or past its
+// reported exit; a lead takes no slot and meets no capacity check. A resume is no start and meets none. An admitted
 // start then prepares the clone (workspace.ts) and a worker's dependencies, in phase preparing, through the seam,
 // and verifies the clone's project config last. Any failure after admission, a clone that cannot be prepared or a
 // failed preparation say, releases what the start took and is one attempt.failed_to_start with refused null (X-40),
@@ -358,12 +358,13 @@ export class AttemptController {
   /**
    * Whether the attempt takes one of the runner's capacity slots, as the hub counts them (design 6.6): a worker that
    * holdsSlot, unless its turn policy waits for its quota, which the hub hears as attempt.quota, or hold_attempt
-   * arrived, which the hub sends as it records the submission and frees the slot. A lead takes none. The runtime
-   * counts these for every other start's admission.
+   * arrived, which the hub sends as it records the submission and frees the slot, or attempt.exited is reported, which
+   * frees the slot on the hub while the exit's cleanup still runs here. A lead takes none. The runtime counts these
+   * for every other start's admission.
    */
   get takesSlot(): boolean {
     const waiting = this.live?.policy.waitingForQuota ?? false;
-    return this.holdsSlot && this.role !== 'lead' && !this.held && !waiting;
+    return this.holdsSlot && this.role !== 'lead' && !this.held && !waiting && !this.standing.exited;
   }
 
   /** The clone the last start prepared; null before one. */
