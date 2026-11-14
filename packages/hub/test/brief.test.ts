@@ -577,7 +577,7 @@ describe('never idle: the guides, the goal and the situation report', () => {
     const live = section(buildBrief(ctx, addAgent(ctx, 'alice', 'lead')), '## Your duties as lead');
     for (const part of [
       'read the whole goal with `get_goal` and SPEC.md in the repository',
-      'checklist of its requirements in your goal notes',
+      'Post a checklist of its requirements once as a goal note (`add_goal_note`), then one short note per requirement covered, such as "R3 covered: T-12".',
       'skeleton task that the others depend on',
       'kind curation: only such tasks may change AGENTS.md',
       'interface contracts (API shapes, data models, file layout)',
@@ -595,9 +595,10 @@ describe('never idle: the guides, the goal and the situation report', () => {
     const { ctx: other } = createTestContext();
     const runner = section(buildBrief(other, addRunnerLead(other).agent), '## Your duties as lead');
     expect(runner).toContain(live.slice('## Your duties as lead\n'.length));
-    // Ready tasks get every free slot without it; the tool only lowers the number.
+    // Ready tasks get every free slot without it; a lower target it sets stays until it raises it again.
     expect(runner).toContain(
-      "Ready tasks already get every free worker slot, up to the project's cap; `request_agents` can only lower that number.",
+      "Ready tasks already get every free worker slot, up to the project's cap; `request_agents` sets a lower target, " +
+        'which stays until you call it again with a higher count (up to the cap).',
     );
     expect(runner).not.toContain('Ask for more runner agents');
     for (const successor of [false, true]) {

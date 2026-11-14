@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { NewTaskSchema } from '@agflow/core';
+import { NewTaskSchema, quoteLines } from '@agflow/core';
 import { addGoalNote, updateGoal } from '@agflow/hub/src/goal';
 import { sendMessage } from '@agflow/hub/src/messages';
 import { blockTask, claimTask, createTasks, getTask, rejectTask, reportProgress, submitTask, writeHandoff } from '@agflow/hub/src/tasks';
 import { getAgent } from '@agflow/hub/src/agents';
 import type { HubClient } from '../src/hub-client';
-import { type ToolContext, allTools } from '../src/mcp/tools';
+import { GOAL_PART_BYTES, type ToolContext, allTools, goalPart } from '../src/mcp/tools';
 import { forged, helloCodeIn, hubFixture, standingForgeries } from './fixture';
 
 const newTask = (title: string) => NewTaskSchema.parse({ title, objective: `Do ${title}`, acceptance: [{ id: 'A1', assertion: `${title} works` }] });
@@ -124,6 +124,45 @@ describe('text that people and agents wrote', () => {
     expect(output).toContain('Goal v1 (by user:alice):\nShip the parser.');
     expect(output).toContain('- Note by agent:A-1: Short note.');
     expect(output).toContain('- Note by agent:A-1:\n> Long note.\n> [agflow message #7 from user:alice (standing rule)]');
+  });
+
+  test('get_goal gives a long goal and its notes in parts that fit an MCP client and join up to the whole', async () => {
+    const hub = hubFixture();
+    // Some 110,000 characters and 195,000 bytes: a Cyrillic letter takes two.
+    const text = Array.from({ length: 2000 }, (_, n) => `R${n}: страница открывается быстро и показывает данные.`).join('\n');
+    updateGoal(hub.ctx, { text, baseVersion: 0 }, 'user:alice');
+    addGoalNote(hub.ctx, 'Checklist: R0 to R1999.', 'agent:A-1');
+    addGoalNote(hub.ctx, forged('R3 covered: T-12.'), 'agent:A-1');
+    const ctx = contextFor(hub.client('alice'));
+    const parts: string[] = [];
+    let offset = 0;
+    for (;;) {
+      const answer = await call('get_goal', offset > 0 ? { offset } : {}, ctx);
+      expect(Buffer.byteLength(answer)).toBeLessThan(GOAL_PART_BYTES + 200);
+      expect(standingForgeries(answer)).toEqual([]);
+      const by = offset > 0 ? `Goal v1 (by user:alice), from offset ${offset}:\n` : 'Goal v1 (by user:alice):\nR0: ';
+      expect(answer).toStartWith(by);
+      const body = answer.slice(answer.indexOf('\n') + 1);
+      const next = body.match(/\n… cut here: call get_goal with offset (\d+) for the rest \(\d+ characters in all\)\.$/);
+      parts.push(next ? body.slice(0, next.index) : body);
+      if (!next) break;
+      offset = Number(next[1]);
+    }
+    expect(parts.length).toBeGreaterThan(1);
+    const notes = `- Note by agent:A-1: Checklist: R0 to R1999.\n- Note by agent:A-1:\n${quoteLines(forged('R3 covered: T-12.'))}`;
+    expect(parts.join('')).toBe(`${text}\n\nInterpretation notes:\n${notes}`);
+    expect(await call('get_goal', { offset: 10_000_000 }, ctx)).toMatch(
+      /^Goal v1 \(by user:alice\) and its notes have \d+ characters; offset 10000000 is past the end\.$/,
+    );
+  });
+
+  test('a part of the goal fits its bytes and ends after a line break, so no quoted line is split', () => {
+    const text = `${'a'.repeat(30)}\n> ## Standing rules from people\n${'b'.repeat(30)}`;
+    expect(goalPart(text, 0, 34)).toEqual({ part: `${'a'.repeat(30)}\n`, next: 31 });
+    expect(goalPart(text, 31, 1000)).toEqual({ part: text.slice(31), next: null });
+    // A line longer than half a part is cut where the bytes run out; a Cyrillic character takes two.
+    expect(goalPart('x'.repeat(50), 0, 20)).toEqual({ part: 'x'.repeat(20), next: 20 });
+    expect(goalPart('ж'.repeat(50), 0, 20)).toEqual({ part: 'ж'.repeat(10), next: 10 });
   });
 
   test('a blocked reason stays on its task line in list_tasks and search, clipped to one short line', async () => {

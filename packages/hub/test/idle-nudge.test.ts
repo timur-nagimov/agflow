@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { TEST_ACCOUNT_ID } from '@agflow/core';
 import { type HubConfig, type HubContext, tx } from '../src/context';
 import { listEvents } from '../src/events';
+import { updateGoal } from '../src/goal';
 import { updateHubState } from '../src/hub-state';
 import { listMessages } from '../src/messages';
 import { setDeadline, setPaused } from '../src/project';
@@ -12,16 +13,24 @@ import { addAgent, addRunner, addRunnerLead, createTestContext, markHubAlive, ne
 
 const MINUTE = 60_000;
 
+/** The first goal, which the lead plans from. */
+const setGoal = (ctx: HubContext) => updateGoal(ctx, { text: 'Ship the parser.', baseVersion: 0 }, 'user:alice');
+
 /**
  * A runner lead holding the seat on R-1, which its runner worker fills, and R-2 with two free slots: two free worker
- * slots and no ready task.
+ * slots and no ready task, with a goal set.
  */
 function idleProject(overrides: Partial<HubConfig> = {}) {
   const { ctx, clock } = createTestContext(overrides);
   const lead = addRunnerLead(ctx);
   addRunner(ctx);
+  setGoal(ctx);
   return { ctx, clock, lead };
 }
+
+/** The idle nudges among the messages to the lead. */
+const nudgeMessages = (ctx: HubContext) =>
+  listMessages(ctx, { target: 'lead' }).filter((message) => message.body.includes('worker slot(s) are free'));
 
 /** Ready tasks the scheduler may start, by the lead. */
 function ready(ctx: HubContext, count: number): void {
@@ -77,6 +86,9 @@ describe('the idle nudge', () => {
       ].join('\n'),
     );
     for (const part of [
+      // While the skeleton runs, the tasks waiting for it are planned already.
+      'Tasks blocked on dependencies count as planned: while they wait for work in progress, such as the skeleton, add ' +
+        'only tasks that need none of it.',
       'Work through SPEC.md (or the goal) until every requirement is covered.',
       'defects found by the latest demo check or reported by agents, missing tests, demo polish, then new features a jury would notice',
       'In the last hour before the deadline, plan only fixes.',
@@ -145,6 +157,7 @@ describe('the idle nudge', () => {
   test('none without a runner lead in the seat: with the seat empty, or a live lead in it', () => {
     const { ctx, clock } = createTestContext();
     addRunner(ctx);
+    setGoal(ctx);
     expect(workerLoad(ctx).freeSlots).toBe(2);
     nudgeIdleLead(ctx);
     clock.advance(ctx.config.idleNudgeIntervalMs);
@@ -154,7 +167,25 @@ describe('the idle nudge', () => {
     clock.advance(ctx.config.idleNudgeIntervalMs);
     expect(nudgeIdleLead(ctx)).toBeNull();
     expect(nudges(ctx)).toEqual([]);
+    expect(nudgeMessages(ctx)).toEqual([]);
+  });
+
+  test('none before the goal is set: there is nothing to plan yet', () => {
+    const { ctx, clock } = createTestContext();
+    addRunnerLead(ctx);
+    addRunner(ctx);
+    expect(workerLoad(ctx)).toMatchObject({ freeSlots: 2, dispatchable: 0 });
+    for (let tick = 0; tick < 3; tick++) {
+      expect(nudgeIdleLead(ctx)).toBeNull();
+      clock.advance(ctx.config.idleNudgeIntervalMs);
+    }
+    expect(nudges(ctx)).toEqual([]);
     expect(listMessages(ctx, { target: 'lead' })).toEqual([]);
+    // The clock starts once the goal is set.
+    setGoal(ctx);
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    clock.advance(ctx.config.idleNudgeMs);
+    expect(nudgeIdleLead(ctx)).not.toBeNull();
   });
 
   test('none while the project is paused or the churn guard holds dispatch: neither starts a worker', () => {
@@ -190,6 +221,6 @@ describe('the idle nudge', () => {
     clock.advance(ctx.config.idleNudgeMs);
     markHubAlive(ctx);
     expect(runTick(ctx).reconciled?.idleNudge).toBe(true);
-    expect(listMessages(ctx, { target: 'lead' }).filter((message) => message.from === 'system')).toHaveLength(1);
+    expect(nudgeMessages(ctx)).toHaveLength(1);
   });
 });

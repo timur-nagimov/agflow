@@ -113,6 +113,32 @@ export function taskLine(task: Task): string {
 
 export const lines = (parts: Array<string | false | null | undefined | 0>) => parts.filter(Boolean).join('\n');
 
+/**
+ * The most UTF-8 bytes of the goal and its notes that one get_goal answer gives. An agent's client cuts a long tool
+ * result short or refuses it (Claude Code at about 25,000 tokens), and a token is a byte at least, so a part fits
+ * whatever the text is.
+ */
+export const GOAL_PART_BYTES = 20_000;
+
+/**
+ * The part of `text` from `offset` that fits `maxBytes` of UTF-8, and the offset of the next part, or null when this
+ * one reaches the end. A part that stops short ends after a line break when one is in its second half, so a quoted
+ * line of a note is not split between two answers.
+ */
+export function goalPart(text: string, offset: number, maxBytes: number): { part: string; next: number | null } {
+  let bytes = 0;
+  let end = offset;
+  for (const char of text.slice(offset)) {
+    bytes += Buffer.byteLength(char);
+    if (bytes > maxBytes) break;
+    end += char.length;
+  }
+  if (end >= text.length) return { part: text.slice(offset), next: null };
+  const lineEnd = text.lastIndexOf('\n', end - 1) + 1;
+  if (lineEnd - offset > (end - offset) / 2) end = lineEnd;
+  return { part: text.slice(offset, end), next: end };
+}
+
 /** Where a chat that holds a task works. claim_task and resume_claim both end with it. */
 const workInside = (path: string, branch: string) => `Work only inside ${path} (branch ${branch}). Commit there; submit pushes the branch.`;
 
@@ -203,15 +229,27 @@ export const sharedTools: ToolDef[] = [
     {},
     async (_args, ctx) => (await asAgent(ctx).brief()).brief,
   ),
-  defineTool('get_goal', "The project's current goal and the lead's interpretation notes.", {}, async (_args, ctx) => {
-    const { current, notes } = await hub(ctx).goal();
-    if (!current) return 'No goal has been set yet.';
-    return lines([
-      `Goal v${current.version} (by ${current.author}):`,
-      current.text,
-      notes.length > 0 && `\nInterpretation notes:\n${notes.map((note) => labelled(`- Note by ${note.author}:`, note.text)).join('\n')}`,
-    ]);
-  }),
+  defineTool(
+    'get_goal',
+    "The project's current goal and the lead's interpretation notes. A long goal comes in parts: an answer that stops short names the offset to call again with.",
+    { offset: z.number().int().min(0).optional() },
+    async ({ offset = 0 }, ctx) => {
+      const { current, notes } = await hub(ctx).goal();
+      if (!current) return 'No goal has been set yet.';
+      const whole = lines([
+        current.text,
+        notes.length > 0 && `\nInterpretation notes:\n${notes.map((note) => labelled(`- Note by ${note.author}:`, note.text)).join('\n')}`,
+      ]);
+      const by = `Goal v${current.version} (by ${current.author})`;
+      if (offset >= whole.length) return `${by} and its notes have ${whole.length} characters; offset ${offset} is past the end.`;
+      const { part, next } = goalPart(whole, offset, GOAL_PART_BYTES);
+      return lines([
+        offset > 0 ? `${by}, from offset ${offset}:` : `${by}:`,
+        part,
+        next !== null && `… cut here: call get_goal with offset ${next} for the rest (${whole.length} characters in all).`,
+      ]);
+    },
+  ),
   defineTool(
     'list_tasks',
     'List tasks, optionally filtered by status, for example ["ready"].',
