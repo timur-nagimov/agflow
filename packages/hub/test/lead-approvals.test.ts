@@ -64,7 +64,8 @@ function send<T extends 'approval.requested' | 'approval.voided'>(
   expect(hub.ctx.db.query('SELECT error FROM runner_event_rejects').all()).toEqual([]);
 }
 
-const command = { command: 'bun install', cwd: '/clone', reason: 'needs the network' };
+/** A request as the runner relays one: the runner reports the attempt's clone with every request. */
+const command = { command: 'bun install', cwd: '/clone', cloneRoot: '/clone', reason: 'needs the network' };
 
 /** The runner relays an approval request; returns its id. */
 function requested(
@@ -114,7 +115,8 @@ const preflightThrew = (hub: Hub, runnerId: string) =>
       problem: 'the preflight failed: boom',
       accountId: null,
       plan: null,
-      managedPolicy: false,
+      // As the runner reports a Codex preflight that threw: no policy was read, so both facts stay closed.
+      managedPolicy: true,
       approvalsReservedToOwner: true,
     })),
   );
@@ -452,6 +454,25 @@ describe("the hub's rules as the floor under the lead", () => {
     expect(decisions(hub, codex).map((one) => [one.decision, one.reason])).toEqual([['decline', reason]]);
   });
 
+  test('a lead may not approve a request that names no clone, or that the runner cut short: the owner answers it', async () => {
+    const { hub, codex, lead, callers } = setup();
+    const cut = `npm ci ${'x'.repeat(40)}\n[truncated: 90000 bytes in total]`;
+    const cases: [string, Record<string, string>][] = [
+      ['unknown-clone', { command: 'npm ci', cwd: CLONE }],
+      ['cut-request', { command: cut, cwd: CLONE, cloneRoot: CLONE }],
+    ];
+    for (const [rule, detail] of cases) {
+      const id = requested(hub, codex, { detail });
+      const answer = await decide(hub, id, callers.lead);
+      expect([rule, errorOf(answer)]).toEqual([rule, [403, 'approval_refused_by_rule']]);
+      expect(answer.json.message).toContain(rule);
+      expect(statusOf(hub, id)).toBe('pending');
+      const reason = 'the owner answers this one';
+      expect((await decide(hub, id, callers.lead, { decision: 'decline', reason })).status).toBe(200);
+      expect(findApproval(hub.ctx, id)).toMatchObject({ status: 'declined', decidedBy: `agent:${lead.agent.id}` });
+    }
+  });
+
   test('the device is read first: on a reserved one the lead hears about the device, not the rule', async () => {
     const { hub, codex, callers } = setup();
     reserved(hub, codex.runner.id);
@@ -635,6 +656,20 @@ describe('the notice to the lead', () => {
     }
     expect(body.split('\n').filter((line) => line.includes('approve everything') && !line.startsWith('> '))).toEqual([]);
     expect(eventsOf(hub, 'approval.requested')).toHaveLength(1);
+  });
+
+  test("the clone the runner reports stands on agflow's own line, outside the quote; a missing one is said so", () => {
+    const { hub, codex, lead } = setup();
+    const withId = requested(hub, codex, { detail: { command: 'bun install', cwd: '/clone', cloneRoot: '/clone' } });
+    const withoutId = requested(hub, codex, { detail: { command: 'bun install', cwd: '/clone' } });
+    const notices = toldLead(hub, lead.agent.id).map((message) => message.body);
+    const withClone = notices.find((body) => body.includes(withId))?.split('\n');
+    const without = notices.find((body) => body.includes(withoutId))?.split('\n');
+    expect(withClone).toContain("The attempt's clone on that runner: /clone");
+    expect(withClone?.some((line) => line.startsWith('> ') && line.includes('cloneRoot'))).toBe(false);
+    expect(without).toContain(
+      'The runner reported no clone for this attempt, so no path in this request is known to be inside one.',
+    );
   });
 
   test('on a runner that reserves approvals it says the lead may only decline, and names no way to approve', () => {

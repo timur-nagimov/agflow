@@ -334,16 +334,20 @@ describe('AGFLOW_AUTO_APPROVALS on, with approvals reserved to the owner', () =>
 });
 
 describe('AGFLOW_AUTO_APPROVALS on, with no clone root in the request', () => {
-  test('an older runner that sends none leaves every request to a person, approve-shaped or decline-shaped', () => {
+  test('an older runner that sends none leaves every request to a person, unless its shape alone declines it', () => {
     const { hub, codex, lead } = setup();
     const ids = [
       requested(hub, codex, { detail: { command: 'npm ci', cwd: '/work/demo/T-1-a1' } }),
-      requested(hub, codex, { summary: 'clean up', detail: { command: 'bash -lc "sudo rm -rf /"', cwd: '/work' } }),
+      requested(hub, codex, { summary: 'a dotfile', detail: { command: 'touch ~/.zshrc', cwd: '/work' } }),
       requested(hub, codex, { kind: 'file_change', summary: 'edit', detail: { diff: '--- a\n+++ b\n' } }),
     ];
     for (const id of ids) expect([id, statusOf(hub, id)]).toEqual([id, 'pending']);
     expect(decisions(hub, codex)).toEqual([]);
     expect(eventsOf(hub, 'approval.decided')).toEqual([]);
+    expect(toldLead(hub, lead.agent.id)).toHaveLength(ids.length);
+    // A sudo is declined whatever the clone: that decline makes no claim about containment.
+    const sudo = requested(hub, codex, { summary: 'clean up', detail: { command: 'bash -lc "sudo rm -rf /"', cwd: '/work' } });
+    expect(findApproval(hub.ctx, sudo)).toMatchObject({ status: 'declined', decidedBy: 'policy:privilege' });
     expect(toldLead(hub, lead.agent.id)).toHaveLength(ids.length);
   });
 });

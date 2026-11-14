@@ -150,7 +150,8 @@ describe('internet through the hub, end to end', () => {
 });
 
 describe('approvals answered by the lead, end to end', () => {
-  const detail = { command: 'curl https://example.com', cwd: '/clone', reason: 'needs the network' };
+  // As a current runner relays it: with the clone of the attempt, which the hub's rules check every path against.
+  const detail = { command: 'curl https://example.com', cwd: '/clone', cloneRoot: '/clone', reason: 'needs the network' };
 
   test('the lead lists a request and approves it where no managed policy applies', async () => {
     const { hub } = unattendedHub();
