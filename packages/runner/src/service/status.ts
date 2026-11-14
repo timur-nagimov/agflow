@@ -152,6 +152,7 @@ export function buildStatusReport(input: StatusInput): RunningStatus {
       accountId: vendor.accountId,
       plan: vendor.plan,
       managedPolicy: vendor.managedPolicy,
+      approvalsReservedToOwner: vendor.approvalsReservedToOwner,
       models: { lead: vendor.models.lead, worker: vendor.models.worker },
       ceilings: { fiveHour: vendor.ceilings.fiveHour, weekly: vendor.ceilings.weekly },
       allowPaidUsage: vendor.allowPaidUsage,

@@ -50,6 +50,7 @@ function preflight(
       accountId: TEST_ACCOUNT_ID,
       plan: 'test mode',
       managedPolicy: false,
+      approvalsReservedToOwner: false,
       ...fields,
     },
     quota: QUOTA,

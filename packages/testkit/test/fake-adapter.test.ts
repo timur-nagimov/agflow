@@ -430,6 +430,7 @@ describe('FakeAdapter.preflight', () => {
         accountId: null,
         plan: null,
         managedPolicy: false,
+        approvalsReservedToOwner: false,
       },
       quota,
       weakened: [],

@@ -444,7 +444,13 @@ export interface RunnerVendor {
   accountId: string | null;
   /** 'Claude Max', 'ChatGPT Plus' */
   plan: string | null;
+  /** The device has managed configuration for this vendor; it says nothing about who answers approvals. */
   managedPolicy: boolean;
+  /**
+   * The device policy regulates who may answer approvals, or could not be read (design 6.10). Absent from an older
+   * runner's report, which the hub reads as reserved: a policy it has not heard of fails closed.
+   */
+  approvalsReservedToOwner?: boolean;
   models: { lead: string; worker: string };
   /** A copy of the runner's settings, for display; 0..1. */
   ceilings: { fiveHour: number; weekly: number };
@@ -505,7 +511,7 @@ export interface Approval {
 
 /**
  * A pending approval as GET /api/approvals lists it for the agent holding the lead seat (design 6.10, Who may answer).
- * leadMayApprove is false on a runner whose vendor reports a managed device policy, or that the hub cannot find: the
+ * leadMayApprove is false where the hub cannot confirm that the runner leaves this vendor's approvals to an agent: the
  * lead may only decline that one, or leave it to the owner.
  */
 export interface LeadApproval extends Approval {

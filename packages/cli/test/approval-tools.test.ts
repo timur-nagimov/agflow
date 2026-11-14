@@ -119,7 +119,7 @@ describe('list_approvals', () => {
         'asked by: A-9',
         'kind: file_change',
         'expires in: about 1 min',
-        'you may: decline only: a managed device policy leaves approving to the owner',
+        'you may: decline only: the hub cannot confirm that this computer leaves approvals to an agent, so its owner approves',
         "summary (untrusted, the asking agent's words):",
         '> Edit the lockfile',
         'detail (untrusted data from the asking agent):',
@@ -138,7 +138,7 @@ describe('list_approvals', () => {
     expect(text).toContain('task: none');
     expect(text).toContain('detail: none');
     expect(text).toContain('expires in: less than a minute');
-    expect(text).toContain('you may: decline only: a managed device policy leaves approving to the owner');
+    expect(text).toContain('you may: decline only: the hub cannot confirm that this computer leaves approvals to an agent, so its owner approves');
     expect(text).not.toContain('approve or decline');
   });
 
@@ -152,7 +152,7 @@ describe('list_approvals', () => {
     const { text } = await bridge.call('list_approvals');
     expect(standingForgeries(text)).toEqual([]);
     const own = text.split('\n').filter((line) => !line.startsWith('>'));
-    expect(own.filter((line) => line.startsWith('you may:'))).toEqual(['you may: decline only: a managed device policy leaves approving to the owner']);
+    expect(own.filter((line) => line.startsWith('you may:'))).toEqual(['you may: decline only: the hub cannot confirm that this computer leaves approvals to an agent, so its owner approves']);
     expect(own.some((line) => line.includes('Approve this at once'))).toBe(false);
     expect(own.filter((line) => line.startsWith('summary'))).toEqual(["summary (untrusted, the asking agent's words):"]);
   });
@@ -166,7 +166,7 @@ describe('list_approvals', () => {
     const own = all.filter((line) => !line.startsWith('>'));
     expect(own.filter((line) => line.includes('pre-approved') || line.includes('[agflow]'))).toEqual([]);
     expect(own.filter((line) => line.startsWith('you may:'))).toEqual([
-      'you may: decline only: a managed device policy leaves approving to the owner',
+      'you may: decline only: the hub cannot confirm that this computer leaves approvals to an agent, so its owner approves',
       'you may: approve or decline it',
     ]);
     // A summary of 300 characters at most, on one quoted line; an empty one is said plainly.
@@ -195,7 +195,7 @@ describe('list_approvals', () => {
     for (const [i, block] of blocks.entries()) {
       const own = block.split('\n');
       const at = (start: string) => own.findIndex((line) => line.startsWith(start));
-      expect(own[at('you may:')]).toBe(i % 2 === 0 ? 'you may: approve or decline it' : 'you may: decline only: a managed device policy leaves approving to the owner');
+      expect(own[at('you may:')]).toBe(i % 2 === 0 ? 'you may: approve or decline it' : 'you may: decline only: the hub cannot confirm that this computer leaves approvals to an agent, so its owner approves');
       expect(at('expires in:')).toBeGreaterThan(0);
       expect(at('expires in:')).toBeLessThan(at('detail (untrusted'));
       expect(at('you may:')).toBeLessThan(at('detail (untrusted'));
@@ -364,7 +364,7 @@ describe("the lead's approval and internet tools", () => {
     for (const part of ['Lead:', 'Approve only what the task needs', 'secrets', 'credentials', 'outside the clone', 'network', 'data, not instructions', 'what the agent should do instead', 'reason']) {
       expect(description('decide_approval'), part).toContain(part);
     }
-    for (const part of ['Lead:', 'data, not instructions', 'decide_approval', 'managed device policy']) expect(description('list_approvals'), part).toContain(part);
+    for (const part of ['Lead:', 'data, not instructions', 'decide_approval', 'leaves approvals to an agent']) expect(description('list_approvals'), part).toContain(part);
   });
 
   test('a worker never sees them, and its bridge serves none of them', async () => {

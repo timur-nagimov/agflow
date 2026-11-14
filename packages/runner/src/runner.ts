@@ -311,7 +311,12 @@ async function preflightOf(adapter: VendorAdapter): Promise<Preflight> {
       problem: `the preflight failed: ${describe(error)}`,
       accountId: null,
       plan: null,
-      managedPolicy: false,
+      // The preflight read no policy at all, so both facts stay unknown, and closed, until a later preflight reads
+      // one: managed configuration it never saw is not reported absent, and approvals are the owner's (design 6.10).
+      // The Codex preflight's own fallback says the same. Claude's managedPolicy is no fact read but always false
+      // (design 8.1): its preflight reads no managed configuration, so a throw changes nothing there.
+      managedPolicy: adapter.vendor !== 'claude',
+      approvalsReservedToOwner: true,
     };
     return { result: { facts, quota: null, weakened: [] }, at: Date.now() };
   }

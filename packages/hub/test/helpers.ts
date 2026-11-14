@@ -106,6 +106,7 @@ export function testVendor(vendor: Vendor): RunnerVendor {
     accountId: TEST_ACCOUNT_ID,
     plan: 'test mode',
     managedPolicy: false,
+    approvalsReservedToOwner: false,
     models:
       vendor === 'claude'
         ? { lead: 'claude-opus-5-5', worker: 'claude-sonnet-5-5' }

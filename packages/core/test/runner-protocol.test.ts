@@ -67,6 +67,7 @@ const vendor: RunnerVendor = {
   accountId: TEST_ACCOUNT_ID,
   plan: 'Claude Max',
   managedPolicy: false,
+  approvalsReservedToOwner: false,
   models: { lead: 'claude-opus-5-5', worker: 'claude-sonnet-5-5' },
   ceilings: { fiveHour: 0.85, weekly: 0.85 },
   allowPaidUsage: false,
@@ -519,6 +520,14 @@ describe('value schemas', () => {
     expect(VendorQuotaSchema.safeParse({ ...quota, windows: { fiveHour: null, weekly: 1 } }).success).toBe(true);
     expect(VendorQuotaSchema.safeParse({ ...quota, windows: { fiveHour: 1.2, weekly: 0 } }).success).toBe(false);
     expect(AccountQuotaReportSchema.safeParse({ vendor: 'claude', accountId: null, quota }).success).toBe(false);
+  });
+
+  test('a vendor report without approvalsReservedToOwner parses, so an older runner is still heard', () => {
+    const { approvalsReservedToOwner: _reserved, ...older } = vendor;
+    expect(RunnerVendorSchema.safeParse(older).data).toEqual(older);
+    expect(RunnerVendorSchema.safeParse({ ...vendor, approvalsReservedToOwner: true }).success).toBe(true);
+    // Absence is the only way to leave it unsaid: null is not a boolean.
+    expect(RunnerVendorSchema.safeParse({ ...vendor, approvalsReservedToOwner: null }).success).toBe(false);
   });
 
   test('AttemptFacts ages are non-negative integers and contextUsed is 0..1 or null', () => {

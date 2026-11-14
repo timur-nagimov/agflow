@@ -137,6 +137,7 @@ describe('CodexAdapter', () => {
         accountId: TEST_ACCOUNT_ID,
         plan: 'test mode',
         managedPolicy: true,
+        approvalsReservedToOwner: false,
       },
       quota: null,
       weakened: [],

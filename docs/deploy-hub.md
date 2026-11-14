@@ -171,7 +171,7 @@ it is marked merged, so the hub releases dependent tasks after their dependencie
 
 By default a person merges accepted work, brings outside data into the repository and answers every approval request.
 Four opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
-after a change. The rules behind the last two are in the
+after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
 - **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal, marking tasks
@@ -192,11 +192,22 @@ after a change. The rules behind the last two are in the
   off and restarting ends every grant, and the hub's journal names the tasks. An agent that was asked to stop
   fetches nothing more.
 - **`AGFLOW_LEAD_APPROVALS=1`.** Removes: the runner owner answering each Codex approval request in a browser. The
-  agent holding the lead seat may decline other agents' requests, with a reason, and approve them when the device's
-  Codex policy is not managed. A request nobody answered in time is then declined without marking the owner away. The
-  owner can still answer first. Risk: an approved command runs outside the sandbox, with network access and write
-  access to all the owner's files, on the lead's judgement instead of the owner's, and a lead can be misled by the
-  text of a request.
+  agent holding the lead seat may decline other agents' requests, with a reason, and approve them unless the device's
+  Codex policy reserves approvals to its owner. A request nobody answered in time is
+  then declined without marking the owner away. The owner can still answer first. Risk: an approved command runs
+  outside the sandbox, with network access and write access to all the owner's files, on the lead's judgement instead
+  of the owner's, and a lead can be misled by the text of a request.
+
+  A managed device policy no longer blocks this by itself. agflow reads what the policy regulates: one that restricts
+  who may answer approvals (`allowed_approvals_reviewers`, `allowed_approval_policies`), or one the runner could not
+  read, reserves approvals to the owner; one that restricts sandbox modes, remote control, computer use or an external
+  browser restricts those and says nothing about approvals. The Runners card shows both facts.
+- **`AGFLOW_AUTO_APPROVALS=1`.** Removes: anyone, person or agent, reading each request before it is answered. The hub
+  approves every approval request the moment it arrives, recorded as `hub:auto-approvals` in the attempt's log and the
+  event. Only a request from a runner whose device policy reserves approvals to its owner waits for the owner. Risk:
+  every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
+  owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
+  removing the line and restarting the hub.
 
 ### What agents fetched
 

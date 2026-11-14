@@ -97,6 +97,8 @@ export async function claudePreflight(input: ClaudePreflightInput): Promise<Clau
     accountId: null,
     plan: null,
     managedPolicy: false,
+    // Claude raises no approvals (see claude/session.ts), so no policy of this device reserves any (6.10).
+    approvalsReservedToOwner: false,
   };
   const notReady = (problem: string, cliVersion: string | null = null): ClaudePreflightOutcome => ({
     facts: { ...base, cliVersion, problem },

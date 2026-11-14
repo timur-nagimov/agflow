@@ -17,7 +17,9 @@ export interface PreflightResult {
   facts: Pick<
     RunnerVendor,
     'vendor' | 'cliVersion' | 'ownerCliVersion' | 'ready' | 'problem' | 'accountId' | 'plan' | 'managedPolicy'
-  >;
+  > &
+    // Optional on the wire for older runners, required of a preflight: every one of them knows the answer (6.10).
+    Required<Pick<RunnerVendor, 'approvalsReservedToOwner'>>;
   quota: VendorQuota | null;
   /** Boundaries this laptop cannot enforce, merged with the runner's own into hello.profile.weakened. */
   weakened: string[];

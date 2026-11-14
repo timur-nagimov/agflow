@@ -257,6 +257,7 @@ describe('preflight: the handshake', () => {
           accountId: ACCOUNT_ID,
           plan: 'Claude Max',
           managedPolicy: false,
+          approvalsReservedToOwner: false,
         },
         // The recording's usage call has rate_limits null.
         quota: null,

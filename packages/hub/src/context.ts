@@ -143,10 +143,16 @@ export interface HubConfig extends HubRunnerSettings {
   agentFetch?: boolean | undefined;
   /**
    * AGFLOW_LEAD_APPROVALS: the agent holding the lead seat may answer the approvals of other agents' attempts with its
-   * agent token (design 6.10, Who may answer): decline any of them, approve only those of a runner whose vendor reports
-   * no managed device policy. Off by default: only the owner answers, in a browser.
+   * agent token (design 6.10, Who may answer): decline any of them, approve those of a runner whose device leaves the
+   * vendor's approvals to an agent. Off by default: only the owner answers, in a browser.
    */
   leadApprovals?: boolean | undefined;
+  /**
+   * AGFLOW_AUTO_APPROVALS: the hub approves every approval request the moment it stores it, wherever the runner's
+   * device leaves the vendor's approvals to an agent; a request from a device that reserves them waits for the owner.
+   * Off by default.
+   */
+  autoApprovals?: boolean | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */

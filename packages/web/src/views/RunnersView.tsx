@@ -139,7 +139,9 @@ function VendorPanel({
   const account = accountOf(runner, vendor, accounts);
   const view = vendorView(vendor, account);
   const quota = quotaMeters(vendor, account, now);
-  const notes = [view.managed, view.degraded, view.ownerAway].filter((note): note is string => note !== null);
+  const notes = [view.managed, view.approvals, view.degraded, view.ownerAway].filter(
+    (note): note is string => note !== null,
+  );
   return (
     <section className="vendor">
       <header className="vendor-head">

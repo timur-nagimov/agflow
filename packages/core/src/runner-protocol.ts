@@ -441,6 +441,8 @@ export const RunnerVendorSchema = schemaFor<RunnerVendor>()(
     accountId: AccountIdSchema.nullable(),
     plan: z.string().nullable(),
     managedPolicy: z.boolean(),
+    // Optional: an older runner sends no such fact, and the hub reads its absence as reserved (design 6.10).
+    approvalsReservedToOwner: z.boolean().optional(),
     models: z.strictObject({ lead: Name, worker: Name }),
     ceilings: CeilingsSchema,
     allowPaidUsage: z.boolean(),
