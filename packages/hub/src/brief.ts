@@ -755,7 +755,7 @@ const REPORT_LIMIT = 2500;
  * deadline, the ready tasks no runner agent will run, those only a runner with the open profile will and those the last
  * tick could not start, the work waiting on the lead and the work agents review, the tasks the hub accepted itself
  * since the lead last woke, the blocked and outdated tasks, the gaps the authors of accepted work named, and as many
- * recent events as fit.
+ * recent events as fit. The gaps always fit: the lists before them are cut to make room.
  */
 export function situationReport(ctx: HubContext): string {
   const tasks = listTasks(ctx);
@@ -803,8 +803,9 @@ export function situationReport(ctx: HubContext): string {
       ...outdated.slice(0, 15).map((task) => `- ${task.id} (v${task.goalVersion}) [${task.status}] ${clip(task.title, 80)}`),
     );
   }
-  lines.push(...gapLinesBlock(ctx, tasks));
-  const head = lines.join('\n');
+  // The gap lines reach the lead nowhere else, so on a full report the lists before them give way.
+  const gaps = gapLinesBlock(ctx, tasks).join('\n');
+  const head = gaps === '' ? lines.join('\n') : `${clip(lines.join('\n'), REPORT_LIMIT - gaps.length - 1)}\n${gaps}`;
   const events: string[] = [];
   let size = head.length + '\nRecent events:'.length;
   for (const event of listEvents(ctx.db, { latest: true, limit: 15 })) {

@@ -18,7 +18,7 @@ import { listMessages } from '../src/messages';
 import { findSubmission, gapLines } from '../src/submission-store';
 import { requestSubmission } from '../src/submissions';
 import { getTask } from '../src/task-store';
-import { createTasks } from '../src/tasks';
+import { blockTask, createTasks } from '../src/tasks';
 import { type RunnerAttempt, addRunnerAttempt, addRunnerLead } from './helpers';
 import { createTestHub } from './http-helpers';
 
@@ -180,6 +180,44 @@ describe('what the authors of submissions disclose, and what demo checks find', 
     expect(gapLines({ summary: 'Gaps: none.\nNo gap: here', evidence: [] })).toEqual([]);
   });
 
+  test('a gap line in markdown counts too: emphasis, code, a heading or a quote; the marks around its colon go', () => {
+    const summary = [
+      '**gap:** wire the menu',
+      '- **Gap**: the `user_id` column needs an index',
+      '`gap:` code gap',
+      '_gap:_ x',
+      '### gap: a heading',
+      '> gap: a quote',
+      '**Gaps:** none',
+      'gapless: no',
+    ].join('\n');
+    expect(gapLines({ summary, evidence: [] })).toEqual([
+      'gap: wire the menu',
+      'Gap: the `user_id` column needs an index',
+      'gap: code gap',
+      'gap: x',
+      'gap: a heading',
+      'gap: a quote',
+    ]);
+  });
+
+  test('on a full report the lists before the gap lines give way: the gap lines and their pointer stay whole', () => {
+    const hub = createTestHub({ autoAccept: true });
+    addRunnerLead(hub.ctx);
+    for (let n = 0; n < 10; n++) {
+      const held = addRunnerAttempt(hub.ctx);
+      blockTask(hub.ctx, held.task.id, held.agent, `${n}: ${'r'.repeat(200)}`);
+    }
+    const long = { summary: `Interface: none.\ngap: ${'g'.repeat(400)}`, evidence: [] };
+    const ids = Array.from({ length: 5 }, () => submit(hub, passed, undefined, long).held.task.id);
+    const report = situationReport(hub.ctx);
+    expect(report.length).toBeLessThanOrEqual(2500);
+    expect(report).toContain('\nBlocked:\n');
+    const block = report.slice(report.indexOf('\nGaps the authors named'));
+    expect(block.split('\n').filter((line) => line.startsWith('>'))).toEqual(Array(3).fill(`> gap: ${'g'.repeat(192)}…`));
+    expect(block).toEndWith(`\nand 2 more: ${ids[3]}, ${ids[4]}; \`get_task\` shows their summaries.`);
+  });
+
   test("the lead's situation report quotes the gap lines of the work the hub accepted since its last wake-up", () => {
     const hub = createTestHub({ autoAccept: true });
     addRunnerLead(hub.ctx);
@@ -236,13 +274,14 @@ describe('what the authors of submissions disclose, and what demo checks find', 
       `Walked every flow. ${'n'.repeat(1600)}`,
       'DEFECT: an empty search answers 500. Steps: open /search?q=',
       '- DEFECT: the price filter ignores 0. Steps: set the price to 0',
+      '- **DEFECT**: the login button does nothing. Steps: click it',
       'DEFECTS: none of the others is open.',
     ].join('\n');
     submit(hub, passed, addRunnerAttempt(hub.ctx, { taskId: demo?.id }), { summary, evidence: [] });
     const [told] = toLead(hub).filter((message) => message.body.includes('was submitted by'));
     expect(told?.body).toContain(`wrote:\n${quoteLines(summary)}\n`);
     expect(told?.body).toEndWith(
-      '\nIts summary has 2 DEFECT line(s). Turn each DEFECT line into a fix task with create_tasks, then accept the ' +
+      '\nIts summary has 3 DEFECT line(s). Turn each DEFECT line into a fix task with create_tasks, then accept the ' +
         'demo check.',
     );
   });
