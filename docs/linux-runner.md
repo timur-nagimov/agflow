@@ -47,8 +47,11 @@ git config --global user.email you@example.com
 ```
 
 The service has no SSH agent and nobody to type a password. For an `https://` project URL, store a fine-grained token
-that can push to the repository with `git config --global credential.helper store`; for a `git@` URL, make an SSH key
-without a passphrase on the VM and add it to your GitHub account. Check it with `git ls-remote` on the project's URL.
+with `git config --global credential.helper store`. Give it read and write access to the repository's Contents and
+Workflows: without Workflows, GitHub refuses every push that changes `.github/workflows`, which agents may do under
+the open profile, and later pushes of `main` and of branches that merged it fail too. For a `git@` URL, make an SSH
+key without a passphrase on the VM and add it to your GitHub account. Check it with `git ls-remote` on the project's
+URL.
 
 Then sign in to the hub and set the runner up:
 

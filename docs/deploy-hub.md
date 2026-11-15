@@ -232,7 +232,7 @@ restore its archive as a backup ([Backups and restore](#backups-and-restore)).
 ## Unattended operation
 
 By default a person merges accepted work, brings outside data into the repository and answers every approval request,
-and the lead reviews every submission. Six opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
+and the lead reviews every submission. Seven opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
 after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
