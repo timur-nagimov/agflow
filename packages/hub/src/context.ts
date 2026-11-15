@@ -20,7 +20,10 @@ export interface HubRunnerSettings {
   recoveryMs: number;
   approvalMs: number;
   leadReviewMs: number;
-  /** How long the dispatchable ready tasks must be fewer than the worker slots before the runner lead is nudged. */
+  /**
+   * How long the dispatchable ready tasks, with those parked while main's check fails, must be fewer than the worker
+   * slots before the runner lead is nudged.
+   */
   idleNudgeMs: number;
   /** The least time between two idle nudges; 0 turns them off. */
   idleNudgeIntervalMs: number;

@@ -297,9 +297,9 @@ after a change. The details are in the
   `declare_blocked`: agflow then parks the task instead of blocking it. The attempt is replaced, which counts no
   failure, asks for a handoff note and tells nobody, and the task waits, ready, with the board saying why, until
   `main`'s check passes, or 45 minutes at most. The lead's situation report names the parked tasks, and the idle
-  nudge counts them among the tasks that can start. An agent that stalls while its last submission failed this way
-  is parked the same way. A pass afterwards tells people and the lead, and cancels the fix task if nobody has started
-  it. The Load page shows where the check of `main` passed, or since when it fails. Only runners of this release
+  nudge counts them as dispatchable. An agent that stalls while its last submission failed this way is parked the
+  same way. A pass afterwards tells people and the lead, and cancels the fix task if nobody has started it.
+  The Load page shows where the check of `main` passed, or since when it fails. Only runners of this release
   (runner protocol 4) that can prepare dependencies, as `agflow runner status` shows, check `main`, so deploy the hub
   first, then update the runners: a hub older than its runners refuses them.
 - **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
@@ -326,7 +326,7 @@ after a change. The details are in the
   the hub applies as `hub:review`, with no push: accept, accept with follow-ups, which go to the lead, or reject,
   which sends the findings back to the author's session. The task's later submissions, agflow's own tasks and live
   chats go on as before (live chats' submissions and demo checks go to the lead). The lead's report names the tasks
-  under review apart from those awaiting its own. Risks:
+  under review apart from those awaiting its own, and the periodic review leaves them to their reviewers. Risks:
   - The review runs at the strong tier, on the lead's model, so each one draws on the quota the lead uses.
   - A review that does not start within 5 minutes, or gives no verdict within 20, lets the hub accept the task as
     before, unread. It waits while the project is paused or the hub is down, and both times start again after the
@@ -501,6 +501,27 @@ Work that stops on its own reaches people as a message from agflow on the Messag
   with `update_task`, then unblock it, or cancel it.
 - **The deadline.** People and the lead hear that the project is paused and merges are held, with where `main`
   stands ([At the deadline](#at-the-deadline)).
+- **Runners failing the same way.** When three attempts at a task end the same way on runners, it is blocked for a
+  re-plan, and people and the lead hear of it: the runners or the setup are the likelier cause.
+- **A protected path.** When a runner finds that an attempt changed a path no runner agent may change, or refuses a
+  submission for it, people and the lead hear which paths.
+- **A branch moved outside agflow.** When a submission's push finds its branch at a commit agflow did not make, the
+  task is blocked for people, who hear of it; unblocking it adopts that commit.
+- **A safety limit.** When the open-task or hourly task limit refuses new tasks, people hear of it, at most once an
+  hour. When agents change the plan `AGFLOW_MAX_PLAN_CHANGES_PER_HOUR` times within an hour, the churn guard pauses
+  worker dispatch, and people hear of it when the pause starts.
+- **Late work and dropped stops.** A runner's late push for a task this hub does not have reaches people with its
+  ref. A stop asked for while a submission was pending is dropped once the submission is recorded, and whoever asked,
+  a person or the lead, hears of it.
+
+Besides the messages above that name it, the lead hears of: each submission up for its review (a runner's with its
+check, its `gap:` and evidence lines, and for a demo check the count of its `DEFECT:` lines); a reviewer's
+follow-ups (`AGFLOW_REVIEW=1`); a task its agent declared blocked or impossible, or one blocked for a re-plan after
+its attempts failed; a stale task; the open tasks that depend on a cancelled one; each new demo check; a goal set or
+changed; a branch pushed after agflow stopped counting on its submission; an owner whose expired approval holds
+their runners back; the approval requests it may answer (`AGFLOW_LEAD_APPROVALS=1`); the idle nudge; and the
+periodic review. A task parked while `main` fails tells nobody, and a task the hub accepts itself, after its check
+or its review, comes up in the lead's next situation report instead.
 
 ## Joining from a Mac
 
