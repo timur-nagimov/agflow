@@ -85,7 +85,8 @@ const tasks = (count: number): string => `${count} task${count === 1 ? '' : 's'}
 
 /**
  * The demo check's contract, after count tasks were done. It is strong: finding what others missed takes the stronger
- * model. Its summary lists each defect on a line of its own that starts "DEFECT:", which the lead's message counts.
+ * model. Its summary lists each defect on a line of its own that starts "DEFECT:", which the lead's message counts. It
+ * says where it departs from the workers' guide, which asks every task for tests, wiring and gap: lines.
  */
 export function demoCheckContract(count: number, now: number, vendorHint: Vendor | null): NewTask {
   const folder = `docs/qa/${folderTime(now)}/`;
@@ -100,7 +101,8 @@ export function demoCheckContract(count: number, now: number, vendorHint: Vendor
       'docs/STATUS.md as working, broken or missing. Call list_tasks and leave out every defect an open task already',
       'covers. List each other defect in your submission summary as one line that starts with "DEFECT:", most severe',
       'first, with steps to reproduce; with none, write the single line "DEFECTS: none". Change nothing but',
-      'docs/STATUS.md, docs/qa/** and scripts/demo.sh.',
+      'docs/STATUS.md, docs/qa/** and scripts/demo.sh. Unlike other tasks, add no test and wire nothing in; start the',
+      'summary with "Interface: none." and write DEFECT lines in place of gap: lines.',
     ].join(' '),
     why:
       `A jury judges the product it can run. This check finds what does not work yet, after ${tasks(count)} done; ` +

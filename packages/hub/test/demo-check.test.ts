@@ -134,6 +134,9 @@ describe('the demo check', () => {
       'Call list_tasks and leave out every defect an open task already covers.',
       'List each other defect in your submission summary as one line that starts with "DEFECT:", most severe first, ' +
         'with steps to reproduce; with none, write the single line "DEFECTS: none".',
+      // Where it departs from the workers' guide, which every worker's brief holds.
+      'Unlike other tasks, add no test and wire nothing in; start the summary with "Interface: none." and write ' +
+        'DEFECT lines in place of gap: lines.',
     ]) {
       expect([words, contract.objective.includes(words)]).toEqual([words, true]);
     }
