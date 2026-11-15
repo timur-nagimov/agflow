@@ -40,10 +40,12 @@ const PROJECT = 'codex-real';
 
 /**
  * A committed project config: every start and resume runs with one, trusted or not, and must see no configWarning
- * (a thread started in a clone with .codex/ once failed on Codex's startup warning). Its effort is not the default
- * ('low' for the pinned slug with this provider), so a request shows whether the thread loaded it.
+ * (a thread started in a clone with .codex/ once failed on Codex's startup warning). Its verbosity is not the default
+ * ('low' for the pinned slug), so a request shows whether the thread loaded it; its effort is not the runner's, so a
+ * request shows that the runner's wins.
  */
-export const PROJECT_CODEX_CONFIG = '# The project\'s own Codex settings.\nmodel_reasoning_effort = "high"\n';
+export const PROJECT_CODEX_CONFIG =
+  '# The project\'s own Codex settings.\nmodel_reasoning_effort = "high"\nmodel_verbosity = "high"\n';
 
 /** A committed repo skill: an untrusted thread still loads it (design 9.2), and the skills check must allow it. */
 export const REPO_SKILL_MARKER = 'REPO-SKILL-MARKER';

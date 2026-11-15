@@ -85,7 +85,13 @@ export function appServerEnv(input: {
   );
 }
 
-/** The reasoning effort of a strong task: above Codex's default, medium, and one every reasoning model takes. */
+/**
+ * The reasoning effort of every thread that is not strong, workers and leads alike. Left unset, Codex takes the model's
+ * catalog default, which for gpt-6.1-sol is low.
+ */
+export const CODEX_STANDARD_EFFORT = 'medium';
+
+/** The reasoning effort of a strong task: above the standard one, and one every reasoning model takes. */
 export const CODEX_STRONG_EFFORT = 'high';
 
 /** What thread/start and thread/resume both receive (design 9.2). */
@@ -121,8 +127,8 @@ export type CodexThreadOverrides = {
       };
     };
     web_search: 'cached' | 'disabled';
-    /** Set for a strong task only; Codex's own default otherwise. */
-    model_reasoning_effort?: typeof CODEX_STRONG_EFFORT;
+    /** Always set: high for a strong task, medium otherwise. */
+    model_reasoning_effort: typeof CODEX_STANDARD_EFFORT | typeof CODEX_STRONG_EFFORT;
   };
 };
 
@@ -196,7 +202,7 @@ export function threadOverrides(
       },
       // Opt-in search stays cached; it does not enable network access for shell commands.
       web_search: launch.profile.webTools ? 'cached' : 'disabled',
-      ...(launch.tier === 'strong' ? { model_reasoning_effort: CODEX_STRONG_EFFORT } : {}),
+      model_reasoning_effort: launch.tier === 'strong' ? CODEX_STRONG_EFFORT : CODEX_STANDARD_EFFORT,
     },
   } satisfies CodexThreadOverrides & ParamsOf<'thread/start'> & Omit<ParamsOf<'thread/resume'>, 'threadId'>;
 }

@@ -7,6 +7,7 @@ import { type NewTask, NewTaskSchema, type Task, type Vendor, isClosed } from '@
 import { findAttempt } from './attempt-store';
 import { type HubContext, tx } from './context';
 import { insertMessage } from './messages';
+import { getProject } from './project';
 import { findTask } from './task-store';
 import { createTasks, creationGuard } from './tasks';
 
@@ -82,43 +83,64 @@ function folderTime(now: number): string {
 
 const tasks = (count: number): string => `${count} task${count === 1 ? '' : 's'}`;
 
-/** The demo check's contract, after count tasks were done. */
+/**
+ * The demo check's contract, after count tasks were done. It is strong: finding what others missed takes the stronger
+ * model. Its summary lists each defect on a line of its own that starts "DEFECT:", which the lead's message counts. It
+ * says where it departs from the workers' guide, which asks every task for tests, wiring and gap: lines.
+ */
 export function demoCheckContract(count: number, now: number, vendorHint: Vendor | null): NewTask {
   const folder = `docs/qa/${folderTime(now)}/`;
   return NewTaskSchema.parse({
     title: `${DEMO_CHECK_TITLE} ${tasks(count)}`,
     objective: [
       'From a clean checkout of main, install and start the product the way AGENTS.md says (with scripts/demo.sh',
-      'when it exists). Walk every user flow SPEC.md describes, as a user would. Save a screenshot of every screen',
-      `into ${folder}, with Playwright or the product's own tools. Record each SPEC.md requirement in`,
-      'docs/STATUS.md as working, broken or missing. List every defect, with steps to reproduce, in your submission',
-      'summary. Change nothing but docs/STATUS.md, docs/qa/** and scripts/demo.sh.',
+      'when it exists). Walk every user flow SPEC.md describes, as a user would. In each flow also try inputs of your',
+      "own, not only SPEC.md's examples: other values, empty input, wrong input. Also read what merged since the last",
+      'demo check (git log) and look for features that break or duplicate each other. Save a screenshot of every',
+      `screen into ${folder}, with Playwright or the product's own tools. Record each SPEC.md requirement in`,
+      'docs/STATUS.md as working, broken or missing. Call list_tasks and leave out every defect an open task already',
+      'covers. List each other defect in your submission summary as one line that starts with "DEFECT:", most severe',
+      'first, with steps to reproduce; with none, write the single line "DEFECTS: none". Change nothing but',
+      'docs/STATUS.md, docs/qa/** and scripts/demo.sh. Unlike other tasks, add no test and wire nothing in; start the',
+      'summary with "Interface: none." and write DEFECT lines in place of gap: lines.',
     ].join(' '),
     why:
       `A jury judges the product it can run. This check finds what does not work yet, after ${tasks(count)} done; ` +
-      'the lead turns each defect it lists into a fix task.',
+      'the lead turns each DEFECT line into a fix task.',
     nonGoals: ['Fixing the defects it finds: the lead makes fix tasks of them.'],
     acceptance: [
       { id: 'A1', assertion: 'docs/STATUS.md marks every requirement of SPEC.md as working, broken or missing.' },
       { id: 'A2', assertion: `${folder} holds a screenshot of every screen the flows reach.` },
-      { id: 'A3', assertion: 'The submission summary lists every defect found, each with steps to reproduce.' },
+      {
+        id: 'A3',
+        assertion:
+          'The submission summary has one line per defect no open task covers, starting with "DEFECT:", most severe ' +
+          'first, each with steps to reproduce, or the single line "DEFECTS: none".',
+      },
       { id: 'A4', assertion: 'Nothing outside docs/STATUS.md, docs/qa/** and scripts/demo.sh changed.' },
     ],
     ownedPaths: [...DEMO_CHECK_PATHS],
     priority: 1,
+    tier: 'strong',
     ...(vendorHint === null ? {} : { vendorHint }),
   });
 }
 
+/** The time before the deadline in which one task done is enough for the next demo check. */
+const LAST_HOUR_MS = 60 * 60_000;
+
 /**
  * Creates the next demo check when it is due (AGFLOW_DEMO_CHECK_EVERY): at least that many tasks done since the last
- * check was created, none still open, and room under the task limits. Its vendor hint is the vendor that implemented
- * fewer of the last tasks done, so the other model checks the work. The lead is told what to do with it. Returns the
- * new task, or null.
+ * check was created, or one in the last hour before the deadline, none still open, and room under the task limits. Its
+ * vendor hint is the vendor that implemented fewer of the last tasks done, so the other model checks the work. The
+ * lead is told what to do with it. Returns the new task, or null.
  */
 export function ensureDemoCheck(ctx: HubContext): Task | null {
-  const every = ctx.config.demoCheckEvery ?? 0;
-  if (every <= 0) return null;
+  const configured = ctx.config.demoCheckEvery ?? 0;
+  if (configured <= 0) return null;
+  const { deadlineAt } = getProject(ctx);
+  const left = deadlineAt === null ? null : deadlineAt - ctx.now();
+  const every = left !== null && left > 0 && left <= LAST_HOUR_MS ? 1 : configured;
   const checks = demoChecks(ctx);
   if (checks.some((check) => !isClosed(check.task.status))) return null;
   const done = doneTasks(ctx, new Set(checks.map((check) => check.task.id)));

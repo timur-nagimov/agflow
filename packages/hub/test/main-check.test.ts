@@ -1,25 +1,47 @@
 import { describe, expect, test } from 'bun:test';
-import { PROTOCOL_VERSION, type RawRunnerEvent, type RunnerEventData, type SubmissionCheck } from '@agflow/core';
+import {
+  type AttemptFacts,
+  PROTOCOL_VERSION,
+  type RawRunnerEvent,
+  type RunnerEventData,
+  type SubmissionCheck,
+  type Task,
+} from '@agflow/core';
 import { getAttempt } from '../src/attempt-store';
+import { onExited, renewLeases } from '../src/attempts';
+import { situationReport } from '../src/brief';
 import { type CommandRow, findCommand, pendingCommands, recordResult } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
+import { updateGoal } from '../src/goal';
 import {
   FIX_MAIN_TITLE,
   MAIN_CHECK_RETRY_MS,
+  PARK_MAX_MS,
   mainHealth,
   openFixTask,
   queueMainCheck,
   retryFixTask,
+  waitsForMain,
 } from '../src/main-check';
 import { listMessages } from '../src/messages';
-import { setPaused } from '../src/project';
-import { runTick } from '../src/scheduler';
+import { setPaused, setWorkerTarget } from '../src/project';
+import { expireReviews, tasksUnderReview } from '../src/review';
+import { nudgeIdleLead, readySet, runTick, workerLoad } from '../src/scheduler';
 import { requestSubmission } from '../src/submissions';
+import { judgeStalls } from '../src/supervisor';
 import { getTask, move } from '../src/task-store';
-import { cancelTask, createTasks, markMerged } from '../src/tasks';
-import { type RunnerAttempt, addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
+import { blockTask, cancelTask, createTasks, declareImpossible, markMerged } from '../src/tasks';
+import {
+  type RunnerAttempt,
+  addRunner,
+  addRunnerAttempt,
+  addRunnerLead,
+  createTestContext,
+  markHubAlive,
+  newTask,
+} from './helpers';
 
 const sha = (char: string) => char.repeat(40);
 const short = (char: string) => char.repeat(7);
@@ -28,7 +50,7 @@ const failed: SubmissionCheck = { status: 'failed', command, durationMs: 61_000,
 const passed: SubmissionCheck = { status: 'passed', command, durationMs: 58_000, tail: '12 pass' };
 
 /** A hub with auto merge, and a runner of this release, which speaks the protocol that knows check_main. */
-function setup(config: { autoAccept?: boolean; maxTasksPerHour?: number } = {}) {
+function setup(config: { autoAccept?: boolean; review?: boolean; maxTasksPerHour?: number } = {}) {
   const { ctx, clock } = createTestContext({ autoMerge: true, ...config });
   return { ctx, clock, runner: current(ctx) };
 }
@@ -238,7 +260,7 @@ describe('when main fails', () => {
     expect(fix?.objective).toEndWith(`> line 59 ${'x'.repeat(55)}`);
   });
 
-  test('a pass after a failure tells people, and cancels the fix task that nobody has claimed', () => {
+  test('a pass after a failure tells people and the lead, and cancels the fix task that nobody has claimed', () => {
     const { ctx, runner } = setup();
     merge(ctx, sha('a'));
     answer(ctx, runner, failed);
@@ -246,10 +268,12 @@ describe('when main fails', () => {
     merge(ctx, sha('b'), 'Print the config');
     answer(ctx, runner, passed);
     expect(getTask(ctx, fix?.id as string).status).toBe('cancelled');
-    expect(told(ctx, 'humans')[0]?.body).toBe(
-      `main's check passes again at ${short('b')}; it had failed since ${short('a')}. agflow cancelled ${fix?.id}, ` +
-        'which nobody had started.',
-    );
+    for (const to of ['humans', 'lead']) {
+      expect(told(ctx, to)[0]?.body).toBe(
+        `main's check passes again at ${short('b')}; it had failed since ${short('a')}. agflow cancelled ${fix?.id}, ` +
+          'which nobody had started.',
+      );
+    }
     expect(mainHealth(ctx)).toEqual({ status: 'passed', sha: sha('b'), at: ctx.now() });
   });
 
@@ -321,7 +345,8 @@ describe('when main fails', () => {
     expect(fix.title).toBe(`${FIX_MAIN_TITLE} the check fails after ${third}`);
     expect(fix.objective).toEndWith('> FAIL src/lint.test.ts');
     expect(getTask(ctx, old.id).status).toBe('claimed');
-    expect(told(ctx, 'lead').map((message) => message.taskId)).toEqual([fix.id, old.id]);
+    // The newest first: the failure, the pass in between, the first failure.
+    expect(told(ctx, 'lead').map((message) => message.taskId)).toEqual([fix.id, null, old.id]);
     expect(mainHealth(ctx)).toEqual({ status: 'failed', since: sha('c'), fixTask: fix.id });
   });
 });
@@ -365,8 +390,8 @@ describe('submissions while main fails', () => {
     const fix = openFixTask(ctx);
     const hint =
       `main's own check has failed since ${short('a')}; ${fix?.id} fixes it. If the failure is not from your change, ` +
-      `do not fix it in your branch: keep your change focused, and submit again after ${fix?.id} is merged (the ` +
-      'runner merges the newest main before each check).';
+      `do not fix it in your branch: call declare_blocked with the reason "waiting for ${fix?.id}". agflow then ` +
+      "parks your task and starts it again once main's check passes.";
     const heard = (held: RunnerAttempt) =>
       listMessages(ctx, {}).find((message) => message.to === `agent:${held.agent.id}`)?.body ?? '';
     const worker = addRunnerAttempt(ctx);
@@ -400,5 +425,228 @@ describe('submissions while main fails', () => {
       'task.accepted',
       'hub:auto-accept',
     ]);
+  });
+});
+
+/** The runner reports the attempt's process gone, as it does once a stop completes. */
+function exited(ctx: HubContext, attemptId: string): void {
+  const data = {
+    code: 0,
+    signal: null,
+    stoppedBy: 'close',
+    handoffWritten: true,
+    cause: null,
+    finalSha: null,
+    finalWip: null,
+    pushError: null,
+  } as const;
+  tx(ctx, (emit) => onExited(ctx, emit, getAttempt(ctx, attemptId), data));
+}
+
+/** Whether dispatch may start the task now, and why not (readySet). */
+function dispatchable(ctx: HubContext, taskId: string): { now: boolean; why: string | null } {
+  const waiting = new Map<string, string>();
+  const ready = readySet(ctx, waiting).map((candidate) => candidate.id);
+  return { now: ready.includes(taskId), why: waiting.get(taskId) ?? null };
+}
+
+describe('parking a task while main fails', () => {
+  /** main fails at a, with its fix task open, and a worker whose submission then failed its check. */
+  function waiting() {
+    const { ctx, clock, runner } = setup();
+    merge(ctx, sha('a'));
+    answer(ctx, runner, failed);
+    const fix = openFixTask(ctx) as Task;
+    const worker = addRunnerAttempt(ctx);
+    submit(ctx, worker, refusedCheck);
+    return { ctx, clock, runner, fix, worker };
+  }
+
+  const parked = (fix: Task, minutes: number) =>
+    `it waits for main's check to pass (${fix.id} fixes it), up to ${minutes} more min`;
+
+  test('declare_blocked parks the task: replaced with a handoff, nothing counted or told, and dispatch leaves it', () => {
+    const { ctx, fix, worker } = waiting();
+    expect(waitsForMain(ctx, worker.attempt)).toBe(true);
+    const lead = told(ctx, 'lead');
+    blockTask(ctx, worker.task.id, worker.agent, `waiting for ${fix.id}`);
+    expect(getAttempt(ctx, worker.attempt.id).stopRequested).toMatchObject({
+      cause: 'replace',
+      by: 'system',
+      handoff: true,
+      reason:
+        `main's own check fails and ${fix.id} fixes it, so agflow parks ${worker.task.id} until it passes, then ` +
+        `starts ${worker.task.id} again`,
+    });
+    expect(getTask(ctx, worker.task.id).status).toBe('claimed');
+    exited(ctx, worker.attempt.id);
+    expect(getAttempt(ctx, worker.attempt.id)).toMatchObject({ endReason: 'replaced', failureClass: null });
+    expect(getTask(ctx, worker.task.id)).toMatchObject({ status: 'ready', blockedKind: null, nextDispatchAt: null });
+    expect([told(ctx, 'lead'), told(ctx, 'humans').length]).toEqual([lead, 1]);
+    expect(dispatchable(ctx, worker.task.id)).toEqual({ now: false, why: parked(fix, 45) });
+    // The fix task itself is never parked.
+    expect(dispatchable(ctx, fix.id)).toEqual({ now: true, why: null });
+  });
+
+  test('the parked task is dispatchable again once main passes, and the lead hears of the pass', () => {
+    const { ctx, runner, worker } = waiting();
+    blockTask(ctx, worker.task.id, worker.agent, 'waiting for main');
+    exited(ctx, worker.attempt.id);
+    expect(dispatchable(ctx, worker.task.id).now).toBe(false);
+    merge(ctx, sha('b'), 'Print the config');
+    // Between the fix's merge and the check that confirms it, main still fails.
+    expect(dispatchable(ctx, worker.task.id).now).toBe(false);
+    answer(ctx, runner, passed);
+    expect(dispatchable(ctx, worker.task.id)).toEqual({ now: true, why: null });
+    expect(told(ctx, 'lead')[0]?.body).toStartWith(`main's check passes again at ${short('b')}`);
+  });
+
+  test('a parked task waits 45 minutes at most', () => {
+    const { ctx, clock, fix, worker } = waiting();
+    blockTask(ctx, worker.task.id, worker.agent, 'waiting for main');
+    exited(ctx, worker.attempt.id);
+    clock.advance(PARK_MAX_MS - 60_000);
+    expect(dispatchable(ctx, worker.task.id)).toEqual({ now: false, why: parked(fix, 1) });
+    clock.advance(60_000);
+    expect(dispatchable(ctx, worker.task.id)).toEqual({ now: true, why: null });
+  });
+
+  test('a stall of an attempt that waits for main parks it instead of counting it', () => {
+    const { ctx, clock, fix, worker } = waiting();
+    const beat = () => {
+      const attempt = getAttempt(ctx, worker.attempt.id);
+      const facts: AttemptFacts = {
+        attemptId: attempt.id,
+        fence: attempt.fence,
+        phase: 'idle',
+        eventAgeMs: ctx.config.stallMs,
+        tool: null,
+        fsAgeMs: ctx.config.stallMs,
+        commitAgeMs: null,
+        turns: 3,
+        turnsWithoutProgress: 0,
+        repeatedCalls: 0,
+        continuations: 4,
+        vendorErrorMs: 0,
+        activeMs: 90_000,
+        contextUsed: 0.42,
+      };
+      tx(ctx, (emit) => renewLeases(ctx, emit, worker.runner.id, [facts]));
+    };
+    beat();
+    expect(judgeStalls(ctx)).toEqual({ suspected: [worker.attempt.id], stopped: [] });
+    clock.advance(ctx.config.heartbeatMs);
+    beat();
+    expect(judgeStalls(ctx)).toEqual({ suspected: [], stopped: [worker.attempt.id] });
+    expect(getAttempt(ctx, worker.attempt.id).stopRequested).toMatchObject({ cause: 'replace', by: 'system' });
+    expect(listEvents(ctx.db).filter((event) => event.type === 'agent.stalled')).toEqual([]);
+    exited(ctx, worker.attempt.id);
+    expect(getAttempt(ctx, worker.attempt.id)).toMatchObject({ endReason: 'replaced', failureClass: null });
+    expect(dispatchable(ctx, worker.task.id)).toEqual({ now: false, why: parked(fix, 45) });
+  });
+
+  test('only an attempt whose newest submission failed its check while main fails waits for main', () => {
+    const { ctx, fix, worker } = waiting();
+    // Another refusal, no submission at all, and the fix task's own failure do not.
+    const dirty = addRunnerAttempt(ctx);
+    submit(ctx, dirty, { ...refusedCheck, error: 'dirty', check: null });
+    const fresh = addRunnerAttempt(ctx);
+    const fixer = addRunnerAttempt(ctx, { taskId: fix.id });
+    submit(ctx, fixer, refusedCheck);
+    expect([dirty, fresh, fixer].map((held) => waitsForMain(ctx, held.attempt))).toEqual([false, false, false]);
+    // declare_impossible still goes to the lead: the contract is the lead's to decide.
+    declareImpossible(ctx, worker.task.id, worker.agent, 'A1 contradicts A2');
+    expect(getAttempt(ctx, worker.attempt.id).stopRequested?.cause).toBe('impossible');
+    expect(told(ctx, 'lead')[0]?.body).toContain('cannot be done as specified');
+  });
+
+  test("the lead's report and the idle nudge name the parked task, and the nudge counts it as dispatchable", () => {
+    const { ctx, clock, fix, worker } = waiting();
+    // A runner lead holds the seat, its runner worker on a task of its own, and the goal is set.
+    addRunnerLead(ctx);
+    updateGoal(ctx, { text: 'Ship the parser.', baseVersion: 0 }, 'user:alice');
+    blockTask(ctx, worker.task.id, worker.agent, `waiting for ${fix.id}`);
+    exited(ctx, worker.attempt.id);
+    const line =
+      `Parked until main's check passes (${fix.id} fixes it): ${worker.task.id}. They start again by themselves; ` +
+      'do not cancel or recreate them.';
+    const report = situationReport(ctx);
+    expect(report).toContain('Ready tasks: 2, 1 of them dispatchable now.');
+    expect(report).toContain(`Accepted, not merged: 0.\n${line}\n`);
+    // Two worker slots, the running one and a free one: the fix task and the parked task, which takes a slot by itself
+    // once main passes, are as many. No nudge.
+    tx(ctx, () => setWorkerTarget(ctx, 2));
+    expect(workerLoad(ctx)).toMatchObject({ running: 1, freeSlots: 1, ready: 2, dispatchable: 1 });
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    clock.advance(ctx.config.idleNudgeMs);
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    // A third worker slot has no task behind it: the nudge goes out, and names the parked task.
+    tx(ctx, () => setWorkerTarget(ctx, 3));
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    clock.advance(ctx.config.idleNudgeMs);
+    const nudge = nudgeIdleLead(ctx)?.body ?? '';
+    expect(nudge).toStartWith(
+      'Only 1 ready task(s) are dispatchable and 1 parked, fewer than the 3 worker slot(s) (1 running, 2 free).',
+    );
+    expect(nudge).toContain(`\n${line}\n`);
+  });
+
+  test("the lead's report names a parked task on its parked line, not again among the ready tasks that cannot start", () => {
+    const { ctx, fix, worker } = waiting();
+    blockTask(ctx, worker.task.id, worker.agent, `waiting for ${fix.id}`);
+    exited(ctx, worker.attempt.id);
+    markHubAlive(ctx);
+    runTick(ctx);
+    const report = situationReport(ctx);
+    expect(report).toContain(`Parked until main's check passes (${fix.id} fixes it): ${worker.task.id}.`);
+    expect(report).not.toContain(`${worker.task.id}: it waits for main's check`);
+  });
+
+  test("a review is never parked, and a parked task's first green submission is still reviewed", () => {
+    const { ctx, runner } = setup({ autoAccept: true, review: true });
+    const green = { ok: true, headSha: sha('8'), remoteHead: sha('8'), error: null, detail: null, check: passed };
+    merge(ctx, sha('a'));
+    answer(ctx, runner, passed);
+    // A green submission goes to a review, then main's check fails.
+    const author = addRunnerAttempt(ctx);
+    submit(ctx, author, green);
+    const review = tasksUnderReview(ctx).get(author.task.id) as string;
+    merge(ctx, sha('b'), 'Print the config');
+    answer(ctx, runner, failed);
+    const fix = openFixTask(ctx) as Task;
+    // Its reviewer, which submitted nothing, is blocked as any agent is: the hub then accepts the task as before.
+    const reviewer = addRunnerAttempt(ctx, { taskId: review });
+    expect(waitsForMain(ctx, reviewer.attempt)).toBe(false);
+    blockTask(ctx, review, reviewer.agent, `waiting for ${fix.id}`);
+    expect(getAttempt(ctx, reviewer.attempt.id).stopRequested).toMatchObject({ cause: 'blocked' });
+    exited(ctx, reviewer.attempt.id);
+    expect(getTask(ctx, review).status).toBe('blocked');
+    expect(expireReviews(ctx)).toBe(1);
+    expect(getTask(ctx, author.task.id).status).toBe('merging');
+    // A task whose check failed only because of main is parked; once main passes, its green submission is reviewed.
+    const worker = addRunnerAttempt(ctx);
+    submit(ctx, worker, refusedCheck);
+    blockTask(ctx, worker.task.id, worker.agent, `waiting for ${fix.id}`);
+    exited(ctx, worker.attempt.id);
+    expect(dispatchable(ctx, worker.task.id).now).toBe(false);
+    merge(ctx, sha('c'), 'Lint the config');
+    answer(ctx, runner, passed);
+    const again = addRunnerAttempt(ctx, { taskId: worker.task.id, runnerId: worker.runner.id });
+    submit(ctx, again, green);
+    expect(getTask(ctx, worker.task.id).status).toBe('submitted');
+    expect(tasksUnderReview(ctx).has(worker.task.id)).toBe(true);
+  });
+
+  test("while main passes, a failed check is the agent's own: declare_blocked blocks the task and tells the lead", () => {
+    const { ctx, runner } = setup();
+    merge(ctx, sha('a'));
+    answer(ctx, runner, passed);
+    const worker = addRunnerAttempt(ctx);
+    submit(ctx, worker, refusedCheck);
+    expect(waitsForMain(ctx, worker.attempt)).toBe(false);
+    blockTask(ctx, worker.task.id, worker.agent, 'the tests need a database');
+    expect(getAttempt(ctx, worker.attempt.id).stopRequested?.cause).toBe('blocked');
+    expect(getTask(ctx, worker.task.id)).toMatchObject({ status: 'blocked', blockedKind: 'agent' });
+    expect(told(ctx, 'lead')[0]?.body).toContain(`${worker.task.id} ("Do the thing") is blocked, reported by`);
   });
 });

@@ -256,7 +256,7 @@ export function onApprovalRequested(
       from: 'system',
       to: `agent:${lead.agentId}`,
       taskId: approval.taskId,
-      body: leadNotice(approval, attempt, mayApprove),
+      body: leadNotice(approval, attempt, mayApprove, ctx.config.autoApprovals === true),
     });
     ctx.db.query('UPDATE approvals SET lead_notified_at = $now WHERE id = $id').run({ id: approvalId, now });
   }
@@ -272,9 +272,10 @@ const DEVICE_REFUSAL =
 /**
  * What the lead is told about a request it may answer. The summary and the detail are the asking agent's and its
  * vendor's text, so every line of them is quoted: none can pose as the hub, as a person or as the answer to give.
- * An approval the device reserves to its owner is not offered.
+ * An approval the device reserves to its owner is not offered; on a run with AGFLOW_AUTO_APPROVALS, where nobody may
+ * be at the machine, the lead is asked to decline it at once rather than leave the agent waiting for its expiry.
  */
-function leadNotice(approval: Approval, attempt: Attempt, mayApprove: boolean): string {
+function leadNotice(approval: Approval, attempt: Attempt, mayApprove: boolean, unattended: boolean): string {
   const { id, detail } = approval;
   const fields = (Object.keys(detail) as (keyof Approval['detail'])[])
     .filter((key) => detail[key] !== undefined)
@@ -290,7 +291,10 @@ function leadNotice(approval: Approval, attempt: Attempt, mayApprove: boolean): 
       'refuses it; the reason goes to the asking agent, so say what to do instead.'
     : `You may only decline it: ${DEVICE_REFUSAL} ` +
       `decide_approval("${id}", "decline", reason) refuses it; the reason goes to the asking agent, so say what to ` +
-      `do instead. Or leave it to ${approval.owner}, who answers in the browser.`;
+      (unattended
+        ? `do instead. This run approves without people, so nobody may be at ${approval.owner}'s machine: decline it ` +
+          'now rather than let the agent wait for it to expire.'
+        : `do instead. Or leave it to ${approval.owner}, who answers in the browser.`);
   return (
     `Approval ${id}: ${approval.agentId} (${attempt.vendor}), ${where} on ${approval.owner}'s runner ` +
     `${approval.runnerId}, asks for an approval of kind ${approval.kind}.\n` +

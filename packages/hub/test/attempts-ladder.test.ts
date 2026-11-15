@@ -124,7 +124,48 @@ describe('the retry ladder', () => {
     const [toPeople] = messagesTo(ctx, 'humans');
     expect(toPeople?.taskId).toBe(taskId);
     expect(toPeople?.body).toContain(`${taskId} ("Parse the config") failed`);
-    expect(messagesTo(ctx, 'lead')).toHaveLength(1);
+    // The lead hears of it too, with the same words: nothing depends on it.
+    expect(messagesTo(ctx, 'lead').map((message) => [message.taskId, message.body])).toEqual([
+      [taskId, toLead?.body],
+      [taskId, toPeople?.body],
+    ]);
+  });
+
+  test('a failed task names the open tasks that depend on it to the lead, and their reason asks for a decision', () => {
+    const { ctx } = createTestContext();
+    const [base, client, docs] = createTasks(
+      ctx,
+      [
+        newTask({ title: 'Parse the config' }),
+        newTask({ title: 'Print the config', dependsOn: ['#1'] }),
+        newTask({ title: 'Document the config', dependsOn: ['#1'] }),
+      ],
+      'user:alice',
+    );
+    const taskId = base?.id as string;
+    for (const trigger of ['stall_silent', 'stall_loop', 'released'] as const) fail(ctx, taskId, trigger);
+    replan(ctx, taskId);
+    for (const trigger of ['stall_silent', 'stall_loop', 'released'] as const) fail(ctx, taskId, trigger);
+    expect(getTask(ctx, taskId).status).toBe('failed');
+    for (const dependent of [client, docs]) {
+      expect(getTask(ctx, dependent?.id as string)).toMatchObject({
+        status: 'blocked',
+        blockedKind: 'deps',
+        blockedReason: `${taskId} failed; amend or cancel this task`,
+      });
+    }
+    const toLead = messagesTo(ctx, 'lead').at(-1);
+    expect(toLead?.taskId).toBe(taskId);
+    expect(toLead?.body).toBe(
+      [
+        `${taskId} ("Parse the config") failed: 3 more of its attempts failed after its re-plan, so agflow will not ` +
+          'try it again. Look at its attempts and decide what to do with the work.',
+        'These open tasks depend on it:',
+        `- ${client?.id} ("Print the config") [blocked]`,
+        `- ${docs?.id} ("Document the config") [blocked]`,
+        'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
+      ].join('\n'),
+    );
   });
 
   test('infra endings back off 1, 2, 5, 15 and 30 minutes; a runner stop and a refusal neither back off nor reset', () => {

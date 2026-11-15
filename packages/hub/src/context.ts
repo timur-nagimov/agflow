@@ -20,7 +20,10 @@ export interface HubRunnerSettings {
   recoveryMs: number;
   approvalMs: number;
   leadReviewMs: number;
-  /** How long free worker slots must outnumber the dispatchable ready tasks before the runner lead is nudged. */
+  /**
+   * How long the dispatchable ready tasks, with those parked while main's check fails, must be fewer than the worker
+   * slots before the runner lead is nudged.
+   */
   idleNudgeMs: number;
   /** The least time between two idle nudges; 0 turns them off. */
   idleNudgeIntervalMs: number;
@@ -175,6 +178,11 @@ export interface HubConfig extends HubRunnerSettings {
    * hub:auto-accept, and does not wake the lead for it. Off by default: the lead reviews every submission.
    */
   autoAccept?: boolean | undefined;
+  /**
+   * AGFLOW_REVIEW, with autoAccept: a task's first submission whose check passed is reviewed by an agent before the hub
+   * accepts it (review.ts). Off by default: autoAccept accepts it at once.
+   */
+  review?: boolean | undefined;
   /**
    * AGFLOW_DEMO_CHECK_EVERY: after every this many tasks merged (or accepted, without autoMerge and while nothing marks
    * tasks merged), the hub creates a demo-check task (demo-check.ts). loadConfig makes it 5; 0, or a config built

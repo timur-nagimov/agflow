@@ -38,10 +38,11 @@ import { type Emit, listEvents } from './events';
 import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { getHubState, updateHubState } from './hub-state';
-import { queueMainCheck } from './main-check';
+import { parkReason, queueMainCheck, waitsForMain } from './main-check';
 import { MERGE_RETRY_MAX_MS, MERGE_RETRY_MS, failedMerges, mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
+import { reviewCannotFinish, reviewTarget } from './review';
 import { listSubmissions } from './submission-store';
 import {
   RUNNER_HELD_SQL,
@@ -52,11 +53,11 @@ import {
   findTask,
   getTask,
   listTaskNotes,
-  listTasks,
   move,
   overlappingPathHolder,
   rowToTask,
   setAgentTask,
+  strandedDependents,
   unmetDependencies,
   waitingReason,
   writeTask,
@@ -119,8 +120,13 @@ function reaches(ctx: HubContext, from: string, target: string, seen = new Set<s
 
 const HOUR = 60 * 60_000;
 
-/** Why creating count more tasks would pass a safety limit, or null; the demo check asks before it creates its task. */
-export function creationGuard(ctx: HubContext, count: number): string | null {
+/**
+ * Why creating count more tasks would pass a safety limit, or null; the system asks before it creates a task of its
+ * own. The hourly limit counts the tasks agents and people created: the system's own (reviews, demo checks, fixes of
+ * main) do not use up the lead's budget. With hourly false only the open-task limit holds: a review asks so, since one
+ * the hourly limit refused would be skipped for good, while a demo check or a fix of main waits for the next tick.
+ */
+export function creationGuard(ctx: HubContext, count: number, hourly = true): string | null {
   const open = (
     ctx.db
       .query("SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN ('accepted', 'merging', 'merged', 'cancelled', 'failed')")
@@ -129,8 +135,11 @@ export function creationGuard(ctx: HubContext, count: number): string | null {
   if (open + count > ctx.config.maxOpenTasks) {
     return `creating ${count} more task(s) would exceed the limit of ${ctx.config.maxOpenTasks} open tasks`;
   }
+  if (!hourly) return null;
   const recent = (
-    ctx.db.query('SELECT COUNT(*) AS n FROM tasks WHERE created_at > $since').get({ since: ctx.now() - HOUR }) as { n: number }
+    ctx.db
+      .query("SELECT COUNT(*) AS n FROM tasks WHERE created_at > $since AND created_by != 'system'")
+      .get({ since: ctx.now() - HOUR }) as { n: number }
   ).n;
   if (recent + count > ctx.config.maxTasksPerHour) {
     return `creating ${count} more task(s) would exceed the limit of ${ctx.config.maxTasksPerHour} new tasks per hour`;
@@ -206,7 +215,8 @@ export function countPlanChange(
 // ---------------------------------------------------------------------------
 
 export function createTasks(ctx: HubContext, inputs: NewTask[], actor: string): Task[] {
-  const refusal = creationGuard(ctx, inputs.length);
+  // The system asked creationGuard already, with the limits it keeps.
+  const refusal = creationGuard(ctx, inputs.length, actor !== 'system');
   if (refusal) tripGuard(ctx, refusal, actor);
   return tx(ctx, (emit) => {
     const goalVersion = currentGoalVersion(ctx);
@@ -369,24 +379,14 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
       });
     }
     // A cancelled task is never done, so the open tasks that depend on it need the lead's decision.
-    const dependents = listTasks(ctx).filter((other) => !isClosed(other.status) && other.dependsOn.includes(id));
-    for (const dependent of dependents) {
-      if (dependent.status === 'blocked' && dependent.blockedKind === 'deps') {
-        writeTask(ctx, dependent.id, { blockedReason: dependencyReason(ctx, unmetDependencies(ctx, dependent.dependsOn)) });
-      }
-    }
-    if (dependents.length > 0) {
+    const stranded = strandedDependents(ctx, id);
+    if (stranded.length > 0) {
+      const cancelled = `${id} ("${clip(task.title, 120)}") was cancelled by ${actor}.`;
       insertMessage(ctx, emit, {
         from: 'system',
         to: 'lead',
         taskId: id,
-        body: [
-          `${id} ("${clip(task.title, 120)}") was cancelled by ${actor}.`,
-          wrote(actor, clip(reason, 500)),
-          `${dependents.length === 1 ? 'This open task depends' : 'These open tasks depend'} on it:`,
-          ...dependents.map((dependent) => `- ${dependent.id} ("${clip(dependent.title, 80)}") [${dependent.status}]`),
-          'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
-        ].join('\n'),
+        body: [cancelled, wrote(actor, clip(reason, 500)), ...stranded].join('\n'),
       });
     }
     return getTask(ctx, id);
@@ -480,6 +480,8 @@ export function claimTask(
     if (held) throw conflict(`you already hold ${held.id}; submit, release or hand it off first`);
     const task = getTask(ctx, id);
     if (task.status !== 'ready') throw conflict(`${id} is ${task.status}, not ready`);
+    // A review's verdict is taken from a runner agent's submit only (review.ts).
+    if (reviewTarget(ctx, id)) throw conflict(`${id} is a review, which only runner agents take`);
     // An unblocked task is ready while its last attempt still stops; its successor starts from that one's final WIP.
     if (openAttemptOf(ctx, id)) throw conflict('the previous attempt is still stopping');
     if (needsNewBridge(task) && (bridge === null || bridge < BRIDGE_VERSION)) {
@@ -756,7 +758,7 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
       data: { feedback: clip(feedback, 500) },
     });
     const attempt = openRunnerAttempt(ctx, task);
-    if (attempt) return rejectRunnerAttempt(ctx, emit, rejected, attempt, { actor, feedback });
+    if (attempt) return rejectRunnerAttempt(ctx, emit, rejected, attempt, { actor, feedback, conflict: conflicted });
     const author = task.assignee
       ? (ctx.db.query('SELECT id, origin, last_seen_at FROM agents WHERE id = $id').get({ id: task.assignee }) as {
           id: string;
@@ -807,6 +809,11 @@ export function blockTask(
     const task = getTask(ctx, id);
     const attempt = requireHolder(ctx, task, agent, 'claim', token);
     if (attempt && attempt.runnerId !== null) {
+      // An attempt blocked by a failing main is parked: replaced, with a handoff note, telling nobody (waitsForMain).
+      if (kind === 'agent' && waitsForMain(ctx, attempt)) {
+        requestStop(ctx, { attemptId: attempt.id, cause: 'replace', reason: parkReason(ctx, id), by: 'system' });
+        return getTask(ctx, id);
+      }
       // The blocked and impossible rows: blocked at once, and the agent stopped without a handoff turn (design 6.4).
       const cause = kind === 'impossible' ? 'impossible' : 'blocked';
       requestStop(ctx, { attemptId: attempt.id, cause, reason, by: `agent:${agent.id}` });
@@ -819,10 +826,15 @@ export function blockTask(
       setAgentTask(ctx, agent.id, null);
       endLiveAttempt(ctx, task, kind === 'impossible' ? 'impossible' : 'blocked', `agent:${agent.id}`);
     }
+    const next =
+      reviewCannotFinish(ctx, id) ??
+      (kind === 'impossible'
+        ? 'Decide: amend it with update_task and then unblock_task, split it, or cancel it.'
+        : 'Unblock it with unblock_task once this is resolved.');
     const body =
       kind === 'impossible'
-        ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified.\n${wrote(agent.id, reason)}\nDecide: amend it with update_task and then unblock_task, split it, or cancel it.`
-        : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}.\n${wrote(agent.id, reason)}\nUnblock it with unblock_task once this is resolved.`;
+        ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified.\n${wrote(agent.id, reason)}\n${next}`
+        : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}.\n${wrote(agent.id, reason)}\n${next}`;
     insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: id, body });
     return getTask(ctx, id);
   });

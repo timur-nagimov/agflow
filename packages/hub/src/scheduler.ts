@@ -39,17 +39,19 @@ import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
+import { reachDeadline } from './deadline';
 import { ensureDemoCheck } from './demo-check';
 import { currentGoalVersion } from './goal';
 import { churnPaused, getHubState, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
-import { queueMainCheck, retryFixTask } from './main-check';
+import { parkedLine, parkedTasks, queueMainCheck, retryFixTask } from './main-check';
 import { failedMerges, queueMerges } from './merges';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
 import { listAccounts, markOwnerAwayTold, probeUnknownResets } from './quota';
 import { type ClockCheck, checkClock } from './recovery';
+import { expireReviews, tasksUnderReview } from './review';
 import { TAKES_SLOT_SQL } from './runners';
 import { expireSubmissions } from './submissions';
 import { type StallDecisions, judgeStalls } from './supervisor';
@@ -135,21 +137,22 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
 }
 
 /**
- * The ready set in dispatch order (design 6.6, step 3): by priority, then age. Each ready task left out goes into
- * waiting, when given, with why.
+ * The ready set in dispatch order (design 6.6, step 3): by priority, then age. A task parked while main's check fails
+ * waits too (parkedTasks). Each ready task left out goes into waiting, when given, with why.
  */
 export function readySet(ctx: HubContext, waiting?: Map<string, string>): TaskCandidate[] {
   const tasks = listTasks(ctx);
   const columns = dispatchColumns(ctx);
   const pathHolders = tasks.filter((task) => isPathHolder(task, ctx.config.autoMerge === true));
   const context = { now: ctx.now(), maxAttempts: ctx.config.maxAttempts, pathHolders };
+  const parked = parkedTasks(ctx);
   const ready = tasks.flatMap((task) => {
     const stored = columns.get(task.id);
     return task.status === 'ready' && stored ? [candidateOf(ctx, task, stored)] : [];
   });
   return orderReady(
     ready.filter((candidate) => {
-      const why = whyNotDispatchable(candidate, context);
+      const why = whyNotDispatchable(candidate, context) ?? parked.get(candidate.id) ?? null;
       if (why !== null) waiting?.set(candidate.id, why);
       return why === null;
     }),
@@ -446,19 +449,24 @@ export interface TickResult {
  * before dispatch, so that dispatch sees the account it draws on; it takes no slot. A paused project skips the lead
  * seat and dispatch (steps 2 to 6); the agents already running go on under every stall, budget and lease rule. While
  * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts. These three holds
- * are dispatchHold's, and a tick that one of them stops gives every ready task its reason (held). Accepted work goes
- * on merging into main whatever the project's state: the merge queue sends a merge that waits, and one that failed
- * again, main's check follows the merges (queueMainCheck), and a fix of main that the task limits refused is created
- * once they allow it (retryFixTask). Just before dispatch, the demo check may add its task (ensureDemoCheck).
+ * are dispatchHold's, and a tick that one of them stops gives every ready task its reason (held). Once the deadline
+ * has passed, the tick pauses the project, once per deadline (reachDeadline). Accepted work goes on merging into main
+ * whatever the project's state, unless it is paused past its deadline: the merge queue sends a merge that waits, and
+ * one that failed again, main's check follows the merges (queueMainCheck), and a fix of main that the task limits
+ * refused is created once they allow it (retryFixTask). Just before dispatch, the demo check may add its task
+ * (ensureDemoCheck). A review that will not finish lets the hub accept its task as before (expireReviews), while the
+ * project is not paused.
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
   if (inRecovery(ctx)) return held(ctx, { clock, recovering: true, reconciled: null, lead: null, started: [] });
   const reconciled = reconcile(ctx);
+  duty('the deadline', () => reachDeadline(ctx), false);
   duty('the merge queue', () => queueMerges(ctx), null);
   duty("main's check", () => queueMainCheck(ctx), null);
   duty("main's fix task", () => retryFixTask(ctx), null);
   if (getProject(ctx).paused) return held(ctx, { clock, recovering: false, reconciled, lead: null, started: [] });
+  duty('the review timeouts', () => expireReviews(ctx), 0);
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
   // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).
   if (churnPaused(ctx)) return held(ctx, { clock, recovering: false, reconciled, lead, started: [] });
@@ -673,17 +681,22 @@ function quotaLine(account: AccountQuota, now: number): string {
 }
 
 /**
- * The worker load, why worker dispatch is held when it is, one quota line per account and the deadline with the time
- * left, as lines for the lead.
+ * The worker load, with how many submitted tasks agents review, the tasks parked while main's check fails, why worker
+ * dispatch is held when it is, one quota line per account and the deadline with the time left, as lines for the lead.
  */
 export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
+  const reviewing = tasksUnderReview(ctx).size;
+  const underReview = reviewing > 0 ? `, ${reviewing} of them under review by agents` : '';
   // Without a target of its own, the project's target is the cap.
   const lines = [
     `Workers: ${load.running} running (target ${load.target ?? load.cap}, cap ${load.cap}); ${load.freeSlots} free ` +
       'worker slot(s).',
     `Ready tasks: ${load.ready}, ${load.dispatchable} of them dispatchable now. Blocked on dependencies: ` +
-      `${load.blockedOnDependencies}. Submitted: ${load.submitted}. Accepted, not merged: ${load.acceptedNotMerged}.`,
+      `${load.blockedOnDependencies}. Submitted: ${load.submitted}${underReview}. Accepted, not merged: ` +
+      `${load.acceptedNotMerged}.`,
   ];
+  const parked = parkedLine(ctx);
+  if (parked !== null) lines.push(parked);
   const hold = dispatchHold(ctx);
   if (hold !== null) lines.push(`No worker starts now: ${hold}.`);
   const now = ctx.now();
@@ -699,17 +712,21 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
   return lines;
 }
 
-/** What an idle nudge asks of the lead. */
+/** What an idle nudge asks of the lead; its order of improvements is the lead guide's (brief.ts). */
 const NUDGE_PLAN =
-  'Plan the next batch now, so that ready, independent tasks are at least twice the free worker slots. Tasks blocked ' +
-  'on dependencies count as planned: while they wait for work in progress, such as the skeleton, add only tasks that ' +
-  'need none of it. Work through SPEC.md (or the goal) until every requirement is covered. Once it is, plan in this ' +
-  'order: defects found by the latest demo check or reported by agents, missing tests, demo polish, then new features ' +
-  'a jury would notice. In the last hour before the deadline, plan only fixes.';
+  'Plan the next batch now, so that ready, independent tasks are at least as many as the worker slots, running plus ' +
+  'free. Tasks blocked on dependencies count as planned: while they wait for work in progress, such as the skeleton, ' +
+  'add only tasks that need none of it. Work through SPEC.md (or the goal) until every requirement is covered. Once ' +
+  'it is, plan in this order: requirements docs/STATUS.md does not show working, defects from the latest demo check ' +
+  'and gaps agents named, missing tests, demo polish, then new features a jury would notice. In the last hour before ' +
+  'the deadline, plan only fixes.';
+
+/** The worker slots the lead plans for: those workers take now, and the free ones (WorkerLoad). */
+const workerSlots = (load: WorkerLoad): number => load.running + load.freeSlots;
 
 /**
- * When free worker slots began to outnumber the dispatchable ready tasks, per hub context. Kept in memory: a restarted
- * hub only waits idleNudgeMs again before it nudges.
+ * When the dispatchable ready tasks, parked ones counted, became fewer than the worker slots, per hub context. Kept in
+ * memory: a restarted hub only waits idleNudgeMs again before it nudges.
  */
 const idleSince = new WeakMap<HubContext, number>();
 
@@ -722,13 +739,14 @@ function lastNudgeAt(ctx: HubContext): number | null {
 }
 
 /**
- * The idle nudge: while a runner lead holds the seat and free worker slots outnumber the dispatchable ready tasks for
- * idleNudgeMs without a break, the lead gets one system message with the load, each account's quota, the deadline and
- * what to plan; then none before idleNudgeIntervalMs has passed since the last (lead.idle_nudged), and none at all
- * while it is 0. While worker dispatch is held (dispatchHold: a paused project, the churn guard) no worker starts, so
- * none goes out. Without a goal there is nothing to plan, and the work is planned until the deadline, so none goes out
- * before the goal is set or once the deadline has passed. Part of the tick's reconcile step. Returns the message, or
- * null.
+ * The idle nudge: while a runner lead holds the seat and the dispatchable ready tasks, with those parked while main's
+ * check fails (parkedTasks), are fewer than the worker slots, running plus free (workerSlots), for idleNudgeMs without
+ * a break, the lead gets one system message with the load, each account's quota, the deadline and what to plan; then
+ * none before idleNudgeIntervalMs has passed since the last (lead.idle_nudged), and none at all while it is 0. So a
+ * lead whose every slot is busy hears too, before the slots run dry, and parking alone sets off none. While worker
+ * dispatch is held (dispatchHold: a paused project, the churn guard) no worker starts, so none goes out. Without a
+ * goal there is nothing to plan, and the work is planned until the deadline, so none goes out before the goal is set
+ * or once the deadline has passed. Part of the tick's reconcile step. Returns the message, or null.
  */
 export function nudgeIdleLead(ctx: HubContext): Message | null {
   if (ctx.config.idleNudgeIntervalMs === 0) return null;
@@ -736,7 +754,9 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
   const due =
     dispatchHold(ctx) === null && currentGoalVersion(ctx) > 0 && (deadlineAt === null || ctx.now() < deadlineAt);
   const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
-  if (load === null || load.freeSlots <= load.dispatchable) {
+  // A task parked while main's check fails counts as dispatchable: it takes a slot by itself once main passes.
+  const parked = load === null ? 0 : parkedTasks(ctx).size;
+  if (load === null || load.dispatchable + parked >= workerSlots(load)) {
     idleSince.delete(ctx);
     return null;
   }
@@ -753,8 +773,9 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
       from: 'system',
       to: 'lead',
       body:
-        `${load.freeSlots} worker slot(s) are free, more than the ${load.dispatchable} ready task(s) that can start ` +
-        `now.\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
+        `Only ${load.dispatchable} ready task(s) are dispatchable${parked > 0 ? ` and ${parked} parked` : ''}, fewer ` +
+        `than the ${workerSlots(load)} worker slot(s) (${load.running} running, ${load.freeSlots} free).\n` +
+        `${lines.join('\n')}\n\n${NUDGE_PLAN}`,
     });
   });
 }
@@ -824,6 +845,15 @@ function held(ctx: HubContext, result: TickResult): TickResult {
   if (why !== null) for (const task of ready) waiting.set(task.id, why);
   memoryOf(ctx).waiting = waiting;
   return result;
+}
+
+/**
+ * Why each ready task did not start in the last tick, in the order the tick found them: those the rules hold back,
+ * then the rest in dispatch order. Some may no longer be ready. Empty before the first tick. The lead's situation
+ * report names them.
+ */
+export function waitReasons(ctx: HubContext): ReadonlyMap<string, string> {
+  return memories.get(ctx)?.waiting ?? new Map();
 }
 
 /**

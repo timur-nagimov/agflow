@@ -8,6 +8,7 @@ import { requestSubmission } from '@agflow/hub/src/submissions';
 import { tx } from '@agflow/hub/src/context';
 import { updateGoal } from '@agflow/hub/src/goal';
 import { onPrepared } from '@agflow/hub/src/prepare';
+import { tasksUnderReview } from '@agflow/hub/src/review';
 import { runningWorkers } from '@agflow/hub/src/scheduler';
 import { onSubmitted } from '@agflow/hub/src/submissions';
 import { getTask } from '@agflow/hub/src/task-store';
@@ -19,7 +20,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { BRIDGE_TOOL_NAMES, BRIDGE_UNNAMED_TOOLS } from '../../runner/src/adapters/bridge-tools';
 import { type FetchFn, HubClient } from '../src/hub-client';
 import { type RunnerToolContext, runnerLeadTools, runnerToolsFor, runnerWorkerTools } from '../src/mcp/runner-tools';
-import { leadTools, workerTools } from '../src/mcp/tools';
+import { type ToolDef, allTools, leadTools, workerTools } from '../src/mcp/tools';
 import { createMcpServer } from '../src/mcp/server';
 import { HUB_URL, type HubFixture, type RunnerAgent, hubFixture } from './fixture';
 
@@ -193,6 +194,41 @@ describe('the runner tool sets', () => {
   });
 });
 
+describe('the tool schemas as an agent reads them', () => {
+  /** The input schema of a tool of the set, as an MCP client lists it. */
+  async function inputSchema(tools: ToolDef[], name: string) {
+    const server = createMcpServer({ client: null, state: { agentId: null, role: null }, cwd: '/tmp' }, tools);
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const client = new Client({ name: 'agflow-test', version: '0.0.0' });
+    await client.connect(clientSide);
+    const tool = (await client.listTools()).tools.find((candidate) => candidate.name === name);
+    await client.close();
+    return tool?.inputSchema;
+  }
+
+  test("submit's evidence asks for one line per acceptance id, from runner workers and live chats alike", async () => {
+    for (const tools of [runnerWorkerTools, allTools]) {
+      const evidence = (await inputSchema(tools, 'submit'))?.properties?.evidence;
+      expect(evidence).toMatchObject({
+        type: 'array',
+        description: 'One line per acceptance id: "A1: what you ran and what it showed", or "A1: not verified" and why.',
+      });
+    }
+  });
+
+  test('stop_agent has no hold: only a person holds a task', async () => {
+    expect(Object.keys((await inputSchema(runnerLeadTools, 'stop_agent'))?.properties ?? {})).toEqual(['agent_id', 'reason']);
+  });
+
+  test("write_handoff asks for the next step first, as a successor's brief quotes only the start of a note", () => {
+    const handoff = (tools: ToolDef[]) => tools.find((tool) => tool.name === 'write_handoff')?.description;
+    expect(handoff(runnerWorkerTools)).toStartWith('Leave a handoff note for whoever continues your task: the next step and what remains first,');
+    expect(handoff(workerTools)).toBe(handoff(runnerWorkerTools));
+    expect(handoff(runnerLeadTools)).toStartWith('Leave your lead handoff for the next lead: the next step and what you are waiting for first,');
+  });
+});
+
 describe("the unattended options' tools against the hub", () => {
   test("a runner lead grants and revokes a task's internet access with its agent token; a worker's bridge has no such tool", async () => {
     const hub = hubFixture({ agentFetch: true });
@@ -241,7 +277,7 @@ describe('submit', () => {
     const bridge = await bridgeFor(worker, { decide: { prefix: '/api/submissions/', at: 3, run: () => submitted(hub, worker, { error: null }) } });
     const answer = await bridge.call('submit', { task_id: taskId, summary: 'Parser added', evidence: ['bun test: 3 pass'] });
     expect(answer).toEqual({ text: expect.stringContaining(`${taskId} submitted at ${HEAD}`), isError: false });
-    expect(answer.text).toContain('The lead will review it; your work on it is done, so end your turn.');
+    expect(answer.text).toContain('It is up for review; your work on it is done, so end your turn.');
     expect(bridge.gets('/api/submissions/')).toBe(3);
     expect(getTask(hub.ctx, taskId)).toMatchObject({ status: 'submitted', submission: expect.objectContaining({ summary: 'Parser added' }) });
   });
@@ -262,6 +298,50 @@ describe('submit', () => {
         'passed, and merges it into main. Your work on it is done, so end your turn.',
       isError: false,
     });
+  });
+
+  test('a decided submission whose task the hub has closed, as it closes a review task at the verdict, is answered as recorded and closed', async () => {
+    // The hub that closes review tasks answers their submit decided at once; v0.2.0's hub never does, so a stub stands in.
+    const submission = { id: 'S-4', taskId: 'T-9', attemptId: 'T-9-a1', status: 'submitted', summary: 'VERDICT: accept', evidence: [], headSha: null };
+    const client = {
+      viaAgentToken: true,
+      submitWork: async () => ({ submission }),
+      task: async () => ({ task: { id: 'T-9', status: 'cancelled' } }),
+    } as unknown as HubClient;
+    const ctx: RunnerToolContext = {
+      client,
+      state: { agentId: null, role: null },
+      cwd: '/tmp',
+      runner: { attemptId: 'T-9-a1', role: 'worker', pollMs: 5, pollMaxMs: 50 },
+      pendingPrepareId: null,
+    };
+    const submit = runnerWorkerTools.find((tool) => tool.name === 'submit') as ToolDef;
+    expect(await submit.run({ task_id: 'T-9', summary: 'VERDICT: accept' }, ctx)).toBe(
+      'agflow recorded your submission S-4 and closed T-9. Your work on it is done, so end your turn.',
+    );
+  });
+
+  test("a reviewer's verdict on this hub (AGFLOW_REVIEW) is answered as recorded and closed; a malformed one gets the format", async () => {
+    const hub = hubFixture({ autoAccept: true, review: true });
+    const author = runnerAgent(hub);
+    const taskId = author.task?.id as string;
+    const check: SubmissionCheck = { status: 'passed', command: 'bun test', durationMs: 1_200, tail: '3 pass' };
+    requestSubmission(hub.ctx, taskId, author.agent, { summary: 'Parser added', evidence: [] });
+    submitted(hub, author, { error: null, check });
+    const reviewId = tasksUnderReview(hub.ctx).get(taskId) as string;
+    const reviewer = hub.runnerAgent({ taskId: reviewId, vendor: 'codex' });
+    agentHub.set(reviewer, hub);
+    const bridge = await bridgeFor(reviewer);
+    const malformed = await bridge.call('submit', { task_id: reviewId, summary: 'Looks fine to me.' });
+    expect(malformed).toEqual({ text: expect.stringContaining('exactly `VERDICT: accept`'), isError: true });
+    expect(getTask(hub.ctx, taskId).status).toBe('submitted');
+    const answer = await bridge.call('submit', { task_id: reviewId, summary: 'VERDICT: accept', evidence: ['bun test: 3 pass'] });
+    const verdict = hub.ctx.db.query('SELECT id FROM submissions WHERE task_id = $reviewId').get({ reviewId }) as { id: string };
+    expect(answer).toEqual({
+      text: `agflow recorded your submission ${verdict.id} and closed ${reviewId}. Your work on it is done, so end your turn.`,
+      isError: false,
+    });
+    expect([getTask(hub.ctx, taskId).status, getTask(hub.ctx, reviewId).status]).toEqual(['accepted', 'cancelled']);
   });
 
   test('dirty, protected_paths and needs_merge are error results that say what to fix, the detail passed on unchanged', async () => {
@@ -449,7 +529,7 @@ describe('fetch_submission', () => {
 });
 
 describe('lead tools', () => {
-  test("request_agents reports the running count and the target; stop_agent (with hold) and replace_agent act on runner workers, and the hub's refusal for a lead comes back as an error result", async () => {
+  test("request_agents reports the running count and the target; stop_agent and replace_agent act on runner workers, and the hub's refusal for a lead comes back as an error result", async () => {
     const hub = hubFixture();
     const lead = runnerAgent(hub, 'lead');
     const first = runnerAgent(hub);
@@ -463,8 +543,9 @@ describe('lead tools', () => {
       text: 'The target is 2 runner worker(s); 3 running now. New workers prefer codex for the next hour.',
       isError: false,
     });
+    // The bridge offers no hold, and drops one a lead passes anyway: only a person holds a task.
     const stopped = await bridge.call('stop_agent', { agent_id: first.agent.id, reason: 'wrong approach', hold: true });
-    expect(stopped).toEqual({ text: `Asked agflow to stop ${first.agent.id} (attempt ${first.attempt.id}), and its task is held for people.`, isError: false });
+    expect(stopped).toEqual({ text: `Asked agflow to stop ${first.agent.id} (attempt ${first.attempt.id}).`, isError: false });
     const replaced = await bridge.call('replace_agent', { agent_id: second.agent.id, reason: 'stuck for an hour' });
     expect(replaced).toEqual({ text: `Asked agflow to replace ${second.agent.id} (attempt ${second.attempt.id}).`, isError: false });
     const stopRows = hub.ctx.db.query('SELECT id, json_extract(stop_requested, \'$.cause\') AS cause FROM attempts WHERE id IN ($a, $b) ORDER BY id').all({
@@ -473,7 +554,7 @@ describe('lead tools', () => {
     });
     expect(stopRows).toEqual(
       expect.arrayContaining([
-        { id: first.attempt.id, cause: 'stop_hold' },
+        { id: first.attempt.id, cause: 'stop' },
         { id: second.attempt.id, cause: 'replace' },
       ]),
     );

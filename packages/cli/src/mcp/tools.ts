@@ -105,14 +105,26 @@ const acceptanceLines = (task: Task): string =>
 
 const BLOCKED_REASON_LIMIT = 150;
 
+/** A failed merge's error, which comes from git, gets a little more room. */
+const WAIT_REASON_LIMIT = 200;
+
 export function taskLine(task: Task): string {
   const owner = task.assignee ? ` · ${task.assignee}` : '';
   // An agent writes the reason, and it may run over several lines. One clipped line keeps it on its task's line.
-  const reason = task.status === 'blocked' && task.blockedReason ? oneLine(task.blockedReason, BLOCKED_REASON_LIMIT) : '';
+  const blocked = task.status === 'blocked' && task.blockedReason ? oneLine(task.blockedReason, BLOCKED_REASON_LIMIT) : '';
+  // The hub's: why a ready task did not start in its last tick, or how a merging task's merges failed.
+  const reason = blocked || (task.waitReason ? oneLine(task.waitReason, WAIT_REASON_LIMIT) : '');
   return `${task.id} [${task.status}] p${task.priority} ${task.title}${owner}${reason ? ` · ${reason}` : ''}`;
 }
 
 export const lines = (parts: Array<string | false | null | undefined | 0>) => parts.filter(Boolean).join('\n');
+
+/** submit's evidence, for live chats and runner workers alike. */
+export const evidenceInput = z
+  .array(z.string().min(1).max(2000))
+  .max(50)
+  .optional()
+  .describe('One line per acceptance id: "A1: what you ran and what it showed", or "A1: not verified" and why.');
 
 /**
  * The most UTF-8 bytes of the goal and its notes that one get_goal answer gives. An agent's client cuts a long tool
@@ -267,6 +279,7 @@ export const sharedTools: ToolDef[] = [
       taskLine(task),
       labelled('Objective:', task.objective),
       task.why && labelled('Why:', task.why),
+      task.nonGoals.length > 0 && `Non-goals:\n${task.nonGoals.map((nonGoal) => labelled('-', nonGoal)).join('\n')}`,
       `Acceptance criteria:\n${acceptanceLines(task)}`,
       task.ownedPaths.length > 0 && `Owned paths: ${task.ownedPaths.join(', ')}`,
       task.dependsOn.length > 0 && `Depends on: ${task.dependsOn.join(', ')}`,
@@ -354,7 +367,7 @@ export const workerTools: ToolDef[] = [
   ),
   defineTool(
     'write_handoff',
-    'Leave a handoff note for whoever continues your task: what is done, what remains, commands run and results, decisions, failed approaches, the next step.',
+    'Leave a handoff note for whoever continues your task: the next step and what remains first, then what is done, commands run and results, decisions, failed approaches.',
     { task_id: TaskIdSchema, note: z.string().min(1).max(16_000) },
     async ({ task_id, note }, ctx) => {
       await asAgent(ctx).handoff(task_id, note);
@@ -363,11 +376,13 @@ export const workerTools: ToolDef[] = [
   ),
   defineTool(
     'declare_blocked',
-    'Stop work on your task because something outside it blocks you. The lead is told.',
+    'Stop work on your task because something outside it blocks you.',
     { task_id: TaskIdSchema, reason: z.string().min(1).max(4000) },
     async ({ task_id, reason }, ctx) => {
       const { task } = await asAgent(ctx).block(task_id, reason);
-      return `${task.id} is blocked; the lead has been told.`;
+      // True whether the hub tells the lead or, when main's failing check blocks the task, starts the task again once
+      // main passes.
+      return `agflow recorded that ${task.id} is blocked. Stop working on it; when agflow asks, write your handoff note.`;
     },
   ),
   defineTool(
@@ -428,7 +443,7 @@ export const gitTools: ToolDef[] = [
     {
       task_id: TaskIdSchema,
       summary: z.string().min(1).max(8000),
-      evidence: z.array(z.string().min(1).max(2000)).max(50).optional(),
+      evidence: evidenceInput,
     },
     async ({ task_id, summary, evidence }, ctx) => {
       const client = asAgent(ctx);

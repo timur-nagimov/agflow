@@ -74,7 +74,7 @@ export function mainText(main: NonNullable<ProjectLoad['main']>, now: number): s
   return `check fails since ${shortSha(main.since)}: ${fix}`;
 }
 
-/** What the strip shows: workers running of the cap, ready tasks (and how many can start now), free slots now. */
+/** What the strip shows: workers running of the cap, ready tasks (and how many are dispatchable now), free slots now. */
 export function stripNumbers(load: HubLoad): { workers: string; ready: number; dispatchable: number; idle: number } {
   const { workers, tasks, slots } = load.project;
   return {

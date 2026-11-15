@@ -61,8 +61,16 @@ ${LAYOUT[known(stack) ?? 'other']}
 
 ## Definition of done
 
-A task is done when \`bash scripts/check.sh\` passes and its acceptance criteria are met. When SPEC.md is covered,
-keep improving the product until the deadline: fix defects, add tests, polish the demo, add features.
+A task is done when \`bash scripts/check.sh\` passes and every acceptance criterion holds, and you saw it hold through
+the product's real entry point: a test or a one-shot command, never a server left running.
+
+- Try inputs of your own, not only the examples in SPEC.md and the task.
+- Add or extend a test for each criterion. Never weaken, skip or delete a test to make the check pass.
+- Leave no stub or TODO.
+- Read your whole diff before you submit.
+
+When SPEC.md is covered, keep improving the product until the deadline: fix defects, add tests, polish the demo, add
+features.
 
 Keep this file current: when the layout, a command or a convention changes, a curation task changes it here.
 `;

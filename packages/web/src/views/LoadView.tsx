@@ -83,7 +83,7 @@ function ProjectSection({ load }: { load: HubLoad }) {
         <Fact label="Workers">{workersText(project.workers)}</Fact>
         <Fact label="Runner slots">{slotsText(project.slots)}</Fact>
         <Fact label="Idle slot minutes, last hour">{project.idleSlotMinutes}</Fact>
-        <Fact label="Ready">{`${tasks.ready}, ${tasks.dispatchable} of them can start now`}</Fact>
+        <Fact label="Ready">{`${tasks.ready}, ${tasks.dispatchable} of them dispatchable now`}</Fact>
         <Fact label="Waiting on dependencies">{tasks.blockedOnDependencies}</Fact>
         <Fact label="Submitted">{queueText(tasks.submitted)}</Fact>
         <Fact label="Accepted, not merged">{queueText(tasks.acceptedNotMerged)}</Fact>
@@ -92,9 +92,10 @@ function ProjectSection({ load }: { load: HubLoad }) {
         {project.main && <Fact label="Main">{mainText(project.main, now)}</Fact>}
       </dl>
       <p className="hint">
-        A ready task that does not start says why on its board card. Runner slots count the runners that can take a
-        worker, and a lead takes none. Idle slot minutes count their free slots after each scheduler tick, since the
-        hub started. Accepted, not merged includes the tasks agflow is merging.
+        A ready task is dispatchable when the scheduler may start it as soon as a worker slot is free; one that does not
+        start says why on its board card. Runner slots count the runners that can take a worker, and a lead takes none.
+        Idle slot minutes count their free slots after each scheduler tick, since the hub started. Accepted, not merged
+        includes the tasks agflow is merging.
       </p>
     </Section>
   );

@@ -4,6 +4,7 @@ import { listAttempts } from '../src/attempt-store';
 import { type HubContext, tx } from '../src/context';
 import { DEMO_CHECK_PATHS, demoCheckContract, ensureDemoCheck } from '../src/demo-check';
 import { listMessages } from '../src/messages';
+import { setDeadline } from '../src/project';
 import { runTick } from '../src/scheduler';
 import { getTask, listTasks, move } from '../src/task-store';
 import { cancelTask, updateTask } from '../src/tasks';
@@ -123,6 +124,26 @@ describe('the demo check', () => {
     expect(ensureDemoCheck(ctx)?.title).toBe('Demo check after 2 tasks');
   });
 
+  test('runs strong, tries inputs beyond the spec, reads what merged, and lists each defect on a DEFECT line', () => {
+    const contract = demoCheckContract(5, Date.UTC(2026, 10, 15, 14, 30), null);
+    expect(contract.tier).toBe('strong');
+    for (const words of [
+      "In each flow also try inputs of your own, not only SPEC.md's examples: other values, empty input, wrong input.",
+      'Also read what merged since the last demo check (git log) and look for features that break or duplicate each ' +
+        'other.',
+      'Call list_tasks and leave out every defect an open task already covers.',
+      'List each other defect in your submission summary as one line that starts with "DEFECT:", most severe first, ' +
+        'with steps to reproduce; with none, write the single line "DEFECTS: none".',
+      // Where it departs from the workers' guide, which every worker's brief holds.
+      'Unlike other tasks, add no test and wire nothing in; start the summary with "Interface: none." and write ' +
+        'DEFECT lines in place of gap: lines.',
+    ]) {
+      expect([words, contract.objective.includes(words)]).toEqual([words, true]);
+    }
+    expect(contract.objective.length).toBeLessThanOrEqual(4000);
+    expect(contract.acceptance.find((criterion) => criterion.id === 'A3')?.assertion).toContain('"DEFECT:"');
+  });
+
   test('owns no protected path under any runner profile, so any runner may take it', () => {
     const contract = demoCheckContract(5, Date.UTC(2026, 10, 15, 14, 30), null);
     const check = { ownedPaths: contract.ownedPaths, kind: contract.kind, createdBy: 'system' };
@@ -165,6 +186,30 @@ describe('the demo check', () => {
     finish(even, 'claude');
     finish(even, 'codex');
     expect(ensureDemoCheck(even)?.vendorHint).toBeUndefined();
+  });
+
+  test('in the last hour before the deadline one task done is enough; before that hour and after the deadline, N', () => {
+    const { ctx, clock } = createTestContext({ demoCheckEvery: 5 });
+    const hour = 60 * 60_000;
+    setDeadline(ctx, ctx.now() + 2 * hour, 'user:alice');
+    finish(ctx, 'claude');
+    expect(ensureDemoCheck(ctx)).toBeNull();
+    clock.advance(hour);
+    const first = ensureDemoCheck(ctx);
+    expect(first?.title).toBe('Demo check after 1 task');
+    cancelTask(ctx, first?.id as string, 'next one', 'user:alice');
+    finish(ctx, 'codex');
+    const second = ensureDemoCheck(ctx);
+    expect(second?.title).toBe('Demo check after 2 tasks');
+    cancelTask(ctx, second?.id as string, 'next one', 'user:alice');
+    clock.advance(hour);
+    finish(ctx, 'claude');
+    expect(ensureDemoCheck(ctx)).toBeNull();
+    // Off stays off.
+    const off = createTestContext({ demoCheckEvery: 0 });
+    setDeadline(off.ctx, off.ctx.now() + hour, 'user:alice');
+    finish(off.ctx, 'claude');
+    expect(ensureDemoCheck(off.ctx)).toBeNull();
   });
 
   test('the tick creates it before dispatch', () => {

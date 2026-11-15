@@ -8,6 +8,7 @@
 import { COMMAND_MIN_PROTOCOL, CommitShaSchema, type Task, isTaskBranch } from '@agflow/core';
 import { type CommandRow, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
+import { getProject } from './project';
 import { findRunnerRows, runnerInfo } from './runners';
 import { TASK_SELECT, type TaskRow, findTask, rowToTask } from './task-store';
 
@@ -120,7 +121,8 @@ function mergeRunner(ctx: HubContext, taskId: string): string | null {
  * Sends the next merge when none is in flight: one merge at a time, so each leases on the main the one before it left.
  * Called when a task starts merging, when a merge's result arrives, and by every tick, which also retries a merge that
  * failed once its wait is over (mergeDue); a task that waits holds up no other. A task with nothing a runner can merge
- * stays merging until a person marks it merged. Gives the merge_task it queued, or null.
+ * stays merging until a person marks it merged. None goes out while the project is paused past its deadline
+ * (deadline.ts); the one in flight still lands. Gives the merge_task it queued, or null.
  */
 export function queueMerges(ctx: HubContext): CommandRow | null {
   return tx(ctx, () => {
@@ -131,6 +133,9 @@ export function queueMerges(ctx: HubContext): CommandRow | null {
       if (pending.answerable && findTask(ctx, pending.taskId)?.status === 'merging') return null;
       cancel.run({ id: pending.id, now: ctx.now() });
     }
+    // At its deadline the hub pauses the project: main takes no more merges until Resume, or a later deadline.
+    const { paused, deadlineAt } = getProject(ctx);
+    if (paused && deadlineAt !== null && deadlineAt <= ctx.now()) return null;
     for (const task of mergingTasks(ctx)) {
       const head = mergeableHead(task);
       if (head === null || !mergeDue(ctx, task.id)) continue;

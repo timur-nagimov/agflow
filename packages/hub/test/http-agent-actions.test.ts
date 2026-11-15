@@ -108,14 +108,22 @@ describe('POST /api/agents/:id/stop and /replace', () => {
     expect(commandsOf(hub, worker.runner.id, 'stop_attempt')).toEqual([]);
   });
 
-  test('the seat holder may stop, hold or replace runner workers', async () => {
+  test('the seat holder may stop or replace runner workers, but not hold them: only people hold a task', async () => {
     const { hub, worker, lead, leadToken } = setup();
     const hold = await hub.call('POST', `/api/agents/${worker.agent.id}/stop`, {
       ...bearer(leadToken),
       body: { reason: 'Pause this.', hold: true },
     });
-    expect(hold.status).toBe(200);
-    expect(hold.json.attempt.stopRequested).toMatchObject({ cause: 'stop_hold', by: `agent:${lead.agent.id}` });
+    expect([hold.status, hold.json.error]).toEqual([400, 'bad_request']);
+    expect(hold.json.message).toContain('stop the worker without hold');
+    expect(getAttempt(hub.ctx, worker.attempt.id).stopRequested).toBeNull();
+    const stop = await hub.call('POST', `/api/agents/${worker.agent.id}/stop`, {
+      ...bearer(leadToken),
+      body: { reason: 'Pause this.' },
+    });
+    expect(stop.status).toBe(200);
+    expect(stop.json.attempt.stopRequested).toMatchObject({ cause: 'stop', by: `agent:${lead.agent.id}` });
+    expect(getTask(hub.ctx, worker.task.id).status).toBe('claimed');
     const other = addRunnerAttempt(hub.ctx);
     const replace = await hub.call('POST', `/api/agents/${other.agent.id}/replace`, {
       ...bearer(leadToken),

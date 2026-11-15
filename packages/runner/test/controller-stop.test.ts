@@ -48,6 +48,18 @@ async function started(f: RunnerFixture) {
   return controller;
 }
 
+describe('handoffPrompt', () => {
+  test('quotes the reason and asks for what is still open and the next steps before what was done', () => {
+    const prompt = handoffPrompt('a person stopped it');
+    expect(prompt).toStartWith('agflow is stopping this attempt: a person stopped it. Do not start new work. Call write_handoff now');
+    const open = prompt.indexOf('first what is still open and the next steps');
+    expect(open).toBeGreaterThan(0);
+    expect(prompt.indexOf('then what you did')).toBeGreaterThan(open);
+    // Why: the successor's brief quotes only the start of a note.
+    expect(prompt).toContain('their brief shows only the start of the note');
+  });
+});
+
 describe('AttemptController: stops', () => {
   test('a stop with handoff asks for a handoff turn and reports handoffWritten; one without asks none', async () => {
     const f = await createRunnerFixture({

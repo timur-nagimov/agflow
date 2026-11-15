@@ -29,6 +29,7 @@ import {
   CLAUDE_SHELL,
   claudeBinary,
   claudeEmptyDir,
+  claudeMdExcludes,
   claudeTools,
   type ClaudeOptionDeps,
   effectivePermissionMode,
@@ -42,7 +43,7 @@ import type { AgentLaunch } from '../../../src/adapters/types';
 import { runnerPaths } from '../../../src/paths';
 import { type PermissionProfile, standardProfile } from '../../../src/profile';
 
-// Paths that exist nowhere: the options are pure, and the guard resolves missing paths through their parents.
+// Paths that exist nowhere, so the real paths the options and the guard resolve through their parents are the same.
 const HOME = '/Users/owner';
 const paths = runnerPaths('/Users/owner/.agflow');
 const CLAUDE_HOME = paths.homes.claude;
@@ -284,6 +285,7 @@ describe('buildQueryOptions', () => {
         ],
       },
       autoMemoryEnabled: false,
+      claudeMdExcludes: claudeMdExcludes(CLONE),
       crossSessionInbound: 'refuse',
       cleanupPeriodDays: 30,
       syncClaudeAiSkills: false,
@@ -471,6 +473,81 @@ describe('buildQueryOptions', () => {
     expect(buildQueryOptions(launch({ model: 'claude-opus-5-5', tier: 'strong' }), deps()).effort).toBe('xhigh');
     expect(buildQueryOptions(launch({ tier: 'standard' }), deps())).not.toHaveProperty('effort');
     expect(buildQueryOptions(launch(), deps())).not.toHaveProperty('effort');
+  });
+});
+
+describe('claudeMdExcludes', () => {
+  /**
+   * Whether a pattern of the list matches the path. Bun.Glob stands in for the CLI's picomatch: they agree on these
+   * patterns, but Bun.Glob also reads a raw |, + or " as itself, so only a pattern's text shows those escapes.
+   */
+  const excludedBy = (patterns: string[]) => {
+    const globs = patterns.map((pattern) => new Bun.Glob(pattern));
+    return (path: string) => globs.some((glob) => glob.match(path));
+  };
+  const filesOf = (dir: string) => ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md', '.claude/rules/**'].map((file) => `${dir}/${file}`);
+
+  test("it names the instruction files of every directory above the clone, up to /, and none of the clone's", () => {
+    const patterns = claudeMdExcludes(CLONE);
+    expect(patterns).toEqual([
+      ...filesOf(join(paths.work, 'p-1234567890')),
+      ...filesOf(paths.work),
+      ...filesOf('/Users/owner/.agflow'),
+      ...filesOf(HOME),
+      ...filesOf('/Users'),
+      ...filesOf(''),
+    ]);
+    const excluded = excludedBy(patterns);
+    const owners = [
+      `${HOME}/CLAUDE.md`,
+      `${HOME}/CLAUDE.local.md`,
+      `${HOME}/.claude/CLAUDE.md`,
+      `${HOME}/.claude/rules/x.md`,
+      `${HOME}/.claude/rules/team/y.md`,
+      `${HOME}/.agflow/CLAUDE.md`,
+      join(paths.work, 'p-1234567890', 'CLAUDE.md'),
+      '/CLAUDE.md',
+    ];
+    for (const path of owners) expect([path, excluded(path)]).toEqual([path, true]);
+    const project = [
+      join(CLONE, 'CLAUDE.md'),
+      join(CLONE, 'AGENTS.md'),
+      join(CLONE, 'CLAUDE.local.md'),
+      join(CLONE, '.claude', 'CLAUDE.md'),
+      join(CLONE, '.claude', 'rules', 'x.md'),
+      join(CLONE, 'src', 'CLAUDE.md'),
+      `${HOME}/AGENTS.md`,
+      `${HOME}/notes/CLAUDE.md`,
+    ];
+    for (const path of project) expect([path, excluded(path)]).toEqual([path, false]);
+  });
+
+  test("the options exclude the files above the clone's real path, which the CLI walks: a symlinked home leaks nothing", () => {
+    const root = scratchDir();
+    mkdirSync(join(root, 'real', 'work'), { recursive: true });
+    symlinkSync(join(root, 'real'), join(root, 'home'));
+    const clone = join(root, 'home', 'work', 'T-1-a1');
+    const { claudeMdExcludes: patterns } = buildQueryOptions(launch({ clone }), deps()).settings as {
+      claudeMdExcludes: string[];
+    };
+    expect(patterns).toEqual(claudeMdExcludes(join(root, 'real', 'work', 'T-1-a1')));
+    expect(excludedBy(patterns)(join(root, 'real', '.claude', 'rules', 'x.md'))).toBe(true);
+  });
+
+  test('a glob character in a directory name matches only itself', () => {
+    const clone = '/Users/a [b]/{c,d}/*?(e)/T-1-a1';
+    const excluded = excludedBy(claudeMdExcludes(clone));
+    expect(excluded('/Users/a [b]/{c,d}/*?(e)/CLAUDE.md')).toBe(true);
+    expect(excluded('/Users/a [b]/.claude/rules/x.md')).toBe(true);
+    expect(excluded('/Users/a b/{c,d}/*?(e)/CLAUDE.md')).toBe(false);
+    expect(excluded('/Users/a [b]/c/*?(e)/CLAUDE.md')).toBe(false);
+    expect(excluded('/Users/a [b]/{c,d}/xy(e)/CLAUDE.md')).toBe(false);
+    expect(excluded(`${clone}/CLAUDE.md`)).toBe(false);
+    // picomatch takes a raw | as alternation, a + after a bracket as a quantifier and a " as a quote.
+    const odd = claudeMdExcludes('/Users/a|b/x]+y/"q"/T-1-a1');
+    expect(odd.slice(0, 4)).toEqual(filesOf('/Users/a[|]b/x[]][+]y/["]q["]'));
+    expect(excludedBy(odd)('/Users/a|b/x]+y/"q"/.claude/rules/x.md')).toBe(true);
+    expect(excludedBy(odd)('/Users/a|b/x]+y/"q"/T-1-a1/CLAUDE.md')).toBe(false);
   });
 });
 

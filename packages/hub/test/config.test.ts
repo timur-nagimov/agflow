@@ -305,6 +305,15 @@ describe('the unattended options', () => {
     }
   });
 
+  test('AGFLOW_REVIEW is off unless it is 1, and anything but 0 or 1 refuses to start', () => {
+    expect(loadConfig(base).config.review).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_REVIEW: '0' }).config.review).toBe(false);
+    expect(loadConfig({ ...base, AGFLOW_REVIEW: '1' }).config.review).toBe(true);
+    for (const value of ['yes', 'true', '2']) {
+      expect(() => loadConfig({ ...base, AGFLOW_REVIEW: value })).toThrow('AGFLOW_REVIEW must be 0 or 1');
+    }
+  });
+
   test('AGFLOW_DEMO_CHECK_EVERY is 5 unless set, 0 turns the demo check off, and anything else refuses to start', () => {
     expect(loadConfig(base).config.demoCheckEvery).toBe(5);
     expect(loadConfig({ ...base, AGFLOW_DEMO_CHECK_EVERY: '' }).config.demoCheckEvery).toBe(5);

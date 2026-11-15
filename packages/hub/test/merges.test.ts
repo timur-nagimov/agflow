@@ -114,7 +114,18 @@ describe('accepting with AGFLOW_AUTO_MERGE', () => {
     );
     const resume = pendingCommands(ctx, held.runner.id, PROTOCOL_VERSION).find((row) => row.kind === 'resume_attempt');
     expect(resume?.command.kind === 'resume_attempt' && resume.command.prompt).toContain('src/config.ts');
-    expect(getAttempt(ctx, held.attempt.id)).toMatchObject({ status: 'starting', reviewRounds: 1 });
+    // A conflict is no review: it uses none of the author's review rounds.
+    expect(getAttempt(ctx, held.attempt.id)).toMatchObject({ status: 'starting', reviewRounds: 0 });
+  });
+
+  test('a conflict goes back to its author even after both review rounds, and leaves them as they were', () => {
+    const { ctx, held, taskId } = setup();
+    updateAttempt(ctx, held.attempt.id, { reviewRounds: 2 });
+    acceptTask(ctx, taskId, 'user:alice');
+    const [merge] = merges(ctx, held.runner.id);
+    recordResult(ctx, held.runner.id, { commandId: merge?.id as string, ok: true, data: { status: 'conflict', files: [] } });
+    expect(getTask(ctx, taskId)).toMatchObject({ status: 'claimed', currentAttempt: held.attempt.id });
+    expect(getAttempt(ctx, held.attempt.id)).toMatchObject({ status: 'starting', reviewRounds: 2, endReason: null });
   });
 
   test('a failed merge stays merging, is recorded, and goes out again 15 s later, then twice as long after each failure, up to 10 min', () => {

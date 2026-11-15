@@ -1,9 +1,9 @@
-// The SDK options of one Claude session (design 8.2, 7.6, 8.4, X-5, X-13, X-29, X-32). Pure, so a test pins every
-// security-relevant option: the tools, the permission mode and who answers its prompts, the sandbox, the deny rules,
-// the only MCP server, the brief hook, the guard and the CLI's shell.
+// The SDK options of one Claude session (design 8.2, 7.6, 8.4, X-5, X-13, X-29, X-32). Pure but for the clone's real
+// path, so a test pins every security-relevant option: the tools, the permission mode and who answers its prompts, the
+// sandbox, the deny rules, the only MCP server, the brief hook, the guard and the CLI's shell.
 import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { Vendor } from '@agflow/core';
 import type {
   CanUseTool,
@@ -18,6 +18,7 @@ import type { PermissionProfile } from '../../profile';
 import { vendorBinary } from '../../vendor/pins';
 import type { AgentLaunch, AgflowCommand } from '../types';
 import { createGuardHook } from './guard';
+import { realPathOf } from './paths';
 import { claudePermissionRules, claudeSandboxSettings } from './rules';
 
 /**
@@ -176,6 +177,33 @@ export function assertFullModelId(model: string): void {
   }
 }
 
+/** The instruction files Claude Code loads from every directory on the way from / down to its working directory. */
+const INSTRUCTION_FILES = ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md', '.claude/rules/**'];
+
+/**
+ * A path as a glob that matches only itself. The CLI matches with picomatch and turns every backslash of a pattern
+ * into a slash, so a metacharacter is escaped as a bracket of its own. picomatch also reads a | as regex alternation,
+ * a + after a bracket as a quantifier and a " as the start of a quoted string, so those are escaped too.
+ */
+function literalGlob(path: string): string {
+  return path.replace(/[*?[\]{}()|+"]/g, (character) => `[${character}]`);
+}
+
+/**
+ * The settings' claudeMdExcludes for a clone: the instruction files of every directory above it, up to /. The CLI
+ * loads them as the project's instructions, and the clone lies under the owner's home, so the owner's own CLAUDE.md
+ * and ~/.claude/rules would reach every agent. The clone's own files, CLAUDE.md and the AGENTS.md it includes, still
+ * load. Skills, agents, commands and settings come from the base checkout (projectConfigRoot), not from this walk.
+ */
+export function claudeMdExcludes(clone: string): string[] {
+  const patterns: string[] = [];
+  for (let dir = dirname(clone); ; dir = dirname(dir)) {
+    const prefix = dir === '/' ? '' : literalGlob(dir);
+    patterns.push(...INSTRUCTION_FILES.map((file) => `${prefix}/${file}`));
+    if (dir === dirname(dir)) return patterns;
+  }
+}
+
 /**
  * The brief hook's timeout, in seconds. The CLI's default is 600; a start waits for the first turn a bounded time
  * above this one (CLAUDE_START_TIMEOUT_MS), so a stuck hook fails the start instead of holding the attempt.
@@ -272,6 +300,8 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
         ],
       },
       autoMemoryEnabled: false,
+      // The CLI walks up from the real path of its working directory, as it names its project directory.
+      claudeMdExcludes: claudeMdExcludes(realPathOf(launch.clone)),
       crossSessionInbound: 'refuse',
       cleanupPeriodDays: 30,
       syncClaudeAiSkills: false,

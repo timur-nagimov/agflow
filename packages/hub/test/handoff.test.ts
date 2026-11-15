@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { type Attempt, attemptId } from '@agflow/core';
 import { getAttempt, insertAttempt, issueFence, nextAttemptNumber, updateAttempt } from '../src/attempt-store';
-import { BRIEF_HANDOFF_LIMIT, buildBrief } from '../src/brief';
+import { BRIEF_LEAD_HANDOFF_LIMIT, buildBrief } from '../src/brief';
 import { type HubContext, tx } from '../src/context';
 import { GOAL_CUT, updateGoal } from '../src/goal';
 import { HANDOFF_NOTE_LIMIT, assembleHandoffNote, assembleLeadHandoff, handoffWritten } from '../src/handoff';
@@ -428,7 +428,8 @@ describe('assembled lead handoff', () => {
     addLeadNote(ctx, { body: note.body, author: note.author, attemptId: lead.attempt.id });
     const next = addRunnerLead(ctx);
     const brief = buildBrief(ctx, next.agent);
-    expect(BRIEF_HANDOFF_LIMIT).toBe(3000);
+    // The next lead's brief quotes the note's first 1,000 characters, and get_lead_notes gives the rest.
+    expect(BRIEF_LEAD_HANDOFF_LIMIT).toBe(1000);
     expect(brief).toContain('> instruction 20: keep the API stable');
     expect(brief).toContain('> instruction 19: keep the API stable');
   });

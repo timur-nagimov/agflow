@@ -10,12 +10,13 @@ import {
   type Message,
   type Project,
   type RunnerState,
+  type Task,
   type TaskStatus,
   placeLead,
   refusalWords,
 } from '@agflow/core';
 import { findAgent } from './agents';
-import { getAttempt, listAttempts } from './attempt-store';
+import { findAttempt, getAttempt, listAttempts } from './attempt-store';
 import { endAttempt, requestStop, resumeAttempt, startRunnerAttempt } from './attempts';
 import type { CommandRow } from './commands';
 import { type HubContext, tx } from './context';
@@ -34,6 +35,7 @@ import {
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, storeRunnerLeads } from './project';
+import { tasksUnderReview } from './review';
 import { findRunnerRow } from './runners';
 import { listTasks } from './task-store';
 
@@ -206,12 +208,35 @@ const UNDER_REVIEW: readonly TaskStatus[] = ['claimed', 'working', 'submitted'];
 /** How many tasks a review message names; the situation report before it gives the rest. */
 const REVIEW_LIST_LIMIT = 20;
 
+/** How long a task may be in work, in its current attempt, before the periodic review names it. */
+const LONG_IN_WORK_MS = 30 * 60_000;
+
 /**
- * The periodic review (design 6.11, Wake-ups are deliveries): while any task is held or submitted, a message goes to
- * the lead every leadReviewMs, tracked in hub_state.last_lead_review_at. The clock starts when work is first held, so
- * the first review comes leadReviewMs later, and stops when none is. While the seat is empty nothing is sent and the
- * clock keeps running, so a lead that takes the seat gets the review that is due. Part of the tick's reconcile step.
- * Returns the message, or null.
+ * The work the periodic review names, each with how long it has waited and its attempts: a task submitted to the lead
+ * for longer than leadReviewMs, and one claimed or worked on for more than LONG_IN_WORK_MS since its current attempt
+ * started. A submitted task an agent reviews waits for its reviewer, not for the lead (tasksUnderReview). The stall
+ * rules judge the rest; the situation report lists every task.
+ */
+function overdueWork(ctx: HubContext, tasks: readonly Task[], now: number): string[] {
+  const reviewing = tasksUnderReview(ctx);
+  return tasks.flatMap((task) => {
+    if (reviewing.has(task.id)) return [];
+    const submitted = task.status === 'submitted';
+    const attempt = !submitted && task.currentAttempt !== null ? findAttempt(ctx, task.currentAttempt) : null;
+    const since = (submitted ? task.submission?.submittedAt : attempt?.startedAt) ?? task.updatedAt;
+    if (now - since <= (submitted ? ctx.config.leadReviewMs : LONG_IN_WORK_MS)) return [];
+    const minutes = Math.round((now - since) / 60_000);
+    return [`${task.id} [${task.status}] for ${minutes} min, ${task.attemptCount} attempt(s)`];
+  });
+}
+
+/**
+ * The periodic review (design 6.11, Wake-ups are deliveries): while any task is held or submitted, the lead hears of
+ * the work that waits too long (overdueWork) at most every leadReviewMs, tracked in hub_state.last_lead_review_at.
+ * The clock starts when work is first held, so the first review comes leadReviewMs later at the earliest, and stops
+ * when none is. Nothing is sent while no task waits too long, and the review goes out once one does. While the seat
+ * is empty nothing is sent and the clock keeps running, so a lead that takes the seat gets the review that is due.
+ * Part of the tick's reconcile step. Returns the message, or null.
  */
 export function periodicLeadReview(ctx: HubContext): Message | null {
   return tx(ctx, (emit) => {
@@ -227,16 +252,19 @@ export function periodicLeadReview(ctx: HubContext): Message | null {
       return null;
     }
     if (now - lastLeadReviewAt < ctx.config.leadReviewMs || seatHolderId(ctx) === null) return null;
+    const overdue = overdueWork(ctx, tasks, now);
+    if (overdue.length === 0) return null;
     updateHubState(ctx, { lastLeadReviewAt: now });
-    const listed = tasks.slice(0, REVIEW_LIST_LIMIT).map((task) => `${task.id} [${task.status}]`);
-    const rest = tasks.length - listed.length;
+    const listed = overdue.slice(0, REVIEW_LIST_LIMIT);
+    const rest = overdue.length - listed.length;
     const minutes = Math.round(ctx.config.leadReviewMs / 60_000);
     return insertMessage(ctx, emit, {
       from: 'system',
       to: 'lead',
       body:
-        `Periodic review (every ${minutes} min while work is held or submitted): ${listed.join(', ')}` +
-        `${rest > 0 ? ` and ${rest} more` : ''}. Check that held work is moving, and review what is submitted.`,
+        `Periodic review (at most every ${minutes} min) of work that waits long: ${listed.join('; ')}` +
+        `${rest > 0 ? `; and ${rest} more` : ''}. Review what is submitted, and check that work held this long is ` +
+        'moving.',
     });
   });
 }
@@ -264,8 +292,8 @@ function rotateLead(ctx: HubContext, attempt: Attempt, why: string, actor: strin
     const current = getAttempt(ctx, attempt.id);
     if (current.role !== 'lead' || current.status === 'ended' || current.stopRequested !== null) return false;
     const reason =
-      `the lead rotates ${why}; write your lead handoff with write_handoff and no task id, since a fresh lead starts ` +
-      'from it';
+      `the lead rotates ${why}; write your lead handoff with write_handoff and no task id, the next steps and what ` +
+      "is still open first, since a fresh lead's brief shows only its start";
     requestStop(ctx, { attemptId: current.id, cause: 'rotation', reason, by: 'system' });
     emit({
       type: 'lead.rotated',
@@ -312,8 +340,12 @@ export function writeLeadHandoff(ctx: HubContext, agent: Agent, note: string): v
   });
 }
 
-/** How many lead notes GET /api/lead/notes answers: the newest; older ones only repeat what these build on. */
-const LEAD_NOTES_LIMIT = 20;
+/**
+ * How many lead notes GET /api/lead/notes answers: the newest, which hold the newest lead handoff whole (a successor
+ * lead's brief quotes only its start) and the one before it; older ones only repeat what these build on. A note may
+ * hold 16,000 characters, and an agent's client cuts a long tool answer short.
+ */
+const LEAD_NOTES_LIMIT = 4;
 
 /** GET /api/lead/notes: the newest lead notes, handoffs and restatements, newest first. Their bodies are agent text. */
 export function listLeadNotes(ctx: HubContext): LeadNote[] {

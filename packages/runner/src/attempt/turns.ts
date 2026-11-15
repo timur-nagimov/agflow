@@ -1,10 +1,11 @@
 // The runner's turn policy (design 6.8, 6.10, 7.1), one per live agent. It reads the agent's events after the pump
 // and decides what the runner sends on its own:
 // - Continuation: a worker whose turn completed normally, with no successful submit, declare_blocked,
-//   declare_impossible or release_task, gets a continuation prompt listing the task's acceptance ids once
+//   declare_impossible or release_task in that turn, gets a continuation prompt listing the task's acceptance ids once
 //   continuationWait has passed with no hold or stop arriving and no new turn. Never after a failed or interrupted
 //   turn, for leads, or after a tool answered "hub unreachable". One due while the link is down waits for the next
-//   welcome.
+//   welcome. A submit that answered pending ends them only until its submission fails: a failure the runner reports
+//   gives them back, in the running turn too.
 // - The outage nudge (X-38): an attempt whose turn ended because of an outage (a hub-unreachable answer, or the
 //   runner's own interrupt in needs_login) gets one "the agflow hub is reachable again; retry the tool that failed"
 //   once the hub is back: at the next welcome, or as soon as the turn ends when the link is up by then or a welcome
@@ -109,7 +110,10 @@ export class TurnPolicy {
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** The end of a quota wait; a new turn does not cancel it. */
   private quotaTimer: ReturnType<typeof setTimeout> | null = null;
-  /** A submit, declare_blocked, declare_impossible or release_task succeeded: no continuation ever follows. */
+  /**
+   * A submit, declare_blocked, declare_impossible or release_task succeeded in the running or the last turn: no
+   * continuation follows it. After a success the hub's hold or stop comes and keeps every later one back too.
+   */
   private ended = false;
   /** A tool of the running turn answered "hub unreachable". */
   private unreachable = false;
@@ -143,8 +147,11 @@ export class TurnPolicy {
     if (this.closed) return;
     switch (event.type) {
       case 'turn_started':
-        // Whatever was scheduled, a turn runs now; only a quota wait goes on.
+        // Whatever was scheduled, a turn runs now; only a quota wait goes on. A terminal tool of an earlier turn no
+        // longer counts: a submit that answered pending may fail later, and the turn the hub's message starts needs
+        // its continuation.
         this.cancel();
+        this.ended = false;
         this.unreachable = false;
         this.returned = false;
         this.owed = false;
@@ -199,6 +206,14 @@ export class TurnPolicy {
       this.owed = false;
       await this.sendContinuation();
     }
+  }
+
+  /**
+   * The runner reported a failed submission (controller.ts submit): a submit that answered pending no longer ends
+   * continuations, even in the turn that called it.
+   */
+  submissionFailed(): void {
+    this.ended = false;
   }
 
   /** The agent's process is gone: nothing more is scheduled. */

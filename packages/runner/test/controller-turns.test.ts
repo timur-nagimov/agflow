@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, jest, setDefaultTimeout, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   type AttemptPhase,
@@ -183,6 +183,107 @@ describe('AttemptController: continuation', () => {
     // A refused submit is no terminal tool.
     expect(userTexts(f, 'T-10-a1')).toEqual([PROMPT, continuationPrompt(['A1'])]);
   }, 60_000);
+});
+
+describe('AttemptController: continuation after a submission', () => {
+  /** push_submission for attempt a1 of T-<n>, on its own branch. */
+  const submission = (n: number) => ({
+    fence: { epoch: 1, counter: 1 },
+    submissionId: `S-${n}`,
+    branch: `agflow/T-${n}-x`,
+    expectedBranchSha: null,
+    adoptable: [],
+  });
+  const UNCOMMITTED = { do: 'write', path: 'notes.txt', content: 'not committed\n' } as const;
+
+  test('a submit that answered pending gives continuations back when its submission fails, in the next turn or its own', async () => {
+    const failure = { messageId: 7, authority: 'system' as const, text: 'Your submission S-1 of T-1 was refused (dirty).' };
+    const f = await createRunnerFixture({
+      script: scripts({
+        // The submit answers pending; the hub's message about the failure starts the next turn.
+        1: { turns: [[UNCOMMITTED, SUBMIT], [], [SUBMIT]] },
+        // The failure comes while the turn that called submit still runs (a tool waits for the gate file).
+        2: { turns: [[UNCOMMITTED, SUBMIT, { do: 'tool', command: 'while [ ! -e gate ]; do sleep 0.05; done' }], [SUBMIT]] },
+      }),
+    });
+    const next = f.controller('T-1-a1');
+    const own = f.controller('T-2-a1');
+    await Promise.all([next.start(specOf(f, 1)), own.start(specOf(f, 2))]);
+    await waitFor(() => turnsEnded(f, 'T-1-a1') === 1);
+    await waitFor(() =>
+      f.events('attempt.activity').some((event) => event.attemptId === 'T-2-a1' && event.data.summary.includes('gate')),
+    );
+    await Bun.sleep(400);
+    // The submits ended continuations so far.
+    expect(userTexts(f, 'T-1-a1')).toEqual([PROMPT]);
+    for (const [n, controller] of [[1, next], [2, own]] as const) {
+      expect(await controller.submit(submission(n))).toMatchObject({ ok: true, outcome: { ok: false, error: 'dirty' } });
+    }
+    expect(await next.deliver({ fence: { epoch: 1, counter: 1 }, messages: [failure], more: 0 })).toEqual({ ok: true });
+    writeFileSync(join(f.paths.clone(FIXTURE_PROJECT, 'T-2-a1'), 'gate'), '');
+    await waitFor(() => turnsEnded(f, 'T-1-a1') === 3 && turnsEnded(f, 'T-2-a1') === 2);
+    await Bun.sleep(400);
+    expect(userTexts(f, 'T-1-a1')).toEqual([PROMPT, failure.text, continuationPrompt(['A1'])]);
+    expect(userTexts(f, 'T-2-a1')).toEqual([PROMPT, continuationPrompt(['A1'])]);
+  });
+
+  test('a failure the runner never reports, or a pending answer after its report, gives continuations back in the next turn', async () => {
+    const failures = {
+      // expireSubmissions: the hub fails a pending submission at its timeout; the runner reports nothing.
+      1: { messageId: 9, authority: 'system' as const, text: 'Your submission S-1 of T-1 failed: it was still pending after 30 minutes.' },
+      2: { messageId: 10, authority: 'system' as const, text: 'Your submission S-2 of T-2 was refused (dirty).' },
+    };
+    const f = await createRunnerFixture({
+      script: scripts({
+        1: { turns: [[SUBMIT], [], [SUBMIT]] },
+        // The runner reports the failure while a tool waits for the gate; the bridge's last poll still read pending.
+        2: { turns: [[UNCOMMITTED, { do: 'tool', command: 'while [ ! -e gate ]; do sleep 0.05; done' }, SUBMIT], [], [SUBMIT]] },
+      }),
+    });
+    const expired = f.controller('T-1-a1');
+    const late = f.controller('T-2-a1');
+    await Promise.all([expired.start(specOf(f, 1)), late.start(specOf(f, 2))]);
+    await waitFor(() =>
+      f.events('attempt.activity').some((event) => event.attemptId === 'T-2-a1' && event.data.summary.includes('gate')),
+    );
+    expect(await late.submit(submission(2))).toMatchObject({ ok: true, outcome: { ok: false, error: 'dirty' } });
+    writeFileSync(join(f.paths.clone(FIXTURE_PROJECT, 'T-2-a1'), 'gate'), '');
+    await waitFor(() => turnsEnded(f, 'T-1-a1') === 1 && turnsEnded(f, 'T-2-a1') === 1);
+    await Bun.sleep(400);
+    // Each turn ended on a submit that answered pending.
+    for (const n of [1, 2]) expect([n, userTexts(f, `T-${n}-a1`)]).toEqual([n, [PROMPT]]);
+    for (const [n, controller] of [[1, expired], [2, late]] as const) {
+      expect(await controller.deliver({ fence: { epoch: 1, counter: 1 }, messages: [failures[n]], more: 0 })).toEqual({ ok: true });
+    }
+    await waitFor(() => turnsEnded(f, 'T-1-a1') === 3 && turnsEnded(f, 'T-2-a1') === 3);
+    await Bun.sleep(400);
+    for (const n of [1, 2] as const) {
+      expect([n, userTexts(f, `T-${n}-a1`)]).toEqual([n, [PROMPT, failures[n].text, continuationPrompt(['A1'])]]);
+    }
+  });
+
+  test('after a successful submit and its hold no continuation follows, though a message started another turn', async () => {
+    const message = { messageId: 8, authority: 'person' as const, text: 'Thanks; anything left?' };
+    const f = await createRunnerFixture({
+      script: {
+        turns: [
+          [{ do: 'write', path: 'src/app.ts', content: 'tidy\n' }, { do: 'commit', message: 'tidy the app' }, SUBMIT],
+          [{ do: 'sleep', ms: 500 }],
+          [SUBMIT],
+        ],
+      },
+    });
+    const controller = f.controller();
+    await controller.start(f.spec());
+    await waitFor(() => turnsEnded(f, 'T-4-a1') === 1);
+    const pushed = { ...submission(4), branch: 'agflow/T-4-tidy' };
+    expect(await controller.submit(pushed)).toMatchObject({ ok: true, outcome: { ok: true, error: null } });
+    expect(await controller.deliver({ fence: { epoch: 1, counter: 1 }, messages: [message], more: 0 })).toEqual({ ok: true });
+    await waitFor(() => controller.phase === 'turn');
+    expect(await controller.hold({ fence: { epoch: 1, counter: 1 } })).toMatchObject({ ok: true });
+    await Bun.sleep(400);
+    expect(userTexts(f, 'T-4-a1')).toEqual([PROMPT, message.text]);
+  });
 });
 
 describe('AttemptController: outages', () => {
