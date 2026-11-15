@@ -644,8 +644,10 @@ describe('never idle: the guides, the goal and the situation report', () => {
   });
 
   test("the lead's guide says what the hub accepts and merges itself, only while those settings are on", () => {
+    // A passed check whose branch changes the check's own files, and a demo check, still come to the lead.
     const accept =
-      '- The hub itself accepts every submission whose check passed. You review only the submissions left to you.';
+      "- The hub itself accepts a submission whose check passed, unless its branch changes the check's own files or " +
+      'it is a demo check: those come to you with the others.';
     const merge = '- agflow merges accepted work into main itself; a conflict sends the task back to its author.';
     const guides = (config: { autoAccept?: boolean; autoMerge?: boolean }) => {
       const { ctx: live } = createTestContext(config);
@@ -667,7 +669,7 @@ describe('never idle: the guides, the goal and the situation report', () => {
     // Workers' guides never carry them.
     const { ctx } = createTestContext({ autoAccept: true, autoMerge: true });
     for (const agent of [addAgent(ctx), addRunnerAttempt(ctx).agent]) {
-      expect(section(buildBrief(ctx, agent), '## How to work with agflow')).not.toContain('accepts every submission');
+      expect(section(buildBrief(ctx, agent), '## How to work with agflow')).not.toContain('The hub itself accepts');
     }
   });
 

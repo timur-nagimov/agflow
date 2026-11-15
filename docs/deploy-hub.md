@@ -211,7 +211,8 @@ The reset, in one go:
 2. empties the old project: tasks, attempts, submissions, messages, events, goal versions and notes, lead and task
    notes, approvals, deliveries, the runner commands about its work, internet grants and the record of agent fetches,
    runner agents and their tokens, attempt logs, rejected runner events and the lead seat;
-3. keeps sessions, CLI sign-ins, people's live agents, runners and vendor accounts;
+3. keeps sessions, CLI sign-ins, people's live agents, runners and vendor accounts with their quota limits, but
+   clears every owner-away mark (left by an approval that expired) and the runners' counts of failed starts;
 4. sets the name, repository and deadline, unpauses, clears the worker target and the vendor preference, and raises
    the epoch and the id counters as a restore does, so no new attempt, branch or ref collides with an old one; the
    epoch also goes to the backup folder's `epoch` file, so a later restore of an older backup lands above it;
@@ -287,10 +288,13 @@ after a change. The details are in the
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
   `.agflow/config.json` on `main`, such as `"check": "bun test"`; a submission without one goes to the lead as before.
   So does a submission whose branch changes the check's own files, `.agflow/config.json` or a file the check command
-  names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. A runner gives a check
-  `checkMinutes` (10 by default, in `runner.json`) out of the 15 minutes it gives a whole submission, push included,
-  so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long. Risk: the check is the only review, so whatever it
-  does not test is accepted unseen.
+  names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. Nothing else is caught:
+  a branch that changes the `package.json` scripts the check runs, test configuration such as `tsconfig.json` or
+  `pyproject.toml`, or the tests themselves is still accepted by the hub alone. The periodic demo check, which the
+  lead reviews, is the backstop. A runner gives a check `checkMinutes` (10 by default, in `runner.json`) out of the 15
+  minutes it gives a whole submission, push included, so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long.
+  Risk: the check is the only review, so whatever it does not test is accepted unseen, and so is a check an agent
+  weakened in those ways.
 
 Two more settings are on by default:
 
@@ -314,6 +318,57 @@ Two more settings are on by default:
   preferably on the vendor that implemented fewer of the last N tasks. The lead reviews it, even with
   `AGFLOW_AUTO_ACCEPT=1`, and turns its defects into fix tasks. `0` turns it off. Risk: none beyond an agent's usual
   work; it costs one task's quota every N tasks.
+
+### Hackathon settings
+
+For a hackathon, where two Macs and a Linux VM work through a spec unattended until the deadline, put these lines in
+`/etc/agflow/hub.env` and restart the hub. [hub.env.example](../deploy/hub/hub.env.example) ends with the same block,
+commented out.
+
+```
+AGFLOW_MAX_WORKERS=20
+AGFLOW_QUOTA_WAIT_MINUTES=5
+AGFLOW_LEAD_ROTATE_WAKEUPS=100
+AGFLOW_MAX_PLAN_CHANGES_PER_HOUR=600
+AGFLOW_MAX_TASKS_PER_HOUR=300
+AGFLOW_LEAD_REVIEW_MINUTES=10
+AGFLOW_AUTO_ACCEPT=1
+AGFLOW_AUTO_MERGE=1
+AGFLOW_IDLE_NUDGE_MINUTES=5
+AGFLOW_DEMO_CHECK_EVERY=5
+AGFLOW_AGENT_FETCH=1
+AGFLOW_LEAD_APPROVALS=1
+AGFLOW_AUTO_APPROVALS=1
+```
+
+- `AGFLOW_MAX_WORKERS=20`: room for every runner slot, 6 on each Mac with `--preset hackathon` and 8 on the VM
+  ([linux-runner.md](linux-runner.md)).
+- `AGFLOW_QUOTA_WAIT_MINUTES=5`: a worker whose account ran out waits for its reset only when it comes within 5
+  minutes, not 45; otherwise another account takes over its task.
+- `AGFLOW_LEAD_ROTATE_WAKEUPS=100`: twenty workers wake the lead often, and at 20 wake-ups it would keep starting over
+  from a handoff. It still rotates once 70% of its context is used.
+- `AGFLOW_MAX_PLAN_CHANGES_PER_HOUR=600`: the lead's task creations, edits and cancellations for twenty workers would
+  pass 60 an hour, and the churn guard would hold dispatch.
+- `AGFLOW_MAX_TASKS_PER_HOUR=300`: the lead plans small tasks for twenty workers, twice the free slots ahead, which can
+  pass 60 new tasks an hour.
+- `AGFLOW_LEAD_REVIEW_MINUTES=10`: the lead looks over held and submitted work every 10 minutes, not every 45.
+- `AGFLOW_AUTO_ACCEPT=1`: a submission whose check passed does not wait for the lead.
+- `AGFLOW_AUTO_MERGE=1`: accepted work reaches `main` without a person, and dependent tasks wait for the merge, as
+  `AGFLOW_DEPENDENCIES_NEED_MERGE=1` would make them; leave that one out.
+- `AGFLOW_IDLE_NUDGE_MINUTES=5` and `AGFLOW_DEMO_CHECK_EVERY=5`: the defaults, written out so that the idle nudge and
+  the demo check, the backstop of auto accept, stay on.
+- `AGFLOW_AGENT_FETCH=1`, `AGFLOW_LEAD_APPROVALS=1` and `AGFLOW_AUTO_APPROVALS=1`: nobody has to fetch outside data or
+  answer approval requests during the run. Read their risks above first.
+
+Before the run, check three things:
+
+- `main` accepts direct pushes from every runner's owner: no branch protection, required reviews or required status
+  checks, or auto merge cannot push it.
+- Every runner's git credentials may push changes to `.github/workflows/**`, which agents may make under the open
+  profile: a fine-grained token needs Contents and Workflows read and write, a classic token or an OAuth login the
+  `workflow` scope. Without it GitHub refuses such pushes, a merge into `main` included.
+- `hub.env` keeps one line per key: the deployment (`activate.sh`) refuses a file that sets a key twice, so change the
+  line that is there, such as `AGFLOW_MAX_WORKERS=4`, rather than add another.
 
 ### What agents fetched
 

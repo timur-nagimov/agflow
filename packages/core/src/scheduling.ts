@@ -399,18 +399,25 @@ export interface VendorPreferenceInput {
   readySince: number;
 }
 
+/** The ladder's requirement while it binds: step 2's always, step 3's while a runner offers its vendor; else null. */
+function bindingRequirement(
+  requirement: VendorRequirement | null,
+  offered: readonly Vendor[],
+): VendorRequirement | null {
+  return requirement !== null && (requirement.step === 2 || offered.includes(requirement.vendor)) ? requirement : null;
+}
+
 /**
  * The vendors a task may use now, in tiers tried in order (design 6.6, step 5): placement takes the best account of
- * the first tier that has a usable one. The ladder's requirement binds first: step 2 to the same vendor, step 3 to the
- * other while a runner offers it. Otherwise vendorHint comes first, and the other vendor only once the task has been
- * ready for HINT_WAIT_MS; then the project's preference until it expires, with the other vendor after it. With no
- * preference both vendors make one tier, so the accounts decide.
+ * the first tier that has a usable one. The ladder's requirement binds first (bindingRequirement): step 2 to the same
+ * vendor, step 3 to the other while a runner offers it. Otherwise vendorHint comes first, and the other vendor only
+ * once the task has been ready for HINT_WAIT_MS; then the project's preference until it expires, with the other vendor
+ * after it. With no preference both vendors make one tier, so the accounts decide.
  */
 export function preferredVendors(input: VendorPreferenceInput): Vendor[][] {
-  const { requirement, vendorHint } = input;
-  if (requirement !== null && (requirement.step === 2 || input.offered.includes(requirement.vendor))) {
-    return [[requirement.vendor]];
-  }
+  const { vendorHint } = input;
+  const requirement = bindingRequirement(input.requirement, input.offered);
+  if (requirement !== null) return [[requirement.vendor]];
   const others = (vendor: Vendor): Vendor[] => VENDORS.filter((other) => other !== vendor);
   if (vendorHint !== null) {
     return input.now - input.readySince >= HINT_WAIT_MS ? [[vendorHint], others(vendorHint)] : [[vendorHint]];
@@ -602,10 +609,11 @@ export function place(
 
 /**
  * Why place found no runner for a task, in one line for the board: each runner passed over, with its own refusal or
- * its vendors'. A usable vendor has no refusal, so when the retry ladder asks for one vendor, the line names it. A task
- * that owns greenfield files looks only at runners with the open profile (runnersFor), and says so; with none in the
- * snapshot, it names the files that need one. A task its vendorHint still holds (preferredVendors) says how long it
- * waits for that vendor, and names only that vendor's refusals.
+ * its vendors'. A usable vendor has no refusal, so when the retry ladder's requirement binds, as place binds it
+ * (bindingRequirement), the line names its vendor. A task that owns greenfield files looks only at runners with the
+ * open profile (runnersFor), and says so; with none in the snapshot, it names the files that need one. A task its
+ * vendorHint still holds (preferredVendors) says how long it waits for that vendor, and names only that vendor's
+ * refusals.
  */
 export function placementWords(
   snapshot: PlacementSnapshot,
@@ -613,8 +621,9 @@ export function placementWords(
   refused: readonly RefusedPlacement[],
 ): string {
   const open = openProfileReason(task);
-  if (open !== null && runnersFor(snapshot, task).length === 0) return `it ${open}, and no runner has that profile`;
-  const needed = task.requirement?.vendor ?? null;
+  const candidates = runnersFor(snapshot, task);
+  if (open !== null && candidates.length === 0) return `it ${open}, and no runner has that profile`;
+  const needed = bindingRequirement(task.requirement, offeredVendors(candidates))?.vendor ?? null;
   const hint = needed === null ? task.vendorHint : null;
   const hintLeft = hint === null ? 0 : HINT_WAIT_MS - (snapshot.now - task.readySince);
   const runners = open === null ? 'no runner' : 'no runner with the open profile';

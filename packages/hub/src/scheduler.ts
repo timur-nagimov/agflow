@@ -709,11 +709,6 @@ const NUDGE_PLAN =
  */
 const idleSince = new WeakMap<HubContext, number>();
 
-/** Forgets when the slots went idle, so a new project (a reset) starts the idle clock afresh. */
-export function forgetIdleSince(ctx: HubContext): void {
-  idleSince.delete(ctx);
-}
-
 /** When the newest idle nudge went to the lead, or null. */
 function lastNudgeAt(ctx: HubContext): number | null {
   const row = ctx.db
@@ -789,6 +784,15 @@ function memoryOf(ctx: HubContext): TickMemory {
     memories.set(ctx, memory);
   }
   return memory;
+}
+
+/**
+ * Forgets what the scheduler keeps in memory: why ready tasks waited, the free slot samples and when the slots went
+ * idle (idleSince), so a new project (a reset) starts them all afresh.
+ */
+export function forgetSchedulerMemory(ctx: HubContext): void {
+  memories.delete(ctx);
+  idleSince.delete(ctx);
 }
 
 /**

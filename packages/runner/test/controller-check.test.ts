@@ -122,6 +122,27 @@ describe('the check at submission', () => {
     expect(checkOwnFiles('bun test', ['src/app.ts', 'src/app.test.ts'])).toEqual([]);
   });
 
+  test("the check's own files are found however the command spells their paths", () => {
+    const changed = ['scripts/check.sh', 'src/app.ts'];
+    const commands = [
+      'bash ./scripts//check.sh',
+      'sh scripts/../scripts/check.sh',
+      'sh $PWD/scripts/check.sh',
+      'sh "${PWD}/./scripts/check.sh"',
+      'bash $(pwd)//scripts/check.sh && bun test',
+      'sh "$PWD"/scripts/check.sh',
+      'sh "$(pwd)"/scripts/check.sh',
+      'sh `pwd`/scripts/check.sh',
+      'make check SCRIPT=scripts/check.sh',
+      `python3 -c "import subprocess; subprocess.run(['sh', 'scripts/check.sh'])"`,
+    ];
+    for (const command of commands) {
+      expect([command, checkOwnFiles(command, changed)]).toEqual([command, ['scripts/check.sh']]);
+    }
+    // A path that leaves the clone names none of its files.
+    expect(checkOwnFiles('sh $PWD/../scripts/check.sh', changed)).toEqual([]);
+  });
+
   test('a failing check refuses the submission with the last 60 lines of its output, and nothing is pushed', async () => {
     const { f, submit } = await workedOn('i=1; while [ $i -le 100 ]; do echo line $i; i=$((i+1)); done; exit 3');
     const outcome = await submit();

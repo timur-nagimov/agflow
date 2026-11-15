@@ -3,18 +3,21 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { LiveAttempt } from '@agflow/core';
+import { type LiveAttempt, TEST_ACCOUNT_ID, type Task } from '@agflow/core';
 import { createSession, mintAgentToken } from '../src/auth';
 import { enqueueCommand } from '../src/commands';
-import type { HubContext } from '../src/context';
+import { type HubContext, tx } from '../src/context';
 import { GOING_AWAY_CLOSE, Gateway } from '../src/gateway';
 import { addGoalNote, updateGoal } from '../src/goal';
 import { getHubState, hubEpoch } from '../src/hub-state';
 import { listStandingRules, sendMessage } from '../src/messages';
+import { accountFor, setOwnerAway } from '../src/quota';
 import { COUNTER_ADVANCE } from '../src/restore';
+import { recordFailedStart, setLimited } from '../src/runners';
+import { idleSlotMinutes, runTick, sampleSlots, withWaitReason } from '../src/scheduler';
 import { createTasks } from '../src/tasks';
 import { connectFakeRunner, settle } from './fake-runner';
-import { addAgent, addLeadNote, addRunnerAttempt, addRunnerLead, newTask, sampleCommands } from './helpers';
+import { addAgent, addLeadNote, addRunner, addRunnerAttempt, addRunnerLead, newTask, sampleCommands } from './helpers';
 import { createTestHub } from './http-helpers';
 
 const TOKEN = 'op-0123456789abcdef0123456789abcdef';
@@ -309,5 +312,43 @@ describe('the project reset', () => {
     expect(welcome?.hubEpoch).toBe(2);
     expect(welcome?.project).toEqual({ name: 'afisha', repo: 'https://github.com/acme/afisha' });
     expect(welcome?.stop).toEqual([{ attemptId: attempt.id, reason: 'the hub does not know this attempt' }]);
+  });
+
+  test("clears the owner-away marks, the failed starts and the scheduler's memory; quota limits stay", async () => {
+    const hub = createTestHub({ operatorToken: TOKEN, operatorUser: 'alice' });
+    const { ctx, clock } = hub;
+    const runnerId = addRunner(ctx);
+    const task = createTasks(ctx, [newTask()], 'user:alice')[0] as Task;
+    sampleSlots(ctx);
+    // Alice let an approval expire, so the task waits for her; her runner failed a start, and her account's lead
+    // model met its limit.
+    tx(ctx, (emit) =>
+      setOwnerAway(ctx, emit, { owner: 'alice', vendor: 'claude', accountId: TEST_ACCOUNT_ID, approvalId: 'P-1' }),
+    );
+    recordFailedStart(ctx, runnerId, 'claude');
+    const resetsAt = ctx.now() + 60 * 60_000;
+    setLimited(ctx, runnerId, { vendor: 'claude', role: 'lead', resetsAt });
+    runTick(ctx);
+    clock.advance(15_000);
+    const reason = () => withWaitReason(ctx, task).waitReason;
+    const hold = () => {
+      const row = ctx.db.query('SELECT vendor_holds FROM runners WHERE id = $id').get({ id: runnerId });
+      return JSON.parse((row as { vendor_holds: string }).vendor_holds).claude;
+    };
+    expect([reason(), idleSlotMinutes(ctx)]).toEqual([`no runner can take it: ${runnerId} claude owner away`, 0.5]);
+    expect(hold()).toMatchObject({ failedStarts: 1 });
+
+    expect((await hub.call('POST', '/api/operator/project/reset', { ...op(), body: RESET })).status).toBe(200);
+    // The new project may use alice's account at once, and her runner's failed starts of the old one count no more.
+    expect(accountFor(ctx, 'alice', 'claude', TEST_ACCOUNT_ID)?.ownerAway).toBe(false);
+    // A limit is the account's, not the project's: it holds until its reset.
+    expect(hold()).toEqual({
+      degradedUntil: null,
+      failedStarts: 0,
+      notReadySince: null,
+      limitedUntil: { lead: resetsAt },
+    });
+    // No task waits for an old reason, and the free slot minutes count again from nothing.
+    expect([reason(), idleSlotMinutes(ctx)]).toEqual([null, 0]);
   });
 });

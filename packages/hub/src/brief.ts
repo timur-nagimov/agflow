@@ -86,7 +86,8 @@ const RUNNER_LEAD_GUIDE = `${LEAD_GUIDE}
 
 // The lead guide's lines for AGFLOW_AUTO_ACCEPT and AGFLOW_AUTO_MERGE, each there only while its setting is on.
 const AUTO_ACCEPT_LINE =
-  '- The hub itself accepts every submission whose check passed. You review only the submissions left to you.';
+  "- The hub itself accepts a submission whose check passed, unless its branch changes the check's own files or it " +
+  'is a demo check: those come to you with the others.';
 const AUTO_MERGE_LINE = '- agflow merges accepted work into main itself; a conflict sends the task back to its author.';
 
 /** The lead's guide, with the line of each of AGFLOW_AUTO_ACCEPT and AGFLOW_AUTO_MERGE that is on. */

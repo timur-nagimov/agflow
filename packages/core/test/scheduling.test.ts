@@ -501,12 +501,35 @@ describe('placementWords', () => {
     expect(placementWords(view, hinted, refused)).toBe(
       'it waits up to 45 s for its preferred vendor codex: R-1 codex quota used up; R-2 full',
     );
-    // Once the wait is over, or when the ladder asks for a vendor, the hint holds nothing.
+    // Once the wait is over, or when the ladder's requirement binds, as a step-2 one always does, the hint holds
+    // nothing.
     const waited = candidate({ vendorHint: 'codex', readySince: NOW - HINT_WAIT_MS });
     expect(placementWords(view, waited, [])).toBe('no runner can take it: none offers a vendor');
     const required = candidate({ vendorHint: 'codex', readySince: NOW, requirement: { step: 2, vendor: 'claude' } });
     expect(placementWords(view, required, [])).toBe(
       'no runner can take it (the retry ladder asks for claude): none offers claude',
+    );
+  });
+
+  test('a step-3 requirement binds as in place: only while a runner offers its vendor, else the hint holds', () => {
+    const requirement = { step: 3, vendor: 'codex' } as const;
+    const step3 = candidate({ vendorHint: 'claude', readySince: NOW - 15_000, requirement });
+    // R-1 offers only Claude, whose account is used up: the ladder's ask for Codex holds nothing, the hint does.
+    const claudeOnly = snapshot([runner()], [account({ quota: quota({ state: 'exhausted' }) })]);
+    const unplaced = place(claudeOnly, step3, { projectPref: null });
+    expect(unplaced.placement).toBeNull();
+    expect(placementWords(claudeOnly, step3, unplaced.refused)).toBe(
+      'it waits up to 45 s for its preferred vendor claude: R-1 claude quota used up',
+    );
+    // With no hint either vendor may take it.
+    expect(placementWords(claudeOnly, candidate({ requirement }), unplaced.refused)).toBe(
+      'no runner can take it: R-1 claude quota used up',
+    );
+    // Once a runner offers Codex, the requirement binds, though that runner has no room now.
+    const codex = vendorSlot({ vendor: 'codex', accountId: CODEX_ACCOUNT });
+    const full = snapshot([runner({ capacity: 1, openAttempts: 1, vendors: [vendorSlot(), codex] })]);
+    expect(placementWords(full, step3, place(full, step3, { projectPref: null }).refused)).toBe(
+      'no runner can take it (the retry ladder asks for codex): R-1 full',
     );
   });
 
