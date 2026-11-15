@@ -405,10 +405,11 @@ describe('denied paths', () => {
     );
   });
 
-  test('writes: runner state, vaults, vendor and CLI config, LaunchAgents and shell profiles', () => {
+  test('writes: runner state, vaults, the seccomp helper, vendor and CLI config, LaunchAgents, shell profiles', () => {
     expect(deniedWritePaths({ home: owner, paths, vendorHomes })).toEqual([
       tree('/h/runner'),
       tree('/h/vaults'),
+      tree('/h/seccomp'),
       tree(`${owner}/.claude`),
       file(`${owner}/.claude.json`),
       tree(`${owner}/.codex`),

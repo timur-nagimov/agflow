@@ -93,6 +93,7 @@ describe('Claude permission rules', () => {
     expect(edits(deny)).toEqual([
       'Edit(//Users/owner/.agflow/runner/**)',
       'Edit(//Users/owner/.agflow/vaults/**)',
+      'Edit(//Users/owner/.agflow/seccomp/**)',
       'Edit(//Users/owner/.claude/**)',
       'Edit(//Users/owner/.claude.json)',
       'Edit(//Users/owner/.codex/**)',

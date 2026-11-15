@@ -1,6 +1,6 @@
 // The permission profile and the denied paths of design 7.6, as data. The vendor adapters render them: Claude's
 // permission rules and sandbox settings (M2d), Codex's sandbox (M2e), and dependency preparation's sandbox (M2c).
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import type { Vendor } from '@agflow/core';
 import type { RunnerConfig } from './config';
 import type { RunnerPaths } from './paths';
@@ -132,7 +132,7 @@ export function deniedReadPaths(input: DeniedPathsInput): DeniedPath[] {
 
 /**
  * Paths agents may not write: runner state, vendor homes outside it and the vaults (with the attempts' tools
- * directories), vendor and CLI config, LaunchAgents and shell profiles.
+ * directories), the seccomp helper, vendor and CLI config, LaunchAgents and shell profiles.
  */
 export function deniedWritePaths(input: DeniedPathsInput): DeniedPath[] {
   const home = (...parts: string[]) => join(input.home, ...parts);
@@ -140,6 +140,8 @@ export function deniedWritePaths(input: DeniedPathsInput): DeniedPath[] {
     tree(input.paths.runner),
     ...outsideHomes(input),
     tree(input.paths.vaults),
+    // AGFLOW_HOME/seccomp: the helper that preparation and the submission check run under on Linux (prep/seccomp.ts).
+    tree(join(dirname(input.paths.runner), 'seccomp')),
     tree(home('.claude')),
     file(home('.claude.json')),
     tree(home('.codex')),

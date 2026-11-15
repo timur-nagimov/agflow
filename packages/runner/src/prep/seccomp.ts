@@ -26,7 +26,8 @@ export interface SeccompHelperOptions {
 /**
  * The seccomp helper of this machine's architecture. An embedded one is written to
  * AGFLOW_HOME/seccomp/<arch>/apply-seccomp (mode 0755), and written again whenever that file differs from it. The
- * directory lies outside the runner tree, which the sandboxes hide, and no sandbox lets a command write it.
+ * directory lies outside the runner tree, which the sandboxes hide. No sandbox lets a command write it, and
+ * deniedWritePaths keeps Claude's in-process tools from it too.
  */
 export function seccompHelper(options: SeccompHelperOptions = {}): string {
   const arch = options.arch ?? process.arch;
