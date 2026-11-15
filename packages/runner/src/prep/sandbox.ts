@@ -1,7 +1,8 @@
 // One dependency-preparation command inside Anthropic's sandbox runtime (design 7.7), in the runner process:
 // SandboxManager is initialised once with the profile's domains, and each command is wrapped with its attempt's
-// prepPolicy. Under the open profile commands reach any host and use local ports. Commands are always spawned
-// asynchronously, because the runtime's proxies run on this process's event loop and spawnSync would deadlock on them.
+// prepPolicy. Under the open profile commands reach any host and use local ports. On Linux they run under the runtime's
+// seccomp filter, which refuses them unix sockets, or not at all. Commands are always spawned asynchronously, because
+// the runtime's proxies run on this process's event loop and spawnSync would deadlock on them.
 // checkPrepSandbox is the self-check behind profile.dependencyPrep.
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,6 +14,7 @@ import { type Logger, noopLogger } from '../log';
 import { boundedWait } from '../processes';
 import { standardProfile } from '../profile';
 import type { PrepPolicy } from './plan';
+import { seccompHelper } from './seccomp';
 
 export type SandboxBackend = Pick<
   typeof SandboxManager,
@@ -28,6 +30,10 @@ export interface PrepSandboxOptions {
   /** Maximum UTF-8 bytes, including the truncation marker. Defaults to 16 KiB. */
   tailBytes?: number;
   manager?: SandboxBackend;
+  /** The machine's OS, process.platform by default: on Linux commands run under the runtime's seccomp filter. */
+  platform?: NodeJS.Platform;
+  /** The path of the filter's helper on Linux; seccompHelper() by default. */
+  seccompHelper?: () => string;
 }
 
 export interface PrepRunSpec {
@@ -110,7 +116,9 @@ async function drain(reader: ReadableStreamDefaultReader<Uint8Array>, tail: LogT
 export class PrepSandbox {
   readonly allowedDomains: readonly string[];
   readonly open: boolean;
+  readonly platform: NodeJS.Platform;
   private readonly manager: SandboxBackend;
+  private readonly seccompHelper: () => string;
   private readonly timeoutMs: number;
   private readonly tailBytes: number;
   private readonly logger: Logger;
@@ -118,7 +126,9 @@ export class PrepSandbox {
   constructor(options: PrepSandboxOptions) {
     this.allowedDomains = Object.freeze([...new Set(options.allowedDomains)].sort());
     this.open = options.open ?? false;
+    this.platform = options.platform ?? process.platform;
     this.manager = options.manager ?? SandboxManager;
+    this.seccompHelper = options.seccompHelper ?? seccompHelper;
     this.timeoutMs = positiveInteger(options.timeoutMs ?? DEFAULT_TIMINGS.prep, 'timeoutMs');
     this.tailBytes = positiveInteger(options.tailBytes ?? 16 * 1024, 'tailBytes');
     this.logger = options.logger ?? noopLogger;
@@ -137,6 +147,17 @@ export class PrepSandbox {
       if (!this.manager.isSupportedPlatform()) throw new Error('preparation sandbox: unsupported platform');
       const { errors } = this.manager.checkDependencies();
       if (errors.length) throw new Error(`preparation sandbox: ${errors.join('; ')}`);
+      // On Linux the seccomp filter keeps commands from unix sockets: the user's systemd manager listens on one, and
+      // would start any command outside the sandbox.
+      let seccomp: { applyPath: string } | undefined;
+      if (this.platform === 'linux') {
+        try {
+          seccomp = { applyPath: this.seccompHelper() };
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error(`preparation sandbox: no seccomp helper to keep commands from unix sockets: ${reason}`);
+        }
+      }
       await this.manager.initialize(
         {
           network: {
@@ -148,10 +169,14 @@ export class PrepSandbox {
           },
           // No command may rely on the fallback. Task 10 supplies complete per-call filesystem lists.
           filesystem: { allowWrite: [], denyWrite: ['/'], denyRead: ['/'], allowRead: [] },
+          ...(seccomp ? { seccomp } : {}),
         },
         this.open ? async () => true : undefined,
         false,
       );
+      // Without a helper the runtime only warns, and runs commands with every unix socket open.
+      const unfiltered = seccomp && this.manager.checkDependencies().warnings.find((text) => text.includes('seccomp'));
+      if (unfiltered) throw new Error(`preparation sandbox: ${unfiltered}; on Linux it runs only under the filter`);
     });
     initializations.set(this.manager, { domains, promise });
     return promise;
@@ -248,7 +273,41 @@ export interface CheckPrepSandboxOptions extends Partial<PrepSandboxOptions> {
   sandbox?: PrepSandbox;
 }
 
-/** A real filesystem operation, not just a dependency check; setup and ProfileSummary use the same answer. */
+/**
+ * The runner listens on a unix socket in the probe directory, and a sandboxed socat must fail to connect to it, as it
+ * must to the systemd manager's. socat is one of the runtime's own Linux dependencies.
+ */
+async function probeUnixSockets(directory: string, probe: (argv: string[]) => Promise<PrepRunResult>): Promise<void> {
+  const socket = join(directory, 'probe.sock');
+  let connected = false;
+  const listener = Bun.listen({
+    unix: socket,
+    socket: {
+      open: () => {
+        connected = true;
+      },
+      data: () => {},
+    },
+  });
+  try {
+    const result = await probe([Bun.which('socat') ?? 'socat', '-u', 'OPEN:/dev/null', `UNIX-CONNECT:${socket}`]);
+    if (connected || result.code === 0) throw new Error('unix sockets are reachable inside the preparation sandbox');
+    // 126 and 127: the shell found no socat to run; no code: a signal or the timeout ended it.
+    if (result.code === null || result.code >= 126) {
+      throw new Error(
+        `preparation sandbox unix socket probe did not run (exit ${result.code}, signal ${result.signal}): ` +
+          result.logTail.trim(),
+      );
+    }
+  } finally {
+    listener.stop(true);
+  }
+}
+
+/**
+ * A real filesystem operation, not just a dependency check, and on Linux a unix socket the sandbox must keep commands
+ * from; setup and ProfileSummary use the same answer.
+ */
 export async function checkPrepSandbox(
   options: CheckPrepSandboxOptions = {},
 ): Promise<{ works: boolean; reason: string | null }> {
@@ -262,30 +321,34 @@ export async function checkPrepSandbox(
       });
     await sandbox.init();
     directory = realpathSync(mkdtempSync(join(tmpdir(), 'agflow-prep-check-')));
-    const result = await sandbox.run({
-      argv: ['/bin/sh', '-c', 'printf agflow-prep-ok > probe'],
-      cwd: directory,
-      env: { PATH: '/usr/bin:/bin', HOME: directory, TMPDIR: directory },
-      policy: {
-        filesystem: {
-          allowWrite: [directory],
-          denyWrite: ['/tmp/claude', '/private/tmp/claude'],
-          denyRead: [],
-          allowRead: [directory],
+    const cwd = directory;
+    const probe = (argv: string[]) =>
+      sandbox.run({
+        argv,
+        cwd,
+        env: { PATH: '/usr/bin:/bin', HOME: cwd, TMPDIR: cwd },
+        policy: {
+          filesystem: {
+            allowWrite: [cwd],
+            denyWrite: ['/tmp/claude', '/private/tmp/claude'],
+            denyRead: [],
+            allowRead: [cwd],
+          },
+          network: { allowedDomains: [...sandbox.allowedDomains], deniedDomains: [] },
         },
-        network: { allowedDomains: [...sandbox.allowedDomains], deniedDomains: [] },
-      },
-      timeoutMs: options.timeoutMs ?? 10_000,
-    });
+        timeoutMs: options.timeoutMs ?? 10_000,
+      });
+    const result = await probe(['/bin/sh', '-c', 'printf agflow-prep-ok > probe']);
     if (result.code !== 0 || result.signal || result.timedOut) {
       throw new Error(
         `preparation sandbox probe failed (exit ${result.code}, signal ${result.signal}, ` +
           `timedOut ${result.timedOut}): ${result.logTail.trim()}`,
       );
     }
-    if (readFileSync(join(directory, 'probe'), 'utf8') !== 'agflow-prep-ok') {
+    if (readFileSync(join(cwd, 'probe'), 'utf8') !== 'agflow-prep-ok') {
       throw new Error('preparation sandbox probe did not write the expected file');
     }
+    if (sandbox.platform === 'linux') await probeUnixSockets(cwd, probe);
     return { works: true, reason: null };
   } catch (error) {
     return { works: false, reason: error instanceof Error ? error.message : String(error) };

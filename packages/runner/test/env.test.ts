@@ -11,6 +11,7 @@ import {
   type PermissionProfile,
   profileOf,
   standardProfile,
+  userRuntimeDirs,
 } from '../src/profile';
 
 const CLONE = '/h/work/demo-0123456789/T-4-a1';
@@ -369,7 +370,7 @@ describe('denied paths', () => {
   const vendorHomes = { claude: '/h/runner/homes/claude', codex: '/h/runner/homes/codex' };
 
   test('reads: credentials, vendor state and the whole runner tree, under the given home and AGFLOW_HOME', () => {
-    expect(deniedReadPaths({ home: owner, paths, vendorHomes })).toEqual([
+    expect(deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'darwin' })).toEqual([
       tree(`${owner}/.ssh`),
       file(`${owner}/.netrc`),
       file(`${owner}/.git-credentials`),
@@ -388,10 +389,33 @@ describe('denied paths', () => {
     ]);
   });
 
-  test('writes: runner state, vaults, vendor and CLI config, LaunchAgents and shell profiles', () => {
+  test("reads on Linux: the user's runtime directories too, where the systemd manager listens", () => {
+    const mac = deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'darwin' });
+    expect(deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'linux' })).toEqual([
+      ...mac,
+      ...userRuntimeDirs().map(tree),
+    ]);
+    expect(userRuntimeDirs({}, 1001)).toEqual(['/run/user/1001']);
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: '/run/user/1001/' }, 1001)).toEqual(['/run/user/1001']);
+    // The manager listens in /run/user/<uid> whatever the environment says: another user's session, or WSLg's.
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: '/run/user/1000' }, 1001)).toEqual(['/run/user/1001', '/run/user/1000']);
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: '/mnt/wslg/runtime-dir' }, 1000)).toEqual([
+      '/run/user/1000',
+      '/mnt/wslg/runtime-dir',
+    ]);
+    // A relative value is no runtime directory.
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: 'run/user/1000' }, 1001)).toEqual(['/run/user/1001']);
+    // Writes are the same on both.
+    expect(deniedWritePaths({ home: owner, paths, vendorHomes, platform: 'linux' })).toEqual(
+      deniedWritePaths({ home: owner, paths, vendorHomes, platform: 'darwin' }),
+    );
+  });
+
+  test('writes: runner state, vaults, the seccomp helper, vendor and CLI config, LaunchAgents, shell profiles', () => {
     expect(deniedWritePaths({ home: owner, paths, vendorHomes })).toEqual([
       tree('/h/runner'),
       tree('/h/vaults'),
+      tree('/h/seccomp'),
       tree(`${owner}/.claude`),
       file(`${owner}/.claude.json`),
       tree(`${owner}/.codex`),

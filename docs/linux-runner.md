@@ -22,9 +22,12 @@ them: `--folder-id`, `--zone`, `--subnet-id`, plus `--name` (the VM and the runn
 The VM costs money until you delete it. Its cloud-init:
 
 - creates the user with your SSH key and passwordless sudo, for upkeep;
-- installs git, bubblewrap, socat, ripgrep, lsof and curl;
+- installs git, bubblewrap, socat, ripgrep, lsof, curl, unzip and build-essential;
 - sets `kernel.apparmor_restrict_unprivileged_userns = 0` in `/etc/sysctl.d`, because Ubuntu 24.04 otherwise keeps
   bubblewrap, and so the Claude and Codex sandboxes, from starting;
+- installs uv into `/usr/local/bin` and Bun 1.3.11 into `/usr/local`, so both are on every login shell's PATH: the
+  scripts that `agflow start` seeds for a python or typescript project run them, in dependency preparation and in the
+  check of each submission;
 - downloads the released agflow binary to `/usr/local/bin/agflow`;
 - turns on lingering for the user, so the runner runs with nobody logged in and starts at boot.
 
@@ -32,10 +35,12 @@ The script prints the VM's address and the steps below.
 
 ## Sign in and set up
 
-Sign in as the runner's user (`ssh agflow@VM_IP`) and wait for cloud-init:
+Sign in as the runner's user (`ssh agflow@VM_IP`), wait for cloud-init, and check the sandbox that dependency
+preparation and the submission check run in. The check needs no sign-in, and prints the reason when it fails:
 
 ```bash
 cloud-init status --wait
+agflow runner check-sandbox
 ```
 
 Agents commit as the git identity setup finds, and the runner fetches and pushes with your own git login, as on a Mac.
@@ -122,7 +127,12 @@ agflow runner install
   `~/.bashrc` in each of them; Ubuntu's stock `~/.bashrc` returns at once there, so keep it that way.
 - **Sandbox.** Both sandboxes use bubblewrap instead of macOS's seatbelt. Claude's needs `bwrap`, `socat` and `rg` on
   the PATH, and Ubuntu's restriction on user namespaces off. Claude's preflight checks both and names the fix:
-  `sudo apt-get install bubblewrap socat ripgrep`, or the sysctl above.
+  `sudo apt-get install bubblewrap socat ripgrep`, or the sysctl above. Claude's commands, dependency preparation and
+  the submission check run under the sandbox's seccomp filter, which refuses them unix sockets, and the user's runtime
+  directory, `/run/user/<uid>`, is hidden from them. The agflow binary carries the filter's helper and writes it to
+  `~/.agflow/seccomp`. Without the filter, preparation and the check refuse to run, and setup's dependency
+  preparation check fails; `agflow runner check-sandbox` tells why. Local ports work within one command only: a server
+  that one command starts is out of the next one's reach.
 - **Logins.** Nothing reads a Keychain. Codex keeps its login in the runner's Codex home, Claude's is the token in
   `runner.env`. The token names no plan, so the hub shows the Claude plan as unknown. Neither does it name the account,
   so the runner reports a hash of the token as the account: the hub counts this runner's Claude quota apart from the
@@ -134,10 +144,11 @@ agflow runner install
   another machine is refused, as on a Mac.
 - **Uninstall.** `agflow runner uninstall` removes the unit. The Claude token stays in `runner.env` until
   `agflow runner uninstall --purge` removes the runner's data.
-- **Open profile.** Claude's commands keep unix sockets shut, as under the standard profile. On a Mac the open profile
-  opens them, but here the user's systemd manager listens on one, under `/run/user`, and would start any command
-  outside the sandbox. Codex's commands get the network under the open profile, and Codex's sandbox may not keep them
-  from that socket. Treat a Codex command on an open-profile VM as able to start a process outside its sandbox with
+- **Open profile.** Claude's commands and dependency preparation keep unix sockets shut, as under the standard
+  profile. On a Mac the open profile opens Claude's, but here the user's systemd manager listens on one, under
+  `/run/user`, and would start any command outside the sandbox. Local ports still work within one command only.
+  Codex's commands get the network under the open profile, and Codex's sandbox may not keep them from that socket.
+  Treat a Codex command on an open-profile VM as able to start a process outside its sandbox with
   `systemd-run --user`. That process can read the Claude token in `runner.env` and your git credentials, and become
   root through sudo.
 

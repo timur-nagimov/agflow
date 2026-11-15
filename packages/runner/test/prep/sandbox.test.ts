@@ -226,6 +226,51 @@ describe('PrepSandbox backend contract', () => {
     await expect(new PrepSandbox({ ...options, manager }).init()).rejects.toThrow('domains');
   });
 
+  test('on Linux commands run under the seccomp filter, and without it nothing runs', async () => {
+    const configs: SandboxRuntimeConfig[] = [];
+    const recording = (overrides: Partial<SandboxBackend> = {}) =>
+      backend({
+        initialize: async (value) => {
+          configs.push(value);
+        },
+        ...overrides,
+      });
+    let lookups = 0;
+    const helper = () => {
+      lookups++;
+      return '/agflow/seccomp/x64/apply-seccomp';
+    };
+    await new PrepSandbox({ ...options, platform: 'linux', seccompHelper: helper, manager: recording() }).init();
+    expect(configs[0]?.seccomp).toEqual({ applyPath: '/agflow/seccomp/x64/apply-seccomp' });
+    await new PrepSandbox({ ...options, platform: 'darwin', seccompHelper: helper, manager: recording() }).init();
+    expect(configs[1]).not.toHaveProperty('seccomp');
+    expect(lookups).toBe(1);
+    // No helper, or a runtime that still finds none: preparation and the check refuse to run.
+    const f = fixture();
+    const missing = new PrepSandbox({
+      ...options,
+      platform: 'linux',
+      seccompHelper: () => {
+        throw new Error('the sandbox runtime has no seccomp helper for ia32');
+      },
+      manager: recording(),
+    });
+    await expect(missing.init()).rejects.toThrow('no seccomp helper to keep commands from unix sockets');
+    await expect(missing.run(f.spec(['/usr/bin/true']))).rejects.toThrow('no seccomp helper');
+    expect(configs).toHaveLength(2);
+    const unfiltered = { errors: [], warnings: ['seccomp not available - unix socket access not restricted'] };
+    const warned = new PrepSandbox({
+      ...options,
+      platform: 'linux',
+      seccompHelper: helper,
+      manager: recording({ checkDependencies: () => unfiltered }),
+    });
+    await expect(warned.run(f.spec(['/usr/bin/true']))).rejects.toThrow('seccomp not available');
+    // The Mac's sandbox is as it was.
+    const mac = recording({ checkDependencies: () => unfiltered });
+    await new PrepSandbox({ ...options, platform: 'darwin', manager: mac }).init();
+  });
+
   test('failed initialization is retained without retrying a partly started global runtime', async () => {
     let calls = 0;
     const sandbox = new PrepSandbox({
@@ -516,9 +561,11 @@ describe('checkPrepSandbox', () => {
   });
 
   test('verifies the probe file, reports command failure, and never throws', async () => {
-    expect(await checkPrepSandbox({ manager: backend() })).toEqual({ works: true, reason: null });
+    // A pass-through runs the probes unsandboxed; on Linux the unix socket probe would fail it.
+    expect(await checkPrepSandbox({ platform: 'darwin', manager: backend() })).toEqual({ works: true, reason: null });
     for (const command of ['exit 0', 'echo probe-failed >&2; exit 7']) {
       const result = await checkPrepSandbox({
+        platform: 'darwin',
         manager: backend({
           wrapWithSandboxArgv: async () => ({ argv: ['/bin/sh', '-c', command], env: process.env }),
         }),
@@ -526,5 +573,36 @@ describe('checkPrepSandbox', () => {
       expect(result.works).toBe(false);
       expect(result.reason).toBeTruthy();
     }
+  });
+
+  test("on Linux a probe command must not reach the runner's unix socket", async () => {
+    // socat in a sandbox: one that lets it connect, one whose filter refuses it the socket, one that cannot run it.
+    const sandboxed = (socat: 'connects' | 'refused' | 'missing') =>
+      backend({
+        wrapWithSandboxArgv: async (command) => {
+          const socket = /'UNIX-CONNECT:([^']+)'/.exec(command)?.[1];
+          if (socket === undefined) return { argv: ['/bin/sh', '-c', command], env: process.env };
+          const connect = `require('node:net').connect(${JSON.stringify(socket)})
+            .on('connect', () => process.exit(0)).on('error', () => process.exit(2))`;
+          const argv = {
+            connects: [process.execPath, '-e', connect],
+            refused: ['/bin/sh', '-c', 'echo "socket(1, 1, 0): Operation not permitted" >&2; exit 1'],
+            missing: ['/bin/sh', '-c', 'exit 127'],
+          }[socat];
+          return { argv, env: process.env };
+        },
+      });
+    const linux = { platform: 'linux' as const, seccompHelper: () => '/agflow/seccomp/x64/apply-seccomp' };
+    expect(await checkPrepSandbox({ ...linux, manager: sandboxed('connects') })).toEqual({
+      works: false,
+      reason: 'unix sockets are reachable inside the preparation sandbox',
+    });
+    expect(await checkPrepSandbox({ ...linux, manager: sandboxed('refused') })).toEqual({ works: true, reason: null });
+    expect((await checkPrepSandbox({ ...linux, manager: sandboxed('missing') })).reason).toContain('did not run');
+    // The Mac's check has no such probe.
+    expect(await checkPrepSandbox({ platform: 'darwin', manager: sandboxed('connects') })).toEqual({
+      works: true,
+      reason: null,
+    });
   });
 });

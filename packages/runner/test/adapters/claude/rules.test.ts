@@ -9,7 +9,7 @@ import {
   claudeSandboxSettings,
 } from '../../../src/adapters/claude/rules';
 import { runnerPaths } from '../../../src/paths';
-import { standardProfile } from '../../../src/profile';
+import { standardProfile, userRuntimeDirs } from '../../../src/profile';
 
 // Paths that exist nowhere, so the rules come only from what the input says.
 const HOME = '/Users/owner';
@@ -93,6 +93,7 @@ describe('Claude permission rules', () => {
     expect(edits(deny)).toEqual([
       'Edit(//Users/owner/.agflow/runner/**)',
       'Edit(//Users/owner/.agflow/vaults/**)',
+      'Edit(//Users/owner/.agflow/seccomp/**)',
       'Edit(//Users/owner/.claude/**)',
       'Edit(//Users/owner/.claude.json)',
       'Edit(//Users/owner/.codex/**)',
@@ -189,7 +190,16 @@ describe('Claude sandbox settings', () => {
       strictAllowlist: false,
       allowLocalBinding: true,
     });
-    expect(claudeSandboxSettings(input({ platform: 'linux' }))).toEqual(claudeSandboxSettings(input()));
+    // The standard profile's sandbox is the Mac's, with the user's runtime directories hidden too.
+    const mac = claudeSandboxSettings(input());
+    const denyRead = [...mac.filesystem!.denyRead!];
+    denyRead.splice(-1, 0, ...userRuntimeDirs());
+    expect(claudeSandboxSettings(input({ platform: 'linux' }))).toEqual({
+      ...mac,
+      filesystem: { ...mac.filesystem, denyRead },
+    });
+    const { deny } = claudePermissionRules(input({ platform: 'linux' }));
+    for (const dir of userRuntimeDirs()) expect(deny).toContain(`Read(/${dir}/**)`);
   });
 
   test('denyRead holds work/*/* and the whole runner tree; allowRead the clone and its project directory', () => {

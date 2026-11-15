@@ -3,7 +3,9 @@
 // agflow command (selfCommand) and the directory of its credentials (configDir). Each subcommand loads its modules
 // when it runs: every other command, the hooks Claude Code and Codex run on each prompt above all, must not pay for
 // the runner's module graph. A static-string import() is still bundled by `bun build --compile`.
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
+import type { checkPrepSandbox } from '@agflow/runner/src/prep/sandbox';
 import type { startRunnerService } from '@agflow/runner/src/service/host';
 import type { installService } from '@agflow/runner/src/service/launchd';
 import type { RunnerStatusReport } from '@agflow/runner/src/service/status';
@@ -33,6 +35,7 @@ export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-serv
   agflow runner uninstall [--purge]
                                 Stop, log out, retire and remove the service; --purge deletes local runner data
   agflow runner status [--json]  Show the runner's status and attempts
+  agflow runner check-sandbox    Check this machine's dependency preparation sandbox, with no sign-in
 `;
 
 export async function runnerCommand(
@@ -44,6 +47,7 @@ export async function runnerCommand(
     startRunnerService?: typeof startRunnerService;
     installService?: typeof installService;
     installSystemdService?: typeof installSystemdService;
+    checkPrepSandbox?: typeof checkPrepSandbox;
     env?: Record<string, string | undefined>;
     exec?: Exec;
     uid?: number;
@@ -201,6 +205,24 @@ export async function runnerCommand(
         exec: deps.exec, uid: deps.uid, home: deps.home, machinePlatform: platform, ...deps.uninstall,
         env: deps.uninstall?.env ?? env,
       });
+    },
+    // The self-check setup runs in the service, here with no hub or vendor sign-in, so an operator can try a machine.
+    'check-sandbox': async (args, io) => {
+      if (args.positional.length > 2) throw new UsageError('usage: agflow runner check-sandbox');
+      const { runnerPaths } = await import('@agflow/runner/src/paths');
+      const { loadRunnerConfig } = await import('@agflow/runner/src/config');
+      const { profileOf, standardProfile } = await import('@agflow/runner/src/profile');
+      const check = deps.checkPrepSandbox ?? (await import('@agflow/runner/src/prep/sandbox')).checkPrepSandbox;
+      const paths = runnerPaths();
+      // The runner's profile, or the standard one on a machine that has no runner yet.
+      const profile = existsSync(paths.config) ? profileOf(loadRunnerConfig(paths.config, env)) : standardProfile;
+      const { works, reason } = await check({
+        allowedDomains: profile.network.allowedDomains,
+        open: profile.name === 'open',
+        platform,
+      });
+      io.out(`${works ? 'ok' : 'FAIL'} preparation sandbox (${profile.name} profile): ${works ? 'works' : reason}\n`);
+      return works ? 0 : 1;
     },
   };
   const name = args.positional[1];
