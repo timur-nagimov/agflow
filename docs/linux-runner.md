@@ -4,8 +4,8 @@ A runner on a Linux cloud machine keeps the agents working while the laptops sle
 and project as the Macs and uses the same Claude and Codex subscriptions. The hub places work on it like on any other
 runner, and prefers it over a laptop on battery: it always reports AC power.
 
-The machine is Ubuntu 24.04 on Yandex Cloud with 16 vCPU, 32 GB of RAM and a 200 GB SSD. Any Ubuntu 24.04 machine,
-x64 or arm64, works the same way; only the first step changes.
+The machine is Ubuntu 24.04 on Yandex Cloud, by default with 16 vCPU, 32 GB of RAM and a 200 GB SSD. Any Ubuntu 24.04
+machine, x64 or arm64, works the same way; only the first step changes.
 
 ## Create the VM
 
@@ -18,6 +18,14 @@ scripts/provision-runner-vm.sh
 It takes the folder and the zone from `yc config` and the zone's first subnet of the folder. Flags override each of
 them: `--folder-id`, `--zone`, `--subnet-id`, plus `--name` (the VM and the runner's default name, `agflow-runner`),
 `--ssh-key` (your public key, `~/.ssh/id_ed25519.pub`) and `--user` (the user that runs the runner, `agflow`).
+
+`--cores`, `--memory` and `--disk` (in GB) size the VM. A new cloud's quotas are small, often 2 vCPU, 16 GB and 10 GB
+of SSD a zone, and yc then refuses the default VM ("The limit on maximum amount of memory has exceeded"); some zones,
+such as ru-central1-b, take no new VMs at all ("Zone ... is not available"). Raise the zone's compute quotas in the
+console (**Quotas**), or pass a VM that fits: `--zone ru-central1-d --cores 2 --memory 8 --disk 10` is enough to try the
+runner with one worker slot. A zone where the folder has no subnet needs one first, such as
+`yc vpc subnet create --zone ru-central1-d --network-name default --range 10.131.0.0/24`. A stopped VM can grow:
+`yc compute instance update NAME --cores 16 --memory 32` and `yc compute disk update NAME-boot --size 200`.
 
 The VM costs money until you delete it. Its cloud-init:
 
@@ -66,7 +74,8 @@ agflow runner setup
 ```
 
 For a hackathon, run `agflow runner setup --preset hackathon --capacity 8` instead: the open profile and 8 worker
-slots, which suit the VM's 16 vCPU and 32 GB. Leave out `--yes`, or setup cannot ask for the Claude token. Read
+slots, which suit the default VM's 16 vCPU and 32 GB; give a smaller VM about one slot for every 2 vCPU, as the script
+prints. Leave out `--yes`, or setup cannot ask for the Claude token. Read
 **Open profile** below first: with it, a Codex command on the VM may get out of its sandbox.
 
 `agflow login` shows a link and a code: open the link in a browser on your Mac. Setup asks for the runner's name and
