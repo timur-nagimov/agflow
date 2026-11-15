@@ -59,10 +59,33 @@ export interface PrepareOutcome {
   logTail: string | null;
 }
 
+/** A submission's check (design 6.13): the project's check command, run in the clone as a preparation's commands are. */
+export interface CheckInput {
+  clone: string;
+  /** The project's vault; its preparation directory holds the check's temporary files. */
+  vault: Vault;
+  /** The check of .agflow/config.json on main, run with /bin/sh -c. */
+  command: string;
+  /** The agent environment the check runs with, as a preparation's. */
+  env: Record<string, string>;
+  timeoutMs: number;
+}
+
+/** How a check ran: its exit, whether it timed out, the end of its output and how long it took. */
+export interface CheckRun {
+  code: number | null;
+  signal: string | null;
+  timedOut: boolean;
+  logTail: string;
+  durationMs: number;
+}
+
 export interface DependencyPreparer {
   /** Whether this runner can prepare dependencies at all; it feeds hello's profile.dependencyPrep. */
   readonly available: boolean;
   prepare(input: PrepareInput): Promise<PrepareOutcome>;
+  /** Runs a submission's check in the preparation's sandbox; absent where the runner has none. */
+  check?(input: CheckInput): Promise<CheckRun>;
 }
 
 /** Prepares nothing and reports that it cannot. */

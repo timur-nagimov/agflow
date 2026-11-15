@@ -608,6 +608,34 @@ describe('never idle: the guides, the goal and the situation report', () => {
     }
   });
 
+  test("the lead's guide says what the hub accepts and merges itself, only while those settings are on", () => {
+    const accept =
+      '- The hub itself accepts every submission whose check passed. You review only the submissions left to you.';
+    const merge = '- agflow merges accepted work into main itself; a conflict sends the task back to its author.';
+    const guides = (config: { autoAccept?: boolean; autoMerge?: boolean }) => {
+      const { ctx: live } = createTestContext(config);
+      const { ctx: runner } = createTestContext(config);
+      return [
+        section(buildBrief(live, addAgent(live, 'alice', 'lead')), '## Your duties as lead'),
+        section(buildBrief(runner, addRunnerLead(runner).agent), '## Your duties as lead'),
+      ];
+    };
+    const has = (guide: string) => [guide.includes(accept), guide.includes(merge)];
+    for (const guide of guides({})) expect(has(guide)).toEqual([false, false]);
+    for (const guide of guides({ autoAccept: true })) {
+      expect([has(guide), guide.endsWith(accept)]).toEqual([[true, false], true]);
+    }
+    for (const guide of guides({ autoMerge: true })) {
+      expect([has(guide), guide.endsWith(merge)]).toEqual([[false, true], true]);
+    }
+    for (const guide of guides({ autoAccept: true, autoMerge: true })) expect(guide).toEndWith(`${accept}\n${merge}`);
+    // Workers' guides never carry them.
+    const { ctx } = createTestContext({ autoAccept: true, autoMerge: true });
+    for (const agent of [addAgent(ctx), addRunnerAttempt(ctx).agent]) {
+      expect(section(buildBrief(ctx, agent), '## How to work with agflow')).not.toContain('accepts every submission');
+    }
+  });
+
   test("both workers' guides send them to AGENTS.md and SPEC.md, keep them to their owned paths, and merge and check before a submit", () => {
     const { ctx } = createTestContext();
     for (const agent of [addAgent(ctx), addRunnerAttempt(ctx).agent]) {

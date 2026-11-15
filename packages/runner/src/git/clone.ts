@@ -4,7 +4,7 @@
 // the start commit (a lead's clone detached at main), .agflow/run/ excluded from the agent's git, and the start
 // pinned in the vault. From hand-over on, the clone and its .git are the agent's and untrusted: the runner reads
 // its refs as plain files and works on its files only through the vault, with --work-tree and a temporary index,
-// writing .git/HEAD and .git/index back as files.
+// writing .git/HEAD and .git/index back as files, and a branch ref as a file git checks out into .git.
 import { randomUUID } from 'node:crypto';
 import { constants, existsSync } from 'node:fs';
 import { copyFile, type FileHandle, lstat, mkdir, mkdtemp, open, rename, rm, writeFile } from 'node:fs/promises';
@@ -289,4 +289,47 @@ export async function fastForwardLeadClone(target: CloneTarget): Promise<FastFor
     await vault.pin(attemptId, { start: main });
     return { moved: true, from, to: main };
   });
+}
+
+/**
+ * Writes a ref of the clone as a file of its .git, the way restore writes protected files: a blob of the sha checked
+ * out from the vault with a temporary index and .git as the work tree. git never writes through a link, and replaces a
+ * link or a directory in the file's way or in a parent's.
+ */
+async function writeCloneRef(target: CloneTarget, ref: string, sha: string): Promise<void> {
+  checkRefName(ref);
+  if (!SHA.test(sha)) throw new Error(`not a commit sha: ${JSON.stringify(sha)}`);
+  const { vault, local } = target;
+  const gitDir = await gitDirOf(target.clone);
+  const blob = await runGit(local, [`--git-dir=${vault.path}`, 'hash-object', '-w', '--stdin'], { input: `${sha}\n` });
+  await withTempIndex(async (index) => {
+    const git = (args: string[]) =>
+      runGit(local, [`--git-dir=${vault.path}`, `--work-tree=${gitDir}`, ...args], { env: { GIT_INDEX_FILE: index } });
+    await git(['update-index', '--add', '--cacheinfo', `100644,${blob.stdout.trim()},${ref}`]);
+    await git(['checkout-index', '-f', '--', ref]);
+  });
+}
+
+/**
+ * A submission's merge of main (design 6.13): moves a clean task clone on its branch from its head, from, to the
+ * merge commit to. The files change through the vault with a two-tree read-tree; .git/index is written as a file,
+ * and the branch ref then names to. The start and head pins move to it, as a lead's fast-forward moves its start pin,
+ * so protected paths are restored from the main it merged from then on. A clone whose files already match to (a move
+ * cut short) is finished; one that changed otherwise is refused.
+ */
+export async function moveTaskClone(target: CloneTarget & { branch: string; from: string; to: string }): Promise<void> {
+  const { vault, clone, attemptId, from, to } = target;
+  await withTempIndex(async (index) => {
+    const git = worktreeGit(target, index);
+    if (await matchesCommit(git, from)) {
+      const moved = await git(['read-tree', '-m', '-u', from, to]);
+      if (moved.code !== 0) throw new Error(`cannot move ${clone} to ${to}: ${moved.stderr.trim()}`);
+    } else if (!(await matchesCommit(git, to))) {
+      throw new Error(`${clone} changed while ${vault.mainBranch} was merged into it`);
+    }
+    const gitDir = await gitDirOf(clone);
+    await replaceGitFile(gitDir, 'index', (path) => copyFile(index, path, constants.COPYFILE_EXCL));
+  });
+  await writeCloneRef(target, `refs/heads/${target.branch}`, to);
+  await vault.pin(attemptId, { start: to, head: to });
 }

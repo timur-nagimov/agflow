@@ -38,6 +38,7 @@ import { type HubContext, tx } from './context';
 import { currentGoalVersion } from './goal';
 import { churnPaused, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
+import { queueMerges } from './merges';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
@@ -129,7 +130,7 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
 export function readySet(ctx: HubContext): TaskCandidate[] {
   const tasks = listTasks(ctx);
   const columns = dispatchColumns(ctx);
-  const pathHolders = tasks.filter(isPathHolder);
+  const pathHolders = tasks.filter((task) => isPathHolder(task, ctx.config.autoMerge === true));
   const context = { now: ctx.now(), maxAttempts: ctx.config.maxAttempts, pathHolders };
   const ready = tasks.flatMap((task) => {
     const stored = columns.get(task.id);
@@ -409,12 +410,15 @@ export interface TickResult {
  * starts, while runners reconnect and replay (design 6.14); agents' bridge calls work meanwhile. The lead starts
  * before dispatch, so that dispatch sees the account it draws on; it takes no slot. A paused project skips the lead
  * seat and dispatch (steps 2 to 6); the agents already running go on under every stall, budget and lease rule. While
- * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts.
+ * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts. Accepted work goes
+ * on merging into main whatever the project's state: the merge queue sends a merge that waits, and one that failed
+ * again.
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
   if (inRecovery(ctx)) return { clock, recovering: true, reconciled: null, lead: null, started: [] };
   const reconciled = reconcile(ctx);
+  duty('the merge queue', () => queueMerges(ctx), null);
   if (getProject(ctx).paused) return { clock, recovering: false, reconciled, lead: null, started: [] };
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
   // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).

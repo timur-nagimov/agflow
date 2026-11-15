@@ -145,6 +145,8 @@ export const RunnerConfigSchema = z
       .prefault({}),
     minFreeGb: z.number().min(0).default(10),
     batteryDrainPercent: z.number().min(0).max(100).default(20),
+    /** How long a submission's check may run before it fails as timed out, in minutes. */
+    checkMinutes: z.number().positive().default(10),
     /** CLAUDE_CONFIG_DIR and CODEX_HOME exactly as setup created them; null means the layout's homes (vendorHomes). */
     homes: z
       .strictObject({ claude: CanonicalPath.nullable().default(null), codex: CanonicalPath.nullable().default(null) })

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { COMMAND_MIN_PROTOCOL, type RunnerCommand, RunnerCommandSchema, type Vendor } from '@agflow/core';
-import { gitIn } from '@agflow/testkit';
+import { commitFiles, gitIn } from '@agflow/testkit';
 import type { PreflightResult } from '../src/adapters/types';
 import type { AttemptController, ControllerDeps } from '../src/attempt/controller';
 import { saveRunnerConfig } from '../src/config';
@@ -168,6 +168,8 @@ function commands(f: RunnerFixture): RunnerCommand[] {
     { kind: 'delete_refs', refs: [] },
     { kind: 'update_settings', settings: { capacity: 3 }, version: 1 },
     { kind: 'preflight', vendor: 'claude' },
+    // main already holds its head, so it merges with no push.
+    { kind: 'merge_task', taskId: 'T-4', title: 'Tidy the app', branch: 'agflow/T-4-tidy', headSha: f.origin.mainSha },
   ];
 }
 
@@ -514,6 +516,28 @@ describe('CommandExecutor', () => {
     expect((await gitIn(f.vault.path, ['rev-parse', ref])).trim()).toBe(sha);
     expect(await x.run.onCommand(message({ kind: 'refresh_vault', taskId: 'T-4', refs: ['refs/heads/missing'] }, 2)))
       .toMatchObject({ ok: false, error: expect.stringContaining('missing') });
+  });
+
+  test("merge_task merges the accepted head into main with the runner's identity, and reports a conflict's files", async () => {
+    const f = await createRunnerFixture();
+    f.config.commitIdentity = { name: 'Owner', email: 'owner@agflow.invalid' };
+    const x = executor(f);
+    const branch = 'agflow/T-4-tidy';
+    const head = await commitFiles(f.origin.path, { branch, files: { 'src/app.ts': 'tidy\n' } });
+    const command = { kind: 'merge_task', taskId: 'T-4', title: 'Tidy the app', branch, headSha: head } as const;
+    const merged = await x.run.onCommand(message(command));
+    const main = await gitIn(f.origin.path, ['rev-parse', 'refs/heads/main']);
+    expect(merged).toEqual({ ok: true, data: { status: 'merged', sha: main } });
+    expect(await gitIn(f.origin.path, ['log', '-1', '--format=%P|%s|%an', main])).toBe(
+      `${f.origin.mainSha} ${head}|Merge T-4: Tidy the app|Owner`,
+    );
+    const other = 'agflow/T-5-other';
+    const clash = await commitFiles(f.origin.path, { branch: other, files: { 'src/app.ts': 'other\n' }, from: f.origin.mainSha });
+    expect(await x.run.onCommand(message({ ...command, taskId: 'T-5', branch: other, headSha: clash }, 2))).toEqual({
+      ok: true,
+      data: { status: 'conflict', files: ['src/app.ts'] },
+    });
+    expect(await gitIn(f.origin.path, ['rev-parse', 'refs/heads/main'])).toBe(main);
   });
 
   test('refreshes the vault, reports preflight, deletes with exact leases, and persists a settings echo with pending drain', async () => {
@@ -1112,7 +1136,7 @@ describe('CommandExecutor', () => {
     expect(calls).toHaveLength(count);
   }, 30_000);
 
-  test('restart re-runs exactly the ten idempotent handlers, update_settings once the hub sends it again, and interrupts the other seven, without tokens', async () => {
+  test('restart re-runs exactly the eleven idempotent handlers, update_settings once the hub sends it again, and interrupts the other seven, without tokens', async () => {
     const f = await createRunnerFixture();
     const x = executor(f);
     const handlers = probes(x.controller('T-4-a1'));
@@ -1136,6 +1160,7 @@ describe('CommandExecutor', () => {
       'update_settings',
       'preflight',
       'prepare_dependencies',
+      'merge_task',
     ];
     expect([...RESTARTABLE_COMMANDS].sort()).toEqual(restartable.sort());
     // A hub restored without it would never send it again: it waits for the hub, and runs then.
@@ -1154,9 +1179,10 @@ describe('CommandExecutor', () => {
         );
       expect(await restarted.onCommand(message(command, i + 1))).toEqual(entry.result!);
     }
-    expect(refresh).toHaveBeenCalledTimes(1);
+    // refresh_vault and merge_task each fetch, and delete_refs and merge_task each push.
+    expect(refresh).toHaveBeenCalledTimes(2);
     expect(preflight).toHaveBeenCalledTimes(1);
-    expect(remote).toHaveBeenCalledTimes(1);
+    expect(remote).toHaveBeenCalledTimes(2);
     expect(save).toHaveBeenCalledTimes(1);
     expect(x.journal.running()).toEqual([]);
   });

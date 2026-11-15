@@ -28,6 +28,7 @@ import {
   RunnerSettingsChangesSchema,
   RunnerVendorSchema,
   StopCauseSchema,
+  SubmissionCheckSchema,
   SubmissionIdSchema,
   VendorQuotaSchema,
   schemaFor,
@@ -297,6 +298,7 @@ export const SubmissionRecordSchema = schemaFor<SubmissionRecord>()(
       error: z.string().nullable(),
       requestedAt: NonNegativeInt,
       decidedAt: NonNegativeInt.nullable(),
+      check: SubmissionCheckSchema.optional(),
     })
     .refine((submission) => namesTask(submission.attemptId, submission.taskId), {
       error: 'expected the task its attempt id names',

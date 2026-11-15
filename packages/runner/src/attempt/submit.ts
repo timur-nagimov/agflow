@@ -5,16 +5,24 @@
 // whose detail tells the agent to merge main when main has changed those paths, rather than revert them. Protected
 // changes are judged against the submission base: the restore base, or, once the branch has merged a newer main,
 // that merge's base on main, so a branch that followed the advice carries main's own versions and passes as it is.
+// Then main merges into the branch, unless the branch holds it already: a conflict refuses the submission with
+// merge_conflict, naming the files, and leaves the clone alone; a clean merge becomes a commit on the branch in the
+// clone. The project's check (.agflow/config.json on main) runs in the clone on the result, after the dependencies are
+// prepared again when main merged in, and a failure of either refuses the submission with check_failed and the end of
+// its output. Under the open profile a failed preparation refuses nothing: the check runs anyway, and its output ends
+// with a note of the failure. What the check gave travels with the outcome either way.
 // The task branch and the WIP ref then move together under the stale-lease rules (pushSubmission). Remote failures
-// are retried with a doubling delay until submitRetry passes (remote) or a stop or hold for the attempt arrives
-// (interrupted); a refusal that cannot clear (the attempt was fenced, ended or exited) ends the retries at once. The
-// outcome is the outbox event attempt.submitted, and the command result repeats it.
-import { type AttemptSpec, isTaskBranch, type RunnerEvent } from '@agflow/core';
+// are retried with a doubling delay until submitRetry has passed since the submission began (remote) or a stop or
+// hold for the attempt arrives (interrupted); a refusal that cannot clear (the attempt was fenced, ended or exited)
+// ends the retries at once. The outcome is the outbox event attempt.submitted, and the command result repeats it.
+import { type AttemptSpec, CHECK_TAIL_MAX, isTaskBranch, type RunnerEvent, type SubmissionCheck } from '@agflow/core';
 import { doublingDelay } from '../backoff';
 import { mergeBase } from '../git/protect';
 import type { SubmitPushOutcome } from '../git/push';
 import { type GitEnvironment, runGit } from '../git/run';
 import type { Vault } from '../git/vault';
+import type { CheckRun } from '../seams';
+import { clip } from './pump';
 import { clipViolationPaths } from './workspace';
 
 /** attempt.submitted's data: the outcome of one push_submission. */
@@ -106,10 +114,88 @@ export async function protectedDetail(input: {
   return `${intro} Revert them to the versions your branch started from, commit, and submit again.`;
 }
 
+/**
+ * merge_conflict's detail: main does not merge into the branch cleanly, the files where, and how the agent merges it
+ * itself. The clone is left as it was.
+ */
+export function conflictDetail(files: readonly string[], main: string): string {
+  const where = files.length > 0 ? ` These files conflict: ${listed(files)}.` : '';
+  return (
+    `${main} does not merge into your branch cleanly.${where} Merge it yourself (\`git fetch origin && git merge ` +
+    `origin/${main}\`), resolve the conflicts, run the project's check, commit, and submit again.`
+  );
+}
+
+/** The lines of a check's output its refusal and its tail keep. */
+export const CHECK_TAIL_LINES = 60;
+
+/** The last CHECK_TAIL_LINES lines of a check's output, cut to its last CHECK_TAIL_MAX bytes. */
+export function checkTail(output: string): string {
+  const lines = output.replace(/\n+$/, '').split('\n').slice(-CHECK_TAIL_LINES).join('\n');
+  const bytes = Buffer.from(lines);
+  if (bytes.length <= CHECK_TAIL_MAX) return lines;
+  let start = bytes.length - CHECK_TAIL_MAX;
+  // The cut can land inside a character: it starts at the next whole one.
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+  return bytes.subarray(start).toString('utf8');
+}
+
+/** A check that did not run: none, with why in its tail. */
+export function noCheck(command: string | null, why: string): SubmissionCheck {
+  return { status: 'none', command, durationMs: 0, tail: checkTail(why) };
+}
+
+/** What a check that ran gives: passed only when it exited 0 in time. */
+export function checkOf(command: string, run: CheckRun): SubmissionCheck {
+  const passed = run.code === 0 && run.signal === null && !run.timedOut;
+  return { status: passed ? 'passed' : 'failed', command, durationMs: Math.round(run.durationMs), tail: checkTail(run.logTail) };
+}
+
+/** check_failed's detail: how the check failed, what the agent does about it, and the end of its output. */
+export function checkFailedDetail(check: SubmissionCheck, run: CheckRun, timeoutMs: number, main: string): string {
+  const limit = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} min` : `${timeoutMs} ms`;
+  const how = run.timedOut
+    ? `timed out after ${limit}`
+    : run.signal !== null
+      ? `was killed by ${run.signal}`
+      : `exited with code ${run.code ?? 'unknown'}`;
+  const intro =
+    `the project's check \`${check.command}\` ${how}, run on your branch with ${main} merged in. Run it yourself, ` +
+    'make it pass, commit, and submit again.';
+  return check.tail === '' ? intro : `${intro} The last lines of its output:\n${check.tail}`;
+}
+
+/** A check that did not run because the dependencies, prepared again after main merged in, failed: failed, with why. */
+export function prepFailedCheck(
+  command: string,
+  prep: { error: string | null; logTail: string | null },
+): SubmissionCheck {
+  const output = [prep.logTail?.trimEnd() ?? '', prep.error ?? 'the preparation failed'].filter((part) => part !== '');
+  return { status: 'failed', command, durationMs: 0, tail: checkTail(output.join('\n')) };
+}
+
+/** check_failed's detail when the dependencies could not be prepared for the check: what the agent does about it. */
+export function prepFailedDetail(check: SubmissionCheck, main: string): string {
+  return (
+    `the dependencies could not be prepared again after ${main} merged into your branch, so the project's check ` +
+    `\`${check.command}\` did not run. Call prepare_dependencies, fix what makes it fail, commit, and submit again. ` +
+    `The last lines of its output:\n${check.tail}`
+  );
+}
+
+/**
+ * The line that ends the check's output under the open profile when the dependencies, prepared again after main
+ * merged in, failed: there the check runs anyway, since the agent can install what it needs itself.
+ */
+export function prepFailedNote(error: string | null, main: string): string {
+  const why = clip((error ?? 'the preparation failed').replace(/\s+/g, ' ').trim(), 300);
+  return `The dependencies could not be prepared again after ${main} merged in (${why}). The check ran anyway.`;
+}
+
 export interface SubmitPushRetryInput {
   /** One try: the push, or why it may not run now (a remote outcome). */
   push(): Promise<SubmitPushOutcome>;
-  /** submitRetry. */
+  /** What is left of submitRetry; with nothing left, the push still makes its one try. */
   budgetMs: number;
   /** Whether a stop or hold for the attempt arrived since the submission began. */
   interrupted(): boolean;

@@ -171,8 +171,9 @@ The allowlist is checked whenever a session verifies; removing a login invalidat
 
 ## Operator access
 
-M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. To run a
-project unattended, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
+M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. With
+`AGFLOW_AUTO_MERGE=1` agflow merges accepted work itself ([Unattended operation](#unattended-operation)), and no
+script needs to. To run a project unattended without it, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
 for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login the script acts as) in
 `/etc/agflow/hub.env` and restart. Seven routes then accept the header `X-Agflow-Operator: <token>`:
 
@@ -230,8 +231,8 @@ restore its archive as a backup ([Backups and restore](#backups-and-restore)).
 
 ## Unattended operation
 
-By default a person merges accepted work, brings outside data into the repository and answers every approval request.
-Four opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
+By default a person merges accepted work, brings outside data into the repository and answers every approval request,
+and the lead reviews every submission. Six opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
 after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
@@ -241,7 +242,7 @@ after a change. The details are in the
   owner's Keychain for `agflow start`.
 - **`AGFLOW_DEPENDENCIES_NEED_MERGE=1`.** Removes: checking that a dependency reached `main` before dependent work
   starts. Risk: if nothing marks accepted tasks merged, dependent tasks wait forever. Set it only together with an
-  operator that merges.
+  operator that merges. `AGFLOW_AUTO_MERGE=1` works this way by itself.
 - **`AGFLOW_AGENT_FETCH=1`.** Removes: fetching outside data for agents. The hub downloads one public URL at a time
   for a Claude agent, for the lead and for the tasks the lead granted internet access, and the agent's bridge saves
   the file inside its clone. Agents still have no network of their own. Risk: an agent that reads hostile text can
@@ -270,6 +271,23 @@ after a change. The details are in the
   every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
   owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
   removing the line and restarting the hub.
+- **`AGFLOW_AUTO_MERGE=1`.** Removes: merging accepted work by hand, and the operator script that did it. Accepting a
+  task moves it to `merging`, and the hub sends one merge at a time to a runner, the author's when it is online. The
+  runner merges the accepted head into `main` in its vault as a commit "Merge T-42: title" and pushes `main` leased on
+  the `main` it merged; when `main` moved meanwhile it fetches and tries again, up to 5 times. It pushes with its
+  owner's git credentials, the same ones that push the task branches, so **`main` must accept direct pushes from both
+  owners**: no branch protection, required reviews or required status checks on `main`. A conflict sends the task
+  back to its author through `rejected`, with the conflicting files as feedback. A merge that fails otherwise leaves
+  the task in `merging`, tells people once, and is tried again every tick; a person who merges it by hand marks it
+  merged. A dependency then counts as done only once merged, and accepted and merging tasks keep their owned paths.
+  Risk: work reaches `main` with no person looking at the merge, and the repository's own CI runs after it landed.
+- **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
+  accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
+  woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
+  `.agflow/config.json` on `main`, such as `"check": "bun test"`; a submission without one goes to the lead as before.
+  A runner gives a check `checkMinutes` (10 by default, in `runner.json`) out of the 15 minutes it gives a whole
+  submission, push included, so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long. Risk: the check is the
+  only review, so whatever it does not test is accepted unseen.
 
 One more setting is on by default:
 

@@ -23,7 +23,8 @@
 // What the runner sends the agent on its own, continuations, vendor-error retries, quota waits and the one nudge
 // after an outage, is the turn policy's (turns.ts). A resume (resume.ts) stops a live process first, then prepares
 // the clone the attempt has and resumes its session with the new fence and token. A submission (submit.ts) harvests
-// the clone and pushes the task branch and the WIP ref together; a stop or hold arriving meanwhile ends its retries.
+// the clone, merges main into it and runs the project's check there, then pushes the task branch and the WIP ref
+// together; a stop or hold arriving meanwhile ends its retries.
 // An attempt the hub ended (welcome.stop) is stopped without a handoff turn, its new work going to a late-work ref; an
 // agent's prepare_dependencies runs the preparer in its clone under the request's id.
 // A take-over (takeover.ts) stops the agent with a handoff turn, pushes its work, and hands the clone to a person
@@ -46,6 +47,7 @@ import {
   type RunnerEvent,
   type StartRefusal,
   type StoppedBy,
+  type SubmissionCheck,
   lateWorkRef,
   localPinRefs,
   type Vendor,
@@ -66,12 +68,14 @@ import { diffFingerprint, FactsTracker } from '../facts';
 import { lsRemote, pushLateWork, pushSubmission, type PushResult, pushWip, type SubmitPushOutcome } from '../git/push';
 import { detectProtected, resolveRestoreBase, restoreProtected } from '../git/protect';
 import { type GitEnvironment, runGit } from '../git/run';
-import { cloneExists } from '../git/clone';
+import { cloneExists, moveTaskClone } from '../git/clone';
+import { isAncestor, mainOf, mergeMainInto } from '../git/merge';
 import type { Vault } from '../git/vault';
 import type { RunnerHubHttp } from '../hub-http';
 import type { Logger } from '../log';
 import type { NewEvent, Outbox } from '../outbox';
 import type { RunnerPaths } from '../paths';
+import { readPrepConfig } from '../prep/config';
 import type { SerialQueue } from '../queue';
 import { removeAgentTools } from '../run-dir';
 import { boundedWait, findCloneProcesses, type ProcessIdentity } from '../processes';
@@ -90,8 +94,15 @@ import {
   resumedSpec,
 } from './resume';
 import {
+  checkFailedDetail,
+  checkOf,
+  conflictDetail,
   dirtyDetail,
   isOwnBranch,
+  noCheck,
+  prepFailedCheck,
+  prepFailedDetail,
+  prepFailedNote,
   protectedDetail,
   pushSubmissionWithRetries,
   type SubmitCommand,
@@ -1008,6 +1019,9 @@ export class AttemptController {
     stops: number,
   ): Promise<SubmittedData> {
     const { vault, local, logger, store, wipGate } = this.deps;
+    // submitRetry is as long as the hub waits for the whole submission: the push gets what the merge, the preparation
+    // and the check leave of it.
+    const began = Date.now();
     const branch = command.branch;
     const refused = (fields: Pick<SubmittedData, 'error' | 'detail'> & Partial<SubmittedData>): SubmittedData => ({
       submissionId: command.submissionId,
@@ -1028,7 +1042,7 @@ export class AttemptController {
     } catch (error) {
       return refused({ error: 'remote', detail: `cannot harvest the clone: ${describe(error)}` });
     }
-    const headSha = work.head;
+    let headSha = work.head;
     // Every skipped file is an uncommitted change the snapshot left out: the submission would go without it.
     const dirty = [...new Set([...work.uncommitted, ...work.skipped])].sort();
     if (dirty.length > 0) return refused({ error: 'dirty', headSha, detail: dirtyDetail(dirty) });
@@ -1051,10 +1065,23 @@ export class AttemptController {
       sha = work.head;
       tree = (await runGit(local, [`--git-dir=${vault.path}`, 'rev-parse', `${sha}^{tree}`])).stdout.trim();
     }
+    let checked: Awaited<ReturnType<AttemptController['mergeAndCheck']>>;
+    try {
+      checked = await this.mergeAndCheck(spec, clone, branch, sha);
+    } catch (error) {
+      const detail = `cannot merge ${vault.mainBranch} into the branch: ${describe(error)}`;
+      return refused({ error: 'remote', headSha, detail });
+    }
+    const { check } = checked;
+    if (!checked.ok) return refused({ error: checked.error, headSha: checked.head, detail: checked.detail, check });
+    if (checked.merge !== null) {
+      ({ sha, tree } = checked.merge);
+      headSha = sha;
+    }
     const wipRef = spec.wipRef as string;
     const settled = () => this.standing.fenced || this.standing.ended || this.standing.exited;
     const pushed = await pushSubmissionWithRetries({
-      budgetMs: this.deps.config().timings.submitRetry,
+      budgetMs: this.deps.config().timings.submitRetry - (Date.now() - began),
       interrupted: () => this.stopsArrived !== stops,
       stopArrived: () => this.nextStop(),
       // Only the link's gate clears by itself; a fenced, ended or exited attempt never pushes again.
@@ -1086,16 +1113,128 @@ export class AttemptController {
       },
     });
     if (pushed === 'interrupted') {
-      return refused({ error: 'interrupted', headSha, detail: 'a stop or hold arrived while the push was retried' });
+      return refused({ error: 'interrupted', headSha, detail: 'a stop or hold arrived while the push was retried', check });
     }
     if (pushed.ok) {
       store.update(this.attemptId, { wipSha: sha, pushedSha: sha, lastPushAt: Date.now() });
-      this.lastWork = { head: work.head, tree };
+      this.lastWork = { head: headSha, tree };
       this.heldWork = null;
       this.deps.wipFailures.succeeded();
     }
     const { ok, remoteHead, error, detail } = pushed;
-    return { submissionId: command.submissionId, ok, headSha, remoteHead, error, detail };
+    return { submissionId: command.submissionId, ok, headSha, remoteHead, error, detail, check };
+  }
+
+  /**
+   * A submission's merge of main and its check (design 6.13). Unless the branch holds main already, main merges into
+   * it in the vault, and the clone moves to the merge commit while the agent's groups are paused; a conflict changes
+   * nothing. The project's check then runs in the clone, after the dependencies are prepared again when main merged
+   * in. Gives the merge commit and its tree, null when the branch held main, or the refusal: merge_conflict naming the
+   * files, or check_failed with the end of the output. Each gives what the check gave.
+   */
+  private async mergeAndCheck(
+    spec: Omit<AttemptSpec, 'agentToken'>,
+    clone: string,
+    branch: string,
+    head: string,
+  ): Promise<
+    | { ok: true; merge: { sha: string; tree: string } | null; check: SubmissionCheck }
+    | { ok: false; error: 'merge_conflict' | 'check_failed'; head: string; detail: string; check: SubmissionCheck | null }
+  > {
+    const { vault, local, store } = this.deps;
+    const config = this.deps.config();
+    const git = { vault, local };
+    const main = await mainOf(git);
+    let merge: { sha: string; tree: string } | null = null;
+    let mergedBase: string | null = null;
+    if (!(await isAncestor(git, main, head))) {
+      const message = `Merge ${vault.mainBranch} into ${branch}`;
+      const merged = await mergeMainInto({ ...git, head, main, message, identity: config.commitIdentity });
+      if (!merged.merged) {
+        const detail = conflictDetail(merged.files, vault.mainBranch);
+        return { ok: false, error: 'merge_conflict', head, detail, check: null };
+      }
+      const groups = this.live === null ? [] : [...store.processes(this.attemptId), ...this.live.pump.groups()];
+      const target = { vault, local, attemptId: this.attemptId, clone, branch, from: head, to: merged.sha };
+      await withPausedGroups(groups, () => moveTaskClone(target));
+      merge = { sha: merged.sha, tree: merged.tree };
+      // The pins moved: the restore base is the main that merged in, for the preparation below and any later one.
+      mergedBase = await resolveRestoreBase(vault, spec);
+      if (this.prepared !== null) this.prepared.base = mergedBase;
+    }
+    const timeoutMs = Math.max(1, Math.round(config.checkMinutes * 60_000));
+    const ran = await this.runCheck(spec, clone, main, timeoutMs, mergedBase);
+    if (ran.refusal !== null) {
+      return { ok: false, error: 'check_failed', head: merge?.sha ?? head, detail: ran.refusal, check: ran.check };
+    }
+    return { ok: true, merge, check: ran.check };
+  }
+
+  /**
+   * The project's check, read from .agflow/config.json on main, run in the clone by the preparer's sandbox with the
+   * agent's environment and no agent token. When main merged in, it may have changed what the dependencies need: they
+   * are prepared first, as at a start, at mergedBase, the restore base the merge gave. A preparation that fails
+   * refuses the submission, except under the open profile: there, as at a start, the agent can install for itself, so
+   * the check runs anyway and its tail ends with a note of the failure. A check that cannot run (no command, a config
+   * that does not read, a runner with no sandbox, a failure to start it) is none, with why in its tail: the submission
+   * goes on without it. Gives what the check gave, and the refusal's detail when the check, or the preparation before
+   * it, failed.
+   */
+  private async runCheck(
+    spec: Omit<AttemptSpec, 'agentToken'>,
+    clone: string,
+    main: string,
+    timeoutMs: number,
+    mergedBase: string | null,
+  ): Promise<{ check: SubmissionCheck; refusal: string | null }> {
+    const { preparer, vault, paths, store } = this.deps;
+    let command: string | undefined;
+    try {
+      command = (await readPrepConfig(vault, main))?.check;
+    } catch (error) {
+      return { check: noCheck(null, describe(error)), refusal: null };
+    }
+    if (command === undefined) return { check: noCheck(null, ''), refusal: null };
+    if (!preparer.available || preparer.check === undefined) {
+      const why = 'this runner cannot run it: it has no sandbox for preparation commands';
+      return { check: noCheck(command, why), refusal: null };
+    }
+    const env = buildAgentEnv({
+      vendor: spec.vendor,
+      spec: { ...spec, agentToken: '' },
+      clone,
+      tools: paths.agentTools(vault.project, this.attemptId),
+      tmpDir: this.prepared?.tmpDir ?? store.get(this.attemptId)?.tmpDir ?? null,
+      config: this.deps.config(),
+      paths,
+    });
+    delete env.AGFLOW_AGENT_TOKEN;
+    let note = '';
+    if (mergedBase !== null) {
+      const input = { attemptId: this.attemptId, vendor: spec.vendor, clone, vault, baseSha: mergedBase, env };
+      let prep: Omit<PrepareOutcome, 'ran'>;
+      try {
+        prep = await preparer.prepare({ ...input, requestId: null });
+      } catch (error) {
+        prep = { ok: false, error: describe(error), logTail: null };
+      }
+      if (!prep.ok && this.deps.config().profile !== 'open') {
+        const check = prepFailedCheck(command, prep);
+        return { check, refusal: prepFailedDetail(check, vault.mainBranch) };
+      }
+      if (!prep.ok) note = prepFailedNote(prep.error, vault.mainBranch);
+    }
+    const noted = (output: string) =>
+      note === '' ? output : [output.trimEnd(), note].filter((part) => part !== '').join('\n');
+    try {
+      const ran = await preparer.check({ clone, vault, command, env, timeoutMs });
+      const run = { ...ran, logTail: noted(ran.logTail) };
+      const check = checkOf(command, run);
+      const refusal = check.status === 'failed' ? checkFailedDetail(check, run, timeoutMs, vault.mainBranch) : null;
+      return { check, refusal };
+    } catch (error) {
+      return { check: noCheck(command, noted(`the runner could not run it: ${describe(error)}`)), refusal: null };
+    }
   }
 
   /** Resolves when the next stop, hold or resume arrives. */

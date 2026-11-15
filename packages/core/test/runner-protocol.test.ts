@@ -6,6 +6,7 @@ import {
   type AttemptSpec,
   AttemptFactsSchema,
   AttemptSpecSchema,
+  CHECK_TAIL_MAX,
   CLOSE_CODES,
   COMMAND_MIN_PROTOCOL,
   EXIT_CAUSES,
@@ -16,6 +17,7 @@ import {
   type InjectedMessage,
   InjectedMessageSchema,
   LiveAttemptSchema,
+  MergeTaskResultSchema,
   PROTOCOL_VERSION,
   type Parsed,
   ProfileSummarySchema,
@@ -148,7 +150,7 @@ const messages: InjectedMessage[] = [
   { messageId: 17, authority: 'person', text: '> timur: please add a test for the empty password' },
 ];
 
-// One command of each kind; the mapped type makes the compiler insist on all 17.
+// One command of each kind; the mapped type makes the compiler insist on all 18.
 const commands: { [K in RunnerCommandKind]: Extract<RunnerCommand, { kind: K }> } = {
   start_attempt: { kind: 'start_attempt', attempt: spec },
   resume_attempt: {
@@ -201,6 +203,7 @@ const commands: { [K in RunnerCommandKind]: Extract<RunnerCommand, { kind: K }> 
   preflight: { kind: 'preflight', vendor: 'codex' },
   delete_refs: { kind: 'delete_refs', refs: [{ ref: 'refs/agflow/T-42/a3', expectedSha: sha('c') }] },
   update_settings: { kind: 'update_settings', settings: { capacity: 3, draining: false }, version: 4 },
+  merge_task: { kind: 'merge_task', taskId: 'T-42', title: 'Add the login form', branch: 'agflow/T-42-add-login', headSha: sha('d') },
 };
 
 type Variant<M extends { t: string }, T extends M['t']> = Extract<M, { t: T }>;
@@ -302,9 +305,9 @@ describe('round trips', () => {
     for (const message of hubMessages) expect(fromHub(message)).toEqual({ ok: true, value: message });
   });
 
-  test('each of the 17 command kinds round-trips through RunnerCommandSchema', () => {
-    expect(RUNNER_COMMAND_KINDS).toHaveLength(17);
-    expect(new Set(RUNNER_COMMAND_KINDS).size).toBe(17);
+  test('each of the 18 command kinds round-trips through RunnerCommandSchema', () => {
+    expect(RUNNER_COMMAND_KINDS).toHaveLength(18);
+    expect(new Set(RUNNER_COMMAND_KINDS).size).toBe(18);
     for (const kind of RUNNER_COMMAND_KINDS) {
       expect([kind, RunnerCommandSchema.safeParse(commands[kind]).data]).toEqual([kind, commands[kind]]);
     }
@@ -558,10 +561,28 @@ describe('value schemas', () => {
 });
 
 describe('commands', () => {
-  test('COMMAND_MIN_PROTOCOL maps all 17 kinds to 1', () => {
+  test('COMMAND_MIN_PROTOCOL maps the 17 kinds of protocol 1 to 1, and merge_task to 3', () => {
     expect(Object.keys(COMMAND_MIN_PROTOCOL).sort()).toEqual([...RUNNER_COMMAND_KINDS].sort());
-    for (const kind of RUNNER_COMMAND_KINDS) expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, 1]);
+    for (const kind of RUNNER_COMMAND_KINDS) {
+      expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, kind === 'merge_task' ? 3 : 1]);
+    }
     expect(PROTOCOL_VERSION).toBe(3);
+  });
+
+  test("merge_task's result is merged with main's full sha, or a conflict with its files", () => {
+    const parses = (data: unknown) => MergeTaskResultSchema.safeParse(data).success;
+    expect(parses({ status: 'merged', sha: sha('a') })).toBe(true);
+    expect(parses({ status: 'conflict', files: ['src/app.ts', 'README.md'] })).toBe(true);
+    for (const bad of [
+      { status: 'merged', sha: 'abc1234' },
+      { status: 'merged' },
+      { status: 'conflict', files: [''] },
+      { status: 'conflict', files: [], extra: 1 },
+      { status: 'pushed', sha: sha('a') },
+      null,
+    ]) {
+      expect([bad, parses(bad)]).toEqual([bad, false]);
+    }
   });
 
   test('start_attempt and resume_attempt carry an agent token', () => {
@@ -911,6 +932,25 @@ describe('runner events', () => {
     expect(errorOf(parseRunnerEvent(submitted({ ...success, headSha: null })))).toContain('data.headSha');
   });
 
+  test("attempt.submitted may carry the project's check: absent from older runners, null before it ran", () => {
+    const submitted = (data: Partial<RunnerEventData['attempt.submitted']>) => withData('attempt.submitted', data);
+    const check = { status: 'passed', command: 'bun test', durationMs: 1200, tail: '3 pass\n' } as const;
+    expect(parses(submitted({}))).toBe(true);
+    expect(parses(submitted({ check: null }))).toBe(true);
+    expect(parses(submitted({ check }))).toBe(true);
+    expect(parses(submitted({ check: { status: 'none', command: null, durationMs: 0, tail: '' } }))).toBe(true);
+    expect(parses(submitted({ check: { ...check, tail: 'x'.repeat(CHECK_TAIL_MAX) } }))).toBe(true);
+    for (const bad of [
+      { ...check, tail: 'x'.repeat(CHECK_TAIL_MAX + 1) },
+      { ...check, status: 'skipped' },
+      { ...check, command: '' },
+      { ...check, durationMs: -1 },
+      { ...check, extra: 1 },
+    ]) {
+      expect([bad, parses(submitted({ check: bad as never }))]).toEqual([bad, false]);
+    }
+  });
+
   test('every sha a runner reports is full: a 7-hex sha is an error', () => {
     const short = 'abc1234';
     for (const event of [
@@ -978,8 +1018,16 @@ describe('runner events', () => {
       'branch_moved',
       'remote',
       'interrupted',
+      'merge_conflict',
+      'check_failed',
     ]);
-    expect([...FIXABLE_SUBMIT_ERRORS]).toEqual(['dirty', 'protected_paths', 'needs_merge']);
+    expect([...FIXABLE_SUBMIT_ERRORS]).toEqual([
+      'dirty',
+      'protected_paths',
+      'needs_merge',
+      'merge_conflict',
+      'check_failed',
+    ]);
     expect([...EXIT_CAUSES]).toEqual(['suspend', 'runner_stop']);
     expect([...STOPPED_BY]).toEqual(['interrupt', 'close', 'sigterm', 'sigkill', 'none']);
     expect([...VENDOR_OUTCOME_KINDS]).toEqual(['auth', 'context', 'policy', 'denials', 'session_budget']);

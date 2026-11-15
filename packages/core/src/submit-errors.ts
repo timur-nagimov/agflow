@@ -1,7 +1,10 @@
 // The codes of a runner's submission outcomes (design 6.13) and how SubmissionRecord.error spells a failure. The web
 // UI imports these values, so the module stays free of zod (X-48); runner-protocol.ts builds its schema from them.
 
-/** attempt.submitted error codes. */
+/**
+ * attempt.submitted error codes. merge_conflict: main does not merge into the branch cleanly; check_failed: the
+ * project's check failed on the branch with main merged in.
+ */
 export const SUBMIT_ERRORS = [
   'dirty',
   'protected_paths',
@@ -9,6 +12,8 @@ export const SUBMIT_ERRORS = [
   'branch_moved',
   'remote',
   'interrupted',
+  'merge_conflict',
+  'check_failed',
 ] as const;
 export type SubmitError = (typeof SUBMIT_ERRORS)[number];
 
@@ -17,6 +22,8 @@ export const FIXABLE_SUBMIT_ERRORS = [
   'dirty',
   'protected_paths',
   'needs_merge',
+  'merge_conflict',
+  'check_failed',
 ] as const satisfies readonly SubmitError[];
 
 const isSubmitError = (text: string): text is SubmitError => (SUBMIT_ERRORS as readonly string[]).includes(text);

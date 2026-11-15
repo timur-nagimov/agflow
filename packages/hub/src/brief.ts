@@ -19,6 +19,7 @@ import { type LeadNoteRow, holdsSeat, leadNoteFromRow } from './hub-state';
 import { listStandingRules, unreadFor } from './messages';
 import { getProject } from './project';
 import { loadLines, workerLoad } from './scheduler';
+import { AUTO_ACCEPT } from './submission-store';
 import { findTask, listTaskNotes, listTasks } from './task-store';
 import { clip, quotedWithin } from './text';
 
@@ -79,6 +80,19 @@ const RUNNER_LEAD_GUIDE = `${LEAD_GUIDE}
 - Your clone is a checkout of main for reading. You have no branch and push nothing.
 - When agflow asks, write a lead handoff for the lead after you with \`write_handoff\` and no task id.`;
 
+// The lead guide's lines for AGFLOW_AUTO_ACCEPT and AGFLOW_AUTO_MERGE, each there only while its setting is on.
+const AUTO_ACCEPT_LINE =
+  '- The hub itself accepts every submission whose check passed. You review only the submissions left to you.';
+const AUTO_MERGE_LINE = '- agflow merges accepted work into main itself; a conflict sends the task back to its author.';
+
+/** The lead's guide, with the line of each of AGFLOW_AUTO_ACCEPT and AGFLOW_AUTO_MERGE that is on. */
+function leadGuide(ctx: HubContext, guide: string): string {
+  const lines = [guide];
+  if (ctx.config.autoAccept) lines.push(AUTO_ACCEPT_LINE);
+  if (ctx.config.autoMerge) lines.push(AUTO_MERGE_LINE);
+  return lines.join('\n');
+}
+
 const PAUSED = 'THE PROJECT IS PAUSED. Do not start new work. Finish or hand off what you hold.';
 
 const OPEN_STATUSES = new Set<TaskStatus>([
@@ -111,7 +125,7 @@ export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions 
     );
   }
   if (project.paused) parts.push(PAUSED);
-  parts.push(lead ? LEAD_GUIDE : WORKER_GUIDE);
+  parts.push(lead ? leadGuide(ctx, LEAD_GUIDE) : WORKER_GUIDE);
   parts.push(goalSection(ctx, GOAL_LIMIT));
   parts.push(standingRules(ctx));
   const messages = messagesSection(ctx, agent);
@@ -147,7 +161,7 @@ function runnerBrief(ctx: HubContext, agent: Agent): string {
     `in project "${project.name}" (${project.repo})${as}.`;
   const before = [`# agflow brief for ${agent.id}`, intro];
   if (project.paused) before.push(PAUSED);
-  before.push(lead ? RUNNER_LEAD_GUIDE : RUNNER_WORKER_GUIDE);
+  before.push(lead ? leadGuide(ctx, RUNNER_LEAD_GUIDE) : RUNNER_WORKER_GUIDE);
   if (!lead) before.push(runnerTask(ctx, attempt));
   const successor = attempt !== null && isSuccessor(attempt);
   const handoff = lead ? leadHandoffSection(ctx) : successor ? handoffSection(ctx, attempt) : null;
@@ -456,13 +470,43 @@ function yourTask(ctx: HubContext, agent: Agent, budget: number): string {
   return `${clip(text, budget - pointer.length - 1)}\n${pointer}`;
 }
 
+/** When a lead last woke: the newest start, resume or delivery of any lead attempt; 0 before the first. */
+function lastLeadWakeup(ctx: HubContext): number {
+  const row = ctx.db
+    .query(
+      `SELECT MAX(runner_commands.created_at) AS at FROM runner_commands
+       JOIN attempts ON attempts.id = runner_commands.attempt_id
+       WHERE attempts.role = 'lead' AND runner_commands.kind IN ('start_attempt', 'resume_attempt', 'deliver')`,
+    )
+    .get() as { at: number | null };
+  return row.at ?? 0;
+}
+
+/**
+ * The line naming the tasks the hub accepted itself (AGFLOW_AUTO_ACCEPT, hub:auto-accept) since the lead last woke,
+ * which no message woke it for; null when there are none.
+ */
+function autoAcceptedLine(ctx: HubContext, tasks: readonly Task[]): string | null {
+  const rows = ctx.db
+    .query(
+      `SELECT subject, MIN(id) AS first FROM events WHERE type = 'task.accepted' AND actor = $actor
+         AND ts > $since GROUP BY subject ORDER BY first`,
+    )
+    .all({ actor: AUTO_ACCEPT, since: lastLeadWakeup(ctx) }) as { subject: string }[];
+  if (rows.length === 0) return null;
+  const titles = new Map(tasks.map((task) => [task.id, task.title]));
+  const named = rows.slice(0, 10).map(({ subject }) => `${subject} "${clip(titles.get(subject) ?? '', 60)}"`);
+  const more = rows.length > named.length ? ` and ${rows.length - named.length} more` : '';
+  return `Accepted by the hub since your last wake-up, their check passed: ${named.join(', ')}${more}.`;
+}
+
 /** The most a situation report takes; its oldest events give way first. */
 const REPORT_LIMIT = 2500;
 
 /**
  * The lead's situation report, at every wake-up: the board, the worker load with each account's quota and the
  * deadline, the ready tasks no runner agent will run and those only a runner with the open profile will, the work
- * waiting on the lead, and as many recent events as fit.
+ * waiting on the lead, the tasks the hub accepted itself since the lead last woke, and as many recent events as fit.
  */
 export function situationReport(ctx: HubContext): string {
   const tasks = listTasks(ctx);
@@ -490,6 +534,8 @@ export function situationReport(ctx: HubContext): string {
       ...submitted.slice(0, 10).map((task) => `- ${task.id} "${clip(task.title, 80)}" by ${task.assignee ?? 'unknown'}`),
     );
   }
+  const autoAccepted = autoAcceptedLine(ctx, tasks);
+  if (autoAccepted !== null) lines.push(autoAccepted);
   const blocked = tasks.filter((task) => task.status === 'blocked' && task.blockedKind !== 'deps');
   if (blocked.length > 0) {
     lines.push('Blocked:', ...blocked.slice(0, 10).map((task) => `- ${task.id}:\n${quoted(task.blockedReason ?? '', 150)}`));
