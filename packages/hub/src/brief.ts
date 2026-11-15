@@ -185,7 +185,7 @@ function runnerBrief(ctx: HubContext, agent: Agent): string {
   if (project.paused) before.push(PAUSED);
   before.push(lead ? leadGuide(ctx, RUNNER_LEAD_GUIDE) : RUNNER_WORKER_GUIDE);
   if (!lead) before.push(runnerTask(ctx, attempt));
-  const successor = attempt !== null && isSuccessor(attempt);
+  const successor = attempt !== null && isSuccessor(ctx, attempt);
   const handoff = lead ? leadHandoffSection(ctx) : successor ? handoffSection(ctx, attempt) : null;
   const after = [handoff, lead ? situationReport(ctx) : null].filter((part) => part !== null);
   const messages = messagesSection(ctx, agent);
@@ -208,9 +208,17 @@ function runnerTask(ctx: HubContext, attempt: Attempt | null): string {
   return lines.join('\n');
 }
 
-/** An attempt that follows an earlier one of its task, or an earlier lead: it restates before it works (design 6.8). */
-export function isSuccessor(attempt: Pick<Attempt, 'number'>): boolean {
-  return attempt.number > 1;
+/**
+ * An attempt that follows an earlier one of its task, or an earlier lead: it restates before it works (design 6.8). A
+ * lead follows one when this database holds an earlier lead attempt or a lead handoff (newestLeadHandoff). Its number
+ * does not say: a project reset and a restore advance the lead_attempt counter (restore.ts, COUNTER_ADVANCE).
+ */
+export function isSuccessor(ctx: HubContext, attempt: Pick<Attempt, 'number' | 'taskId'>): boolean {
+  if (attempt.taskId !== null) return attempt.number > 1;
+  const earlier = ctx.db
+    .query('SELECT 1 FROM attempts WHERE task_id IS NULL AND number < $number LIMIT 1')
+    .get({ number: attempt.number });
+  return earlier !== null || newestLeadHandoff(ctx) !== null;
 }
 
 /**
