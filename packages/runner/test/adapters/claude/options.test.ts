@@ -29,6 +29,7 @@ import {
   CLAUDE_SHELL,
   claudeBinary,
   claudeEmptyDir,
+  claudeMdExcludes,
   claudeTools,
   type ClaudeOptionDeps,
   effectivePermissionMode,
@@ -284,6 +285,7 @@ describe('buildQueryOptions', () => {
         ],
       },
       autoMemoryEnabled: false,
+      claudeMdExcludes: claudeMdExcludes(CLONE),
       crossSessionInbound: 'refuse',
       cleanupPeriodDays: 30,
       syncClaudeAiSkills: false,
@@ -471,6 +473,61 @@ describe('buildQueryOptions', () => {
     expect(buildQueryOptions(launch({ model: 'claude-opus-5-5', tier: 'strong' }), deps()).effort).toBe('xhigh');
     expect(buildQueryOptions(launch({ tier: 'standard' }), deps())).not.toHaveProperty('effort');
     expect(buildQueryOptions(launch(), deps())).not.toHaveProperty('effort');
+  });
+});
+
+describe('claudeMdExcludes', () => {
+  /** Whether a pattern of the list matches the path, as the CLI's picomatch would: Bun.Glob agrees on these. */
+  const excludedBy = (patterns: string[]) => {
+    const globs = patterns.map((pattern) => new Bun.Glob(pattern));
+    return (path: string) => globs.some((glob) => glob.match(path));
+  };
+  const filesOf = (dir: string) => ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md', '.claude/rules/**'].map((file) => `${dir}/${file}`);
+
+  test("it names the instruction files of every directory above the clone, up to /, and none of the clone's", () => {
+    const patterns = claudeMdExcludes(CLONE);
+    expect(patterns).toEqual([
+      ...filesOf(join(paths.work, 'p-1234567890')),
+      ...filesOf(paths.work),
+      ...filesOf('/Users/owner/.agflow'),
+      ...filesOf(HOME),
+      ...filesOf('/Users'),
+      ...filesOf(''),
+    ]);
+    const excluded = excludedBy(patterns);
+    const owners = [
+      `${HOME}/CLAUDE.md`,
+      `${HOME}/CLAUDE.local.md`,
+      `${HOME}/.claude/CLAUDE.md`,
+      `${HOME}/.claude/rules/x.md`,
+      `${HOME}/.claude/rules/team/y.md`,
+      `${HOME}/.agflow/CLAUDE.md`,
+      join(paths.work, 'p-1234567890', 'CLAUDE.md'),
+      '/CLAUDE.md',
+    ];
+    for (const path of owners) expect([path, excluded(path)]).toEqual([path, true]);
+    const project = [
+      join(CLONE, 'CLAUDE.md'),
+      join(CLONE, 'AGENTS.md'),
+      join(CLONE, 'CLAUDE.local.md'),
+      join(CLONE, '.claude', 'CLAUDE.md'),
+      join(CLONE, '.claude', 'rules', 'x.md'),
+      join(CLONE, 'src', 'CLAUDE.md'),
+      `${HOME}/AGENTS.md`,
+      `${HOME}/notes/CLAUDE.md`,
+    ];
+    for (const path of project) expect([path, excluded(path)]).toEqual([path, false]);
+  });
+
+  test('a glob character in a directory name matches only itself', () => {
+    const clone = '/Users/a [b]/{c,d}/*?(e)/T-1-a1';
+    const excluded = excludedBy(claudeMdExcludes(clone));
+    expect(excluded('/Users/a [b]/{c,d}/*?(e)/CLAUDE.md')).toBe(true);
+    expect(excluded('/Users/a [b]/.claude/rules/x.md')).toBe(true);
+    expect(excluded('/Users/a b/{c,d}/*?(e)/CLAUDE.md')).toBe(false);
+    expect(excluded('/Users/a [b]/c/*?(e)/CLAUDE.md')).toBe(false);
+    expect(excluded('/Users/a [b]/{c,d}/xy(e)/CLAUDE.md')).toBe(false);
+    expect(excluded(`${clone}/CLAUDE.md`)).toBe(false);
   });
 });
 
