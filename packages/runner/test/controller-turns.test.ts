@@ -227,6 +227,41 @@ describe('AttemptController: continuation after a submission', () => {
     expect(userTexts(f, 'T-2-a1')).toEqual([PROMPT, continuationPrompt(['A1'])]);
   });
 
+  test('a failure the runner never reports, or a pending answer after its report, gives continuations back in the next turn', async () => {
+    const failures = {
+      // expireSubmissions: the hub fails a pending submission at its timeout; the runner reports nothing.
+      1: { messageId: 9, authority: 'system' as const, text: 'Your submission S-1 of T-1 failed: it was still pending after 30 minutes.' },
+      2: { messageId: 10, authority: 'system' as const, text: 'Your submission S-2 of T-2 was refused (dirty).' },
+    };
+    const f = await createRunnerFixture({
+      script: scripts({
+        1: { turns: [[SUBMIT], [], [SUBMIT]] },
+        // The runner reports the failure while a tool waits for the gate; the bridge's last poll still read pending.
+        2: { turns: [[UNCOMMITTED, { do: 'tool', command: 'while [ ! -e gate ]; do sleep 0.05; done' }, SUBMIT], [], [SUBMIT]] },
+      }),
+    });
+    const expired = f.controller('T-1-a1');
+    const late = f.controller('T-2-a1');
+    await Promise.all([expired.start(specOf(f, 1)), late.start(specOf(f, 2))]);
+    await waitFor(() =>
+      f.events('attempt.activity').some((event) => event.attemptId === 'T-2-a1' && event.data.summary.includes('gate')),
+    );
+    expect(await late.submit(submission(2))).toMatchObject({ ok: true, outcome: { ok: false, error: 'dirty' } });
+    writeFileSync(join(f.paths.clone(FIXTURE_PROJECT, 'T-2-a1'), 'gate'), '');
+    await waitFor(() => turnsEnded(f, 'T-1-a1') === 1 && turnsEnded(f, 'T-2-a1') === 1);
+    await Bun.sleep(400);
+    // Each turn ended on a submit that answered pending.
+    for (const n of [1, 2]) expect([n, userTexts(f, `T-${n}-a1`)]).toEqual([n, [PROMPT]]);
+    for (const [n, controller] of [[1, expired], [2, late]] as const) {
+      expect(await controller.deliver({ fence: { epoch: 1, counter: 1 }, messages: [failures[n]], more: 0 })).toEqual({ ok: true });
+    }
+    await waitFor(() => turnsEnded(f, 'T-1-a1') === 3 && turnsEnded(f, 'T-2-a1') === 3);
+    await Bun.sleep(400);
+    for (const n of [1, 2] as const) {
+      expect([n, userTexts(f, `T-${n}-a1`)]).toEqual([n, [PROMPT, failures[n].text, continuationPrompt(['A1'])]]);
+    }
+  });
+
   test('after a successful submit and its hold no continuation follows, though a message started another turn', async () => {
     const message = { messageId: 8, authority: 'person' as const, text: 'Thanks; anything left?' };
     const f = await createRunnerFixture({
