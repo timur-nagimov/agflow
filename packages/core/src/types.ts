@@ -565,6 +565,12 @@ export interface SubmissionCheck {
   durationMs: number;
   /** The end of the command's output, at most 4 KB. */
   tail: string;
+  /**
+   * The check's own files that the branch changes, when the check passed: .agflow/config.json, which names the check,
+   * and any file its command names, such as scripts/check.sh. Absent when there are none. AGFLOW_AUTO_ACCEPT leaves
+   * such a submission to the lead, since a check the agent changed cannot vouch for its work.
+   */
+  ownFilesChanged?: string[];
 }
 
 export interface LeadSeat {

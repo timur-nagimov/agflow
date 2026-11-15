@@ -38,6 +38,13 @@ export function isAncestor(git: MergeGit, ancestor: string, descendant: string):
   return gitOk(git.local, [`--git-dir=${git.vault.path}`, 'merge-base', '--is-ancestor', ancestor, descendant]);
 }
 
+/** The files that differ between two commits in the vault, a rename as its old and new path. */
+export async function changedFiles(git: MergeGit, from: string, to: string): Promise<string[]> {
+  const args = [`--git-dir=${git.vault.path}`, 'diff-tree', '-r', '--name-only', '--no-renames', '-z', from, to];
+  const { stdout } = await runGit(git.local, args);
+  return stdout.split('\0').filter((path) => path !== '');
+}
+
 /** main's commit in the vault. */
 export async function mainOf(git: MergeGit): Promise<string> {
   const sha = await commitOf(git, `refs/heads/${git.vault.mainBranch}`);

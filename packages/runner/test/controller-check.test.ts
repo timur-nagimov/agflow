@@ -2,6 +2,7 @@ import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { join } from 'node:path';
 import type { FakeStep } from '@agflow/testkit';
 import { commitFiles, fileAt, gitIn } from '@agflow/testkit';
+import { checkOwnFiles } from '../src/attempt/submit';
 import { resolveRestoreBase } from '../src/git/protect';
 import { runGit } from '../src/git/run';
 import { createDependencyPreparer } from '../src/prep/preparer';
@@ -48,11 +49,17 @@ const originRef = (f: RunnerFixture, ref: string) =>
  */
 async function workedOn(
   check: string | null,
-  options: { checkMinutes?: number; sandbox?: boolean; files?: Record<string, string>; profile?: 'open' } = {},
+  options: {
+    checkMinutes?: number;
+    sandbox?: boolean;
+    files?: Record<string, string>;
+    profile?: 'open';
+    turn?: FakeStep[];
+  } = {},
 ) {
   const f = await createRunnerFixture({
     files: { ...files(check), ...options.files },
-    script: { turns: [COMMITTED] },
+    script: { turns: [options.turn ?? COMMITTED] },
     config: {
       ...(options.checkMinutes === undefined ? {} : { checkMinutes: options.checkMinutes }),
       ...(options.profile === undefined ? {} : { profile: options.profile }),
@@ -82,7 +89,8 @@ async function workedOn(
 
 describe('the check at submission', () => {
   test('a check that passes lets the submission go, and its result travels with it', async () => {
-    const command = 'test -f src/app.ts && test -z "$AGFLOW_AGENT_TOKEN" && echo checked';
+    // It names no file the branch changes, so the check has no own files changed.
+    const command = 'test -f README.md && test -z "$AGFLOW_AGENT_TOKEN" && echo checked';
     const { f, submit } = await workedOn(command);
     const head = await gitIn(cloneOf(f), ['rev-parse', 'HEAD']);
     const outcome = await submit();
@@ -90,6 +98,28 @@ describe('the check at submission', () => {
     expect(outcome.check).toEqual({ status: 'passed', command, durationMs: expect.any(Number), tail: 'checked' });
     expect(await originRef(f, `refs/heads/${BRANCH}`)).toBe(head);
     expect(f.events('attempt.submitted').map((event) => event.data.check?.status)).toEqual(['passed']);
+  });
+
+  test("a passed check names the check's own files the branch changes: the agent may have made it pass", async () => {
+    const weakened: FakeStep[] = [
+      { do: 'write', path: 'scripts/check.sh', content: 'echo all good; exit 0\n' },
+      { do: 'write', path: 'src/app.ts', content: 'broken\n' },
+      { do: 'commit', message: 'make the check pass' },
+    ];
+    const { submit } = await workedOn('bash scripts/check.sh', {
+      files: { 'scripts/check.sh': 'echo failing; exit 1\n' },
+      turn: weakened,
+    });
+    const outcome = await submit();
+    expect(outcome).toMatchObject({ ok: true, error: null });
+    expect(outcome.check).toMatchObject({ status: 'passed', tail: 'all good', ownFilesChanged: ['scripts/check.sh'] });
+  });
+
+  test('the check\'s own files are .agflow/config.json and the files its command names', () => {
+    const changed = ['.agflow/config.json', 'scripts/check.sh', 'scripts/lint.sh', 'src/app.ts'];
+    expect(checkOwnFiles('bash scripts/check.sh', changed)).toEqual(['.agflow/config.json', 'scripts/check.sh']);
+    expect(checkOwnFiles('./scripts/lint.sh && bun test', changed)).toEqual(['.agflow/config.json', 'scripts/lint.sh']);
+    expect(checkOwnFiles('bun test', ['src/app.ts', 'src/app.test.ts'])).toEqual([]);
   });
 
   test('a failing check refuses the submission with the last 60 lines of its output, and nothing is pushed', async () => {

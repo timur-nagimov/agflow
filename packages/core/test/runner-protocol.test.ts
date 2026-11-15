@@ -953,7 +953,11 @@ describe('runner events', () => {
     expect(parses(submitted({ check }))).toBe(true);
     expect(parses(submitted({ check: { status: 'none', command: null, durationMs: 0, tail: '' } }))).toBe(true);
     expect(parses(submitted({ check: { ...check, tail: 'x'.repeat(CHECK_TAIL_MAX) } }))).toBe(true);
+    // A passed check may name the check's own files that the branch changes.
+    expect(parses(submitted({ check: { ...check, ownFilesChanged: ['scripts/check.sh'] } }))).toBe(true);
     for (const bad of [
+      { ...check, ownFilesChanged: [] },
+      { ...check, ownFilesChanged: [''] },
       { ...check, tail: 'x'.repeat(CHECK_TAIL_MAX + 1) },
       { ...check, status: 'skipped' },
       { ...check, command: '' },

@@ -4,12 +4,14 @@ import { getAttempt } from '../src/attempt-store';
 import { mintAgentToken } from '../src/auth';
 import { situationReport } from '../src/brief';
 import { pendingCommands, recordResult } from '../src/commands';
+import { demoCheckContract } from '../src/demo-check';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
 import { listMessages } from '../src/messages';
 import { findSubmission } from '../src/submission-store';
 import { requestSubmission } from '../src/submissions';
 import { getTask } from '../src/task-store';
+import { createTasks } from '../src/tasks';
 import { type RunnerAttempt, addRunnerAttempt, addRunnerLead } from './helpers';
 import { createTestHub } from './http-helpers';
 
@@ -88,6 +90,26 @@ describe('AGFLOW_AUTO_ACCEPT', () => {
     expect(told?.body).toContain('No check ran: .agflow/config.json on main names none.');
     const older = submit(hub, null);
     expect(getTask(hub.ctx, older.held.task.id).status).toBe('submitted');
+  });
+
+  test("a passed check whose own files the branch changes goes to the lead, which is told to read them", () => {
+    const hub = createTestHub({ autoAccept: true });
+    const command = 'bash scripts/check.sh';
+    const changed: SubmissionCheck = { ...passed, command, ownFilesChanged: ['scripts/check.sh'] };
+    const { held } = submit(hub, changed);
+    expect(getTask(hub.ctx, held.task.id).status).toBe('submitted');
+    const [told] = toLead(hub);
+    expect(told?.body).toContain("The runner's check `bash scripts/check.sh` passed in 4 s.");
+    expect(told?.body).toContain("Its branch changes the check's own files (scripts/check.sh): read those changes");
+  });
+
+  test('a demo check whose check passed goes to the lead with its summary, which lists the defects', () => {
+    const hub = createTestHub({ autoAccept: true });
+    const [demo] = createTasks(hub.ctx, [demoCheckContract(5, hub.ctx.now(), null)], 'system');
+    const { held } = submit(hub, passed, addRunnerAttempt(hub.ctx, { taskId: demo?.id }));
+    expect(getTask(hub.ctx, held.task.id).status).toBe('submitted');
+    const [told] = toLead(hub).filter((message) => message.body.includes('was submitted by'));
+    expect(told?.body).toContain(work.summary);
   });
 
   test("without it, the lead reviews a submission whose check passed, and its message names the check", () => {

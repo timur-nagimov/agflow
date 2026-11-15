@@ -69,7 +69,7 @@ import { lsRemote, pushLateWork, pushSubmission, type PushResult, pushWip, type 
 import { detectProtected, resolveRestoreBase, restoreProtected } from '../git/protect';
 import { type GitEnvironment, runGit } from '../git/run';
 import { cloneExists, moveTaskClone } from '../git/clone';
-import { isAncestor, mainOf, mergeMainInto } from '../git/merge';
+import { changedFiles, isAncestor, mainOf, mergeMainInto } from '../git/merge';
 import type { Vault } from '../git/vault';
 import type { RunnerHubHttp } from '../hub-http';
 import type { Logger } from '../log';
@@ -96,6 +96,7 @@ import {
 import {
   checkFailedDetail,
   checkOf,
+  checkOwnFiles,
   conflictDetail,
   dirtyDetail,
   isOwnBranch,
@@ -1129,8 +1130,9 @@ export class AttemptController {
    * A submission's merge of main and its check (design 6.13). Unless the branch holds main already, main merges into
    * it in the vault, and the clone moves to the merge commit while the agent's groups are paused; a conflict changes
    * nothing. The project's check then runs in the clone, after the dependencies are prepared again when main merged
-   * in. Gives the merge commit and its tree, null when the branch held main, or the refusal: merge_conflict naming the
-   * files, or check_failed with the end of the output. Each gives what the check gave.
+   * in. A check that passed names the check's own files the branch changes (checkOwnFiles): the branch may have
+   * weakened it. Gives the merge commit and its tree, null when the branch held main, or the refusal: merge_conflict
+   * naming the files, or check_failed with the end of the output. Each gives what the check gave.
    */
   private async mergeAndCheck(
     spec: Omit<AttemptSpec, 'agentToken'>,
@@ -1167,7 +1169,12 @@ export class AttemptController {
     if (ran.refusal !== null) {
       return { ok: false, error: 'check_failed', head: merge?.sha ?? head, detail: ran.refusal, check: ran.check };
     }
-    return { ok: true, merge, check: ran.check };
+    let check = ran.check;
+    if (check.status === 'passed' && check.command !== null) {
+      const own = checkOwnFiles(check.command, await changedFiles(git, main, merge?.sha ?? head));
+      if (own.length > 0) check = { ...check, ownFilesChanged: own };
+    }
+    return { ok: true, merge, check };
   }
 
   /**

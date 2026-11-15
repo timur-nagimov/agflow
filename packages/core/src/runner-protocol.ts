@@ -879,6 +879,7 @@ export const SubmissionCheckSchema = schemaFor<SubmissionCheck>()(
     command: Name.nullable(),
     durationMs: NonNegativeInt,
     tail: z.string().max(CHECK_TAIL_MAX),
+    ownFilesChanged: z.array(Name).min(1).optional(),
   }),
 );
 

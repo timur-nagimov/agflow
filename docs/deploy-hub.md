@@ -286,9 +286,11 @@ after a change. The details are in the
   accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
   `.agflow/config.json` on `main`, such as `"check": "bun test"`; a submission without one goes to the lead as before.
-  A runner gives a check `checkMinutes` (10 by default, in `runner.json`) out of the 15 minutes it gives a whole
-  submission, push included, so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long. Risk: the check is the
-  only review, so whatever it does not test is accepted unseen.
+  So does a submission whose branch changes the check's own files, `.agflow/config.json` or a file the check command
+  names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. A runner gives a check
+  `checkMinutes` (10 by default, in `runner.json`) out of the 15 minutes it gives a whole submission, push included,
+  so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long. Risk: the check is the only review, so whatever it
+  does not test is accepted unseen.
 
 Two more settings are on by default:
 
@@ -309,8 +311,9 @@ Two more settings are on by default:
   in `SPEC.md`, saves a screenshot of every screen under `docs/qa/<time>/`, records each requirement in
   `docs/STATUS.md` as working, broken or missing, and lists every defect with steps to reproduce in its submission. It
   may change only those files and `scripts/demo.sh`, which no runner profile protects. It runs at priority 1,
-  preferably on the vendor that implemented fewer of the last N tasks, and the lead turns its defects into fix tasks.
-  `0` turns it off. Risk: none beyond an agent's usual work; it costs one task's quota every N tasks.
+  preferably on the vendor that implemented fewer of the last N tasks. The lead reviews it, even with
+  `AGFLOW_AUTO_ACCEPT=1`, and turns its defects into fix tasks. `0` turns it off. Risk: none beyond an agent's usual
+  work; it costs one task's quota every N tasks.
 
 ### What agents fetched
 

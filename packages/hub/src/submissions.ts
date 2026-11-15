@@ -166,7 +166,11 @@ function checkLine(check: SubmissionCheck | null | undefined): string {
     return `No check ran${check.command ? ` (\`${check.command}\`)` : ''}:\n${quoteLines(clip(check.tail, 600))}\n`;
   }
   const seconds = Math.round(check.durationMs / 1000);
-  return `The runner's check \`${check.command}\` ${check.status} in ${seconds} s.\n`;
+  const own = check.ownFilesChanged
+    ? `Its branch changes the check's own files (${check.ownFilesChanged.join(', ')}): read those changes before you ` +
+      'accept it.\n'
+    : '';
+  return `The runner's check \`${check.command}\` ${check.status} in ${seconds} s.\n${own}`;
 }
 
 /** The runner's check, stored with its submission as it reported it. */
@@ -217,7 +221,8 @@ function recordable(task: Task, attempt: Attempt | null, submission: SubmissionR
  * with its branch head and its work position, and the attempt holds (hold_attempt). A recorded stop is dropped, with
  * its stop_attempt if the runner has not taken it; the requester of one held back for the submission is told. The lead
  * is told, as in M1, with the runner's check; with AGFLOW_AUTO_ACCEPT a submission whose check passed is accepted
- * instead, as a lead's accept would, and the lead hears of it in its next situation report.
+ * instead, as a lead's accept would, and the lead hears of it in its next situation report. A branch that changes the
+ * check's own files, and a demo check, go to the lead all the same.
  */
 function recordSuccess(
   ctx: HubContext,
@@ -266,7 +271,13 @@ function recordSuccess(
         `${submission.id} was recorded, and ${task.id} is up for review.`,
     });
   }
-  const autoAccepted = ctx.config.autoAccept === true && outcome.check?.status === 'passed';
+  // A check the branch changed vouches for nothing, and a demo check, the only task the system creates, lists defects
+  // for the lead to turn into tasks: both go to the lead.
+  const autoAccepted =
+    ctx.config.autoAccept === true &&
+    outcome.check?.status === 'passed' &&
+    outcome.check.ownFilesChanged === undefined &&
+    task.createdBy !== 'system';
   if (!autoAccepted) {
     refreshLeadSubmission(ctx, task.id, branch);
     insertMessage(ctx, emit, {

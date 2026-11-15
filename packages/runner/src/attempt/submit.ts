@@ -10,7 +10,8 @@
 // clone. The project's check (.agflow/config.json on main) runs in the clone on the result, after the dependencies are
 // prepared again when main merged in, and a failure of either refuses the submission with check_failed and the end of
 // its output. Under the open profile a failed preparation refuses nothing: the check runs anyway, and its output ends
-// with a note of the failure. What the check gave travels with the outcome either way.
+// with a note of the failure. What the check gave travels with the outcome either way; a passed one names the check's
+// own files that the branch changes (checkOwnFiles), which keep the hub from accepting it by itself.
 // The task branch and the WIP ref then move together under the stale-lease rules (pushSubmission). Remote failures
 // are retried with a doubling delay until submitRetry has passed since the submission began (remote) or a stop or
 // hold for the attempt arrives (interrupted); a refusal that cannot clear (the attempt was fenced, ended or exited)
@@ -21,6 +22,7 @@ import { mergeBase } from '../git/protect';
 import type { SubmitPushOutcome } from '../git/push';
 import { type GitEnvironment, runGit } from '../git/run';
 import type { Vault } from '../git/vault';
+import { PREP_CONFIG_PATH } from '../prep/config';
 import type { CheckRun } from '../seams';
 import { clip } from './pump';
 import { clipViolationPaths } from './workspace';
@@ -149,6 +151,16 @@ export function noCheck(command: string | null, why: string): SubmissionCheck {
 export function checkOf(command: string, run: CheckRun): SubmissionCheck {
   const passed = run.code === 0 && run.signal === null && !run.timedOut;
   return { status: passed ? 'passed' : 'failed', command, durationMs: Math.round(run.durationMs), tail: checkTail(run.logTail) };
+}
+
+/**
+ * The check's own files among those a branch changes: .agflow/config.json, which names the check, and any file the
+ * command names as a word, such as scripts/check.sh in `bash scripts/check.sh`. Files the check reaches only another
+ * way, such as a script that check.sh calls or a test, are not among them.
+ */
+export function checkOwnFiles(command: string, changed: readonly string[]): string[] {
+  const words = new Set(command.split(/[\s;&|()<>'"`]+/).map((word) => word.replace(/^(?:\.\/)+/, '')));
+  return changed.filter((path) => path === PREP_CONFIG_PATH || words.has(path));
 }
 
 /** check_failed's detail: how the check failed, what the agent does about it, and the end of its output. */

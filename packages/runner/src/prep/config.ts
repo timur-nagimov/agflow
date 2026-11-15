@@ -5,7 +5,8 @@ import { z } from 'zod';
 import { runGit } from '../git/run';
 import type { Vault } from '../git/vault';
 
-const CONFIG_PATH = '.agflow/config.json';
+/** Where the config lives in the repository. */
+export const PREP_CONFIG_PATH = '.agflow/config.json';
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const WhenPath = z
   .string()
@@ -48,7 +49,7 @@ export async function readPrepConfig(vault: Vault, baseSha: string): Promise<Pre
   try {
     if (!/^[a-f0-9]{40}$/.test(baseSha)) throw new Error('expected a full restore-base commit sha');
     const git = async (args: string[]) => (await runGit(vault.local, ['--git-dir', vault.path, ...args])).stdout;
-    const entry = await git(['ls-tree', '-z', baseSha, '--', CONFIG_PATH]);
+    const entry = await git(['ls-tree', '-z', baseSha, '--', PREP_CONFIG_PATH]);
     if (entry === '') return null;
     const match = entry.match(/^(100644|100755) blob ([a-f0-9]{40})\t\.agflow\/config\.json\0$/);
     if (!match) throw new Error('must be a regular file');
@@ -65,6 +66,6 @@ export async function readPrepConfig(vault: Vault, baseSha: string): Promise<Pre
     }
     return parsed.data;
   } catch (error) {
-    throw new Error(`${CONFIG_PATH}: ${(error as Error).message}`, { cause: error });
+    throw new Error(`${PREP_CONFIG_PATH}: ${(error as Error).message}`, { cause: error });
   }
 }
