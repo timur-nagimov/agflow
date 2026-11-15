@@ -477,7 +477,10 @@ describe('buildQueryOptions', () => {
 });
 
 describe('claudeMdExcludes', () => {
-  /** Whether a pattern of the list matches the path, as the CLI's picomatch would: Bun.Glob agrees on these. */
+  /**
+   * Whether a pattern of the list matches the path. Bun.Glob stands in for the CLI's picomatch: they agree on these
+   * patterns, but Bun.Glob also reads a raw |, + or " as itself, so only a pattern's text shows those escapes.
+   */
   const excludedBy = (patterns: string[]) => {
     const globs = patterns.map((pattern) => new Bun.Glob(pattern));
     return (path: string) => globs.some((glob) => glob.match(path));
@@ -528,6 +531,11 @@ describe('claudeMdExcludes', () => {
     expect(excluded('/Users/a [b]/c/*?(e)/CLAUDE.md')).toBe(false);
     expect(excluded('/Users/a [b]/{c,d}/xy(e)/CLAUDE.md')).toBe(false);
     expect(excluded(`${clone}/CLAUDE.md`)).toBe(false);
+    // picomatch takes a raw | as alternation, a + after a bracket as a quantifier and a " as a quote.
+    const odd = claudeMdExcludes('/Users/a|b/x]+y/"q"/T-1-a1');
+    expect(odd.slice(0, 4)).toEqual(filesOf('/Users/a[|]b/x[]][+]y/["]q["]'));
+    expect(excludedBy(odd)('/Users/a|b/x]+y/"q"/.claude/rules/x.md')).toBe(true);
+    expect(excludedBy(odd)('/Users/a|b/x]+y/"q"/T-1-a1/CLAUDE.md')).toBe(false);
   });
 });
 

@@ -181,10 +181,11 @@ const INSTRUCTION_FILES = ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md', 
 
 /**
  * A path as a glob that matches only itself. The CLI matches with picomatch and turns every backslash of a pattern
- * into a slash, so a metacharacter is escaped as a bracket of its own.
+ * into a slash, so a metacharacter is escaped as a bracket of its own. picomatch also reads a | as regex alternation,
+ * a + after a bracket as a quantifier and a " as the start of a quoted string, so those are escaped too.
  */
 function literalGlob(path: string): string {
-  return path.replace(/[*?[\]{}()]/g, (character) => `[${character}]`);
+  return path.replace(/[*?[\]{}()|+"]/g, (character) => `[${character}]`);
 }
 
 /**
