@@ -25,7 +25,7 @@ import {
 import { z } from 'zod';
 import { HubClientError } from '../hub-client';
 import { saveInside, savePathSegments } from './save-file';
-import { type ToolContext, type ToolDef, ToolError, asAgent, defineTool, leadTools, lines, oneLine, sharedTools, workerTools } from './tools';
+import { type ToolContext, type ToolDef, ToolError, asAgent, defineTool, evidenceInput, leadTools, lines, oneLine, sharedTools, workerTools } from './tools';
 
 /** What the runner tells its bridge through the agent environment. */
 export interface RunnerBridgeSettings {
@@ -161,7 +161,7 @@ const submit = defineTool(
   {
     task_id: TaskIdSchema,
     summary: z.string().min(1).max(8000),
-    evidence: z.array(z.string().min(1).max(2000)).max(50).optional(),
+    evidence: evidenceInput,
   },
   async ({ task_id, summary, evidence }, ctx) => {
     const { runner } = runnerContext(ctx);
@@ -173,9 +173,13 @@ const submit = defineTool(
         : submission;
     if (!decided) return `${SUBMISSION_PENDING} (${submission.id} of ${task_id}).`;
     if (decided.status === 'failed') throw new ToolError(submissionRefusal(decided));
-    const done = `${decided.taskId} submitted at ${decided.headSha ?? 'an unknown commit'} (${decided.id}).`;
-    // The hub accepts a submission whose check passed as it records it (AGFLOW_AUTO_ACCEPT): the task's status says.
+    // The hub accepts a submission whose check passed as it records it (AGFLOW_AUTO_ACCEPT), and closes a review task
+    // as it records the reviewer's verdict: the task's status says.
     const status = await client.task(decided.taskId).then(({ task }) => task.status, () => null);
+    if (status === 'cancelled') {
+      return `agflow recorded your submission ${decided.id} and closed ${decided.taskId}. Your work on it is done, so end your turn.`;
+    }
+    const done = `${decided.taskId} submitted at ${decided.headSha ?? 'an unknown commit'} (${decided.id}).`;
     if (status === null) return `${done} Your work on it is done, so end your turn.`;
     const accepted = AUTO_ACCEPTED[status];
     if (accepted) {
@@ -249,15 +253,15 @@ const requestAgents = defineTool(
   },
 );
 
+/** No hold: only a person holds a task (Stop and hold in the browser), so the lead stops, cancels or amends instead. */
 const stopAgent = defineTool(
   'stop_agent',
-  'Lead: stop a worker running on a runner. It writes a handoff note first; with hold, its task waits for people instead of going to the next worker.',
-  { agent_id: AgentIdSchema, reason: z.string().min(1).max(4000), hold: z.boolean().optional() },
-  async ({ agent_id, reason, hold }, ctx) => {
-    const { attempt } = await asAgent(ctx).stopAgent(agent_id, { reason, hold: hold ?? false });
-    const held = hold ? ', and its task is held for people' : '';
+  'Lead: stop a worker running on a runner. It writes a handoff note first, and its task goes to the next worker.',
+  { agent_id: AgentIdSchema, reason: z.string().min(1).max(4000) },
+  async ({ agent_id, reason }, ctx) => {
+    const { attempt } = await asAgent(ctx).stopAgent(agent_id, { reason });
     const deferred = attempt.stopRequested?.deferred ? ' It waits until the submission it has pending is decided.' : '';
-    return `Asked agflow to stop ${agent_id} (attempt ${attempt.id})${held}.${deferred}`;
+    return `Asked agflow to stop ${agent_id} (attempt ${attempt.id}).${deferred}`;
   },
 );
 
@@ -279,7 +283,7 @@ const replaceAgent = defineTool(
  */
 const leadHandoff = defineTool(
   'write_handoff',
-  "Leave your lead handoff for the next lead: the plan's state, decisions, what you are waiting for, the next step. A lead holds no task, so task_id is refused: for a note on a task, use send_message to \"task:T-<n>\".",
+  "Leave your lead handoff for the next lead: the next step and what you are waiting for first, then the plan's state and decisions. A lead holds no task, so task_id is refused: for a note on a task, use send_message to \"task:T-<n>\".",
   { note: z.string().min(1).max(16_000), task_id: TaskIdSchema.optional() },
   async ({ note, task_id }, ctx) => {
     if (task_id) {

@@ -85,12 +85,13 @@ describe.skipIf(bin === null)('the real app-server at start', () => {
       await log.next('turn_ended');
       const untrusted = projectConfigVerified ? [] : [expect.stringContaining('the thread runs untrusted')];
       expect(log.of('warning').map((event) => event.text)).toEqual(untrusted);
-      // Only a trusted thread reads the project's config (effort 'high'); an untrusted one keeps the default.
-      const reasoning = { effort: projectConfigVerified ? 'high' : 'low' };
+      // Only a trusted thread reads the project's config (verbosity 'high'); an untrusted one keeps the default. Either
+      // way the runner's effort for a standard task, medium, wins over the project's and over the model's own, low.
+      const body = { reasoning: { effort: 'medium' }, text: { verbosity: projectConfigVerified ? 'high' : 'low' } };
       expect(h.provider.requests[0]).toMatchObject({
         model: a.launch.model,
         threadId: session.sessionRef,
-        body: { reasoning },
+        body,
       });
       // The repo skill loads either way (design 9.2), and the skills check allowed it.
       expect(JSON.stringify(h.provider.requests[0]!.body.input)).toContain(REPO_SKILL_MARKER);
@@ -106,13 +107,13 @@ describe.skipIf(bin === null)('the real app-server at start', () => {
       const resumedLog = new EventLog(resumed.events);
       expect(resumed.sessionRef).toBe(session.sessionRef);
       expect(await resumedLog.next('started')).toMatchObject({ sessionRef: session.sessionRef });
-      // A resume sends no prompt of its own. The resumed thread applies the same trust: its next request carries the
-      // same effort.
+      // A resume sends no prompt of its own. The resumed thread applies the same trust and effort: its next request
+      // carries the same settings.
       expect(h.provider.requests).toHaveLength(1);
       await resumed.send({ id: 'msg-1', text: 'Carry on.', authority: 'person' });
       await resumedLog.next('turn_ended');
       expect(h.provider.requests).toHaveLength(2);
-      expect(h.provider.requests[1]).toMatchObject({ threadId: session.sessionRef, body: { reasoning } });
+      expect(h.provider.requests[1]).toMatchObject({ threadId: session.sessionRef, body });
       expect(h.provider.requests[1]!.instructions).toContain(codexToolsNote(a.launch.bridge.tools));
       await resumed.close();
       await resumedLog.done;

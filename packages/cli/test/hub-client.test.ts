@@ -161,7 +161,8 @@ describe('HubClient for runner agents', () => {
     const first = hub.runnerAgent();
     const second = hub.runnerAgent();
     expect(await lead.client.staffing({ count: 2, reason: 'two ready tasks' })).toEqual({ running: expect.any(Number), target: 2 });
-    const stopped = await lead.client.stopAgent(first.agent.id, { reason: 'wrong approach', hold: false });
+    // No hold: only a person holds a task.
+    const stopped = await lead.client.stopAgent(first.agent.id, { reason: 'wrong approach' });
     expect(stopped.attempt).toMatchObject({ id: first.attempt.id, stopRequested: expect.objectContaining({ cause: 'stop' }) });
     const replaced = await lead.client.replaceAgent(second.agent.id, 'stuck for an hour');
     expect(replaced.attempt).toMatchObject({ id: second.attempt.id, stopRequested: expect.objectContaining({ cause: 'replace' }) });

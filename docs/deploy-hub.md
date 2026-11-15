@@ -436,7 +436,9 @@ Before the run, check four things:
 - `hub.env` keeps one line per key: the deployment (`activate.sh`) refuses a file that sets a key twice, so change the
   line that is there, such as `AGFLOW_MAX_WORKERS=4`, rather than add another.
 - The hub and every runner run this release, the hub upgraded first: only runners of runner protocol 4 check `main`
-  after a merge, and only those whose `agflow runner status` shows the dependencies available.
+  after a merge, and only those whose `agflow runner status` shows the dependencies available. A runner of this
+  release keeps prompting an agent to continue when its slow submission fails, so a `timings.bridgePollMax` raised in
+  `runner.json` to cover that is no longer needed.
 
 ### What agents fetched
 

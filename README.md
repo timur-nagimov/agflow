@@ -104,7 +104,7 @@ agflow runner setup
 agflow runner status
 ```
 
-Setup records the machine identity, login-shell PATH, proxy/certificate settings and git commit identity in `~/.agflow/runner/runner.json` (mode 0600). Defaults include capacity 2, keep-awake on AC and paid usage off. It installs pinned vendor binaries into its own vendor directory, logs in to separate runner vendor homes, and installs the service: the macOS LaunchAgent, or a systemd user unit on Linux, where Codex signs in with a device code and Claude with a `claude setup-token` token ([Linux runner](docs/linux-runner.md)). It leaves your own vendor installations alone. `--relogin` repeats vendor logins; `--no-service` omits service installation; `--yes` accepts setup defaults.
+Setup records the machine identity, login-shell PATH, proxy/certificate settings and git commit identity in `~/.agflow/runner/runner.json` (mode 0600). Defaults include capacity 2, keep-awake on AC and paid usage off. It installs pinned vendor binaries into its own vendor directory, logs in to separate runner vendor homes, and installs the service: the macOS LaunchAgent, or a systemd user unit on Linux, where Codex signs in with a device code and Claude with a `claude setup-token` token ([Linux runner](docs/linux-runner.md)). It leaves your own vendor installations alone, and agents do not read your own instructions: Claude agents skip the `CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md` and `.claude/rules` of every directory above their clone, such as your `~/.claude/rules`, and read only the project's. `--relogin` repeats vendor logins; `--no-service` omits service installation; `--yes` accepts setup defaults.
 
 Flags answer setup's questions and set the rest of `runner.json`: `--name <name>`, `--capacity <1-16>`, `--ceiling <0.5-1>` (both quota windows of both vendors), `--keep-awake always|ac|off` and `--profile standard|auto|open`. `--preset hackathon` means capacity 6, ceilings 1, keep-awake always and the open profile; a flag given beside it wins. Rerunning setup with flags changes a kept `runner.json` as local edits, which the hub hears at the runner's next connection. A rerun also records the login-shell PATH again, so tools installed since setup reach agents and dependency preparation. While the runner runs, setup refuses flags that would change `runner.json` and keeps its PATH: stop it first with `agflow runner stop`.
 
@@ -145,9 +145,11 @@ agflow start --spec brief.pdf --spec https://example.com/rules.html --repo acme/
   `textutil`. SPEC.md holds their text, and the originals go to `docs/spec/`. A file with no text, such as an image or
   a scanned PDF, gets a section in SPEC.md that asks the first task to transcribe it.
 - **The seed commit.** SPEC.md, `docs/spec/`, AGENTS.md (the stack, where things go, the commands and the definition
-  of done), a CLAUDE.md that includes it, `.agflow/config.json` (dependency preparation runs `scripts/install.sh`, and
-  the check is `bash scripts/check.sh`), `scripts/install.sh`, `scripts/check.sh`, `scripts/demo.sh` and a
-  `.gitignore`. The scripts do nothing in an empty project and run the stack's tools once its manifest exists:
+  of done: every acceptance criterion seen to hold through the product's real entry point, inputs beyond the spec's
+  examples, a test for each criterion that is never weakened, no stub or TODO, the whole diff read), a CLAUDE.md that
+  includes it, `.agflow/config.json` (dependency preparation runs `scripts/install.sh`, and the check is
+  `bash scripts/check.sh`), `scripts/install.sh`, `scripts/check.sh`, `scripts/demo.sh` and a `.gitignore`. The
+  scripts do nothing in an empty project and run the stack's tools once its manifest exists:
   `--stack python` runs uv, pytest and ruff; `--stack typescript` runs Bun or npm, the tests and tsc; any other text
   gets scripts that say what to fill in. The seed goes on the hub's main branch (`AGFLOW_MAIN_BRANCH`, `main` by
   default), the one its attempts start from: the first commit of an empty repository, or a new commit on top of that
@@ -290,7 +292,7 @@ For a hackathon run unattended, [Hackathon settings](docs/deploy-hub.md#hackatho
 
 Behind a proxy, set `AGFLOW_PUBLIC_URL` to the address people open in the browser, with `https://` if the proxy terminates TLS. A signed-in browser can change things only from the hub's own pages, which the hub recognises by this address or by the request's Host header.
 
-Durations use the units in their variable names. Production minimums are tick 5 seconds, recovery 30 seconds, and runner lease, stall, approval and submit timeout 5 minutes each. Runner profiles/models and local settings live in `runner.json`; M2 shows profiles in the UI but does not edit them there.
+Durations use the units in their variable names. Production minimums are tick 5 seconds, recovery 30 seconds, and runner lease, stall, approval and submit timeout 5 minutes each. Runner profiles/models and local settings live in `runner.json`; M2 shows profiles in the UI but does not edit them there. Codex agents, workers and leads, reason at effort medium (gpt-6.1-sol's own default is low), and on a strong task at high; Claude agents keep the CLI's default effort, and use xhigh on a strong task.
 
 ### GitHub sign-in
 

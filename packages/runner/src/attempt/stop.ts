@@ -41,12 +41,15 @@ export type StopOutcome =
   | { ok: true; stoppedBy: StoppedBy; exitedSeq: number }
   | { ok: false; error: 'stale_fence' | 'not_running' };
 
-/** The handoff turn's prompt: the hub's or the runner's reason, then what the note must hold. */
+/**
+ * The handoff turn's prompt: the hub's or the runner's reason, then what the note must hold, what is left first: a
+ * successor's brief quotes only the start of a note.
+ */
 export function handoffPrompt(reason: string): string {
   return (
     `agflow is stopping this attempt: ${reason}. Do not start new work. Call write_handoff now with a handoff note ` +
-    'for whoever continues: what you did, what is left, what you were about to do next, and anything that surprised ' +
-    'you. Your uncommitted work is saved for them.'
+    'for whoever continues: first what is still open and the next steps, since their brief shows only the start of ' +
+    'the note; then what you did, and anything that surprised you. Your uncommitted work is saved for them.'
   );
 }
 
