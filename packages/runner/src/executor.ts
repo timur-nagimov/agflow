@@ -8,7 +8,7 @@
 //   order, which is the hub's seq order; deliver, interrupt and decide_approval act on the live session at once.
 //   Different attempts run concurrently; the runner's own commands (refresh_vault, preflight, delete_refs,
 //   update_settings, merge_task) run one at a time. check_main runs apart from them, one check at a time: a check may
-//   take checkMinutes, and must never hold a merge back.
+//   take checkMinutes, and must never hold a merge back. One for a sha already queued or running joins that check.
 // - welcome.stop is applied before any command that follows the welcome: each attempt named there is marked ended at
 //   once, a live process is stopped without a handoff turn (its new work goes to a late-work ref), and later commands
 //   for it answer attempt_ended, except those that outlive an attempt: cleanup_attempt, upload_transcript and
@@ -178,6 +178,8 @@ export class CommandExecutor {
   private readonly held: (() => void)[] = [];
   /** The runner's own commands, one at a time. */
   private readonly runnerQueue = new SerialQueue();
+  /** main's checks queued or running, by sha. */
+  private readonly mainChecks = new Map<string, Promise<CommandResult>>();
   private paused = false;
   /** Each hello starts a new lineage: an update_settings taken before the latest one answers nothing (X-12). */
   private lineage = 0;
@@ -389,8 +391,7 @@ export class CommandExecutor {
   ): Promise<CommandResult | Waits | null> {
     const attemptId = attemptOf(command);
     if (attemptId === null) {
-      // On a queue of its own: the runner's other commands, merge_task among them, never wait for a check.
-      if (command.kind === 'check_main') return this.runnerQueue.run('main-check', () => this.checkMain(command));
+      if (command.kind === 'check_main') return this.queueMainCheck(command);
       return this.runnerQueue.run('runner', () => this.runnerCommand(commandId, command, execution));
     }
     // A command held by a pause meets a welcome.stop that came meanwhile.
@@ -495,6 +496,23 @@ export class CommandExecutor {
       default:
         return { ok: false, error: 'unsupported' };
     }
+  }
+
+  /**
+   * check_main, on a queue of its own: the runner's other commands, merge_task among them, never wait for a check. One
+   * for a sha already queued or running joins that check: the hub sends a new one when it cancelled the first, whose
+   * runner it saw go offline, and the runner, which never hears of that cancel, still runs the first.
+   */
+  private queueMainCheck(command: Extract<RunnerCommand, { kind: 'check_main' }>): Promise<CommandResult> {
+    const queued = this.mainChecks.get(command.sha);
+    if (queued) return queued;
+    const result = this.runnerQueue.run('main-check', () => this.checkMain(command));
+    this.mainChecks.set(command.sha, result);
+    const forget = () => {
+      if (this.mainChecks.get(command.sha) === result) this.mainChecks.delete(command.sha);
+    };
+    void result.then(forget, forget);
+    return result;
   }
 
   /** check_main: main's check at the sha; the result's data is a MainCheckResult. */

@@ -7,7 +7,7 @@
 import { type MainCheckResult, restoreSet } from '@agflow/core';
 import { removeTree } from './attempt/cleanup';
 import { clip } from './attempt/pump';
-import { checkOf, noCheck, prepFailedCheck } from './attempt/submit';
+import { checkEnding, checkOf, noCheck, prepFailedCheck } from './attempt/submit';
 import type { RunnerConfig } from './config';
 import { buildAgentEnv } from './env';
 import { createDetachedClone } from './git/clone';
@@ -64,8 +64,10 @@ function noted(output: string, note: string): string {
  * check_main: fetches main, then checks the sha in a fresh clone at paths.clone(project, MAIN_CHECK), made anew and
  * removed afterwards. The dependencies are prepared first, every entry of the config at the sha. A preparation that
  * fails fails the check, except under the open profile, where the check runs anyway and its output ends with a note of
- * the failure, as at a submission. A check that cannot run (no command, a config that does not read, a runner with no
- * sandbox, a failure to start it) is none, with why in its tail. Throws when the vault cannot get the sha.
+ * the failure, as at a submission. A check that failed gets a line after its output, before that note, on how it
+ * ended: it timed out, was killed, or exited with a code. A check that cannot run (no command, a config that does not
+ * read, a runner with no sandbox, a failure to start it) is none, with why in its tail. Throws when the vault cannot
+ * get the sha.
  */
 export async function checkMain(input: MainCheckInput): Promise<MainCheckResult> {
   const { sha, vault, preparer, config } = input;
@@ -100,7 +102,9 @@ export async function checkMain(input: MainCheckInput): Promise<MainCheckResult>
     const timeoutMs = Math.max(1, Math.round(config.checkMinutes * 60_000));
     try {
       const ran = await preparer.check({ clone, vault, command, env, timeoutMs });
-      return { sha, check: checkOf(command, { ...ran, logTail: noted(ran.logTail, note) }) };
+      // How it failed, as a submission's refusal says it: a check that timed out may have printed only passing tests.
+      const ending = checkOf(command, ran).status === 'failed' ? `The check ${checkEnding(ran, timeoutMs)}.` : '';
+      return { sha, check: checkOf(command, { ...ran, logTail: noted(noted(ran.logTail, ending), note) }) };
     } catch (error) {
       return { sha, check: noCheck(command, noted(`the runner could not run it: ${describe(error)}`, note)) };
     }

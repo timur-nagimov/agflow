@@ -69,11 +69,39 @@ describe("main's check", () => {
     expect(existsSync(cloneOf(f))).toBe(false);
   });
 
-  test('a check that fails gives failed with the end of its output', async () => {
+  test('a check that fails gives failed with the end of its output, and how it ended', async () => {
     const f = await createRunnerFixture({ files: files({ check: 'echo 1 test failed; exit 3' }) });
     const result = await check(f, await realPreparer(f));
-    expect(result.check).toMatchObject({ status: 'failed', command: 'echo 1 test failed; exit 3', tail: '1 test failed' });
+    expect(result.check).toMatchObject({
+      status: 'failed',
+      command: 'echo 1 test failed; exit 3',
+      tail: '1 test failed\nThe check exited with code 3.',
+    });
     expect(existsSync(cloneOf(f))).toBe(false);
+  });
+
+  test('a check that timed out or was killed says so after its output, which may show only passing tests', async () => {
+    const f = await createRunnerFixture({ files: files({ check: 'bun test' }) });
+    const runs = [
+      { code: null, signal: 'SIGTERM', timedOut: true, logTail: '12 pass', durationMs: 600_000 },
+      { code: null, signal: 'SIGKILL', timedOut: false, logTail: '12 pass', durationMs: 3 },
+    ];
+    const nothing = { ran: false, ok: true, error: null, logTail: null };
+    const preparer: DependencyPreparer = {
+      available: true,
+      prepare: async () => nothing,
+      prepareFresh: async () => nothing,
+      check: async () => runs.shift() as (typeof runs)[number],
+    };
+    // checkMinutes is 10 by default.
+    expect((await check(f, preparer)).check).toMatchObject({
+      status: 'failed',
+      tail: '12 pass\nThe check timed out after 10 min.',
+    });
+    expect((await check(f, preparer)).check).toMatchObject({
+      status: 'failed',
+      tail: '12 pass\nThe check was killed by SIGKILL.',
+    });
   });
 
   test('a preparation that fails fails the check under the standard profile, which then does not run', async () => {

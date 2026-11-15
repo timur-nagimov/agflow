@@ -588,6 +588,39 @@ describe('CommandExecutor', () => {
     expect(await held).toEqual({ ok: true, data: { status: 'merged', sha } });
   });
 
+  test('a check_main for a sha whose check is queued or running joins it, and one after it runs anew', async () => {
+    const config = JSON.stringify({ check: 'bun test' });
+    const f = await createRunnerFixture({ files: { 'README.md': '# demo\n', '.agflow/config.json': config } });
+    const checking = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let runs = 0;
+    const nothing = { ran: false, ok: true, error: null, logTail: null };
+    const preparer: DependencyPreparer = {
+      available: true,
+      prepare: async () => nothing,
+      prepareFresh: async () => nothing,
+      check: async () => {
+        runs += 1;
+        checking.resolve();
+        await release.promise;
+        return { code: 0, signal: null, timedOut: false, logTail: '1 pass', durationMs: 1_000 };
+      },
+    };
+    const run = new CommandExecutor({ ...executor(f).options, preparer });
+    const sha = f.origin.mainSha;
+    const check = { status: 'passed', command: 'bun test', durationMs: 1_000, tail: '1 pass' };
+    const passed = { ok: true, data: { sha, check } };
+    const first = run.onCommand(message({ kind: 'check_main', sha }));
+    await checking.promise;
+    // The hub cancelled the first, its runner seen offline, and sent the check again; the runner still runs the first.
+    const again = run.onCommand(message({ kind: 'check_main', sha }, 2));
+    release.resolve();
+    expect([await first, await again]).toEqual([passed, passed]);
+    expect(runs).toBe(1);
+    expect(await run.onCommand(message({ kind: 'check_main', sha }, 3))).toEqual(passed);
+    expect(runs).toBe(2);
+  });
+
   test('refreshes the vault, reports preflight, deletes with exact leases, and persists a settings echo with pending drain', async () => {
     const f = await createRunnerFixture();
     const x = executor(f);
