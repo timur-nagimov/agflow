@@ -11,6 +11,7 @@ import {
   type PermissionProfile,
   profileOf,
   standardProfile,
+  userRuntimeDir,
 } from '../src/profile';
 
 const CLONE = '/h/work/demo-0123456789/T-4-a1';
@@ -369,7 +370,7 @@ describe('denied paths', () => {
   const vendorHomes = { claude: '/h/runner/homes/claude', codex: '/h/runner/homes/codex' };
 
   test('reads: credentials, vendor state and the whole runner tree, under the given home and AGFLOW_HOME', () => {
-    expect(deniedReadPaths({ home: owner, paths, vendorHomes })).toEqual([
+    expect(deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'darwin' })).toEqual([
       tree(`${owner}/.ssh`),
       file(`${owner}/.netrc`),
       file(`${owner}/.git-credentials`),
@@ -386,6 +387,22 @@ describe('denied paths', () => {
       tree(`${owner}/.kube`),
       file(`${owner}/.docker/config.json`),
     ]);
+  });
+
+  test("reads on Linux: the user's runtime directory too, where the systemd manager listens", () => {
+    const mac = deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'darwin' });
+    expect(deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'linux' })).toEqual([
+      ...mac,
+      tree(userRuntimeDir()),
+    ]);
+    expect(userRuntimeDir({ XDG_RUNTIME_DIR: '/run/user/1000' }, 1000)).toBe('/run/user/1000');
+    expect(userRuntimeDir({}, 1001)).toBe('/run/user/1001');
+    // A relative value is no runtime directory.
+    expect(userRuntimeDir({ XDG_RUNTIME_DIR: 'run/user/1001' }, 1001)).toBe('/run/user/1001');
+    // Writes are the same on both.
+    expect(deniedWritePaths({ home: owner, paths, vendorHomes, platform: 'linux' })).toEqual(
+      deniedWritePaths({ home: owner, paths, vendorHomes, platform: 'darwin' }),
+    );
   });
 
   test('writes: runner state, vaults, vendor and CLI config, LaunchAgents and shell profiles', () => {

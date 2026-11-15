@@ -9,7 +9,7 @@ import {
   claudeSandboxSettings,
 } from '../../../src/adapters/claude/rules';
 import { runnerPaths } from '../../../src/paths';
-import { standardProfile } from '../../../src/profile';
+import { standardProfile, userRuntimeDir } from '../../../src/profile';
 
 // Paths that exist nowhere, so the rules come only from what the input says.
 const HOME = '/Users/owner';
@@ -189,7 +189,15 @@ describe('Claude sandbox settings', () => {
       strictAllowlist: false,
       allowLocalBinding: true,
     });
-    expect(claudeSandboxSettings(input({ platform: 'linux' }))).toEqual(claudeSandboxSettings(input()));
+    // The standard profile's sandbox is the Mac's, with the user's runtime directory hidden too.
+    const mac = claudeSandboxSettings(input());
+    const denyRead = [...mac.filesystem!.denyRead!];
+    denyRead.splice(-1, 0, userRuntimeDir());
+    expect(claudeSandboxSettings(input({ platform: 'linux' }))).toEqual({
+      ...mac,
+      filesystem: { ...mac.filesystem, denyRead },
+    });
+    expect(claudePermissionRules(input({ platform: 'linux' })).deny).toContain(`Read(/${userRuntimeDir()}/**)`);
   });
 
   test('denyRead holds work/*/* and the whole runner tree; allowRead the clone and its project directory', () => {

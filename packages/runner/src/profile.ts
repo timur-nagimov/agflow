@@ -8,7 +8,8 @@ import type { RunnerPaths } from './paths';
 export interface PermissionProfile {
   /**
    * Claude: acceptEdits with the sandbox, or auto mode with the sandbox. open is the hackathon profile: acceptEdits
-   * with a sandbox whose commands reach any host, local ports and unix sockets, Docker's included; Codex commands and
+   * with a sandbox whose commands reach any host, and on a Mac local ports and every unix socket, Docker's included; on
+   * Linux a command's local ports are its own and the seccomp filter keeps unix sockets shut. Codex commands and
    * dependency preparation get the network too, and agents may change the greenfield files (core's protected-paths).
    */
   name: 'standard' | 'auto' | 'open';
@@ -60,10 +61,24 @@ export interface DeniedPathsInput {
   paths: Pick<RunnerPaths, 'runner' | 'vaults' | 'work'>;
   /** vendorHomes(config, paths): runner.json may put them outside the runner tree, shared by several runners. */
   vendorHomes: Record<Vendor, string>;
+  /** The machine's OS, process.platform by default: on Linux the user's runtime directory is denied too. */
+  platform?: NodeJS.Platform;
 }
 
 const tree = (path: string): DeniedPath => ({ path, tree: true });
 const file = (path: string): DeniedPath => ({ path, tree: false });
+
+/**
+ * The user's runtime directory on Linux, $XDG_RUNTIME_DIR or /run/user/<uid>. The systemd user manager and the session
+ * bus listen there, and either starts a process outside every sandbox.
+ */
+export function userRuntimeDir(
+  env: Record<string, string | undefined> = process.env,
+  uid: number = process.getuid?.() ?? 0,
+): string {
+  const dir = env.XDG_RUNTIME_DIR;
+  return dir && isAbsolute(dir) ? dir : `/run/user/${uid}`;
+}
 
 /** The vendor homes the runner tree does not already cover: their logins, transcripts and .claude.json. */
 function outsideHomes(input: DeniedPathsInput): DeniedPath[] {
@@ -87,10 +102,10 @@ function checked(input: DeniedPathsInput, denied: DeniedPath[]): DeniedPath[] {
 }
 
 /**
- * Paths agents may not read: credentials, vendor and CLI state, the whole runner tree and vendor homes outside it.
- * The Claude adapter names only the runner tree's sensitive parts in its Read rules, keeps its allowRead for the
- * attempt's own project directory, and adds the work root to its sandbox's denyRead with the clone allowed; neither
- * is listed here.
+ * Paths agents may not read: credentials, vendor and CLI state, the whole runner tree and vendor homes outside it, and
+ * on Linux the user's runtime directory. The Claude adapter names only the runner tree's sensitive parts in its Read
+ * rules, keeps its allowRead for the attempt's own project directory, and adds the work root to its sandbox's denyRead
+ * with the clone allowed; neither is listed here. A path that does not exist hides nothing, and the sandboxes skip it.
  */
 export function deniedReadPaths(input: DeniedPathsInput): DeniedPath[] {
   const home = (...parts: string[]) => join(input.home, ...parts);
@@ -111,6 +126,7 @@ export function deniedReadPaths(input: DeniedPathsInput): DeniedPath[] {
     tree(home('.config', 'gcloud')),
     tree(home('.kube')),
     file(home('.docker', 'config.json')),
+    ...((input.platform ?? process.platform) === 'linux' ? [tree(userRuntimeDir())] : []),
   ]);
 }
 
