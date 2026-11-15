@@ -26,6 +26,7 @@ function input(overrides: Partial<ClaudeRulesInput> = {}): ClaudeRulesInput {
     profile: standardProfile,
     clone: CLONE,
     tmpDir: TMP,
+    platform: 'darwin',
     ...overrides,
   };
 }
@@ -179,6 +180,16 @@ describe('Claude sandbox settings', () => {
     expect(claudeSandboxSettings(input({ profile: { ...standardProfile, name: 'auto' } })).network).toEqual(
       claudeSandboxSettings(input()).network,
     );
+  });
+
+  test("on Linux the open profile keeps unix sockets shut: the systemd manager's would run commands outside", () => {
+    const profile = { ...standardProfile, name: 'open' as const, webTools: true };
+    expect(claudeSandboxSettings(input({ profile, platform: 'linux' })).network).toEqual({
+      allowedDomains: [...standardProfile.network.allowedDomains],
+      strictAllowlist: false,
+      allowLocalBinding: true,
+    });
+    expect(claudeSandboxSettings(input({ platform: 'linux' }))).toEqual(claudeSandboxSettings(input()));
   });
 
   test('denyRead holds work/*/* and the whole runner tree; allowRead the clone and its project directory', () => {

@@ -65,7 +65,10 @@ export interface ClaudeOptionDeps {
   compaction: { preCompact: HookCallback; postCompact: HookCallback };
   /** A new session's id; randomUUID by default. */
   newSessionId?: () => string;
-  /** The machine's OS, which picks the CLI's shell (CLAUDE_LINUX_SHELL on Linux); process.platform by default. */
+  /**
+   * The machine's OS, which picks the CLI's shell (CLAUDE_LINUX_SHELL on Linux) and whether the open profile opens
+   * unix sockets (a Mac only); process.platform by default.
+   */
   platform?: NodeJS.Platform;
 }
 
@@ -212,6 +215,7 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
   // The agent's HOME is where the rules point and where the CLI expands ~; the runner's own never counts.
   const home = launch.env.HOME;
   if (!home) throw new Error("a Claude launch's environment needs HOME");
+  const platform = deps.platform ?? process.platform;
   const scope = {
     home,
     paths: deps.paths,
@@ -219,6 +223,7 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
     profile: launch.profile,
     clone: launch.clone,
     tmpDir: launch.tmpDir,
+    platform,
   };
   const rules = claudePermissionRules(scope);
   const emptyDir = claudeEmptyDir(claudeHome);
@@ -230,7 +235,7 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
     spawnClaudeCodeProcess: deps.spawnClaudeCodeProcess,
     cwd: launch.clone,
     // Whole: the SDK gives the child exactly this environment.
-    env: claudeEnv(launch.env, emptyDir, deps.platform ?? process.platform),
+    env: claudeEnv(launch.env, emptyDir, platform),
     ...session,
     model: launch.model,
     // A standard task keeps the CLI's own effort.

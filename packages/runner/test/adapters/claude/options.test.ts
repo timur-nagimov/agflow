@@ -157,6 +157,7 @@ describe('buildQueryOptions', () => {
       profile: standardProfile,
       clone: CLONE,
       tmpDir: TMP,
+      platform: 'darwin' as const,
     };
     expect(options.sandbox).toEqual(claudeSandboxSettings(input));
     expect(typeof options.settings).toBe('object');
@@ -218,6 +219,10 @@ describe('buildQueryOptions', () => {
     expect(options.allowDangerouslySkipPermissions).toBeUndefined();
     expect(options.tools).toEqual([...CLAUDE_BUILTIN_TOOLS, 'WebFetch', 'WebSearch']);
     expect(options.sandbox?.network).toMatchObject({ strictAllowlist: false, allowLocalBinding: true });
+    // The machine's OS reaches the sandbox: unix sockets stay shut on Linux.
+    expect(options.sandbox?.network).toMatchObject({ allowAllUnixSockets: true });
+    const linux = buildQueryOptions(launch({ profile: open }), deps({ autoOffered: true, platform: 'linux' }));
+    expect(linux.sandbox?.network).not.toHaveProperty('allowAllUnixSockets');
     const context = { signal: new AbortController().signal, toolUseID: 'toolu_1', requestId: 'request-1' };
     expect(CLAUDE_NETWORK_ASK).toBe('SandboxNetworkAccess');
     expect(await openProfilePrompts(CLAUDE_NETWORK_ASK, { host: 'api.example.com' }, context)).toEqual({
@@ -261,6 +266,7 @@ describe('buildQueryOptions', () => {
       profile: standardProfile,
       clone: CLONE,
       tmpDir: TMP,
+      platform: 'darwin',
     });
     expect(options.settings).toEqual({
       permissions: { allow: rules.allow, deny: rules.deny },

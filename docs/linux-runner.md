@@ -58,7 +58,8 @@ agflow runner setup
 ```
 
 For a hackathon, run `agflow runner setup --preset hackathon --capacity 8` instead: the open profile and 8 worker
-slots, which suit the VM's 16 vCPU and 32 GB. Leave out `--yes`, or setup cannot ask for the Claude token.
+slots, which suit the VM's 16 vCPU and 32 GB. Leave out `--yes`, or setup cannot ask for the Claude token. Read
+**Open profile** below first: with it, a Codex command on the VM may get out of its sandbox.
 
 `agflow login` shows a link and a code: open the link in a browser on your Mac. Setup asks for the runner's name and
 capacity, downloads the pinned Claude Code and Codex for Linux, and does the two vendor logins. The VM has no browser,
@@ -130,6 +131,12 @@ agflow runner install
   another machine is refused, as on a Mac.
 - **Uninstall.** `agflow runner uninstall` removes the unit. The Claude token stays in `runner.env` until
   `agflow runner uninstall --purge` removes the runner's data.
+- **Open profile.** Claude's commands keep unix sockets shut, as under the standard profile. On a Mac the open profile
+  opens them, but here the user's systemd manager listens on one, under `/run/user`, and would start any command
+  outside the sandbox. Codex's commands get the network under the open profile, and Codex's sandbox may not keep them
+  from that socket. Treat a Codex command on an open-profile VM as able to start a process outside its sandbox with
+  `systemd-run --user`. That process can read the Claude token in `runner.env` and your git credentials, and become
+  root through sudo.
 
 The user has passwordless sudo, and an approved Codex escalation runs as that user outside the sandbox. Keep nothing on
 the VM that the project does not need.
