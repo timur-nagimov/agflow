@@ -308,6 +308,31 @@ test('reruns preserve the key and unchanged file, skip valid logins, and honor -
   expect(f.registry.requests).toHaveLength(2);
 });
 
+test("a rerun takes the login shell's PATH again, unless the runner runs", async () => {
+  const f = await fixture();
+  await f.run();
+  const before = loadRunnerConfig(f.paths.config);
+  // A tool installed since setup, such as uv in /usr/local/bin, is on the login shell's PATH now.
+  const shellPath =
+    (path: string): Exec =>
+    async (argv, options) => {
+      const result = await f.deps.exec!(argv, options);
+      if (argv[0] !== f.env.SHELL) return result;
+      return { ...result, stdout: result.stdout.replace(/PATH=[^\0]*/, `PATH=${path}`) };
+    };
+  await f.run(['--yes', '--no-service'], { exec: shellPath('/usr/local/bin:/captured/bin:/usr/bin:/bin') });
+  const after = loadRunnerConfig(f.paths.config);
+  expect(after.capturedPath).toBe('/usr/local/bin:/captured/bin:/usr/bin:/bin');
+  expect({ ...after, capturedPath: before.capturedPath }).toEqual(before);
+  expect(f.out.join('')).toContain("runner.json takes the login shell's PATH: /usr/local/bin:/captured/bin");
+  // The running runner owns runner.json.
+  const written = readFileSync(f.paths.config, 'utf8');
+  const lock = await acquireRunnerLock(f.paths, { mode: 'foreground' });
+  afterThisTest(() => lock.release());
+  expect(await f.run(['--yes', '--no-service'], { exec: shellPath('/opt/other/bin:/usr/bin:/bin') })).toBe(0);
+  expect(readFileSync(f.paths.config, 'utf8')).toBe(written);
+});
+
 test('a copied runner.json gets this machine facts, a new key, and the first setup name and capacity', async () => {
   const f = await fixture();
   await f.run();

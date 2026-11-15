@@ -224,9 +224,13 @@ async function configure(
       throw new Error('capacity must be a whole number from 1 to 16');
     }
     if (kept) {
-      const next = withChoices(kept, { ...choices, name, capacity });
-      if (next === null) return kept;
+      // The login shell's PATH again: tools installed since, such as a stack's uv or Bun, reach agents and preparation.
+      const { path } = await captureLoginShellEnv({ env, exec });
+      const refreshed = path === kept.capturedPath ? kept : { ...kept, capturedPath: path };
+      const next = withChoices(refreshed, { ...choices, name, capacity }) ?? refreshed;
+      if (next === kept) return kept;
       saveRunnerConfig(paths.config, next);
+      if (refreshed !== kept) log(`runner.json takes the login shell's PATH: ${path}`);
       return next;
     }
     const { ceiling, keepAwake, profile } = choices;
