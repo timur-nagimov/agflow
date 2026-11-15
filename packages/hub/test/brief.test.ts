@@ -272,6 +272,26 @@ describe('standing rules in the brief', () => {
       '## Standing rules from people\n- #3: Write tests first.\n- #2: Do not touch billing/.\n- #1: Use pnpm.',
     );
   });
+
+  test('take the room a short goal leaves of the 500 characters a brief keeps for the goal', () => {
+    // A goal of 300 characters, as agflow start sets it, four rules of about 540 characters and the largest task.
+    const { ctx } = createTestContext();
+    const goal = `Build what SPEC.md describes. ${'g'.repeat(270)}`;
+    updateGoal(ctx, { text: goal, baseVersion: 0 }, 'user:alice');
+    for (let i = 1; i <= 4; i++) {
+      sendMessage(ctx, { from: 'user:alice', to: 'all', body: `Rule ${i}. ${'r'.repeat(530)}`, standingRule: true });
+    }
+    const worker = addAgent(ctx);
+    holdMaximalTask(ctx, worker);
+    const brief = buildBrief(ctx, getAgent(ctx, worker.id));
+    expect(section(brief, '## Goal (v1)')).toBe(`## Goal (v1)\n${goal}`);
+    const rules = section(brief, '## Standing rules from people');
+    expect(rules.match(/Rule \d/g)).toEqual(['Rule 4', 'Rule 3', 'Rule 2', 'Rule 1']);
+    expect(rules).not.toContain('did not fit in this brief');
+    // Less is spare than the 200 characters the goal leaves of its floor: had the brief kept all 500 for the goal, the
+    // oldest rule would not have fit.
+    expect(BRIEF_LIMIT - brief.length).toBeLessThan(500 - goal.length);
+  });
 });
 
 describe('lead brief', () => {
