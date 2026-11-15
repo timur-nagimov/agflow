@@ -296,8 +296,9 @@ after a change. The details are in the
   agent whose check fails hears which task fixes `main`, and when the failure is not from its change it calls
   `declare_blocked`: agflow then parks the task instead of blocking it. The attempt is replaced, which counts no
   failure, asks for a handoff note and tells nobody, and the task waits, ready, with the board saying why, until
-  `main`'s check passes, or 45 minutes at most. An agent that stalls while its last submission failed this way is
-  parked the same way. A pass afterwards tells people and the lead, and cancels the fix task if nobody has started
+  `main`'s check passes, or 45 minutes at most. The lead's situation report names the parked tasks, and the idle
+  nudge counts them among the tasks that can start. An agent that stalls while its last submission failed this way
+  is parked the same way. A pass afterwards tells people and the lead, and cancels the fix task if nobody has started
   it. The Load page shows where the check of `main` passed, or since when it fails. Only runners of this release
   (runner protocol 4) that can prepare dependencies, as `agflow runner status` shows, check `main`, so deploy the hub
   first, then update the runners: a hub older than its runners refuses them.
@@ -321,14 +322,14 @@ Two more settings are on by default:
 
 - **The idle nudge, `AGFLOW_IDLE_NUDGE_SECONDS` (60) and `AGFLOW_IDLE_NUDGE_MINUTES` (5).** Removes: a person noticing
   that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the free worker
-  slots outnumber the ready tasks that can start, for `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub sends the
-  lead one message: the free slots, the ready, blocked, submitted and accepted tasks, each account's quota, the time
-  left to the deadline, and what to plan next (the spec until it is covered, then defects, missing tests, demo polish
-  and new features, and only fixes in the last hour). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
-  `lead.idle_nudged` records each one. None goes out before the goal is set, while worker dispatch is held (a paused
-  project, the churn guard), or once the deadline has passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk:
-  the lead keeps adding work until the deadline, so the subscriptions stay in use; pause the project, or set a lower
-  worker target, to stop it.
+  slots outnumber the ready tasks that can start (a task parked for a failing `main` counts as one), for
+  `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub sends the lead one message: the free slots, the ready, parked,
+  blocked, submitted and accepted tasks, each account's quota, the time left to the deadline, and what to plan next
+  (the spec until it is covered, then defects, missing tests, demo polish and new features, and only fixes in the last
+  hour). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event `lead.idle_nudged` records each one. None goes
+  out before the goal is set, while worker dispatch is held (a paused project, the churn guard), or once the deadline
+  has passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk: the lead keeps adding work until the deadline, so
+  the subscriptions stay in use; pause the project, or set a lower worker target, to stop it.
 - **The demo check, `AGFLOW_DEMO_CHECK_EVERY` (5).** Removes: a person trying the product by hand from time to time.
   After every N tasks merged, the hub creates one demo-check task, created by `system`, unless one is still open.
   Without `AGFLOW_AUTO_MERGE=1`, accepted tasks count until something marks a task merged. Its agent starts the

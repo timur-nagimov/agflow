@@ -44,7 +44,7 @@ import { ensureDemoCheck } from './demo-check';
 import { currentGoalVersion } from './goal';
 import { churnPaused, getHubState, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
-import { parkedTasks, queueMainCheck, retryFixTask } from './main-check';
+import { parkedLine, parkedTasks, queueMainCheck, retryFixTask } from './main-check';
 import { failedMerges, queueMerges } from './merges';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
@@ -678,8 +678,8 @@ function quotaLine(account: AccountQuota, now: number): string {
 }
 
 /**
- * The worker load, why worker dispatch is held when it is, one quota line per account and the deadline with the time
- * left, as lines for the lead.
+ * The worker load, the tasks parked while main's check fails, why worker dispatch is held when it is, one quota line
+ * per account and the deadline with the time left, as lines for the lead.
  */
 export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
   // Without a target of its own, the project's target is the cap.
@@ -689,6 +689,8 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
     `Ready tasks: ${load.ready}, ${load.dispatchable} of them dispatchable now. Blocked on dependencies: ` +
       `${load.blockedOnDependencies}. Submitted: ${load.submitted}. Accepted, not merged: ${load.acceptedNotMerged}.`,
   ];
+  const parked = parkedLine(ctx);
+  if (parked !== null) lines.push(parked);
   const hold = dispatchHold(ctx);
   if (hold !== null) lines.push(`No worker starts now: ${hold}.`);
   const now = ctx.now();
@@ -741,7 +743,8 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
   const due =
     dispatchHold(ctx) === null && currentGoalVersion(ctx) > 0 && (deadlineAt === null || ctx.now() < deadlineAt);
   const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
-  if (load === null || load.freeSlots <= load.dispatchable) {
+  // A task parked while main's check fails counts as dispatchable: it takes a slot by itself once main passes.
+  if (load === null || load.freeSlots <= load.dispatchable + parkedTasks(ctx).size) {
     idleSince.delete(ctx);
     return null;
   }

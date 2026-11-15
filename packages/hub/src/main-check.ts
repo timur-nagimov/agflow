@@ -253,9 +253,9 @@ export function parkReason(ctx: HubContext, taskId: string): string {
 
 /**
  * Why each parked task waits, while main's check fails: a ready task whose newest attempt the hub replaced because it
- * waited for main, within PARK_MAX_MS of that attempt's end. People and the lead replace an agent as themselves, so a
- * replace by system is a park. Dispatch leaves these tasks alone (scheduler.ts readySet); once main passes, or after
- * PARK_MAX_MS, they start as any ready task does.
+ * waited for main, within PARK_MAX_MS of that attempt's end, in task order. People and the lead replace an agent as
+ * themselves, so a replace by system is a park. Dispatch leaves these tasks alone (scheduler.ts readySet), and the lead
+ * reads their ids (parkedLine); once main passes, or after PARK_MAX_MS, they start as any ready task does.
  */
 export function parkedTasks(ctx: HubContext): Map<string, string> {
   const health = mainHealth(ctx);
@@ -267,7 +267,8 @@ export function parkedTasks(ctx: HubContext): Map<string, string> {
        WHERE tasks.status = 'ready' AND attempts.end_reason = 'replaced' AND attempts.ended_at > $since
          AND json_extract(attempts.stop_requested, '$.cause') = 'replace'
          AND json_extract(attempts.stop_requested, '$.by') = 'system'
-         AND attempts.number = (SELECT MAX(number) FROM attempts AS newer WHERE newer.task_id = attempts.task_id)`,
+         AND attempts.number = (SELECT MAX(number) FROM attempts AS newer WHERE newer.task_id = attempts.task_id)
+       ORDER BY tasks.seq`,
     )
     .all({ since: ctx.now() - PARK_MAX_MS }) as { taskId: string; endedAt: number }[];
   const main = ctx.config.mainBranch;
@@ -275,6 +276,22 @@ export function parkedTasks(ctx: HubContext): Map<string, string> {
   const left = (endedAt: number) => minutesUntil(endedAt + PARK_MAX_MS, ctx.now());
   return new Map(
     rows.map((row) => [row.taskId, `it waits for ${main}'s check to pass${fix}, up to ${left(row.endedAt)} more min`]),
+  );
+}
+
+/**
+ * The lead's line on the tasks parked while main's check fails (parkedTasks), in its situation report and the idle
+ * nudge (scheduler.ts loadLines): they count as ready but not dispatchable, and start again by themselves. Null while
+ * none is parked.
+ */
+export function parkedLine(ctx: HubContext): string | null {
+  const parked = [...parkedTasks(ctx).keys()];
+  if (parked.length === 0) return null;
+  const health = mainHealth(ctx);
+  const fix = health?.status === 'failed' && health.fixTask !== null ? ` (${health.fixTask} fixes it)` : '';
+  return (
+    `Parked until ${ctx.config.mainBranch}'s check passes${fix}: ${parked.join(', ')}. They start again by ` +
+    'themselves; do not cancel or recreate them.'
   );
 }
 

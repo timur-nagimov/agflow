@@ -9,10 +9,12 @@ import {
 } from '@agflow/core';
 import { getAttempt } from '../src/attempt-store';
 import { onExited, renewLeases } from '../src/attempts';
+import { situationReport } from '../src/brief';
 import { type CommandRow, findCommand, pendingCommands, recordResult } from '../src/commands';
 import { type HubContext, tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
+import { updateGoal } from '../src/goal';
 import {
   FIX_MAIN_TITLE,
   MAIN_CHECK_RETRY_MS,
@@ -24,13 +26,21 @@ import {
   waitsForMain,
 } from '../src/main-check';
 import { listMessages } from '../src/messages';
-import { setPaused } from '../src/project';
-import { readySet, runTick } from '../src/scheduler';
+import { setPaused, setWorkerTarget } from '../src/project';
+import { nudgeIdleLead, readySet, runTick, workerLoad } from '../src/scheduler';
 import { requestSubmission } from '../src/submissions';
 import { judgeStalls } from '../src/supervisor';
 import { getTask, move } from '../src/task-store';
 import { blockTask, cancelTask, createTasks, declareImpossible, markMerged } from '../src/tasks';
-import { type RunnerAttempt, addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
+import {
+  type RunnerAttempt,
+  addRunner,
+  addRunnerAttempt,
+  addRunnerLead,
+  createTestContext,
+  markHubAlive,
+  newTask,
+} from './helpers';
 
 const sha = (char: string) => char.repeat(40);
 const short = (char: string) => char.repeat(7);
@@ -547,6 +557,34 @@ describe('parking a task while main fails', () => {
     declareImpossible(ctx, worker.task.id, worker.agent, 'A1 contradicts A2');
     expect(getAttempt(ctx, worker.attempt.id).stopRequested?.cause).toBe('impossible');
     expect(told(ctx, 'lead')[0]?.body).toContain('cannot be done as specified');
+  });
+
+  test("the lead's report and the idle nudge name the parked task, and the nudge counts it as dispatchable", () => {
+    const { ctx, clock, fix, worker } = waiting();
+    // A runner lead holds the seat, its runner worker on a task of its own, and the goal is set.
+    addRunnerLead(ctx);
+    updateGoal(ctx, { text: 'Ship the parser.', baseVersion: 0 }, 'user:alice');
+    blockTask(ctx, worker.task.id, worker.agent, `waiting for ${fix.id}`);
+    exited(ctx, worker.attempt.id);
+    const line =
+      `Parked until main's check passes (${fix.id} fixes it): ${worker.task.id}. They start again by themselves; ` +
+      'do not cancel or recreate them.';
+    const report = situationReport(ctx);
+    expect(report).toContain('Ready tasks: 2, 1 of them dispatchable now.');
+    expect(report).toContain(`Accepted, not merged: 0.\n${line}\n`);
+    // Two free slots: one for the fix task, one the parked task takes by itself once main passes. No nudge.
+    tx(ctx, () => setWorkerTarget(ctx, 3));
+    expect(workerLoad(ctx)).toMatchObject({ running: 1, freeSlots: 2, ready: 2, dispatchable: 1 });
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    clock.advance(ctx.config.idleNudgeMs);
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    // A third free slot has nothing to start: the nudge goes out, and names the parked task.
+    tx(ctx, () => setWorkerTarget(ctx, 4));
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    clock.advance(ctx.config.idleNudgeMs);
+    const nudge = nudgeIdleLead(ctx)?.body ?? '';
+    expect(nudge).toStartWith('3 worker slot(s) are free, more than the 1 ready task(s) that can start now.');
+    expect(nudge).toContain(`\n${line}\n`);
   });
 
   test("while main passes, a failed check is the agent's own: declare_blocked blocks the task and tells the lead", () => {
