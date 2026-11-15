@@ -19,6 +19,7 @@ import { ensureDemoCheck } from '../src/demo-check';
 import { HubError } from '../src/errors';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
+import { periodicLeadReview } from '../src/lead';
 import { listMessages } from '../src/messages';
 import { setPaused } from '../src/project';
 import { checkClock } from '../src/recovery';
@@ -566,6 +567,22 @@ describe('AGFLOW_REVIEW: what else sees a review', () => {
     expect(report).not.toContain(`${review.id} "`);
     mergeResult(hub, held, { status: 'merged', sha: sha('f') });
     expect(ensureDemoCheck(hub.ctx)?.title).toBe('Demo check after 1 task');
+  });
+
+  test('the periodic review leaves a task under review to its reviewer and names the work submitted to the lead', () => {
+    const hub = createTestHub({ autoAccept: true, review: true, leadReviewMs: 10 * 60_000 });
+    addAgent(hub.ctx, 'alice', 'lead');
+    const { held } = reviewed(hub);
+    // The clock starts with the submitted task; past leadReviewMs only the task under review has waited.
+    expect(periodicLeadReview(hub.ctx)).toBeNull();
+    hub.clock.advance(11 * 60_000);
+    expect(periodicLeadReview(hub.ctx)).toBeNull();
+    const waiting = attemptAt(hub, 'Lint', 'system');
+    submit(hub, waiting, noCheck);
+    hub.clock.advance(11 * 60_000);
+    const body = periodicLeadReview(hub.ctx)?.body ?? '';
+    expect(body).toContain(`: ${waiting.task.id} [submitted] for 11 min, 1 attempt(s).`);
+    expect(body).not.toContain(held.task.id);
   });
 
   test('a live chat cannot claim a review', () => {

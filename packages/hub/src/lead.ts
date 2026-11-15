@@ -35,6 +35,7 @@ import {
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, storeRunnerLeads } from './project';
+import { tasksUnderReview } from './review';
 import { findRunnerRow } from './runners';
 import { listTasks } from './task-store';
 
@@ -213,10 +214,13 @@ const LONG_IN_WORK_MS = 30 * 60_000;
 /**
  * The work the periodic review names, each with how long it has waited and its attempts: a task submitted to the lead
  * for longer than leadReviewMs, and one claimed or worked on for more than LONG_IN_WORK_MS since its current attempt
- * started. The stall rules judge the rest; the situation report lists every task.
+ * started. A submitted task an agent reviews waits for its reviewer, not for the lead (tasksUnderReview). The stall
+ * rules judge the rest; the situation report lists every task.
  */
 function overdueWork(ctx: HubContext, tasks: readonly Task[], now: number): string[] {
+  const reviewing = tasksUnderReview(ctx);
   return tasks.flatMap((task) => {
+    if (reviewing.has(task.id)) return [];
     const submitted = task.status === 'submitted';
     const attempt = !submitted && task.currentAttempt !== null ? findAttempt(ctx, task.currentAttempt) : null;
     const since = (submitted ? task.submission?.submittedAt : attempt?.startedAt) ?? task.updatedAt;
