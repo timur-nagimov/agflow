@@ -147,6 +147,23 @@ describe('the seed files', () => {
     expect(typescript.find((file) => file.path === '.gitignore')?.content).toContain('node_modules/');
   });
 
+  test("AGENTS.md's definition of done asks what the hub's worker guide asks, whatever the stack", () => {
+    for (const stack of ['python', 'typescript', 'rust', null]) {
+      const agents = seedFiles({ name: 'afisha', stack, specs }).find((file) => file.path === 'AGENTS.md')?.content as string;
+      const done = agents.split('## Definition of done\n')[1] as string;
+      for (const phrase of [
+        'every acceptance criterion holds',
+        "you saw it hold through\nthe product's real entry point: a test or a one-shot command, never a server left running",
+        'Try inputs of your own, not only the examples in SPEC.md',
+        'Add or extend a test for each criterion. Never weaken, skip or delete a test',
+        'Leave no stub or TODO.',
+        'Read your whole diff before you submit.',
+      ]) {
+        expect([stack, done]).toEqual([stack, expect.stringContaining(phrase)]);
+      }
+    }
+  });
+
   test("the runner's reader takes the seeded .agflow/config.json, whatever the stack", () => {
     for (const stack of ['python', 'typescript', 'Go with Gin', null]) {
       const config = seedFiles({ name: 'afisha', stack, specs }).find((file) => file.path === '.agflow/config.json');
