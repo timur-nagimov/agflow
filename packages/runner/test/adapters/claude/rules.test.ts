@@ -26,6 +26,7 @@ function input(overrides: Partial<ClaudeRulesInput> = {}): ClaudeRulesInput {
     profile: standardProfile,
     clone: CLONE,
     tmpDir: TMP,
+    platform: 'darwin',
     ...overrides,
   };
 }
@@ -166,6 +167,31 @@ describe('Claude sandbox settings', () => {
     expect(claudeSandboxSettings(input({ profile: custom })).network?.allowedDomains).toEqual(['example.org']);
   });
 
+  test('the open profile asks about other hosts instead of refusing them, and opens local ports and sockets', () => {
+    const open = claudeSandboxSettings(input({ profile: { ...standardProfile, name: 'open', webTools: true } }));
+    expect(open.network).toEqual({
+      allowedDomains: [...standardProfile.network.allowedDomains],
+      strictAllowlist: false,
+      allowLocalBinding: true,
+      allowAllUnixSockets: true,
+    });
+    // Everything else stays as under the standard profile.
+    expect({ ...open, network: null }).toEqual({ ...claudeSandboxSettings(input()), network: null });
+    expect(claudeSandboxSettings(input({ profile: { ...standardProfile, name: 'auto' } })).network).toEqual(
+      claudeSandboxSettings(input()).network,
+    );
+  });
+
+  test("on Linux the open profile keeps unix sockets shut: the systemd manager's would run commands outside", () => {
+    const profile = { ...standardProfile, name: 'open' as const, webTools: true };
+    expect(claudeSandboxSettings(input({ profile, platform: 'linux' })).network).toEqual({
+      allowedDomains: [...standardProfile.network.allowedDomains],
+      strictAllowlist: false,
+      allowLocalBinding: true,
+    });
+    expect(claudeSandboxSettings(input({ platform: 'linux' }))).toEqual(claudeSandboxSettings(input()));
+  });
+
   test('denyRead holds work/*/* and the whole runner tree; allowRead the clone and its project directory', () => {
     const { filesystem } = claudeSandboxSettings(input());
     expect(filesystem?.denyRead).toEqual([
@@ -188,7 +214,8 @@ describe('Claude sandbox settings', () => {
     ]);
     expect(filesystem?.allowRead).toEqual([CLONE, claudeProjectDir(paths.homes.claude, CLONE)]);
     expect(filesystem?.allowRead?.[1]?.startsWith(join(paths.homes.claude, 'projects', '-'))).toBe(true);
-    expect(filesystem?.allowWrite).toEqual([TMP]);
+    // The runner's shared pip and uv caches, outside the runner tree.
+    expect(filesystem?.allowWrite).toEqual([TMP, '/Users/owner/.agflow/cache/pip', '/Users/owner/.agflow/cache/uv']);
     expect(filesystem?.denyWrite).toEqual(['/tmp/claude', '/private/tmp/claude', '/Users/owner/.npm/_logs']);
   });
 

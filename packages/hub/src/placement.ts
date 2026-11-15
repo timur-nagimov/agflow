@@ -17,6 +17,7 @@ function runnerSlot(row: RunnerRow): RunnerSlot {
       ready: reported.ready,
       notReadySince: hold?.notReadySince ?? null,
       degradedUntil: hold?.degradedUntil ?? null,
+      limitedUntil: hold?.limitedUntil ?? {},
       accountId: reported.accountId,
       ceilings: info.ceilings[reported.vendor] ?? reported.ceilings,
       allowPaidUsage: info.allowPaidUsage[reported.vendor] ?? reported.allowPaidUsage,
@@ -33,6 +34,7 @@ function runnerSlot(row: RunnerRow): RunnerSlot {
     capacity: row.capacity,
     openAttempts: row.active_attempts,
     power: info.power,
+    profile: info.profile.name,
     vendors,
   };
 }

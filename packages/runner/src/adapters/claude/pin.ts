@@ -12,16 +12,18 @@ export const CLAUDE_CLI_VERSION: string = PINNED.version;
 /** The @anthropic-ai/claude-agent-sdk version packages/runner depends on; its claudeCodeVersion is the CLI pin. */
 export const CLAUDE_SDK_VERSION: string = PINNED.sdkVersion;
 
-/** The pin for a platform (`<os>-<arch>`), or null where M2 pins nothing: preflight reports "unsupported platform". */
+/** The pin for a platform (`<os>-<arch>`), or null where none is: preflight reports "unsupported platform". */
 export function claudePin(platform: string = vendorPlatform()): ClaudePin | null {
   return VENDOR_PINS[platform]?.claude ?? null;
 }
 
 /**
  * Whether the sandbox's denyWrite of the shared /tmp/claude (and /private/tmp/claude) holds on this pin. Settled for
- * 2.1.285 by check:claude-sandbox (test/claude-sandbox/writes.test.ts), where sandboxed writes to both were refused;
- * that check fails whenever this disagrees with the sandbox, so a new pin sets it to what it saw. False makes
- * preflight list '/tmp/claude' as weakened (X-29). Nothing is probed at run time.
+ * 2.1.285 on macOS (seatbelt) by check:claude-sandbox (test/claude-sandbox/writes.test.ts), where sandboxed writes to
+ * both were refused; that check fails whenever this disagrees with the sandbox, so a new pin sets it to what it saw.
+ * On Linux the sandbox is bubblewrap, which mounts every denyWrite path read-only (or a stub over a missing one), so
+ * it holds there too; check:claude-sandbox runs on macOS only. False makes preflight list '/tmp/claude' as weakened
+ * (X-29). Nothing is probed at run time.
  */
 export const TMP_CLAUDE_DENYWRITE_ENFORCED = true;
 

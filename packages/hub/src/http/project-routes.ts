@@ -1,4 +1,5 @@
 import {
+  DeadlineInputSchema,
   GoalDiffQuerySchema,
   GoalNoteInputSchema,
   type HubStatus,
@@ -22,7 +23,7 @@ import {
 import { hubEpoch, leadSeat } from '../hub-state';
 import { setRunnerLeads } from '../lead';
 import { listMessages } from '../messages';
-import { getProject, setPaused } from '../project';
+import { getProject, setDeadline, setPaused } from '../project';
 import { listTasks } from '../task-store';
 import type { App } from './app';
 import { actor, human, leadBody, principal, readBody, readQuery } from './util';
@@ -44,6 +45,12 @@ export function mountProjectRoutes(app: App, ctx: HubContext): void {
     const p = human(c);
     const { paused } = await readBody(c, PauseInputSchema);
     return c.json(setPaused(ctx, paused, actor(p)));
+  });
+
+  app.put('/api/project/deadline', async (c) => {
+    const p = human(c);
+    const { deadline } = await readBody(c, DeadlineInputSchema);
+    return c.json(setDeadline(ctx, deadline === null ? null : Date.parse(deadline), actor(p)));
   });
 
   app.get('/api/status', (c) => {

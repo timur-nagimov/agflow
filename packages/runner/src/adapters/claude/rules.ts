@@ -55,7 +55,7 @@ export interface ClaudeRulesInput {
   /** The agent's HOME (the owner's), given rather than read from the process. */
   home: string;
   /** From runnerPaths(AGFLOW_HOME). */
-  paths: Pick<RunnerPaths, 'runner' | 'vaults' | 'work'>;
+  paths: Pick<RunnerPaths, 'runner' | 'vaults' | 'work' | 'caches'>;
   /** vendorHomes(config, paths); the Claude home is CLAUDE_CONFIG_DIR. */
   vendorHomes: Record<Vendor, string>;
   profile: PermissionProfile;
@@ -63,6 +63,8 @@ export interface ClaudeRulesInput {
   clone: string;
   /** CLAUDE_CODE_TMPDIR. */
   tmpDir: string;
+  /** The machine's OS: the open profile opens unix sockets on a Mac only (claudeNetwork). */
+  platform: NodeJS.Platform;
 }
 
 export interface ClaudePermissionRules {
@@ -106,8 +108,9 @@ export function claudePermissionRules(input: ClaudeRulesInput): ClaudePermission
 /**
  * The top-level sandbox option. denyRead holds 7.6's list plus a two-level glob under work (each clone), with allowRead
  * for the clone and the attempt's project directory. Leaving the clone's parents readable lets Bun resolve package
- * scripts; 2.1.285 honours this generated glob through --settings. Writes go only to the clone (the CLI adds its cwd) and
- * the temporary directory. The CLI copies the Edit deny rules into denyWrite itself.
+ * scripts; 2.1.285 honours this generated glob through --settings. Writes go only to the clone (the CLI adds its cwd),
+ * the temporary directory and the runner's shared pip and uv caches. The CLI copies the Edit deny rules into denyWrite
+ * itself.
  */
 export function claudeSandboxSettings(input: ClaudeRulesInput): SandboxSettings {
   const { readable } = deniedPaths(input);
@@ -115,14 +118,28 @@ export function claudeSandboxSettings(input: ClaudeRulesInput): SandboxSettings 
     enabled: true,
     failIfUnavailable: true,
     allowUnsandboxedCommands: false,
-    network: { allowedDomains: [...input.profile.network.allowedDomains], strictAllowlist: true },
+    network: claudeNetwork(input.profile, input.platform),
     filesystem: {
       denyRead: [...new Set([...readable.map((denied) => denied.path), join(input.paths.work, '*', '*')])],
       allowRead: [input.clone, claudeProjectDir(input.vendorHomes.claude, input.clone)],
-      allowWrite: [input.tmpDir],
+      allowWrite: [input.tmpDir, ...Object.values(input.paths.caches)],
       denyWrite: [...SHARED_TMP, join(input.home, '.npm', '_logs')],
     },
   };
+}
+
+/**
+ * The sandbox's network: the profile's hosts only. Under the open profile those are reached without asking, the CLI
+ * asks about any other host and the adapter answers yes (openProfilePrompts), and commands may bind and reach local
+ * ports. On a Mac they may also use every unix socket, Docker's included. On Linux they may not: there the setting
+ * drops the sandbox's seccomp filter, and the user's systemd manager listens on a unix socket in $XDG_RUNTIME_DIR, so a
+ * command could start another outside the sandbox with `systemd-run --user`.
+ */
+function claudeNetwork(profile: PermissionProfile, platform: NodeJS.Platform): SandboxSettings['network'] {
+  const allowedDomains = [...profile.network.allowedDomains];
+  if (profile.name !== 'open') return { allowedDomains, strictAllowlist: true };
+  const open = { allowedDomains, strictAllowlist: false, allowLocalBinding: true };
+  return platform === 'darwin' ? { ...open, allowAllUnixSockets: true } : open;
 }
 
 /**
@@ -132,7 +149,9 @@ export function claudeSandboxSettings(input: ClaudeRulesInput): SandboxSettings 
  */
 function deniedPaths(input: ClaudeRulesInput): { readable: DeniedPath[]; writable: DeniedPath[] } {
   const roots = [input.home, input.paths.runner, input.paths.vaults, input.paths.work, input.clone, input.tmpDir];
-  for (const path of [...roots, ...Object.values(input.vendorHomes)]) plainPath(path);
+  for (const path of [...roots, ...Object.values(input.paths.caches), ...Object.values(input.vendorHomes)]) {
+    plainPath(path);
+  }
   const readable = deniedReadPaths(input);
   const writable = deniedWritePaths(input);
   for (const denied of [...readable, ...writable]) {

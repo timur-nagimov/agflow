@@ -89,6 +89,27 @@ describe('updating and cancelling', () => {
     expect(getTask(ctx, task.id).vendorHint).toBe('claude');
   });
 
+  test('the contract keeps its tier until a patch changes it; a task without one is standard', () => {
+    const { ctx } = createTestContext();
+    const [strong, plain] = createTasks(ctx, [newTask({ title: 'A', tier: 'strong' }), newTask({ title: 'B' })], 'user:alice');
+    expect(strong.tier).toBe('strong');
+    expect(plain.tier).toBeUndefined();
+    expect(updateTask(ctx, strong.id, { title: 'A2', priority: 1 }, 'user:alice').tier).toBe('strong');
+    expect(updateTask(ctx, strong.id, { tier: 'standard' }, 'user:alice').tier).toBe('standard');
+    expect(updateTask(ctx, plain.id, { tier: 'strong' }, 'agent:A-1').tier).toBe('strong');
+    expect(getTask(ctx, plain.id).tier).toBe('strong');
+  });
+
+  test("the holder is not told about a new tier: it sets only the next attempt's model", () => {
+    const { ctx } = createTestContext();
+    const agent = addAgent(ctx);
+    const [task] = createTasks(ctx, [newTask({ title: 'Parser' })], 'user:alice');
+    claimTask(ctx, task.id, agent);
+    updateTask(ctx, task.id, { tier: 'strong' }, 'user:alice');
+    expect(listMessages(ctx, { target: `agent:${agent.id}` })).toEqual([]);
+    expect(getTask(ctx, task.id).tier).toBe('strong');
+  });
+
   test('adding an unmet dependency blocks a ready task, removing it unblocks', () => {
     const { ctx } = createTestContext();
     const [a, b] = createTasks(ctx, [newTask({ title: 'A' }), newTask({ title: 'B' })], 'user:alice');

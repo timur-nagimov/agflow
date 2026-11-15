@@ -286,10 +286,10 @@ describe('sweepRetention', () => {
 
   test('a platform without pins keeps only referenced vendor versions', async () => {
     const f = fixture();
-    expect(VENDOR_PINS['linux-x64']).toBeUndefined();
+    expect(VENDOR_PINS['win32-x64']).toBeUndefined();
     f.attempt('T-4-a1', { endedAt: null });
     for (const name of ['1.0.0', '2.1.285', '9.0.0']) directory(join(f.paths.vendor, 'claude', name));
-    expect((await sweepRetention({ ...f.input, platform: 'linux-x64' })).vendorVersions).toBe(2);
+    expect((await sweepRetention({ ...f.input, platform: 'win32-x64' })).vendorVersions).toBe(2);
     expect(readdirSync(join(f.paths.vendor, 'claude'))).toEqual(['1.0.0']);
   });
 

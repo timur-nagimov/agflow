@@ -16,6 +16,8 @@
 //   reset is unknown or already past, the wait ends, attempt.quota reports state ok and the turn resumes. Until then
 //   the wait holds: nothing is sent, and a turn that starts (a delivery's) is interrupted. A hit that is only paid
 //   usage is reported with no account, since the account itself is not exhausted and allowPaidUsage is per runner.
+//   Any other reading of the account goes to the hub as attempt.quota with state ok, at most once every
+//   QUOTA_READING_MS, so placement knows how used the account is between preflights.
 // - Other vendor outcomes (auth, context, policy, denials, session_budget) are reported as attempt.vendor_outcome.
 import { randomUUID } from 'node:crypto';
 import {
@@ -39,6 +41,9 @@ export const QUOTA_RESUME_PROMPT = 'The usage limit has reset. Continue where yo
 
 /** The longest delay a timer takes (2^31 - 1 ms, about 24.8 days): a longer one fires at once. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** The shortest time between two live readings of the account that one attempt sends the hub. */
+export const QUOTA_READING_MS = 60_000;
 
 /** The terminal tools whose success ends continuations: the handoff note does not. */
 const ENDING_TOOLS: readonly TerminalTool[] = ['submit', 'blocked', 'impossible', 'released'];
@@ -120,10 +125,17 @@ export class TurnPolicy {
   /** The wait of a limit hit; null when not waiting. */
   private waiting: QuotaWait | null = null;
   private lastQuota: { accountId: string | null; quota: VendorQuota } | null = null;
+  /** When the last live reading went to the hub; null before the first. */
+  private lastReadingAt: number | null = null;
   private closed = false;
 
   constructor(options: TurnPolicyOptions) {
     this.options = options;
+  }
+
+  /** Whether a limit hit's wait holds: the hub has the attempt in quota_wait, and it takes no capacity slot. */
+  get waitingForQuota(): boolean {
+    return this.waiting !== null;
   }
 
   /** Every agent event, after the pump has handled it; nothing once the process is gone. */
@@ -148,6 +160,7 @@ export class TurnPolicy {
       case 'quota':
         this.lastQuota = { accountId: event.accountId, quota: event.quota };
         if (isLimitHit(event.quota, this.options.allowPaidUsage())) this.limitHit(this.lastQuota);
+        else this.reading(this.lastQuota);
         return;
       case 'turn_ended':
         this.turnEnded(event);
@@ -292,6 +305,20 @@ export class TurnPolicy {
       if (this.options.inTurn()) return;
       await this.send(vendorRetryPrompt(this.options.spec().vendor), 'a vendor-error retry');
     });
+  }
+
+  /**
+   * A live reading of the account that is no limit hit (design 6.10): reported as attempt.quota with state ok, which
+   * the hub stores for the account, at most once every QUOTA_READING_MS. Not while a wait holds, whose end reports
+   * itself, nor a reading that names no account or whose state is not ok.
+   */
+  private reading(reading: { accountId: string | null; quota: VendorQuota }): void {
+    const { accountId, quota } = reading;
+    if (this.waiting !== null || accountId === null || quota.state !== 'ok') return;
+    const now = this.now();
+    if (this.lastReadingAt !== null && now - this.lastReadingAt < QUOTA_READING_MS) return;
+    this.lastReadingAt = now;
+    this.options.report({ type: 'attempt.quota', data: { vendor: this.options.spec().vendor, accountId, quota } });
   }
 
   /**

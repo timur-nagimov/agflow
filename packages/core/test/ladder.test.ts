@@ -331,17 +331,17 @@ describe('infra backoff and failure signatures', () => {
     expect(() => infraBackoffMs(1, [])).toThrow(RangeError);
   });
 
-  test('infra endings back off, except the runner stopping itself', () => {
+  test('infra endings back off, except the runner stopping itself and a quota replacement', () => {
     expect(where(backoffApplies)).toEqual([
-      'auth', 'context', 'crashed', 'failed_to_start', 'lost', 'quota', 'vendor_error',
+      'auth', 'context', 'crashed', 'failed_to_start', 'lost', 'vendor_error',
     ]);
   });
 
-  test('signatureApplies is false for lost, runner stops, suspends and refused starts', () => {
-    for (const trigger of ['lost', 'runner_stop', 'suspend', 'refused_start'] as const) {
+  test('signatureApplies is false for lost, runner stops, quota replacements, suspends and refused starts', () => {
+    for (const trigger of ['lost', 'runner_stop', 'quota', 'suspend', 'refused_start'] as const) {
       expect([trigger, signatureApplies(trigger)]).toEqual([trigger, false]);
     }
-    expect(where(signatureApplies)).toEqual(['auth', 'context', 'crashed', 'failed_to_start', 'quota', 'vendor_error']);
+    expect(where(signatureApplies)).toEqual(['auth', 'context', 'crashed', 'failed_to_start', 'vendor_error']);
   });
 
   test('failureSignature is the end reason and the error, or the end reason alone', () => {

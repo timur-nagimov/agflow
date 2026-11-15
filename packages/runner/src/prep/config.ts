@@ -1,10 +1,12 @@
 // The project's dependency-preparation config (design 7.7): `.agflow/config.json`, a people-only file, read from the
-// vault at the restore base (X-16) and never from the clone, whose working tree the agent controls.
+// vault at the restore base (X-16) and never from the clone, whose working tree the agent controls. Its check, the
+// shell command a submission must pass, is read the same way at main.
 import { z } from 'zod';
 import { runGit } from '../git/run';
 import type { Vault } from '../git/vault';
 
-const CONFIG_PATH = '.agflow/config.json';
+/** Where the config lives in the repository. */
+export const PREP_CONFIG_PATH = '.agflow/config.json';
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const WhenPath = z
   .string()
@@ -31,7 +33,13 @@ export const PrepConfigSchema = z.strictObject({
       when: z.array(WhenPath),
       scripts: z.boolean().default(false),
     }),
-  ),
+  ).default([]),
+  // A shell command, run with /bin/sh -c in the clone at each submission; absent means no check.
+  check: z
+    .string()
+    .min(1)
+    .refine((command) => !command.includes('\0'), { error: 'the check must not contain NUL' })
+    .optional(),
 });
 
 export type PrepConfig = z.output<typeof PrepConfigSchema>;
@@ -41,7 +49,7 @@ export async function readPrepConfig(vault: Vault, baseSha: string): Promise<Pre
   try {
     if (!/^[a-f0-9]{40}$/.test(baseSha)) throw new Error('expected a full restore-base commit sha');
     const git = async (args: string[]) => (await runGit(vault.local, ['--git-dir', vault.path, ...args])).stdout;
-    const entry = await git(['ls-tree', '-z', baseSha, '--', CONFIG_PATH]);
+    const entry = await git(['ls-tree', '-z', baseSha, '--', PREP_CONFIG_PATH]);
     if (entry === '') return null;
     const match = entry.match(/^(100644|100755) blob ([a-f0-9]{40})\t\.agflow\/config\.json\0$/);
     if (!match) throw new Error('must be a regular file');
@@ -58,6 +66,6 @@ export async function readPrepConfig(vault: Vault, baseSha: string): Promise<Pre
     }
     return parsed.data;
   } catch (error) {
-    throw new Error(`${CONFIG_PATH}: ${(error as Error).message}`, { cause: error });
+    throw new Error(`${PREP_CONFIG_PATH}: ${(error as Error).message}`, { cause: error });
   }
 }

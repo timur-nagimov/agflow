@@ -1,10 +1,13 @@
 // Submissions from runner agents (design 6.13). Runner agents cannot push, so a submit has two phases: the request
-// here creates a pending submission and sends push_submission, and the runner's attempt.submitted records the outcome.
+// here creates a pending submission and sends push_submission, and the runner's attempt.submitted records the outcome,
+// with the runner's check of it. With AGFLOW_AUTO_ACCEPT, a submission whose check passed is accepted as it is
+// recorded, by hub:auto-accept, and the lead is not woken for it.
 import {
   type Agent,
   type Attempt,
   FIXABLE_SUBMIT_ERRORS,
   type RunnerEventData,
+  type SubmissionCheck,
   type SubmissionRecord,
   type Task,
   parseAttemptId,
@@ -26,6 +29,7 @@ import type { Emit } from './events';
 import { refreshLeadSubmission, submissionReviewInstruction } from './lead-review';
 import { insertMessage } from './messages';
 import {
+  AUTO_ACCEPT,
   type SubmissionRow,
   adoptableShas,
   branchHeadOf,
@@ -37,7 +41,7 @@ import {
   submissionData,
 } from './submission-store';
 import { findTask, getTask, move, setAgentTask, writeTask } from './task-store';
-import { requireHolder } from './tasks';
+import { acceptTask, requireHolder } from './tasks';
 import { clip } from './text';
 
 // The reads live in submission-store.ts, below the modules that end attempts; callers import them from here.
@@ -133,7 +137,7 @@ const detailOf = (runnerId: string | null, detail: string | null): string =>
   detail ? `\n[detail from runner ${runnerId ?? 'unknown'}]\n${quoteLines(detail)}` : '';
 
 /** What the agent fixes after a refusal it can fix; the runner's detail, passed on with it, may say more. */
-function whatToFix(error: FixableError, branch: string): string {
+function whatToFix(error: FixableError, branch: string, main: string): string {
   switch (error) {
     case 'dirty':
       return 'your clone has uncommitted changes, and the runner pushes only commits. Commit them';
@@ -144,7 +148,37 @@ function whatToFix(error: FixableError, branch: string): string {
         `someone added commits to ${branch} on top of agflow work. Run \`git fetch origin && git merge ` +
         `origin/${branch}\` and resolve any conflicts`
       );
+    case 'merge_conflict':
+      return `${main} does not merge into your branch cleanly. Merge it yourself and resolve the conflicts the detail names`;
+    case 'check_failed':
+      return (
+        `the project's check, or the preparation of the dependencies before it, failed on your branch with ${main} ` +
+        'merged in. Make it pass, as the detail shows'
+      );
   }
+}
+
+/** The runner's check in a message to the lead: what ran and how it went, or why none ran. */
+function checkLine(check: SubmissionCheck | null | undefined): string {
+  if (!check) return '';
+  if (check.status === 'none') {
+    if (check.command === null && check.tail === '') return 'No check ran: .agflow/config.json on main names none.\n';
+    return `No check ran${check.command ? ` (\`${check.command}\`)` : ''}:\n${quoteLines(clip(check.tail, 600))}\n`;
+  }
+  const seconds = Math.round(check.durationMs / 1000);
+  const own = check.ownFilesChanged
+    ? `Its branch changes the check's own files (${check.ownFilesChanged.join(', ')}): read those changes before you ` +
+      'accept it.\n'
+    : '';
+  return `The runner's check \`${check.command}\` ${check.status} in ${seconds} s.\n${own}`;
+}
+
+/** The runner's check, stored with its submission as it reported it. */
+function recordCheck(ctx: HubContext, submission: SubmissionRecord, outcome: Outcome): void {
+  if (!outcome.check) return;
+  ctx.db
+    .query('UPDATE submissions SET check_result = $check WHERE id = $id')
+    .run({ id: submission.id, check: JSON.stringify(outcome.check) });
 }
 
 /** What a failure the agent cannot fix tells it: its work is safe, and what it may do next (X-33). */
@@ -186,7 +220,9 @@ function recordable(task: Task, attempt: Attempt | null, submission: SubmissionR
  * A success, in the outcome's transaction (design 6.13, Recording): the submission is recorded, the task submitted
  * with its branch head and its work position, and the attempt holds (hold_attempt). A recorded stop is dropped, with
  * its stop_attempt if the runner has not taken it; the requester of one held back for the submission is told. The lead
- * is told, as in M1.
+ * is told, as in M1, with the runner's check; with AGFLOW_AUTO_ACCEPT a submission whose check passed is accepted
+ * instead, as a lead's accept would, and the lead hears of it in its next situation report. A branch that changes the
+ * check's own files, and a demo check, go to the lead all the same.
  */
 function recordSuccess(
   ctx: HubContext,
@@ -235,16 +271,26 @@ function recordSuccess(
         `${submission.id} was recorded, and ${task.id} is up for review.`,
     });
   }
-  refreshLeadSubmission(ctx, task.id, branch);
-  insertMessage(ctx, emit, {
-    from: 'system',
-    to: 'lead',
-    taskId: task.id,
-    body:
-      `${named(task)} was submitted by ${attempt.agentId} for review on branch ${branch ?? '(none)'} at ` +
-      `${head ?? 'an unknown head'}.\n${attempt.agentId} wrote:\n${quoteLines(clip(submission.summary, 1500))}\n` +
-      submissionReviewInstruction(task.id, branch),
-  });
+  // A check the branch changed vouches for nothing, and a demo check, the only task the system creates, lists defects
+  // for the lead to turn into tasks: both go to the lead.
+  const autoAccepted =
+    ctx.config.autoAccept === true &&
+    outcome.check?.status === 'passed' &&
+    outcome.check.ownFilesChanged === undefined &&
+    task.createdBy !== 'system';
+  if (!autoAccepted) {
+    refreshLeadSubmission(ctx, task.id, branch);
+    insertMessage(ctx, emit, {
+      from: 'system',
+      to: 'lead',
+      taskId: task.id,
+      body:
+        `${named(task)} was submitted by ${attempt.agentId} for review on branch ${branch ?? '(none)'} at ` +
+        `${head ?? 'an unknown head'}.\n${attempt.agentId} wrote:\n${quoteLines(clip(submission.summary, 1500))}\n` +
+        checkLine(outcome.check) +
+        submissionReviewInstruction(task.id, branch),
+    });
+  }
   const recorded = findSubmission(ctx, submission.id) as SubmissionRecord;
   emit({
     type: 'submission.recorded',
@@ -258,6 +304,7 @@ function recordSuccess(
     subject: attemptSubject(attempt),
     data: { ...attemptData(getAttempt(ctx, attempt.id)), submissionId: submission.id },
   });
+  if (autoAccepted) acceptTask(ctx, task.id, AUTO_ACCEPT, `its check \`${outcome.check?.command}\` passed`);
 }
 
 /**
@@ -330,7 +377,7 @@ function recordRefusal(
   const detail = detailOf(attempt.runnerId, outcome.detail);
   const error = outcome.error;
   if (error !== null && (FIXABLE_SUBMIT_ERRORS as readonly string[]).includes(error)) {
-    const fix = whatToFix(error as FixableError, branch);
+    const fix = whatToFix(error as FixableError, branch, ctx.config.mainBranch);
     tellAgent(
       ctx,
       emit,
@@ -416,6 +463,7 @@ export function onSubmitted(
     return;
   }
   recordHeads(ctx, submission, outcome);
+  recordCheck(ctx, submission, outcome);
   const task = getTask(ctx, submission.taskId);
   if (outcome.ok) {
     if (outcome.headSha !== null) writeTask(ctx, task.id, { branchHead: outcome.headSha });

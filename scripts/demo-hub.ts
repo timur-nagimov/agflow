@@ -550,8 +550,8 @@ const MANIFEST_DIFF = [
  * The runner work on R-1 (design 6.4, 6.8, 6.10, 6.13), one worker at a time through the worker target: T-8 logs its
  * work, pushes a WIP and waits for two approvals; T-10's first attempt is replaced by alice, its successor restates the
  * handoff, gets the first attempt's late work, has S-1 refused and S-2 recorded, and holds; T-12 works in a turn. With
- * three workers running (T-8, T-9 and T-12) the target is met, so R-1's free slot stays for a runner lead whenever the
- * seat empties.
+ * three workers running (T-8, T-9 and T-12) the target is met; a runner lead takes no slot, so one starts on R-1
+ * whenever the seat empties.
  */
 async function runnerWork(): Promise<void> {
   await settle('R-1 to take new work again', async () => (await runnerById('R-1'))?.acceptingUntil === null);

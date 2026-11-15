@@ -37,7 +37,7 @@ function fixture() {
     const clone = clones[index]!;
     const tmpDir = join(layout.tmp, `private space's-${index}`);
     mkdirSync(tmpDir, { recursive: true });
-    const env = prepEnv({ agentEnv: { PATH: '/usr/bin:/bin' }, clone, prep, tmpDir, entry });
+    const env = prepEnv({ agentEnv: { PATH: '/usr/bin:/bin' }, clone, prep, tmpDir, entry, caches: paths.caches });
     mkdirSync(env.HOME!, { recursive: true });
     return {
       argv,
@@ -202,6 +202,28 @@ describe('PrepSandbox backend contract', () => {
     const wrong = f.spec(['/usr/bin/true']);
     wrong.policy.network.allowedDomains = [];
     await expect(a.run(wrong)).rejects.toThrow('domains');
+  });
+
+  test('under the open profile commands reach any host and local ports', async () => {
+    let config: SandboxRuntimeConfig | undefined;
+    let answer: unknown;
+    const manager = backend({
+      initialize: async (value, ask) => {
+        config = value;
+        answer = await ask?.({ host: 'api.example.com', port: 443 });
+      },
+    });
+    const open = new PrepSandbox({ ...options, open: true, manager });
+    await open.init();
+    expect(config?.network).toMatchObject({
+      allowedDomains: [...open.allowedDomains],
+      strictAllowlist: false,
+      allowLocalBinding: true,
+    });
+    // The runtime asks about a host the list leaves out; the answer is yes.
+    expect(answer).toBe(true);
+    // The same process cannot run both profiles' preparations.
+    await expect(new PrepSandbox({ ...options, manager }).init()).rejects.toThrow('domains');
   });
 
   test('failed initialization is retained without retrying a partly started global runtime', async () => {

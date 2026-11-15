@@ -6,9 +6,13 @@ import type { RunnerConfig } from './config';
 import type { RunnerPaths } from './paths';
 
 export interface PermissionProfile {
-  /** Claude: acceptEdits with the sandbox, or auto mode with the sandbox. */
-  name: 'standard' | 'auto';
-  /** The hosts agent tool commands may reach (Claude's sandbox). */
+  /**
+   * Claude: acceptEdits with the sandbox, or auto mode with the sandbox. open is the hackathon profile: acceptEdits
+   * with a sandbox whose commands reach any host, local ports and unix sockets, Docker's included; Codex commands and
+   * dependency preparation get the network too, and agents may change the greenfield files (core's protected-paths).
+   */
+  name: 'standard' | 'auto' | 'open';
+  /** The hosts agent tool commands may reach (Claude's sandbox); under open, the hosts reached without asking. */
   network: { allowedDomains: string[] };
   /** WebFetch and WebSearch (Claude), web search (Codex). */
   webTools: boolean;
@@ -37,10 +41,11 @@ export const standardProfile: PermissionProfile = Object.freeze({
 
 /**
  * The profile runner.json asks for. Whether the account offers auto mode is the Claude adapter's to check; it falls
- * back to standard and reports so.
+ * back to standard and reports so. The open profile keeps the web tools.
  */
 export function profileOf(config: Pick<RunnerConfig, 'profile'>): PermissionProfile {
-  return { name: config.profile, network: { allowedDomains: [...REGISTRIES] }, webTools: false };
+  const webTools = config.profile === 'open';
+  return { name: config.profile, network: { allowedDomains: [...REGISTRIES] }, webTools };
 }
 
 /** An absolute path; tree marks a directory whose whole contents are meant. */

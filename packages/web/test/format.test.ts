@@ -178,6 +178,8 @@ describe('task actions', () => {
   test('people get the actions that fit the status', () => {
     expect(actionsFor(task({ status: 'submitted' }))).toEqual(['accept', 'reject', 'cancel']);
     expect(actionsFor(task({ status: 'accepted' }))).toEqual(['merged']);
+    // agflow merges it (AGFLOW_AUTO_MERGE); a person who merged it by hand marks it merged.
+    expect(actionsFor(task({ status: 'merging' }))).toEqual(['merged']);
     expect(actionsFor(task({ status: 'blocked' }))).toEqual(['unblock', 'cancel']);
     expect(actionsFor(task({ status: 'working' }))).toEqual(['release', 'cancel']);
     expect(actionsFor(task({ status: 'ready' }))).toEqual(['cancel']);
@@ -189,6 +191,9 @@ describe('task actions', () => {
       'A-2 is working on this. Release the claim only if the agent is stuck or gone.',
     );
     expect(actionHint(task({ status: 'accepted' }))).toBe('Accepted. Merge its branch, then mark it merged.');
+    expect(actionHint(task({ status: 'merging' }))).toBe(
+      'agflow is merging this into main. Mark it merged only if you merged it yourself.',
+    );
     expect(actionHint(task({ status: 'ready' }))).toBe('');
     expect(actionHint(task({ status: 'submitted', submission: submission() }))).toBe(
       'A-4 submitted this for review. Accept it, or reject it with feedback.',

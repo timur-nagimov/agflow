@@ -1,6 +1,7 @@
 // The runner registry (design 6.1, 6.3): runner rows, their identity checks at hello, the state the hub derives for
 // them, and the Runner view the API and the scheduler read.
 import {
+  type AgentRole,
   CLOSE_CODES,
   PROTOCOL_VERSION,
   type ProfileSummary,
@@ -70,6 +71,11 @@ export interface VendorHold {
   failedStarts: number;
   /** Set by two failed starts or an expired login; a vendor report with a later preflightAt clears it. */
   notReadySince: number | null;
+  /**
+   * Limit hits that left the account usable (setLimited), by model (core's modelClass). Holds written before it existed
+   * have none.
+   */
+  limitedUntil?: Partial<Record<AgentRole, number>>;
 }
 
 export type VendorHolds = Partial<Record<Vendor, VendorHold>>;
@@ -97,12 +103,22 @@ export interface RunnerRow {
   last_seen_at: number;
   created_at: number;
   retired_at: number | null;
-  /** Its starting, running and quota_wait attempts, a lead's included: the ones that take a slot. */
+  /** Its attempts that take a slot (TAKES_SLOT_SQL). */
   active_attempts: number;
 }
 
+/**
+ * SQL that holds for an attempt that takes a slot of its runner and of the project's workers (design 6.6): a worker
+ * starting or running, or one in quota_wait that is asked to stop, whose slot is kept for its successor until it
+ * ends. A lead, a holding attempt and a worker waiting for its quota take none. The runner's admission counts no more
+ * (AttemptController.takesSlot), so a start the hub sends into a free slot finds it free there.
+ */
+export const TAKES_SLOT_SQL =
+  "attempts.role = 'worker' AND (attempts.status IN ('starting', 'running') OR " +
+  "(attempts.status = 'quota_wait' AND attempts.stop_requested IS NOT NULL))";
+
 const RUNNER_SELECT = `SELECT runners.*, (SELECT COUNT(*) FROM attempts WHERE attempts.runner_id = runners.id
-  AND attempts.status IN ('starting', 'running', 'quota_wait')) AS active_attempts FROM runners`;
+  AND ${TAKES_SLOT_SQL}) AS active_attempts FROM runners`;
 
 export const runnerInfo = (row: Pick<RunnerRow, 'info'>): RunnerInfo => JSON.parse(row.info) as RunnerInfo;
 export const vendorHolds = (row: Pick<RunnerRow, 'vendor_holds'>): VendorHolds =>
@@ -771,6 +787,25 @@ export function applyVendorReport(ctx: HubContext, runnerId: string, vendors: Ru
 export function setDegraded(ctx: HubContext, runnerId: string, vendor: Vendor): void {
   const until = ctx.now() + ctx.config.degradedMs;
   changeHold(ctx, runnerId, vendor, (hold) => ({ ...hold, degradedUntil: until }));
+}
+
+/**
+ * A limit hit that left the account usable (design 6.10): a limit of one model, or paid usage the runner refuses. role
+ * names the model that met it (core's modelClass: the attempt's role, or lead for a strong task's worker). No new
+ * attempt on that model on the vendor's account until the reset, or for quotaUnknownMs when it is unknown or past, as
+ * the runner's own wait does; core's usableVendors holds it on every runner of the owner logged in to the same account.
+ */
+export function setLimited(
+  ctx: HubContext,
+  runnerId: string,
+  limit: { vendor: Vendor; role: AgentRole; resetsAt: number | null },
+): void {
+  const now = ctx.now();
+  const until = limit.resetsAt !== null && limit.resetsAt > now ? limit.resetsAt : now + ctx.config.quotaUnknownMs;
+  changeHold(ctx, runnerId, limit.vendor, (hold) => ({
+    ...hold,
+    limitedUntil: { ...hold.limitedUntil, [limit.role]: until },
+  }));
 }
 
 /**

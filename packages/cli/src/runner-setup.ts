@@ -1,7 +1,9 @@
-// Laptop setup (design 7.1): verify sign-in before writes, then reuse the runner's config, pins, logins and service.
-import { existsSync } from 'node:fs';
+// Runner setup (design 7.1): verify sign-in before writes, then reuse the runner's config, pins, logins and service.
+// Flags answer its questions and set runner.json's ceilings, keep-awake and profile; --preset hackathon sets them all.
+import { chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface, type Interface } from 'node:readline/promises';
+import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { editLocalSettings, loadRunnerConfig, type RunnerConfig, saveRunnerConfig } from '@agflow/runner/src/config';
 import { agflowHome, type RunnerPaths, runnerPaths } from '@agflow/runner/src/paths';
@@ -18,11 +20,12 @@ import {
   readMachineId,
 } from '@agflow/runner/src/service/machine';
 import { createRunnerConfig } from '@agflow/runner/src/service/runner-json';
+import { installSystemdService } from '@agflow/runner/src/service/systemd';
 import { defaultExec, type Exec } from '@agflow/runner/src/service/system';
 import { ensurePinnedVendors } from '@agflow/runner/src/vendor/install';
 import { claudeLoginStatus, codexLoginStatus, loginClaude, loginCodex } from '@agflow/runner/src/vendor/login';
 import { type PlatformPins, VENDOR_PINS, vendorPlatform } from '@agflow/runner/src/vendor/pins';
-import type { ParsedArgs } from './args';
+import { type ParsedArgs, UsageError, stringFlag } from './args';
 import { loadCredentials } from './credentials';
 import { type FetchFn, HubClient, HubClientError } from './hub-client';
 import type { Io } from './io';
@@ -51,6 +54,32 @@ export function terminalPrompt(): Prompt & { close(): void } {
   };
 }
 
+/**
+ * Reads a secret without showing it: the lines up to an empty one or the end of the input, joined. A terminal wraps a
+ * long token over lines, and a copy of it keeps the breaks.
+ */
+export async function readSecret(
+  question: string,
+  input: NodeJS.ReadableStream & { isTTY?: boolean } = process.stdin,
+  output: NodeJS.WritableStream = process.stderr,
+): Promise<string> {
+  output.write(question);
+  // The reader shows what is typed on its own output, which goes nowhere.
+  const nowhere = new Writable({ write: (_chunk, _encoding, done) => done() });
+  const reader = createInterface({ input, output: nowhere, terminal: input.isTTY === true });
+  const lines: string[] = [];
+  try {
+    for await (const line of reader) {
+      if (line.trim() === '') break;
+      lines.push(line);
+    }
+  } finally {
+    reader.close();
+  }
+  output.write('\n');
+  return lines.join('\n');
+}
+
 export interface RunnerSetupDeps {
   dir: string;
   paths: RunnerPaths;
@@ -58,10 +87,15 @@ export interface RunnerSetupDeps {
   fetch: FetchFn;
   exec: Exec;
   prompt: Prompt;
+  /** Reads the Claude token on Linux; readSecret by default. */
+  secret: (question: string) => Promise<string>;
   pins: PlatformPins;
   /** The vendor platform key, including for login verification. */
   platform: string;
+  /** The OS: Linux has no browser for the logins and runs the runner as a systemd unit. */
   machinePlatform: NodeJS.Platform;
+  /** Linux's machine id file, /etc/machine-id by default. */
+  machineIdFile: string;
   home: string;
   uid: number;
   agflow: SelfCommand;
@@ -70,25 +104,108 @@ export interface RunnerSetupDeps {
   pollMs: number;
 }
 
+/**
+ * What setup's flags choose, so it asks nothing about them (design 7.1): the name, the capacity, one ceiling for both
+ * windows of both vendors, keep-awake and the profile. A flag given beside --preset wins over the preset.
+ */
+export interface SetupChoices {
+  name?: string;
+  capacity?: number;
+  ceiling?: number;
+  keepAwake?: RunnerConfig['keepAwake'];
+  profile?: RunnerConfig['profile'];
+}
+
+/** --preset hackathon: every slot busy, no ceiling, the laptop always awake, and the open profile. */
+export const HACKATHON_PRESET: Readonly<SetupChoices> = {
+  capacity: 6,
+  ceiling: 1,
+  keepAwake: 'always',
+  profile: 'open',
+};
+
+const KEEP_AWAKE: readonly RunnerConfig['keepAwake'][] = ['always', 'ac', 'off'];
+const PROFILES: readonly RunnerConfig['profile'][] = ['standard', 'auto', 'open'];
+
+/** A capacity as runner.json takes it, a whole number from 1 to 16; null for anything else. */
+function capacityOf(text: string): number | null {
+  const capacity = Number(text);
+  return Number.isInteger(capacity) && capacity >= 1 && capacity <= 16 ? capacity : null;
+}
+
+function usage(message: string): never {
+  throw new UsageError(message);
+}
+
+/** One ceiling for both windows. */
+const both = (ceiling: number) => ({ fiveHour: ceiling, weekly: ceiling });
+
+/** Setup's flags; a value out of range is a usage error, before anything is asked or written. */
+export function setupChoices(args: ParsedArgs): SetupChoices {
+  // A flag given twice counts with its last value, as everywhere in the CLI.
+  const flag = (name: string): string | undefined =>
+    args.flags[name] === true ? usage(`--${name} needs a value`) : stringFlag(args, name);
+  const oneOf = <T extends string>(name: string, values: readonly T[]): T | undefined => {
+    const value = flag(name);
+    if (value === undefined || (values as readonly string[]).includes(value)) return value as T | undefined;
+    return usage(`--${name} must be one of: ${values.join(', ')}`);
+  };
+  const choices: SetupChoices = oneOf('preset', ['hackathon']) ? { ...HACKATHON_PRESET } : {};
+  const name = flag('name')?.trim();
+  if (name !== undefined) choices.name = name || usage('--name must not be empty');
+  const capacity = flag('capacity');
+  if (capacity !== undefined) {
+    choices.capacity = capacityOf(capacity) ?? usage('--capacity must be a whole number from 1 to 16');
+  }
+  const ceiling = flag('ceiling');
+  if (ceiling !== undefined) {
+    const value = Number(ceiling);
+    choices.ceiling = value >= 0.5 && value <= 1 ? value : usage('--ceiling must be a number from 0.5 to 1');
+  }
+  const keepAwake = oneOf('keep-awake', KEEP_AWAKE);
+  if (keepAwake !== undefined) choices.keepAwake = keepAwake;
+  const profile = oneOf('profile', PROFILES);
+  if (profile !== undefined) choices.profile = profile;
+  return choices;
+}
+
+/** The config with the choices laid over it, the settings among them as local edits; null when they change nothing. */
+function withChoices(config: RunnerConfig, choices: SetupChoices): RunnerConfig | null {
+  const { name = config.name, profile = config.profile, capacity, keepAwake, ceiling } = choices;
+  const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
+  const edited = editLocalSettings(config, { capacity, keepAwake, ceilings });
+  if (name === config.name && profile === config.profile && Object.keys(edited.changed).length === 0) return null;
+  return { ...edited.config, name, profile };
+}
+
 async function configure(
   paths: RunnerPaths,
   env: RunnerSetupDeps['env'],
   exec: Exec,
-  platform: NodeJS.Platform,
+  machine: { platform: NodeJS.Platform; machineIdFile?: string },
   prompt: Prompt,
   log: (line: string) => void,
+  choices: SetupChoices = {},
 ): Promise<RunnerConfig> {
-  const machineId = await readMachineId({ exec, platform });
+  const machineId = await readMachineId({ exec, ...machine });
   let lock: RunnerLock;
   try {
     lock = await acquireRunnerLock(paths, { mode: 'foreground', wait: false });
   } catch (error) {
     if (!(error instanceof AlreadyRunningError)) throw error;
+    const running = loadRunnerConfig(paths.config, env);
+    // The running runner owns runner.json: flags that would change it fail setup rather than go unheard.
+    if (withChoices(running, choices) !== null) {
+      throw new Error(
+        `the runner (pid ${error.pid ?? 'unknown'}) is running, so setup cannot change runner.json; ` +
+          'stop it first (agflow runner stop), then run setup again',
+      );
+    }
     log(
       `the runner (pid ${error.pid ?? 'unknown'}) is running, so runner.json stays as it is; ` +
         'change capacity on the hub, or stop the runner and run setup again',
     );
-    return loadRunnerConfig(paths.config, env);
+    return running;
   }
   try {
     // Re-read under the lock: a service may have saved settings while setup checked sign-in.
@@ -99,18 +216,21 @@ async function configure(
     const kept = mismatch ? null : previous;
     const defaultName = kept?.name ?? (await readComputerName(exec));
     const defaultCapacity = kept?.capacity ?? 2;
-    const name = (await prompt.ask('Runner name', defaultName)).trim() || defaultName;
-    const answer = (await prompt.ask('Capacity', String(defaultCapacity))).trim();
-    const capacity = Number(answer || defaultCapacity);
+    // A flag answers its question, so setup does not ask it.
+    const name = choices.name ?? ((await prompt.ask('Runner name', defaultName)).trim() || defaultName);
+    const answer = choices.capacity === undefined ? (await prompt.ask('Capacity', String(defaultCapacity))).trim() : '';
+    const capacity = choices.capacity ?? Number(answer || defaultCapacity);
     if (!Number.isInteger(capacity) || capacity < 1 || capacity > 16) {
       throw new Error('capacity must be a whole number from 1 to 16');
     }
     if (kept) {
-      if (name === kept.name && capacity === kept.capacity) return kept;
-      const next = { ...editLocalSettings(kept, { capacity }).config, name };
+      const next = withChoices(kept, { ...choices, name, capacity });
+      if (next === null) return kept;
       saveRunnerConfig(paths.config, next);
       return next;
     }
+    const { ceiling, keepAwake, profile } = choices;
+    const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
     const captured = await captureLoginShellEnv({ env, exec });
     const config = createRunnerConfig(
       {
@@ -121,7 +241,7 @@ async function configure(
         commitIdentity: await readGitIdentity(exec),
         homes: { claude: canonicalHome(paths.homes.claude), codex: canonicalHome(paths.homes.codex) },
       },
-      { name, capacity },
+      { name, capacity, keepAwake, ceilings, profile },
     );
     saveRunnerConfig(paths.config, config);
     if (mismatch) log('assigned a new runner key because runner.json came from another Mac');
@@ -129,6 +249,39 @@ async function configure(
   } finally {
     lock.release();
   }
+}
+
+/** How every token of `claude setup-token` starts. */
+export const CLAUDE_TOKEN_PREFIX = 'sk-ant-oat';
+
+/**
+ * What the owner does on a machine with no browser (Linux) for a Claude login: makes a token with `claude setup-token`
+ * on a Mac, then pastes it into setup, which --yes keeps from asking.
+ */
+export function claudeTokenSteps(reason: string, ask: boolean): string[] {
+  return [
+    `claude: ${reason}; this machine has no browser, so Claude signs in with a token made on your Mac:`,
+    '  1. on your Mac run: claude setup-token',
+    ask
+      ? '  2. paste the token here, then press Enter on an empty line'
+      : '  2. run agflow runner setup here without --yes, and paste the token when it asks',
+  ];
+}
+
+/**
+ * Saves a pasted token of `claude setup-token` as CLAUDE_CODE_OAUTH_TOKEN in the runner's environment file, readable by
+ * its owner alone. All whitespace goes, which joins the lines of a wrapped token; the rest must start as such a token.
+ */
+export function saveClaudeToken(paths: Pick<RunnerPaths, 'envFile'>, pasted: string): void {
+  const token = pasted.replace(/\s+/g, '');
+  if (!token.startsWith(CLAUDE_TOKEN_PREFIX)) {
+    throw new Error(
+      `that is not a token of claude setup-token, which starts with ${CLAUDE_TOKEN_PREFIX}; ` +
+        'run agflow runner setup again and paste the whole token',
+    );
+  }
+  writeFileSync(paths.envFile, `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`, { mode: 0o600 });
+  chmodSync(paths.envFile, 0o600);
 }
 
 async function serviceChecks(paths: RunnerPaths, socketTimeoutMs: number, checksTimeoutMs: number, pollMs: number) {
@@ -157,6 +310,7 @@ async function serviceChecks(paths: RunnerPaths, socketTimeoutMs: number, checks
 }
 
 export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<RunnerSetupDeps> = {}): Promise<number> {
+  const choices = setupChoices(args);
   const env = deps.env ?? process.env;
   const paths = deps.paths ?? runnerPaths(agflowHome(env));
   const credentials = loadCredentials(deps.dir ?? configDir());
@@ -174,6 +328,9 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
   const log = (line: string) => io.out(`${line}\n`);
   log(`signed in to ${credentials.hubUrl} as ${user}`);
   const exec = deps.exec ?? defaultExec;
+  const machinePlatform = deps.machinePlatform ?? process.platform;
+  // A Linux runner is a cloud machine: no browser for the logins, and systemd instead of launchd.
+  const linux = machinePlatform === 'linux';
   const terminal = args.flags.yes !== true && !deps.prompt ? terminalPrompt() : undefined;
   let config: RunnerConfig;
   try {
@@ -181,9 +338,10 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
       paths,
       env,
       exec,
-      deps.machinePlatform ?? process.platform,
+      { platform: machinePlatform, machineIdFile: deps.machineIdFile },
       args.flags.yes === true ? { ask: async (_question, fallback) => fallback } : (deps.prompt ?? terminal!),
       log,
+      choices,
     );
   } finally {
     terminal?.close();
@@ -193,16 +351,37 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
   const pinOptions = { env, exec, platform, pins, log };
   log('installing the pinned Claude and Codex binaries; the first setup downloads about 550 MB');
   await ensurePinnedVendors(paths, pinOptions);
+  // The Claude token's file holds a secret: only its owner reads it.
+  if (existsSync(paths.envFile)) chmodSync(paths.envFile, 0o600);
+  const ask = args.flags.yes !== true;
+  let claudeToken = false;
   for (const vendor of ['claude', 'codex'] as const) {
-    const options = { version: pins?.[vendor].version, platform, exec, base: env };
+    const options = { version: pins?.[vendor].version, platform, exec, base: env, deviceAuth: linux };
     const status = await (vendor === 'claude' ? claudeLoginStatus : codexLoginStatus)(config, paths, options);
-    if (status.ok && args.flags.relogin !== true) {
+    // On Linux Claude signs in with a token made on a Mac, which setup asks for; --yes asks for nothing.
+    const token = linux && vendor === 'claude';
+    if (status.ok && (args.flags.relogin !== true || (token && !ask))) {
       log(`${vendor}: signed in${status.plan ? ` (${status.plan})` : ''}`);
+    } else if (token) {
+      for (const line of claudeTokenSteps(status.ok ? '--relogin asks for a new token' : status.reason, ask)) log(line);
+      if (ask) {
+        saveClaudeToken(paths, await (deps.secret ?? readSecret)('Token: '));
+        const saved = await claudeLoginStatus(config, paths, options);
+        if (!saved.ok) throw new Error(`claude: ${saved.reason}`);
+        log('claude: signed in');
+      } else {
+        claudeToken = true;
+      }
     } else {
-      log(`${vendor}: login opens now in the runner's own home`);
+      log(
+        linux
+          ? `${vendor}: sign in with the code below, in a browser on any machine`
+          : `${vendor}: login opens now in the runner's own home`,
+      );
       await (vendor === 'claude' ? loginClaude : loginCodex)(config, paths, options);
     }
   }
+  if (claudeToken) return 1;
   if (args.flags['no-service'] === true) {
     log('setup is done; run agflow runner start');
     return 0;
@@ -213,17 +392,22 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
     log('run agflow runner setup --no-service and then agflow runner start to run a test runner in the foreground');
     return 1;
   }
-  const installed = await installService({
+  const service = {
     paths,
     agflow: deps.agflow ?? selfCommand(),
     env,
     exec,
-    uid: deps.uid,
     home: deps.home ?? homedir(),
     log,
-    installPins: (paths) => ensurePinnedVendors(paths, pinOptions),
-  });
-  log(`installed ${installed.plistPath}; the runner starts as ${installed.target}`);
+    installPins: (paths: RunnerPaths) => ensurePinnedVendors(paths, pinOptions),
+  };
+  if (linux) {
+    const installed = await installSystemdService(service);
+    log(`installed ${installed.unitPath}; the runner starts as ${installed.target}`);
+  } else {
+    const installed = await installService({ ...service, uid: deps.uid });
+    log(`installed ${installed.plistPath}; the runner starts as ${installed.target}`);
+  }
   const results = await serviceChecks(
     paths,
     deps.socketTimeoutMs ?? 120_000,

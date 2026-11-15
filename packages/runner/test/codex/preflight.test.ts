@@ -317,7 +317,7 @@ describe('runCodexPreflight', () => {
         {},
         { version: kind === 'mismatch' ? '0.158.0' : kind === 'unreadable' ? 'unknown' : CODEX_VERSION },
       );
-      if (kind === 'platform') Object.assign(fixture.options, { platform: 'linux', arch: 'x64' });
+      if (kind === 'platform') Object.assign(fixture.options, { platform: 'win32', arch: 'x64' });
       if (kind === 'missing') {
         rmSync(fixture.bin);
         // The owner's install is reported even when the runner's own binary is missing.

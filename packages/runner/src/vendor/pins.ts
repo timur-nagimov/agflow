@@ -30,7 +30,10 @@ export interface PlatformPins {
   codex: CodexPin;
 }
 
-/** Keyed by `<process.platform>-<process.arch>`. M2 pins darwin-arm64 only; elsewhere preflight reports it. */
+/**
+ * Keyed by `<process.platform>-<process.arch>`: darwin-arm64 for the Macs, linux-x64 and linux-arm64 for a cloud runner
+ * (glibc builds, as Ubuntu has). Every platform pins the same versions. Elsewhere preflight reports it.
+ */
 export const VENDOR_PINS: Partial<Record<string, PlatformPins>> = {
   'darwin-arm64': {
     // The claude file of the SDK's platform package, which ships the CLI the SDK was built with.
@@ -49,6 +52,40 @@ export const VENDOR_PINS: Partial<Record<string, PlatformPins>> = {
       packageVersion: '0.159.2-darwin-arm64',
       integrity: 'sha512-7SPaPFU0tdqapQ5VEgrF+wb+p9dxfWfLMXMKZMRKoWPn/tLMajlMjYBBnu8o6VtaVH2DHQ6kpnp5TMkv5bqvrg==',
       tree: 'vendor/aarch64-apple-darwin',
+    },
+  },
+  'linux-x64': {
+    claude: {
+      version: '2.1.285',
+      sdkVersion: '0.3.285',
+      package: '@anthropic-ai/claude-agent-sdk-linux-x64',
+      packageVersion: '0.3.285',
+      integrity: 'sha512-yVxQ3Xsmme5M9iXnpVQKaBxhGXktl2m2f19fEig30BblvhhRTjF/H1PY4SCA7g9V1D8Ety+0SKMhGZTca4WcWQ==',
+      sha256: '33dad1ec615a2e08cc78b494f05c110e49916de2c79d78ec8799ebf46b233d29',
+    },
+    codex: {
+      version: '0.159.2',
+      package: '@openai/codex',
+      packageVersion: '0.159.2-linux-x64',
+      integrity: 'sha512-RrCZ1X52wpa1lOsXtCtSyhjOFdQPh7LH5Ccv8HsKmd/2UXbUwxXFqWXFK3JzatquUNGtW/TLox5Y7qVOGkV0/Q==',
+      tree: 'vendor/x86_64-unknown-linux-musl',
+    },
+  },
+  'linux-arm64': {
+    claude: {
+      version: '2.1.285',
+      sdkVersion: '0.3.285',
+      package: '@anthropic-ai/claude-agent-sdk-linux-arm64',
+      packageVersion: '0.3.285',
+      integrity: 'sha512-YbYXqKGtyqpyqY92U8TRcKdrsnO38Ys6oO8aSBqugQyILcv9JEau8/Gtsw1e9cbkGyuNiUP2e2HIiwK3wMa9mg==',
+      sha256: '24fac77749bed3d91365d6b6915aa4b824e14318ecb6bc17adbc192f01c9173d',
+    },
+    codex: {
+      version: '0.159.2',
+      package: '@openai/codex',
+      packageVersion: '0.159.2-linux-arm64',
+      integrity: 'sha512-Pm0W2PnFeTEqPx+AOIwgOVB4dBtY24cuD0tx1hjCor60CbSAT7WBPZVNUINSrTCDrMndvQC67p71ZEz+gmPPkA==',
+      tree: 'vendor/aarch64-unknown-linux-musl',
     },
   },
 };

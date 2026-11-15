@@ -30,12 +30,12 @@ import {
   endingClass,
   failureSignature,
   formatFence,
-  freeSlots,
   infraBackoffMs,
   isTaskBranch,
   ladderStep,
   leadAttemptId,
   localPinRefs,
+  modelClass,
   plannedTaskMove,
   quoteLines,
   restoreSet,
@@ -101,6 +101,8 @@ import {
   recordFailedStart,
   recordStartRefusal,
   resetFailedStarts,
+  runnerInfo,
+  setLimited,
 } from './runners';
 import { failPendingSubmission, pendingSubmissionOf } from './submission-store';
 import {
@@ -169,9 +171,14 @@ function unpushedWork(ctx: HubContext, task: Task): { attemptId: string; runnerI
   return unpushed && { attemptId: last.id, ...unpushed };
 }
 
-/** The restore set and its base, recomputed for every start and resume (X-16). */
-function restoreFor(ctx: HubContext, task: Task | null): AttemptSpec['restore'] {
-  return { paths: restoreSet(task), base: restoreBase(ctx) };
+/**
+ * The restore set and its base, recomputed for every start and resume (X-16), for the profile the attempt's runner
+ * reports: the open profile leaves the greenfield files to its agents.
+ */
+function restoreFor(ctx: HubContext, task: Task | null, runnerId: string | null): AttemptSpec['restore'] {
+  const runner = runnerId === null ? null : findRunnerRow(ctx, runnerId);
+  const profile = runner === null ? 'standard' : runnerInfo(runner).profile.name;
+  return { paths: restoreSet(task, profile), base: restoreBase(ctx) };
 }
 
 /**
@@ -191,13 +198,15 @@ export function buildAttemptSpec(
     role: attempt.role,
     vendor: attempt.vendor,
     model,
+    // Only a strong task names its tier: a start without one is standard to every runner, the older ones included.
+    ...(task?.tier === 'strong' ? { tier: 'strong' as const } : {}),
     fence: attempt.fence,
     hubUrl: ctx.config.publicUrl,
     repo: { url: getProject(ctx).repo, mainBranch: ctx.config.mainBranch },
     start: { ref: attempt.startRef ?? restoreBase(ctx), sha: attempt.startSha },
     branch: task?.branch ?? null,
     wipRef: attempt.wipRef,
-    restore: restoreFor(ctx, task),
+    restore: restoreFor(ctx, task, attempt.runnerId),
     acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     toolCaps: computeToolCaps(ctx.config, task?.checks ?? []),
     // A lead holds no task, so its task.md is empty; its brief carries what it needs.
@@ -567,7 +576,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
       prompt,
       messages,
       taskPack: task ? composeTaskPack(task) : null,
-      restore: restoreFor(ctx, task),
+      restore: restoreFor(ctx, task, attempt.runnerId),
       acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     });
     retargetDeliveries(ctx, attempt.id, command.id, messages);
@@ -620,8 +629,11 @@ export interface Ending {
   ladder: LadderOutcome | null;
 }
 
-/** A task in these statuses keeps its assignee when the attempt ends: it names whose work is in review or merged. */
-const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted'];
+/**
+ * A task in these statuses keeps its assignee when the attempt ends: it names whose work is in review or merged. With
+ * auto merge, the author's attempt ends once the task is merging or merged.
+ */
+const KEEPS_ASSIGNEE: readonly TaskStatus[] = ['submitted', 'accepted', 'merging', 'merged'];
 
 /**
  * Ends an attempt, whatever triggered it (design 6.4): the one path every ending takes, in the caller's transaction or
@@ -837,13 +849,14 @@ const attemptsOf = (ctx: HubContext, taskId: string): Attempt[] =>
   listAttempts(ctx, { task: taskId }).sort((a, b) => a.number - b.number);
 
 /**
- * A runner's own stop and a refused start say nothing about the task, so the backoff passes over them, and live-chat
- * attempts are never on the ladder (design 6.4).
+ * A runner's own stop, a refused start and a quota replacement say nothing about the task, so the backoff passes over
+ * them, and live-chat attempts are never on the ladder (design 6.4).
  */
 const passedOver = (attempt: Attempt): boolean =>
   attempt.runnerId === null ||
   (attempt.endReason === 'stopped' && attempt.failureClass === 'infra') ||
-  (attempt.endReason === 'failed_to_start' && attempt.failureClass === null);
+  (attempt.endReason === 'failed_to_start' && attempt.failureClass === null) ||
+  (attempt.endReason === 'replaced' && attempt.stopRequested?.cause === 'quota');
 
 /** The task's consecutive infra endings, newest back: the infra backoff's index (design 6.9). */
 function consecutiveInfra(attempts: readonly Attempt[]): number {
@@ -958,16 +971,33 @@ export function ladderRequirement(ctx: HubContext, taskId: string): LadderRequir
 // ---------------------------------------------------------------------------
 
 /**
+ * The model an attempt runs (modelClass): its role's, or the lead's when its start named the strong tier. A resume
+ * keeps the model of the start, so a tier the task got since (update_task) does not count.
+ */
+function attemptModel(ctx: HubContext, attempt: Attempt): AgentRole {
+  const row = ctx.db
+    .query(
+      `SELECT json_extract(payload, '$.attempt.tier') AS tier FROM runner_commands
+       WHERE attempt_id = $attemptId AND kind = 'start_attempt' ORDER BY rowid DESC LIMIT 1`,
+    )
+    .get({ attemptId: attempt.id }) as { tier: string | null } | null;
+  return modelClass(attempt.role, row?.tier === 'strong' ? 'strong' : undefined);
+}
+
+/**
  * Whether a rejection can go back to its author (design 6.9, step 1): the author's attempt is holding and resumable, on
- * an online runner with a free slot where its vendor is usable, by core's freeSlots and usableVendors over the
- * placement snapshot (X-46), and no other task holds paths that overlap the task's. Review rounds are the ladder's.
+ * an online runner where its vendor is usable for the attempt's model (attemptModel), by core's usableVendors over the
+ * placement snapshot (X-46), and no other task holds paths that overlap the task's. It needs no free slot: a resume is
+ * no start, and its runner takes it even when full, for as long as the review round lasts. Review rounds are the
+ * ladder's.
  */
 export function authorCanResume(ctx: HubContext, task: Task, attempt: Attempt): boolean {
   if (attempt.status !== 'holding' || !attempt.resumable || attempt.runnerId === null) return false;
   const snapshot = placementSnapshot(ctx);
   const runner = snapshot.runners.find((slot) => slot.id === attempt.runnerId);
-  if (!runner || runner.state !== 'online' || freeSlots(runner) < 1) return false;
-  if (!usableVendors(snapshot, runner).usable.some(({ slot }) => slot.vendor === attempt.vendor)) return false;
+  if (!runner || runner.state !== 'online') return false;
+  const usable = usableVendors(snapshot, runner, attemptModel(ctx, attempt)).usable;
+  if (!usable.some(({ slot }) => slot.vendor === attempt.vendor)) return false;
   return overlappingPathHolder(ctx, task) === null;
 }
 
@@ -1757,9 +1787,13 @@ function endOnExit(
 
 /**
  * attempt.quota (design 6.10, quota_wait; X-14). The account's quota is stored when the event names the account; a
- * null account id updates no account (X-21). An exhaustion moves a running attempt to quota_wait until its reset, and
- * state ok, which the runner reports when it resumes the waiting turn, moves it back to running. A waiting attempt
- * keeps its runner lease, renewed by heartbeats like any other.
+ * null account id updates no account (X-21), and its exhaustion, a limit of one model or paid usage the runner refuses,
+ * keeps the attempt's model off the account until the reset (setLimited), so its successor does not meet the same
+ * limit. The model is the one the attempt started on (attemptModel): the role's, or the lead's for a strong task's
+ * worker.
+ * An exhaustion moves a running attempt to quota_wait until its reset, and state ok, which the runner reports when it
+ * resumes the waiting turn, moves it back to running. A waiting attempt keeps its runner lease, renewed by heartbeats
+ * like any other.
  */
 export function onAttemptQuota(
   ctx: HubContext,
@@ -1770,6 +1804,9 @@ export function onAttemptQuota(
 ): void {
   const { vendor, accountId, quota } = data;
   if (accountId !== null) recordQuotaReports(ctx, emit, runnerId, [{ vendor, accountId, quota }]);
+  else if (quota.state === 'exhausted') {
+    setLimited(ctx, runnerId, { vendor, role: attemptModel(ctx, attempt), resetsAt: quota.resetsAt });
+  }
   if (quota.state === 'ok') {
     leaveQuotaWait(ctx, emit, attempt);
     return;

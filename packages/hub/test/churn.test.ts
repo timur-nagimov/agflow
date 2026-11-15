@@ -91,7 +91,8 @@ describe('the churn budget', () => {
     expect(paused.lead).toMatchObject({ role: 'lead', runnerId });
     clock.advance(HOUR);
     markHubAlive(ctx);
-    expect(runTick(ctx).started.map((attempt) => attempt.taskId)).toEqual(['T-1']);
+    // The lead takes no slot: both of the runner's go to workers.
+    expect(runTick(ctx).started.map((attempt) => attempt.taskId)).toEqual(['T-1', 'T-2']);
   });
 
   test('the M1 creation limits still apply', () => {

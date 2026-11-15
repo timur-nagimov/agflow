@@ -43,7 +43,7 @@ export interface TestHubOptions {
   config?: Partial<HubConfig>;
   /** The runner's owner, who gets the CLI session: alice by default. */
   owner?: string;
-  /** Whether the scheduler starts runner leads; off by default, since a lead would take a runner slot every tick. */
+  /** Whether the scheduler starts runner leads; off by default, so a tick starts only the workers a test expects. */
   runnerLeads?: boolean;
   /**
    * The hub's housekeeping timers (dead links, sign-ins, delivery flushes): off by default, as the fake clock does

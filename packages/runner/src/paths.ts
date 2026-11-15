@@ -1,9 +1,9 @@
-// The runner's layout (design 7.2): its own state under AGFLOW_HOME/runner, the vaults and the attempt clones, plus
-// the short private directories under /tmp that Claude attempts use as CLAUDE_CODE_TMPDIR.
+// The runner's layout (design 7.2): its own state under AGFLOW_HOME/runner, the vaults, the attempt clones and the
+// shared package caches, plus the short private directories under /tmp that Claude attempts use as CLAUDE_CODE_TMPDIR.
 import { createHash, getRandomValues } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 export interface RunnerPaths {
   /** AGFLOW_HOME, ~/.agflow by default. */
@@ -11,6 +11,11 @@ export interface RunnerPaths {
   /** Runner state; agents read only their own Claude project directory in it (design 7.6). */
   runner: string;
   config: string;
+  /**
+   * runner.env (mode 0600): secrets runner.json never holds. A runner with no browser (Linux) keeps the token of
+   * `claude setup-token` there as CLAUDE_CODE_OAUTH_TOKEN.
+   */
+  envFile: string;
   db: string;
   lock: string;
   socket: string;
@@ -32,6 +37,11 @@ export interface RunnerPaths {
   gitExcludes: string;
   /** Dependency caches and tmp of one project. */
   prep(project: string): string;
+  /**
+   * The pip and uv caches that every attempt and dependency preparation of the runner shares (design 7.6, 7.7):
+   * outside the runner tree, and writable inside the sandboxes.
+   */
+  caches: { pip: string; uv: string };
   /** An agent's .git, moved aside at take-over. */
   forensics(attemptId: string): string;
   vaults: string;
@@ -72,6 +82,7 @@ export function runnerPaths(home: string = agflowHome()): RunnerPaths {
     home,
     runner,
     config: join(runner, 'runner.json'),
+    envFile: join(runner, 'runner.env'),
     db: join(runner, 'runner.db'),
     lock: join(runner, 'runner.lock'),
     socket: join(runner, 'runner.sock'),
@@ -87,6 +98,7 @@ export function runnerPaths(home: string = agflowHome()): RunnerPaths {
     gitConfig: join(runner, 'git', 'local.gitconfig'),
     gitExcludes: join(runner, 'git', 'excludes'),
     prep: (project) => join(runner, 'prep', segment(project)),
+    caches: { pip: join(home, 'cache', 'pip'), uv: join(home, 'cache', 'uv') },
     forensics: (attemptId) => join(runner, 'forensics', segment(attemptId)),
     vaults,
     vault: (project) => join(vaults, `${segment(project)}.git`),
@@ -119,6 +131,21 @@ export function projectKey(hubUrl: string, projectName: string): string {
     .digest('hex')
     .slice(0, 10);
   return `${slug}-${hash}`;
+}
+
+/**
+ * Makes the shared caches real directories (mode 0700) before an agent or a preparation uses them: the sandboxes let
+ * commands write there, but not create them. A link or a file an agent left in a cache's place goes; it is never
+ * followed.
+ */
+export function ensureSharedCaches(paths: Pick<RunnerPaths, 'caches'>): void {
+  for (const dir of Object.values(paths.caches)) {
+    mkdirSync(dirname(dir), { recursive: true, mode: 0o700 });
+    const stat = lstatSync(dir, { throwIfNoEntry: false });
+    if (stat?.isDirectory()) continue;
+    if (stat) rmSync(dir, { force: true });
+    mkdirSync(dir, { mode: 0o700 });
+  }
 }
 
 /** Beyond this length of <dir>/claude-<uid>, Claude Code silently falls back to the shared /tmp/claude-<uid>. */

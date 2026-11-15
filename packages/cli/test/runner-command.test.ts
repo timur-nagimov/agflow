@@ -19,6 +19,7 @@ import {
 } from '@agflow/runner/src/service/launchd';
 import { acquireRunnerLock, readLockOwner } from '@agflow/runner/src/service/lock';
 import { readMachineId } from '@agflow/runner/src/service/machine';
+import { SYSTEMD_UNIT, unitPath } from '@agflow/runner/src/service/systemd';
 import { ServiceRuns } from '@agflow/runner/src/service/runs';
 import { waitFor } from '@agflow/runner/test/fixture';
 import { startRunnerAttempt } from '@agflow/runner/test/hub-fixture';
@@ -125,7 +126,7 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
       options.log?.('warning');
       return result;
     });
-    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService })).toBe(0);
+    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService, platform: 'darwin' })).toBe(0);
     expect(installService).toHaveBeenCalledTimes(1);
     expect(err).toEqual(['pins ready\n', 'warning\n']);
     expect(out).toEqual(['installed /scratch/agent.plist; the runner starts as gui/501/dev.agflow.runner\n']);
@@ -136,7 +137,7 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
     const installService = async () => {
       throw new Error('bootstrap failed');
     };
-    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService })).toBe(1);
+    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService, platform: 'darwin' })).toBe(1);
     expect(out).toEqual([]);
     expect(err).toEqual(['agflow: bootstrap failed\n']);
   });
@@ -160,7 +161,7 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
     const installService = (options: Parameters<typeof installRunnerService>[0]) =>
       realInstallService({ ...options, exec, home, uid: 501, installPins });
     const { io, out, err } = capture();
-    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService })).toBe(1);
+    expect(await runnerCommand(parseArgs(['runner', 'install']), io, { installService, platform: 'darwin' })).toBe(1);
     expect(out).toEqual([]);
     expect(err).toEqual([`agflow: ${message}\n`]);
     expect(exec.calls).toEqual([]);
@@ -419,7 +420,7 @@ describe('agflow runner status', () => {
           result: { stdout: 'disabled services = {\n  "dev.agflow.runner" => disabled\n}' },
         },
       ]);
-      const deps = { env: {}, exec, uid: 501, home: tempDir('agf-home-') };
+      const deps = { env: {}, exec, uid: 501, home: tempDir('agf-home-'), platform: 'darwin' as const };
       const human = capture();
       expect(await runnerCommand(parseArgs(['runner', 'status']), human.io, deps)).toBe(0);
       const text = human.out.join('');
@@ -475,7 +476,7 @@ describe('agflow runner status', () => {
     ]);
     for (const flags of [[], ['--json']]) {
       const { io, out, err } = capture();
-      expect(await runnerCommand(parseArgs(['runner', 'status', ...flags]), io, { env: {}, exec, uid: 501, home })).toBe(1);
+      expect(await runnerCommand(parseArgs(['runner', 'status', ...flags]), io, { env: {}, exec, uid: 501, home, platform: 'darwin' })).toBe(1);
       const text = out.join('');
       expect(text).toContain('incompatible protocol');
       expect(text).toContain('Login Items');
@@ -519,7 +520,7 @@ test('runner stop reaches the service and boots out and disables its LaunchAgent
   await waitFor(() => service.runner?.status().link === 'online');
   const exec = recordingExec();
   const { io, out, err } = capture();
-  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home: tempDir('agf-home-') })).toBe(
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home: tempDir('agf-home-'), platform: 'darwin' })).toBe(
     0,
   );
   expect(await service.exited).toMatchObject({ code: 0, clean: true });
@@ -539,7 +540,7 @@ test('runner stop reaches the service and boots out and disables its LaunchAgent
 test('runner restart prints its result and kickstarts a loaded service with no live runner', async () => {
   const exec = recordingExec();
   const { io, out } = capture();
-  expect(await runnerCommand(parseArgs(['runner', 'restart']), io, { env: {}, exec, uid: 501 })).toBe(0);
+  expect(await runnerCommand(parseArgs(['runner', 'restart']), io, { env: {}, exec, uid: 501, platform: 'darwin' })).toBe(0);
   expect(out).toEqual(['the runner restarted under launchd\n']);
   expect(exec.calls.map((call) => call.argv)).toEqual([
     ['launchctl', 'print', 'gui/501/dev.agflow.runner'],
@@ -550,7 +551,7 @@ test('runner restart prints its result and kickstarts a loaded service with no l
 test('runner stop without a runner or loaded job explains how to bring it back', async () => {
   const exec = recordingExec([], { exitCode: 1 });
   const { io, out } = capture();
-  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home: tempDir('agf-home-') })).toBe(
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home: tempDir('agf-home-'), platform: 'darwin' })).toBe(
     0,
   );
   expect(out.join('')).toContain('no runner was running; no LaunchAgent was loaded');
@@ -564,7 +565,7 @@ test('runner stop disables an installed LaunchAgent that is not loaded', async (
   writeFileSync(plistPath({ home }), 'installed');
   const exec = recordingExec([{ argv: ['launchctl', 'print', 'gui/501/dev.agflow.runner'], result: { exitCode: 1 } }]);
   const { io, out } = capture();
-  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home })).toBe(0);
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, { env: {}, exec, uid: 501, home, platform: 'darwin' })).toBe(0);
   expect(out.join('')).toContain('no runner was running; the installed LaunchAgent was not loaded and is now disabled');
   expect(exec.calls.map((call) => call.argv[1])).toEqual(['print', 'disable']);
 });
@@ -590,4 +591,46 @@ test('stop and restart pass the injected test environment through to operations'
   expect(await runnerCommand(parseArgs(['runner', 'stop']), io, deps)).toBe(0);
   await expect(runnerCommand(parseArgs(['runner', 'restart']), io, deps)).rejects.toThrow('no runner service is loaded');
   expect(exec.calls).toEqual([]);
+});
+
+test('on Linux install runs the systemd installer and prints the unit', async () => {
+  const { io, out, err } = capture();
+  const installSystemdService = mock(async (options: { log?: (line: string) => void }) => {
+    options.log?.('pins ready');
+    return { unitPath: '/home/owner/.config/systemd/user/agflow-runner.service', target: SYSTEMD_UNIT, warnings: [] };
+  });
+  const installService = mock(async () => {
+    throw new Error('launchd is not on Linux');
+  });
+  expect(
+    await runnerCommand(parseArgs(['runner', 'install']), io, { installSystemdService, installService, platform: 'linux' }),
+  ).toBe(0);
+  expect(installService).not.toHaveBeenCalled();
+  expect(err).toEqual(['pins ready\n']);
+  expect(out).toEqual([
+    'installed /home/owner/.config/systemd/user/agflow-runner.service; the runner starts as agflow-runner.service\n',
+  ]);
+});
+
+test('on Linux stop disables an installed systemd unit and restart restarts it', async () => {
+  const home = tempDir('agf-home-');
+  mkdirSync(dirname(unitPath(home)), { recursive: true });
+  writeFileSync(unitPath(home), 'installed');
+  const exec = recordingExec();
+  const { io, out } = capture();
+  const deps = { env: {}, exec, home, platform: 'linux' as const };
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), io, deps)).toBe(0);
+  expect(out.join('')).toContain('no runner was running; the systemd unit was stopped and disabled');
+  // Not the foreground start, which ends with the SSH session.
+  expect(out.join('')).toContain('\nrun agflow runner install to bring it back\n');
+  expect(await runnerCommand(parseArgs(['runner', 'restart']), io, deps)).toBe(0);
+  expect(out.join('')).toContain('the runner restarted under systemd');
+  expect(exec.calls.map((call) => call.argv)).toEqual([
+    ['systemctl', '--user', 'disable', '--now', SYSTEMD_UNIT],
+    ['systemctl', '--user', 'is-enabled', '--quiet', SYSTEMD_UNIT],
+    ['systemctl', '--user', 'restart', SYSTEMD_UNIT],
+  ]);
+  const none = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), none.io, { ...deps, home: tempDir('agf-home-') })).toBe(0);
+  expect(none.out.join('')).toContain('no runner was running; no systemd unit was installed');
 });

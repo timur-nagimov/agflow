@@ -55,6 +55,14 @@ describe('PrepConfigSchema', () => {
     (path) => expect(PrepConfigSchema.safeParse({ dependencies: [{ ...entry, when: [path] }] }).success).toBe(false),
   );
 
+  test('a check is one shell command string, and dependencies may then be left out', () => {
+    expect(PrepConfigSchema.parse({ check: 'bun test' })).toEqual({ dependencies: [], check: 'bun test' });
+    expect(PrepConfigSchema.parse({ ...config, check: 'bun run check' }).check).toBe('bun run check');
+    for (const check of ['', 'bun\0test', ['bun', 'test'], 42, null]) {
+      expect([check, PrepConfigSchema.safeParse({ check }).success]).toEqual([check, false]);
+    }
+  });
+
   test('uses strict objects and boolean scripts', () => {
     for (const value of [
       { ...config, extra: true },

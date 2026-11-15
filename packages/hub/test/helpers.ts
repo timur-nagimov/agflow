@@ -1,4 +1,14 @@
-import type { Agent, AgentRole, Attempt, LeadNote, RunnerCommandKind, RunnerVendor, Task, Vendor } from '@agflow/core';
+import type {
+  Agent,
+  AgentRole,
+  Attempt,
+  LeadNote,
+  ProfileSummary,
+  RunnerCommandKind,
+  RunnerVendor,
+  Task,
+  Vendor,
+} from '@agflow/core';
 import {
   AGFLOW_VERSION,
   type NewTask,
@@ -118,8 +128,14 @@ export function testVendor(vendor: Vendor): RunnerVendor {
   };
 }
 
-/** An online runner of the owner's, offering the vendors in test mode, with room for two attempts; returns its id. */
-export function addRunner(ctx: HubContext, options: { owner?: string; vendors?: Vendor[] } = {}): string {
+/**
+ * An online runner of the owner's, offering the vendors in test mode, with room for two attempts and the standard
+ * profile unless told otherwise; returns its id.
+ */
+export function addRunner(
+  ctx: HubContext,
+  options: { owner?: string; vendors?: Vendor[]; profile?: ProfileSummary['name'] } = {},
+): string {
   const owner = options.owner ?? 'alice';
   const now = ctx.now();
   const seq = nextId(ctx.db, 'runner');
@@ -128,7 +144,7 @@ export function addRunner(ctx: HubContext, options: { owner?: string; vendors?: 
     agflowVersion: AGFLOW_VERSION,
     platform: 'darwin-arm64',
     vendors: (options.vendors ?? ['claude']).map(testVendor),
-    profile: { name: 'standard', weakened: [], dependencyPrep: true },
+    profile: { name: options.profile ?? 'standard', weakened: [], dependencyPrep: true },
     git: { ready: true, problem: null, lastPushAt: null },
     power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
     disk: { freeBytes: 100e9, agflowBytes: 0 },
@@ -250,7 +266,7 @@ export function addLeadNote(
     .run({ attemptId: note.attemptId, kind: note.kind ?? 'handoff', body: note.body, author: note.author, now: ctx.now() });
 }
 
-/** One tokenless command of each kind for the attempt; the mapped type makes the compiler insist on all 17. */
+/** One tokenless command of each kind for the attempt; the mapped type makes the compiler insist on all 18. */
 export function sampleCommands(attempt: Attempt): { [K in RunnerCommandKind]: Extract<StoredCommand, { kind: K }> } {
   const { id: attemptId, fence } = attempt;
   const restore = { paths: ['.claude/**'], base: 'refs/heads/main' };
@@ -327,5 +343,12 @@ export function sampleCommands(attempt: Attempt): { [K in RunnerCommandKind]: Ex
     preflight: { kind: 'preflight', vendor: 'codex' },
     delete_refs: { kind: 'delete_refs', refs: [{ ref: 'refs/agflow/T-1/a1', expectedSha: 'c'.repeat(40) }] },
     update_settings: { kind: 'update_settings', settings: { capacity: 3 }, version: 2 },
+    merge_task: {
+      kind: 'merge_task',
+      taskId: attempt.taskId ?? 'T-1',
+      title: 'Do the thing',
+      branch: 'agflow/T-1-do-the-thing',
+      headSha: 'd'.repeat(40),
+    },
   };
 }

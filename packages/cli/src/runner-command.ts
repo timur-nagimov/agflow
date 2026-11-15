@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import type { startRunnerService } from '@agflow/runner/src/service/host';
 import type { installService } from '@agflow/runner/src/service/launchd';
 import type { RunnerStatusReport } from '@agflow/runner/src/service/status';
+import type { installSystemdService } from '@agflow/runner/src/service/systemd';
 import type { Exec } from '@agflow/runner/src/service/system';
 import { type ParsedArgs, UsageError } from './args';
 import type { Io } from './io';
@@ -17,17 +18,20 @@ import type { RunnerUninstallDeps } from './runner-uninstall';
 import { selfCommand } from './self';
 
 /** The runner subcommands' lines in main.ts's HELP; each subcommand adds its own. */
-export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-service]
-                                Set up this laptop's runner: sign-in, runner.json, binaries, logins and the service
+export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-service] [--preset hackathon]
+      [--name <name>] [--capacity <1-16>] [--ceiling <0.5-1>] [--keep-awake always|ac|off]
+      [--profile standard|auto|open]
+                                Set up this machine's runner: sign-in, runner.json, binaries, logins and the service;
+                                --preset hackathon is capacity 6, ceilings 1, keep-awake always and profile open
   agflow runner start [--service]
-                                Run this laptop's runner in the foreground (--service for launchd)
-  agflow runner stop             Hand off agents and stop and disable the LaunchAgent
-  agflow runner restart          Suspend agents and restart the runner under launchd
+                                Run this machine's runner in the foreground (--service for launchd or systemd)
+  agflow runner stop             Hand off agents and stop and disable the service
+  agflow runner restart          Suspend agents and restart the service
   agflow runner drain            Stop accepting new attempts
   agflow runner undrain          Accept new attempts and clear the crash-loop guard
-  agflow runner install          Install and start the LaunchAgent that runs the runner at login
+  agflow runner install          Install and start the service: a LaunchAgent on macOS, a systemd user unit on Linux
   agflow runner uninstall [--purge]
-                                Stop, log out, retire and remove the LaunchAgent; --purge deletes local runner data
+                                Stop, log out, retire and remove the service; --purge deletes local runner data
   agflow runner status [--json]  Show the runner's status and attempts
 `;
 
@@ -39,13 +43,18 @@ export async function runnerCommand(
     uninstall?: Partial<RunnerUninstallDeps>;
     startRunnerService?: typeof startRunnerService;
     installService?: typeof installService;
+    installSystemdService?: typeof installSystemdService;
     env?: Record<string, string | undefined>;
     exec?: Exec;
     uid?: number;
     home?: string;
+    /** Linux runs the runner as a systemd user unit, macOS as a LaunchAgent; process.platform by default. */
+    platform?: NodeJS.Platform;
   } = {},
 ): Promise<number> {
   const env = deps.env ?? process.env;
+  const platform = deps.platform ?? process.platform;
+  const linux = platform === 'linux';
   const drainingCommand =
     (draining: boolean): Command =>
     async (args, io) => {
@@ -63,7 +72,10 @@ export async function runnerCommand(
   const commands: Record<string, Command> = {
     setup: async (args, io) => {
       if (args.positional.length > 2) {
-        throw new UsageError('usage: agflow runner setup [--yes] [--relogin] [--no-service]');
+        throw new UsageError(
+          'usage: agflow runner setup [--yes] [--relogin] [--no-service] [--preset hackathon] [--name <name>] ' +
+            '[--capacity <1-16>] [--ceiling <0.5-1>] [--keep-awake always|ac|off] [--profile standard|auto|open]',
+        );
       }
       const { runnerSetup } = await import('./runner-setup');
       return runnerSetup(args, io, deps.setup);
@@ -95,7 +107,7 @@ export async function runnerCommand(
         const paths = runnerPaths();
         const options = {
           paths, exec: deps.exec, uid: deps.uid, home: deps.home, label: LAUNCHD_LABEL,
-          launchd: env.AGFLOW_TEST !== '1',
+          launchd: env.AGFLOW_TEST !== '1', platform,
         };
         let report: RunnerStatusReport;
         try {
@@ -106,6 +118,7 @@ export async function runnerCommand(
         }
         if (
           options.launchd &&
+          !linux &&
           report.running &&
           (await launchdDisabled(options)) === true &&
           !report.warnings.includes(LOGIN_ITEMS_WARNING)
@@ -127,22 +140,28 @@ export async function runnerCommand(
         exec: deps.exec,
         uid: deps.uid,
         home: deps.home ?? homedir(),
+        platform,
         log: (line) => io.err(`${line}\n`),
       });
-      const launchd = result.bootedOut
-        ? 'the LaunchAgent was booted out and disabled'
-        : result.disabled
-          ? 'the installed LaunchAgent was not loaded and is now disabled'
-          : 'no LaunchAgent was loaded';
-      io.out(`${result.wasRunning ? 'the runner stopped' : 'no runner was running'}; ${launchd}\n`);
-      io.out('run agflow runner install or agflow runner start to bring it back\n');
+      const service = linux
+        ? result.disabled
+          ? 'the systemd unit was stopped and disabled'
+          : 'no systemd unit was installed'
+        : result.bootedOut
+          ? 'the LaunchAgent was booted out and disabled'
+          : result.disabled
+            ? 'the installed LaunchAgent was not loaded and is now disabled'
+            : 'no LaunchAgent was loaded';
+      io.out(`${result.wasRunning ? 'the runner stopped' : 'no runner was running'}; ${service}\n`);
+      // A foreground runner on a cloud machine ends with the SSH session that started it.
+      io.out(`run agflow runner install${linux ? '' : ' or agflow runner start'} to bring it back\n`);
       return 0;
     },
     restart: async (args, io) => {
       if (args.positional.length > 2) throw new UsageError('usage: agflow runner restart');
       const { restartRunner } = await import('@agflow/runner/src/service/stop');
-      await restartRunner({ env, exec: deps.exec, uid: deps.uid, log: (line) => io.err(`${line}\n`) });
-      io.out('the runner restarted under launchd\n');
+      await restartRunner({ env, exec: deps.exec, uid: deps.uid, platform, log: (line) => io.err(`${line}\n`) });
+      io.out(`the runner restarted under ${linux ? 'systemd' : 'launchd'}\n`);
       return 0;
     },
     drain: drainingCommand(true),
@@ -150,15 +169,23 @@ export async function runnerCommand(
     install: async (args, io) => {
       if (args.positional.length > 2) throw new UsageError('usage: agflow runner install');
       try {
-        const install = deps.installService ?? (await import('@agflow/runner/src/service/launchd')).installService;
         const { runnerPaths } = await import('@agflow/runner/src/paths');
-        const result = await install({
+        const options = {
           paths: runnerPaths(),
           agflow: selfCommand(),
           env: process.env,
-          log: (line) => io.err(`${line}\n`),
-        });
-        io.out(`installed ${result.plistPath}; the runner starts as ${result.target}\n`);
+          log: (line: string) => io.err(`${line}\n`),
+        };
+        if (linux) {
+          const install =
+            deps.installSystemdService ?? (await import('@agflow/runner/src/service/systemd')).installSystemdService;
+          const result = await install(options);
+          io.out(`installed ${result.unitPath}; the runner starts as ${result.target}\n`);
+        } else {
+          const install = deps.installService ?? (await import('@agflow/runner/src/service/launchd')).installService;
+          const result = await install(options);
+          io.out(`installed ${result.plistPath}; the runner starts as ${result.target}\n`);
+        }
         return 0;
       } catch (error) {
         io.err(`agflow: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -171,7 +198,7 @@ export async function runnerCommand(
       }
       const { uninstallRunner } = await import('./runner-uninstall');
       return uninstallRunner(args, io, {
-        exec: deps.exec, uid: deps.uid, home: deps.home, ...deps.uninstall,
+        exec: deps.exec, uid: deps.uid, home: deps.home, machinePlatform: platform, ...deps.uninstall,
         env: deps.uninstall?.env ?? env,
       });
     },

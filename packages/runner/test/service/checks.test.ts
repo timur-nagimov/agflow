@@ -237,7 +237,7 @@ for (const [minutes, status] of [
   });
 }
 
-for (const platform of ['darwin', 'linux'] as const) {
+for (const platform of ['darwin', 'win32'] as const) {
   test(`unknown sleep timer warns on ${platform}`, async () => {
     const exec = recordingExec([], { exitCode: 127, stderr: 'pmset missing' });
     const s = await startTestService({ host: { exec, platform } });
@@ -245,9 +245,20 @@ for (const platform of ['darwin', 'linux'] as const) {
       status: 'warn',
       detail: expect.stringContaining('sleep timer could not be read'),
     });
-    if (platform === 'linux') expect(exec.calls).toHaveLength(0);
+    if (platform === 'win32') expect(exec.calls).toHaveLength(0);
   });
 }
+
+test('the sleep check passes on Linux without running pmset', async () => {
+  const exec = recordingExec([], { exitCode: 127, stderr: 'pmset missing' });
+  const s = await startTestService({ host: { exec, platform: 'linux' } });
+  expect(result(await checks(s.paths), 'sleep')).toEqual({
+    name: 'sleep',
+    status: 'pass',
+    detail: 'a Linux runner does not sleep',
+  });
+  expect(exec.calls).toHaveLength(0);
+});
 
 // Hold link startup, leaving the real host and HTTP hub running before their first welcome.
 function holdLink() {

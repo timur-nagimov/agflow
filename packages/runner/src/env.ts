@@ -1,6 +1,7 @@
 // The agent environment (design 7.6): built only from an allowlist, never by removing variables from the runner's
 // own environment, so a secret the runner happens to hold (an API key, an SSH agent, a cloud credential) never
 // reaches an agent. Test mode's claudeEnv comes after the allowlist (15.1).
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { AttemptSpec, Vendor } from '@agflow/core';
@@ -41,18 +42,41 @@ export function userVariables(base: Env): Record<string, string> {
   return env;
 }
 
-/** The package managers' caches, per attempt inside the clone. */
+/** The package managers' caches, per attempt inside the clone; pip's and uv's are the runner's shared ones. */
 const CACHES = {
   BUN_INSTALL_CACHE_DIR: 'bun',
   npm_config_cache: 'npm',
-  PIP_CACHE_DIR: 'pip',
-  UV_CACHE_DIR: 'uv',
   GOMODCACHE: 'go-mod',
   CARGO_HOME: 'cargo',
 } as const;
 
 const BRIDGE_PREFIX = 'AGFLOW_';
 const CONNECTIVITY = new Set<string>(CONNECTIVITY_VARS);
+
+/** What Claude takes from the runner's environment file: the `claude setup-token` token of a runner with no browser. */
+export const RUNNER_ENV_FILE_VARS: readonly string[] = Object.freeze(['CLAUDE_CODE_OAUTH_TOKEN']);
+
+/**
+ * The runner's environment file (paths.envFile): KEY=value lines, of which only RUNNER_ENV_FILE_VARS are read; a
+ * missing file is empty. It is read at each use, so a new token counts from the next Claude start, with no restart.
+ */
+export function readRunnerEnvFile(paths: Pick<RunnerPaths, 'envFile'>): Record<string, string> {
+  let text: string;
+  try {
+    text = readFileSync(paths.envFile, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    throw error;
+  }
+  const env: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match || !RUNNER_ENV_FILE_VARS.includes(match[1]!)) continue;
+    const value = match[2]!.trim().replace(/^(["'])(.*)\1$/, '$2');
+    if (value !== '') env[match[1]!] = value;
+  }
+  return env;
+}
 
 export function buildAgentEnv(input: AgentEnvInput): Record<string, string> {
   const base = input.base ?? process.env;
@@ -71,6 +95,8 @@ export function buildAgentEnv(input: AgentEnvInput): Record<string, string> {
     env.CLAUDE_CONFIG_DIR = homes.claude;
     env.CLAUDE_CODE_TMPDIR = input.tmpDir;
     env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
+    // The login of a runner with no browser. The CLI keeps it out of its tools' environment.
+    Object.assign(env, readRunnerEnvFile(input.paths));
   } else {
     // An empty HOME, so the owner's ~/.agents/skills do not load into the app-server.
     env.HOME = input.paths.homes.codexUser;
@@ -78,6 +104,8 @@ export function buildAgentEnv(input: AgentEnvInput): Record<string, string> {
   }
   env.DISABLE_AUTOUPDATER = '1';
   for (const [name, dir] of Object.entries(CACHES)) env[name] = join(runDir.cache, dir);
+  env.PIP_CACHE_DIR = input.paths.caches.pip;
+  env.UV_CACHE_DIR = input.paths.caches.uv;
   env.PATH = `${runDir.bin}:${input.config.capturedPath}`;
   Object.assign(env, agentGitEnv(runDir));
   Object.assign(env, {

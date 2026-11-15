@@ -1,10 +1,11 @@
-// Claude's preflight (design 8.1, 6.1, 6.10, 7.6, 15.1, X-5, X-29): the pin's platform and binary, then a zero-model
-// handshake whose only input is the local /clear command, run with the full session options in a scratch clone and
-// base checkout, with a bridge whose hub URL refuses connections. On the same query it reads the account, the
-// untyped getSettings() and the experimental usage call. It fails closed and gives facts only, with the quota and the
-// weakened items; the runtime adds models, ceilings, allowPaidUsage, preflightAt and degraded.
+// Claude's preflight (design 8.1, 6.1, 6.10, 7.6, 15.1, X-5, X-29): the pin's platform and binary, a runner.env token
+// the API refused, on Linux what its sandbox (bubblewrap) needs, then a zero-model handshake whose only input is the
+// local /clear command, run with the full session options in a scratch clone and base checkout, with a bridge whose
+// hub URL refuses connections. On the same query it reads the account, the untyped getSettings() and the experimental
+// usage call. It fails closed and gives facts only, with the quota and the weakened items; the runtime adds models,
+// ceilings, allowPaidUsage, preflightAt and degraded.
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Vendor, VendorQuota } from '@agflow/core';
@@ -17,7 +18,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { bridgeOf } from '../../attempt/launch';
 import type { RunnerConfig } from '../../config';
-import { buildAgentEnv } from '../../env';
+import { buildAgentEnv, readRunnerEnvFile } from '../../env';
 import { makeAttemptTmpDir, type RunnerPaths } from '../../paths';
 import { boundedWait } from '../../processes';
 import { profileOf } from '../../profile';
@@ -37,6 +38,11 @@ export const CLAUDE_WEAKENED_AUTO = 'auto';
 
 /** The weakened item of a pin whose sandbox does not enforce the denyWrite of the shared /tmp/claude (8.1, X-29). */
 export const CLAUDE_WEAKENED_TMP = '/tmp/claude';
+
+/** The problem of a runner.env token the API refused: only a new token makes Claude ready again. */
+export const CLAUDE_TOKEN_REFUSED =
+  'the API refused the Claude token in runner.env: make a new one with claude setup-token on your Mac, ' +
+  'then paste it into agflow runner setup --relogin';
 
 /**
  * The hub URL of the handshake's bridge: nothing listens on the discard port, so the connection is refused at once
@@ -72,6 +78,10 @@ export interface ClaudePreflightInput {
   timeoutMs?: number;
   /** TMP_CLAUDE_DENYWRITE_ENFORCED by default. */
   tmpClaudeDenyWriteEnforced?: boolean;
+  /** Linux only: the sysctl file linuxSandboxProblem reads, USERNS_SYSCTL by default. */
+  usernsSysctl?: string;
+  /** A runner.env token the API refused in a session: not ready (CLAUDE_TOKEN_REFUSED) while runner.env holds it. */
+  refusedToken?: string | null;
   /** The runner's environment, for buildAgentEnv's user variables and test mode; process.env by default. */
   env?: Record<string, string | undefined>;
   now?: () => number;
@@ -113,6 +123,14 @@ export async function claudePreflight(input: ClaudePreflightInput): Promise<Clau
     env: { PATH: input.config.capturedPath },
   });
   if (!version.ok) return notReady(version.problem, version.version);
+  // The handshake makes no model call, so it would pass with a token the API refuses.
+  if (input.refusedToken && readRunnerEnvFile(input.paths).CLAUDE_CODE_OAUTH_TOKEN === input.refusedToken) {
+    return notReady(CLAUDE_TOKEN_REFUSED, pin.version);
+  }
+  if (input.platform.startsWith('linux-')) {
+    const problem = linuxSandboxProblem(input.config.capturedPath, { usernsSysctl: input.usernsSysctl });
+    if (problem !== null) return notReady(problem, pin.version);
+  }
 
   const facts = { ...base, cliVersion: pin.version };
   if (profileOf(input.config).name === 'auto') {
@@ -121,6 +139,41 @@ export async function claudePreflight(input: ClaudePreflightInput): Promise<Clau
     if (auto.facts.ready) return outcome(input, facts, auto, [...weakened, CLAUDE_WEAKENED_AUTO]);
   }
   return outcome(input, facts, await handshake(input, pin.version, false), weakened);
+}
+
+/** What the Claude sandbox runs on Linux: bubblewrap, socat for its network proxy and ripgrep for its deny paths. */
+export const LINUX_SANDBOX_TOOLS: readonly string[] = Object.freeze(['bwrap', 'socat', 'rg']);
+
+/** Where Ubuntu (24.04 and later) turns on the restriction that strips bubblewrap's namespaces of their rights. */
+export const USERNS_SYSCTL = '/proc/sys/kernel/apparmor_restrict_unprivileged_userns';
+
+/**
+ * What keeps the Claude sandbox from running on Linux, or null: a tool missing from the captured PATH, which the CLI
+ * looks it up in, or Ubuntu's restriction on user namespaces. The handshake runs no command, so it would not tell.
+ */
+export function linuxSandboxProblem(
+  capturedPath: string,
+  options: { which?: (command: string, path: string) => string | null; usernsSysctl?: string } = {},
+): string | null {
+  const which = options.which ?? ((command: string, path: string) => Bun.which(command, { PATH: path }));
+  const missing = LINUX_SANDBOX_TOOLS.filter((tool) => which(tool, capturedPath) === null);
+  if (missing.length > 0) {
+    return (
+      `the Claude sandbox needs ${missing.join(', ')} on the PATH: ` +
+      'install them with sudo apt-get install bubblewrap socat ripgrep, then run agflow runner setup again'
+    );
+  }
+  let restricted = '';
+  try {
+    restricted = readFileSync(options.usernsSysctl ?? USERNS_SYSCTL, 'utf8').trim();
+  } catch {
+    // No such sysctl: nothing restricts the namespaces.
+  }
+  if (restricted !== '1') return null;
+  return (
+    'Ubuntu keeps bubblewrap from building the Claude sandbox: run ' +
+    'sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 and keep it in /etc/sysctl.d (docs/linux-runner.md)'
+  );
 }
 
 interface HandshakeResult {
@@ -294,7 +347,10 @@ function judge(
   auto: boolean,
   found: { account: AccountInfo | undefined; settings: unknown; usage: unknown; init: SDKSystemMessage | null },
 ): HandshakeResult {
-  const account = checkAccount(found.account, { skipAuthChecks: input.skipAuthChecks });
+  const account = checkAccount(found.account, {
+    skipAuthChecks: input.skipAuthChecks,
+    oauthToken: launch.env.CLAUDE_CODE_OAUTH_TOKEN,
+  });
   const problems: string[] = [];
   if (!account.ready && account.problem !== null) problems.push(account.problem);
   if (found.init === null) {

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { NewTaskSchema, type SubmitError } from '@agflow/core';
+import { NewTaskSchema, type SubmissionCheck, type SubmitError } from '@agflow/core';
 import { recordResult } from '@agflow/hub/src/commands';
 import { requestSubmission } from '@agflow/hub/src/submissions';
 import { tx } from '@agflow/hub/src/context';
@@ -101,12 +101,24 @@ function runnerAgent(hub: HubFixture, role: 'worker' | 'lead' = 'worker'): Runne
 }
 
 /** The runner's attempt.submitted for the agent's pending submission, as the hub applies it. */
-function submitted(hub: HubFixture, agent: RunnerAgent, outcome: { error: SubmitError | null; detail?: string | null }): void {
+function submitted(
+  hub: HubFixture,
+  agent: RunnerAgent,
+  outcome: { error: SubmitError | null; detail?: string | null; check?: SubmissionCheck },
+): void {
   const row = hub.ctx.db.query("SELECT id FROM submissions WHERE attempt_id = $attemptId AND status = 'pending'").get({ attemptId: agent.attempt.id }) as {
     id: string;
   };
   const ok = outcome.error === null;
-  const data = { submissionId: row.id, ok, headSha: HEAD, remoteHead: ok ? null : REMOTE, error: outcome.error, detail: outcome.detail ?? null };
+  const data = {
+    submissionId: row.id,
+    ok,
+    headSha: HEAD,
+    remoteHead: ok ? null : REMOTE,
+    error: outcome.error,
+    detail: outcome.detail ?? null,
+    ...(outcome.check ? { check: outcome.check } : {}),
+  };
   tx(hub.ctx, (emit) => onSubmitted(hub.ctx, emit, agent.attempt.runnerId as string, agent.attempt, { attemptId: agent.attempt.id, data }));
 }
 
@@ -255,6 +267,25 @@ describe('submit', () => {
     expect(answer).toEqual({ text: expect.stringContaining('uncommitted changes. Commit them'), isError: true });
   });
 
+  test("merge_conflict and check_failed are error results that say what to fix, the runner's detail passed on", async () => {
+    const hub = hubFixture();
+    const details = {
+      merge_conflict: 'main does not merge into your branch cleanly. These files conflict: src/parser.ts.',
+      check_failed: "the project's check `bun test` exited with code 1. The last lines of its output:\n1 fail",
+    } as const;
+    for (const [code, detail] of Object.entries(details) as [SubmitError, string][]) {
+      const worker = runnerAgent(hub);
+      const bridge = await bridgeFor(worker, { decide: { prefix: '/api/submissions/', at: 1, run: () => submitted(hub, worker, { error: code, detail }) } });
+      const answer = await bridge.call('submit', { task_id: worker.task?.id, summary: 'Done' });
+      expect([code, answer.isError]).toEqual([code, true]);
+      expect(answer.text).toContain(`was refused (${code}): ${detail}`);
+    }
+    const bare = runnerAgent(hub);
+    const bridge = await bridgeFor(bare, { decide: { prefix: '/api/submissions/', at: 1, run: () => submitted(hub, bare, { error: 'check_failed' }) } });
+    const answer = await bridge.call('submit', { task_id: bare.task?.id, summary: 'Done' });
+    expect(answer).toEqual({ text: expect.stringContaining("the project's check failed on your branch"), isError: true });
+  });
+
   test('branch_moved, remote and interrupted are error results that say the work is safe in its WIP ref', async () => {
     const hub = hubFixture();
     for (const code of ['branch_moved', 'remote', 'interrupted'] as const) {
@@ -340,13 +371,13 @@ describe('prepare_dependencies', () => {
 });
 
 describe('fetch_submission', () => {
-  function setup() {
+  function setup(check?: SubmissionCheck) {
     const hub = hubFixture();
     const lead = runnerAgent(hub, 'lead');
     const worker = runnerAgent(hub);
     const taskId = worker.task!.id;
     requestSubmission(hub.ctx, taskId, worker.agent, { summary: 'Ready', evidence: [] });
-    submitted(hub, worker, { error: null });
+    submitted(hub, worker, { error: null, ...(check ? { check } : {}) });
     const finish = (ok: boolean) => {
       const row = hub.ctx.db.query("SELECT id FROM runner_commands WHERE kind = 'refresh_vault' AND attempt_id = ?").get(lead.attempt.id) as { id: string };
       recordResult(hub.ctx, lead.attempt.runnerId!, { commandId: row.id, ok,
@@ -375,6 +406,14 @@ describe('fetch_submission', () => {
     if (ok) expect(JSON.parse(result.text)).toEqual({ branch: worker.task!.branch, head_sha: HEAD });
     else expect(result.text).toContain('fetch denied');
     expect(bridge.gets('/api/fetch-submission/')).toBe(2);
+  });
+
+  test("relays the runner's check of the submission with its branch and head", async () => {
+    const check: SubmissionCheck = { status: 'passed', command: 'bun test', durationMs: 1_200, tail: '3 pass' };
+    const { lead, worker, taskId, finish } = setup(check);
+    const bridge = await bridgeFor(lead, { decide: { prefix: '/api/fetch-submission/', at: 2, run: () => finish(true) } });
+    const result = await bridge.call('fetch_submission', { task_id: taskId });
+    expect(JSON.parse(result.text)).toEqual({ branch: worker.task!.branch, head_sha: HEAD, check });
   });
 
   test('an unanswered fetch has the polling budget and a later call reports its result without enqueuing again', async () => {

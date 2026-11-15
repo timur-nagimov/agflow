@@ -56,6 +56,17 @@ export function isPaidUsageNotice(text: string): boolean {
   return USAGE_TRANSITION_PREFIXES.some((prefix) => start.startsWith(prefix));
 }
 
+/** The rate limits of one model rather than of the whole account. */
+const MODEL_LIMITS: readonly string[] = ['seven_day_opus', 'seven_day_sonnet'];
+
+/**
+ * Whether a rate_limit_event is about the limit of one model (seven_day_opus or seven_day_sonnet): its hit leaves the
+ * account usable with the other models, so it names no account and only the attempt that met it waits.
+ */
+export function isModelLimit(info: SDKRateLimitInfo): boolean {
+  return info.rateLimitType !== undefined && MODEL_LIMITS.includes(info.rateLimitType);
+}
+
 /**
  * One rate_limit_event's info as a quota. A rejected status is exhausted unless the CLI goes on with paid usage
  * (isUsingOverage or overageInUse): the controller then decides by allowPaidUsage. The event's utilization fills the
@@ -146,6 +157,11 @@ export class QuotaBook {
           };
     this.quotas.set(accountId, merged);
     return merged;
+  }
+
+  /** A limit of one model (isModelLimit), as its own quota: never merged into the account's. */
+  modelLimit(info: SDKRateLimitInfo): VendorQuota {
+    return toVendorQuota(info, this.now());
   }
 
   rateLimit(accountId: string | null, info: SDKRateLimitInfo): VendorQuota {

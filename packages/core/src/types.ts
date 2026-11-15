@@ -1,9 +1,13 @@
+import type { PlacementRefusal } from './scheduling';
+
 export type Vendor = 'claude' | 'codex';
 export type AgentRole = 'lead' | 'worker';
 export type AgentOrigin = 'live' | 'runner';
 export type AgentStatus = 'active' | 'idle' | 'gone';
 
 export type TaskKind = 'code' | 'research' | 'review' | 'curation';
+/** How hard a task is to think through: a strong task runs on the runner's lead model, with more reasoning. */
+export type TaskTier = 'standard' | 'strong';
 export type TaskStatus =
   | 'draft'
   | 'ready'
@@ -63,6 +67,8 @@ export interface TaskContract {
   priority: number;
   /** The vendor the scheduler prefers for this task, after the ladder's vendor requirement (design 6.6, step 5). */
   vendorHint?: Vendor | null;
+  /** Absent: standard. A strong task's attempts run on the runner's lead model, with a higher reasoning effort. */
+  tier?: TaskTier;
 }
 
 export interface Submission {
@@ -104,6 +110,11 @@ export interface Task extends TaskContract {
   nextDispatchAt: number | null;
   /** The lead or a person granted the task internet access: its Claude agents may use fetch_url (design 5). */
   fetchGranted: boolean;
+  /**
+   * Why the scheduler's last tick did not start this ready task, in one line, as GET /api/tasks gives it; null when
+   * that tick said nothing about it.
+   */
+  waitReason?: string | null;
 }
 
 /** What POST /api/fetch answers: one public URL the hub downloaded for a runner agent (design 5, Unattended options). */
@@ -153,6 +164,8 @@ export interface Project {
   paused: boolean;
   /** May the scheduler start leads on runners. */
   runnerLeads: boolean;
+  /** When the project must be done, in epoch ms, which the lead plans against; null for no deadline. */
+  deadlineAt: number | null;
 }
 
 export interface Agent {
@@ -483,7 +496,8 @@ export interface AccountQuota {
 }
 
 export interface ProfileSummary {
-  name: 'standard' | 'auto';
+  /** open: the hackathon profile, with network for agents and the greenfield files theirs to change. */
+  name: 'standard' | 'auto' | 'open';
   /** Boundaries this laptop cannot enforce. */
   weakened: string[];
   /** The sandbox for dependency preparation works here. */
@@ -535,6 +549,28 @@ export interface SubmissionRecord {
   error: string | null;
   requestedAt: number;
   decidedAt: number | null;
+  /** The runner's check of the submission; absent when the runner reported none, as for a refusal before the check. */
+  check?: SubmissionCheck;
+}
+
+/**
+ * The runner's own run of the project's check at submission: the "check" command of .agflow/config.json on main, run
+ * in the clone once main is merged in. none: no check ran, because main's config names none or the runner cannot run
+ * one; the tail then says why.
+ */
+export interface SubmissionCheck {
+  status: 'passed' | 'failed' | 'none';
+  /** The command as the config gives it; null when it gives none. */
+  command: string | null;
+  durationMs: number;
+  /** The end of the command's output, at most 4 KB. */
+  tail: string;
+  /**
+   * The check's own files that the branch changes, when the check passed: .agflow/config.json, which names the check,
+   * and any file its command names, such as scripts/check.sh. Absent when there are none. AGFLOW_AUTO_ACCEPT leaves
+   * such a submission to the lead, since a check the agent changed cannot vouch for its work.
+   */
+  ownFilesChanged?: string[];
 }
 
 export interface LeadSeat {
@@ -580,4 +616,72 @@ export interface FetchSubmissionRequest {
   status: 'pending' | 'ok' | 'failed';
   error: string | null;
   note?: string;
+  /** The runner's check of the submission, when it reported one. */
+  check?: SubmissionCheck;
+}
+
+// ---------------------------------------------------------------------------
+// The load (GET /api/load)
+// ---------------------------------------------------------------------------
+
+/** One owner's account on one vendor, across the owner's runners logged in to it. */
+export interface AccountLoad {
+  owner: string;
+  vendor: Vendor;
+  /** Null when the runners do not know the account. */
+  accountId: string | null;
+  /** 'Claude Max', 'ChatGPT Plus'; null when no runner reports one. */
+  plan: string | null;
+  /**
+   * The vendor's attempts that take a slot on those runners that are online and not draining: workers starting or
+   * running. A lead, and a worker waiting for its quota, take none.
+   */
+  busy: number;
+  /** The slots of the same runners, which the owner's other vendor shares. */
+  capacity: number;
+  /** Utilization 0..1 as placement counts it; null when unknown. */
+  fiveHour: number | null;
+  weekly: number | null;
+  /** The lowest of those runners' ceilings, 0..1. */
+  ceilings: { fiveHour: number; weekly: number };
+  /** The reset of the limiting window; null when unknown. */
+  resetsAt: number | null;
+  /** 'ok' when one of those runners can take an attempt of the vendor now; otherwise placement's refusal. */
+  state: 'ok' | PlacementRefusal;
+}
+
+/** The project's numbers on the Load page. Ages and time left are as of HubLoad.now. */
+export interface ProjectLoad {
+  /** Runner workers that take a slot; the lead's target (null for none); AGFLOW_MAX_WORKERS. */
+  workers: { running: number; target: number | null; cap: number };
+  /**
+   * The slots of the runners that can take a worker, now or once a slot frees (online, not draining, git ready, with a
+   * usable vendor): all, taken, and free. A lead takes none. The lead's report counts its free worker slots from these.
+   */
+  slots: { capacity: number; busy: number; idle: number };
+  /** Free slot minutes in the last hour, from the scheduler's samples since the hub started. */
+  idleSlotMinutes: number;
+  tasks: {
+    ready: number;
+    /**
+     * Ready tasks the scheduler may start now (design 6.6, step 3); none while it holds dispatch: the project is
+     * paused, the churn guard holds it, or the hub recovers after downtime.
+     */
+    dispatchable: number;
+    blockedOnDependencies: number;
+    submitted: { count: number; oldestAgeMs: number | null };
+    /** Accepted tasks not in main yet, the ones agflow is merging (AGFLOW_AUTO_MERGE) included. */
+    acceptedNotMerged: { count: number; oldestAgeMs: number | null };
+    mergedLastHour: number;
+  };
+  /** project.deadline_at, and the time left until it, below 0 once it has passed. */
+  deadline: { at: number | null; leftMs: number | null };
+}
+
+/** GET /api/load: how busy the accounts and the project are, for people in the web UI. */
+export interface HubLoad {
+  /** The hub's clock when it answered. */
+  now: number;
+  accounts: AccountLoad[];
+  project: ProjectLoad;
 }

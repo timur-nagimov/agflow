@@ -1,4 +1,6 @@
 // DependencyPreparer (design 7.7, X-40): trusted config, restored protected paths, and serialized per-attempt runs.
+// A submission's check runs here too, in the same sandbox and environment as a preparation command, with scripts
+// allowed and the attempt's own caches.
 import { lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -6,10 +8,10 @@ import type { AttemptStore } from '../attempt-store';
 import { type RunnerConfig, vendorHomes } from '../config';
 import { removeInClone, restoreProtected } from '../git/protect';
 import { type Logger, noopLogger } from '../log';
-import type { RunnerPaths } from '../paths';
+import { ensureSharedCaches, type RunnerPaths } from '../paths';
 import { profileOf } from '../profile';
 import { runDirOf } from '../run-dir';
-import type { DependencyPreparer, PrepareInput, PrepareOutcome } from '../seams';
+import type { CheckInput, CheckRun, DependencyPreparer, PrepareInput, PrepareOutcome } from '../seams';
 import { readPrepConfig } from './config';
 import { prepEntryKey, prepEnv, prepLayout, prepPolicy, PrepState, whenFingerprint, writePrepToolConfig } from './plan';
 import { checkPrepSandbox, PrepSandbox, type PrepRunResult, type PrepRunSpec } from './sandbox';
@@ -106,13 +108,12 @@ async function cleanUserConfig(clone: string): Promise<void> {
 async function makeRunDirectories(clone: string, prep: string, env: Record<string, string>): Promise<void> {
   const cache = prepLayout(prep).cache;
   mkdirSync(cache, { recursive: true, mode: 0o700 });
+  // pip's and uv's caches are the runner's shared ones, which ensureSharedCaches makes.
   for (const name of [
     'HOME',
     'BUN_INSTALL_CACHE_DIR',
     'npm_config_cache',
     'npm_config_store_dir',
-    'PIP_CACHE_DIR',
-    'UV_CACHE_DIR',
     'GOMODCACHE',
     'CARGO_HOME',
   ]) {
@@ -140,9 +141,10 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
   if (run) {
     available = options.available ?? true;
   } else {
+    const profile = profileOf(options.config());
     const sandbox =
       options.sandbox ??
-      new PrepSandbox({ allowedDomains: profileOf(options.config()).network.allowedDomains, logger });
+      new PrepSandbox({ allowedDomains: profile.network.allowedDomains, open: profile.name === 'open', logger });
     const checked = await checkPrepSandbox({ sandbox });
     available = checked.works;
     if (!available) logger.warn('dependency preparation unavailable', { reason: checked.reason });
@@ -189,8 +191,16 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
         const tmpDir = mkdtempSync(join(layout.tmp, 'run-'));
         try {
           await cleanUserConfig(input.clone);
-          const env = prepEnv({ agentEnv: input.env, clone: input.clone, prep, tmpDir, entry });
+          const env = prepEnv({
+            agentEnv: input.env,
+            clone: input.clone,
+            prep,
+            tmpDir,
+            entry,
+            caches: options.paths.caches,
+          });
           await makeRunDirectories(input.clone, prep, env);
+          ensureSharedCaches(options.paths);
           const result = await commandRun({
             argv: entry.run,
             cwd: input.clone,
@@ -221,8 +231,50 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
     }
   }
 
+  /**
+   * A submission's check: `/bin/sh -c <command>` in the clone, with a preparation's environment and policy for an entry
+   * with scripts, so it uses the attempt's caches and the runner's pip and uv ones, never the project's shared one. The
+   * controller runs it on the attempt's queue, which also runs its preparations, so the two never overlap.
+   */
+  async function check(input: CheckInput): Promise<CheckRun> {
+    if (!available) throw new Error('not available on this runner');
+    realDirectory(input.clone);
+    const prep = options.paths.prep(input.vault.project);
+    const layout = prepLayout(prep);
+    writePrepToolConfig(prep);
+    const entry = { run: ['/bin/sh', '-c', input.command], scripts: true };
+    const settings = options.config();
+    mkdirSync(layout.tmp, { recursive: true, mode: 0o700 });
+    const tmpDir = mkdtempSync(join(layout.tmp, 'check-'));
+    try {
+      await cleanUserConfig(input.clone);
+      const env = prepEnv({ agentEnv: input.env, clone: input.clone, prep, tmpDir, entry, caches: options.paths.caches });
+      await makeRunDirectories(input.clone, prep, env);
+      ensureSharedCaches(options.paths);
+      return await commandRun({
+        argv: entry.run,
+        cwd: input.clone,
+        env,
+        policy: prepPolicy({
+          clone: input.clone,
+          prep,
+          tmpDir,
+          entry,
+          home: ownerHome,
+          paths: options.paths,
+          profile: profileOf(settings),
+          vendorHomes: vendorHomes(settings, options.paths),
+        }),
+        timeoutMs: input.timeoutMs,
+      });
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
   return Object.freeze({
     available,
+    check,
     prepare(input: PrepareInput): Promise<PrepareOutcome> {
       const result = (pending.get(input.attemptId) ?? Promise.resolve()).then(() => prepare(input));
       const settled = result.then(

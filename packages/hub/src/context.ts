@@ -20,6 +20,10 @@ export interface HubRunnerSettings {
   recoveryMs: number;
   approvalMs: number;
   leadReviewMs: number;
+  /** How long free worker slots must outnumber the dispatchable ready tasks before the runner lead is nudged. */
+  idleNudgeMs: number;
+  /** The least time between two idle nudges; 0 turns them off. */
+  idleNudgeIntervalMs: number;
   liveLeadGraceMs: number;
   quotaWaitMaxMs: number;
   quotaUnknownMs: number;
@@ -69,6 +73,8 @@ export const HUB_RUNNER_DEFAULTS: Readonly<HubRunnerSettings> = Object.freeze({
   recoveryMs: 2 * MINUTE,
   approvalMs: 15 * MINUTE,
   leadReviewMs: 45 * MINUTE,
+  idleNudgeMs: 60 * SECOND,
+  idleNudgeIntervalMs: 5 * MINUTE,
   liveLeadGraceMs: 120 * MINUTE,
   quotaWaitMaxMs: 45 * MINUTE,
   quotaUnknownMs: 30 * MINUTE,
@@ -132,6 +138,11 @@ export interface HubConfig extends HubRunnerSettings {
   /** AGFLOW_OPERATOR_USER: the allowed person the operator acts as, in lower case. */
   operatorUser?: string | null | undefined;
   /**
+   * AGFLOW_BACKUP_DIR, where the hub process writes its backups: a project reset writes its archive of the old project
+   * there too. Unset (tests, the demo): a reset writes no archive.
+   */
+  backupDir?: string | undefined;
+  /**
    * AGFLOW_DEPENDENCIES_NEED_MERGE: a dependency counts as done only once it is merged, not when it is accepted, so a
    * dependent's work starts from a main branch that holds it. Off by default (M2: acceptance counts).
    */
@@ -153,6 +164,23 @@ export interface HubConfig extends HubRunnerSettings {
    * Off by default.
    */
   autoApprovals?: boolean | undefined;
+  /**
+   * AGFLOW_AUTO_MERGE: accepting a task moves it to merging, and a runner merges it into main and pushes main
+   * (merges.ts); a conflict sends it back to its author. A dependency then counts as done only once merged, and
+   * accepted and merging tasks keep holding their owned paths. Off by default: people merge accepted work.
+   */
+  autoMerge?: boolean | undefined;
+  /**
+   * AGFLOW_AUTO_ACCEPT: the hub accepts a runner submission whose check passed the moment it records it, as
+   * hub:auto-accept, and does not wake the lead for it. Off by default: the lead reviews every submission.
+   */
+  autoAccept?: boolean | undefined;
+  /**
+   * AGFLOW_DEMO_CHECK_EVERY: after every this many tasks merged (or accepted, without autoMerge and while nothing marks
+   * tasks merged), the hub creates a demo-check task (demo-check.ts). loadConfig makes it 5; 0, or a config built
+   * without it, turns it off.
+   */
+  demoCheckEvery?: number | undefined;
 }
 
 /** The runner gateway, as the modules that queue commands see it. */

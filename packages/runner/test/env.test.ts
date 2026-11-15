@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { realpathSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CONNECTIVITY_VARS, type RunnerConfig, RunnerConfigSchema } from '../src/config';
-import { type AgentEnvInput, bridgeEnvOf, buildAgentEnv, userVariables } from '../src/env';
+import { type AgentEnvInput, bridgeEnvOf, buildAgentEnv, readRunnerEnvFile, userVariables } from '../src/env';
 import { runnerPaths } from '../src/paths';
 import {
   deniedReadPaths,
@@ -185,6 +186,42 @@ describe('buildAgentEnv', () => {
     expect(() => buildAgentEnv(input({ tmpDir: null }))).toThrow('CLAUDE_CODE_TMPDIR');
   });
 
+  test("Claude gets the setup-token of the runner's environment file, and Codex never does", () => {
+    const home = mkdtempSync(join(tmpdir(), 'agf-env-'));
+    try {
+      const withToken = runnerPaths(home);
+      mkdirSync(withToken.runner, { recursive: true });
+      writeFileSync(withToken.envFile, 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-runner\n');
+      const claude = buildAgentEnv(input({ paths: withToken }));
+      expect(claude.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-runner');
+      const codex = buildAgentEnv(input({ vendor: 'codex', tmpDir: null, paths: withToken }));
+      expect(codex.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      expect(Object.values(codex).join('\n')).not.toContain('sk-ant-oat01-runner');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('the environment file gives only its allowlisted names, unquoted, and nothing when missing', () => {
+    const home = mkdtempSync(join(tmpdir(), 'agf-env-'));
+    try {
+      const file = runnerPaths(home);
+      expect(readRunnerEnvFile(file)).toEqual({});
+      mkdirSync(file.runner, { recursive: true });
+      for (const [text, token] of [
+        ['CLAUDE_CODE_OAUTH_TOKEN=plain\n', 'plain'],
+        ["export CLAUDE_CODE_OAUTH_TOKEN='quoted'\r\n", 'quoted'],
+        ['  CLAUDE_CODE_OAUTH_TOKEN = "spaced"  \n', undefined],
+        ['# CLAUDE_CODE_OAUTH_TOKEN=commented\nANTHROPIC_API_KEY=sk-ant-api\nCLAUDE_CODE_OAUTH_TOKEN=\n', undefined],
+      ] as const) {
+        writeFileSync(file.envFile, text);
+        expect(readRunnerEnvFile(file)).toEqual(token === undefined ? {} : { CLAUDE_CODE_OAUTH_TOKEN: token });
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test('Codex gets homes/codex-user as HOME, CODEX_HOME and no autoupdate', () => {
     const env = buildAgentEnv(input({ vendor: 'codex', tmpDir: null }));
     expect(env).toMatchObject({
@@ -210,8 +247,9 @@ describe('buildAgentEnv', () => {
     expect(env).toMatchObject({
       BUN_INSTALL_CACHE_DIR: `${RUN}/cache/bun`,
       npm_config_cache: `${RUN}/cache/npm`,
-      PIP_CACHE_DIR: `${RUN}/cache/pip`,
-      UV_CACHE_DIR: `${RUN}/cache/uv`,
+      // pip and uv share the runner's caches with every attempt and preparation.
+      PIP_CACHE_DIR: '/h/cache/pip',
+      UV_CACHE_DIR: '/h/cache/uv',
       GOMODCACHE: `${RUN}/cache/go-mod`,
       CARGO_HOME: `${RUN}/cache/cargo`,
       PATH: `${TOOLS}/bin:/opt/homebrew/bin:/usr/bin:/bin`,
@@ -319,6 +357,8 @@ describe('the permission profile', () => {
     expect(auto).toEqual({ ...standardProfile, name: 'auto' });
     auto.network.allowedDomains.push('example.com');
     expect(standardProfile.network.allowedDomains).not.toContain('example.com');
+    // The open profile keeps the web tools; its sandboxes render the rest from its name.
+    expect(profileOf(config({ profile: 'open' }))).toEqual({ ...standardProfile, name: 'open', webTools: true });
   });
 });
 

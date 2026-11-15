@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import { NewTaskSchema } from '@agflow/core';
 import { getAgent } from '@agflow/hub/src/agents';
 import { listGoalNotes, updateGoal } from '@agflow/hub/src/goal';
+import { listStandingRules } from '@agflow/hub/src/messages';
+import { setDeadline } from '@agflow/hub/src/project';
 import { blockTask, claimTask, createTasks, getTask, submitTask } from '@agflow/hub/src/tasks';
 import { type ToolContext, allTools } from '../src/mcp/tools';
 import { z } from 'zod';
@@ -59,9 +61,45 @@ describe('lead tools', () => {
     expect(listGoalNotes(hub.ctx, 1).map((note) => note.text)).toEqual(['Reading the goal as CLI only.']);
     const status = await call('get_status', {}, lead);
     expect(status).toContain('Goal: v1');
+    expect(status).toContain('Deadline: none');
     expect(status).toContain('Lead: A-1 (alice)');
+    setDeadline(hub.ctx, Date.UTC(2026, 10, 16, 15, 0, 0), 'user:alice');
+    expect(await call('get_status', {}, lead)).toContain('Deadline: 2026-11-16T15:00:00.000Z');
     expect(await call('get_events', { limit: 3 }, lead)).toMatch(/^#1 /);
     expect(getTask(hub.ctx, 'T-1').priority).toBe(1);
+  });
+
+  test("create_tasks names the tasks no runner agent will run, and those only an open runner will, with the paths", async () => {
+    const hub = hubFixture();
+    const lead = as(hub.liveAgent('alice', 'lead'), 'lead');
+    const skeleton = NewTaskSchema.parse({ ...spec('Skeleton'), ownedPaths: ['package.json', 'AGENTS.md'] });
+    const curated = NewTaskSchema.parse({ ...spec('Conventions'), kind: 'curation', ownedPaths: ['AGENTS.md'] });
+    const settings = NewTaskSchema.parse({ ...spec('Settings'), ownedPaths: ['.claude/settings.json'] });
+    const created = await call(
+      'create_tasks',
+      { tasks: [skeleton, curated, NewTaskSchema.parse(spec('Parser')), settings] },
+      lead,
+    );
+    expect(created).toBe(
+      'Created:\nT-1 [ready] p5 Skeleton\nT-2 [ready] p5 Conventions\nT-3 [ready] p5 Parser\nT-4 [ready] p5 Settings\n' +
+        "No runner agent will run these; they wait for a person's live chat, since they own paths runner agents may not change:\n" +
+        '- T-4: .claude/settings.json (agent configuration, which no runner agent may change)\n' +
+        'T-1 needs a runner with the open profile (owns AGENTS.md).',
+    );
+  });
+
+  test('the lead posts a standing rule with send_message; a worker cannot', async () => {
+    const hub = hubFixture();
+    const lead = as(hub.liveAgent('alice', 'lead'), 'lead');
+    const sent = await call('send_message', { to: 'all', body: 'Use pnpm.', standing_rule: true }, lead);
+    expect(sent).toMatch(/^Sent standing rule #\d+ to all\.$/);
+    expect(listStandingRules(hub.ctx).map((rule) => [rule.from, rule.body])).toEqual([['agent:A-1', 'Use pnpm.']]);
+    const worker = as(hub.liveAgent('bob'), 'worker');
+    await expect(call('send_message', { to: 'lead', body: 'Use npm.', standing_rule: true }, worker)).rejects.toThrow(
+      'only people and the lead can set standing rules',
+    );
+    const send = allTools.find((t) => t.name === 'send_message');
+    expect(send?.description).toContain('standing_rule (lead only)');
   });
 
   test('update_task keeps a multi-line blocked reason on its task line', async () => {

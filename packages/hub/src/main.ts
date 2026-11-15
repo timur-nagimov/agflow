@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { backupAndLog, checkIntegrity, dailyBackupDue } from './backup';
 import { loadConfig } from './config';
 import { createContext } from './context';
+import { getProject } from './project';
 import { acquireDbLock } from './recovery';
 import { startHousekeeping } from './retention';
 import { startHub } from './server';
@@ -39,5 +40,6 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
 process.once('SIGTERM', (signal) => void shutdown(signal));
 process.once('SIGINT', (signal) => void shutdown(signal));
 
-// The banner is the process readiness signal: a reader can send a shutdown signal as soon as it appears.
-console.log(`agflow hub for "${config.projectName}" on ${config.publicUrl} (listening on ${new URL(hub.url).host}, sign-in: ${config.auth})`);
+// The banner is the process readiness signal: a reader can send a shutdown signal as soon as it appears. The project is
+// the database's: AGFLOW_PROJECT_NAME names only a new database's first one, and a project reset replaces it.
+console.log(`agflow hub for "${getProject(ctx).name}" on ${config.publicUrl} (listening on ${new URL(hub.url).host}, sign-in: ${config.auth})`);

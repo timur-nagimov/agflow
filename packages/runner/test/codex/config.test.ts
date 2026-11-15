@@ -242,4 +242,29 @@ describe('threadOverrides', () => {
     const withWebTools = threadOverrides({ ...launch, profile: { ...launch.profile, webTools: true } }, BRIDGE_CWD);
     expect(withWebTools.config.web_search).toBe('cached');
   });
+
+  test('lets commands write the shared caches, and reach the network only under the open profile', () => {
+    const launch = launchFixture();
+    const clone = realpathSync(launch.clone);
+    const caches = ['/h/cache/pip', '/h/cache/uv'];
+    const writableRoots = [join(clone, '.git'), ...caches];
+    expect(threadOverrides(launch, BRIDGE_CWD, caches).config.sandbox_workspace_write).toMatchObject({
+      writable_roots: writableRoots,
+      network_access: false,
+    });
+    const open = { ...launch, profile: { ...launch.profile, name: 'open' as const, webTools: true } };
+    const { config } = threadOverrides(open, BRIDGE_CWD, caches);
+    expect(config.sandbox_workspace_write).toEqual({
+      writable_roots: writableRoots, network_access: true,
+      exclude_slash_tmp: true, exclude_tmpdir_env_var: true,
+    });
+    expect(config.web_search).toBe('cached');
+  });
+
+  test("a strong task asks for a high reasoning effort; a standard one leaves Codex's own", () => {
+    const launch = launchFixture();
+    expect(threadOverrides(launch, BRIDGE_CWD).config).not.toHaveProperty('model_reasoning_effort');
+    expect(threadOverrides({ ...launch, tier: 'standard' }, BRIDGE_CWD).config).not.toHaveProperty('model_reasoning_effort');
+    expect(threadOverrides({ ...launch, tier: 'strong' }, BRIDGE_CWD).config.model_reasoning_effort).toBe('high');
+  });
 });

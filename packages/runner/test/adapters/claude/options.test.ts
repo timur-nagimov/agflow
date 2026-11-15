@@ -24,6 +24,8 @@ import {
   buildQueryOptions,
   CLAUDE_BRIEF_HOOK_TIMEOUT_S,
   CLAUDE_BUILTIN_TOOLS,
+  CLAUDE_LINUX_SHELL,
+  CLAUDE_NETWORK_ASK,
   CLAUDE_SHELL,
   claudeBinary,
   claudeEmptyDir,
@@ -32,6 +34,7 @@ import {
   effectivePermissionMode,
   ensureClaudeEmptyDir,
   inDirectory,
+  openProfilePrompts,
 } from '../../../src/adapters/claude/options';
 import { claudeProjectDir } from '../../../src/adapters/claude/paths';
 import { claudePermissionRules, claudeSandboxSettings } from '../../../src/adapters/claude/rules';
@@ -75,6 +78,7 @@ function deps(overrides: Partial<ClaudeOptionDeps> = {}): ClaudeOptionDeps {
     spawnClaudeCodeProcess: spawn,
     compaction: { preCompact, postCompact },
     newSessionId: () => SESSION,
+    platform: 'darwin',
     ...overrides,
   };
 }
@@ -153,6 +157,7 @@ describe('buildQueryOptions', () => {
       profile: standardProfile,
       clone: CLONE,
       tmpDir: TMP,
+      platform: 'darwin' as const,
     };
     expect(options.sandbox).toEqual(claudeSandboxSettings(input));
     expect(typeof options.settings).toBe('object');
@@ -205,6 +210,30 @@ describe('buildQueryOptions', () => {
     expect(options.allowDangerouslySkipPermissions).toBeUndefined();
   });
 
+  test('the open profile answers the sandbox network asks with yes, and every other prompt with no', async () => {
+    const open: PermissionProfile = { ...standardProfile, name: 'open', webTools: true };
+    const options = buildQueryOptions(launch({ profile: open }), deps({ autoOffered: true }));
+    expect(options.permissionMode).toBe('acceptEdits');
+    expect(options.permissionPrompts).toBe('host');
+    expect(options.canUseTool).toBe(openProfilePrompts);
+    expect(options.allowDangerouslySkipPermissions).toBeUndefined();
+    expect(options.tools).toEqual([...CLAUDE_BUILTIN_TOOLS, 'WebFetch', 'WebSearch']);
+    expect(options.sandbox?.network).toMatchObject({ strictAllowlist: false, allowLocalBinding: true });
+    // The machine's OS reaches the sandbox: unix sockets stay shut on Linux.
+    expect(options.sandbox?.network).toMatchObject({ allowAllUnixSockets: true });
+    const linux = buildQueryOptions(launch({ profile: open }), deps({ autoOffered: true, platform: 'linux' }));
+    expect(linux.sandbox?.network).not.toHaveProperty('allowAllUnixSockets');
+    const context = { signal: new AbortController().signal, toolUseID: 'toolu_1', requestId: 'request-1' };
+    expect(CLAUDE_NETWORK_ASK).toBe('SandboxNetworkAccess');
+    expect(await openProfilePrompts(CLAUDE_NETWORK_ASK, { host: 'api.example.com' }, context)).toEqual({
+      behavior: 'allow',
+      updatedInput: { host: 'api.example.com' },
+    });
+    for (const tool of ['Bash', 'Edit', 'Write', 'mcp__other__tool']) {
+      expect(await openProfilePrompts(tool, {}, context)).toMatchObject({ behavior: 'deny' });
+    }
+  });
+
   test('project settings come only from the base checkout, and a launch without one is refused', () => {
     const options = buildQueryOptions(launch(), deps());
     expect(options.settingSources).toEqual(['project']);
@@ -237,6 +266,7 @@ describe('buildQueryOptions', () => {
       profile: standardProfile,
       clone: CLONE,
       tmpDir: TMP,
+      platform: 'darwin',
     });
     expect(options.settings).toEqual({
       permissions: { allow: rules.allow, deny: rules.deny },
@@ -381,6 +411,20 @@ describe('buildQueryOptions', () => {
     expect(() => buildQueryOptions(launch({ env: homeless }), deps())).toThrow(/HOME/);
   });
 
+  test("on Linux the CLI's shells are /bin/bash, whatever the owner's SHELL or the launch says", () => {
+    expect(CLAUDE_LINUX_SHELL).toBe('/bin/bash');
+    const given = launch();
+    for (const shell of [undefined, '/bin/bash', '/usr/bin/zsh', '/usr/bin/fish']) {
+      const { SHELL: _shell, ...rest } = given.env;
+      const env = { ...rest, ...(shell === undefined ? {} : { SHELL: shell }), CLAUDE_CODE_SHELL: '/bin/zsh' };
+      expect(buildQueryOptions(launch({ env }), deps({ platform: 'linux' })).env).toEqual({
+        ...env,
+        ZDOTDIR: EMPTY,
+        CLAUDE_CODE_SHELL: '/bin/bash',
+      });
+    }
+  });
+
   test("the binary is the one for launch.cliVersion, and the spawn hook is the adapter's", () => {
     const options = buildQueryOptions(launch({ cliVersion: '2.1.200' }), deps());
     expect(options.pathToClaudeCodeExecutable).toBe(join(paths.runner, 'vendor', 'claude', '2.1.200', 'claude'));
@@ -421,6 +465,12 @@ describe('buildQueryOptions', () => {
       expect(() => assertFullModelId(id)).not.toThrow();
     }
     expect(buildQueryOptions(launch(), deps()).model).toBe('claude-sonnet-5-5');
+  });
+
+  test("a strong task asks for the xhigh effort; a standard one keeps the CLI's own", () => {
+    expect(buildQueryOptions(launch({ model: 'claude-opus-5-5', tier: 'strong' }), deps()).effort).toBe('xhigh');
+    expect(buildQueryOptions(launch({ tier: 'standard' }), deps())).not.toHaveProperty('effort');
+    expect(buildQueryOptions(launch(), deps())).not.toHaveProperty('effort');
   });
 });
 

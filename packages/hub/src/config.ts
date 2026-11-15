@@ -21,6 +21,15 @@ function positiveInt(env: Env, key: string, fallback: number, max = Infinity): n
   return value;
 }
 
+/** A count where 0 turns its feature off. */
+function countOf(env: Env, key: string, fallback: number): number {
+  const raw = env[key];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`${key} must be 0 or a positive integer`);
+  return value;
+}
+
 /** An opt-in switch: off when unset or empty, on only as "1". Anything else is a mistake worth stopping the start for. */
 function switchOf(env: Env, key: string): boolean {
   const raw = env[key] ?? '';
@@ -45,6 +54,7 @@ const RUNNER_VARIABLES: readonly (readonly [CountField, string, number])[] = [
   ['recoveryMs', 'AGFLOW_RECOVERY_SECONDS', SECOND],
   ['approvalMs', 'AGFLOW_APPROVAL_MINUTES', MINUTE],
   ['leadReviewMs', 'AGFLOW_LEAD_REVIEW_MINUTES', MINUTE],
+  ['idleNudgeMs', 'AGFLOW_IDLE_NUDGE_SECONDS', SECOND],
   ['liveLeadGraceMs', 'AGFLOW_LIVE_LEAD_GRACE_MINUTES', MINUTE],
   ['quotaWaitMaxMs', 'AGFLOW_QUOTA_WAIT_MINUTES', MINUTE],
   ['quotaUnknownMs', 'AGFLOW_QUOTA_UNKNOWN_MINUTES', MINUTE],
@@ -82,6 +92,9 @@ const TestConfigSchema = z.strictObject({
   recoveryMs: Milliseconds.optional(),
   approvalMs: Milliseconds.optional(),
   leadReviewMs: Milliseconds.optional(),
+  idleNudgeMs: Milliseconds.optional(),
+  // 0 turns the idle nudge off.
+  idleNudgeIntervalMs: z.number().int().min(0).optional(),
   liveLeadGraceMs: Milliseconds.optional(),
   quotaWaitMaxMs: Milliseconds.optional(),
   quotaUnknownMs: Milliseconds.optional(),
@@ -127,6 +140,13 @@ function runnerSettings(env: Env, testMode: boolean): HubRunnerSettings {
       throw new Error(`${variable} must be at least ${minimum / unit} outside test mode (AGFLOW_TEST=1)`);
     }
     settings[key] = value;
+  }
+  // Read apart from the counts above, since 0 is allowed: it turns the idle nudge off.
+  const nudgeMinutes = env.AGFLOW_IDLE_NUDGE_MINUTES;
+  if (nudgeMinutes) {
+    const minutes = Number(nudgeMinutes);
+    if (!Number.isInteger(minutes) || minutes < 0) throw new Error('AGFLOW_IDLE_NUDGE_MINUTES must be 0 or a positive integer');
+    settings.idleNudgeIntervalMs = minutes * MINUTE;
   }
   if (env.AGFLOW_WIP_REF_PREFIX) {
     if (!isValidWipRefPrefix(env.AGFLOW_WIP_REF_PREFIX)) {
@@ -186,6 +206,9 @@ export function loadConfig(env: Env): LoadedConfig {
   const agentFetch = switchOf(env, 'AGFLOW_AGENT_FETCH');
   const leadApprovals = switchOf(env, 'AGFLOW_LEAD_APPROVALS');
   const autoApprovals = switchOf(env, 'AGFLOW_AUTO_APPROVALS');
+  const autoMerge = switchOf(env, 'AGFLOW_AUTO_MERGE');
+  const autoAccept = switchOf(env, 'AGFLOW_AUTO_ACCEPT');
+  const backupDir = env.AGFLOW_BACKUP_DIR ?? 'data/backups';
   const testMode = env.AGFLOW_TEST === '1';
   if (env.AGFLOW_TEST_CONFIG && !testMode) throw new Error('AGFLOW_TEST_CONFIG is honoured only with AGFLOW_TEST=1');
   const config: HubConfig = {
@@ -209,6 +232,10 @@ export function loadConfig(env: Env): LoadedConfig {
     agentFetch,
     leadApprovals,
     autoApprovals,
+    autoMerge,
+    autoAccept,
+    backupDir,
+    demoCheckEvery: countOf(env, 'AGFLOW_DEMO_CHECK_EVERY', 5),
   };
   const overrides = env.AGFLOW_TEST_CONFIG ? testOverrides(env.AGFLOW_TEST_CONFIG) : {};
   Object.assign(config, overrides);
@@ -219,7 +246,7 @@ export function loadConfig(env: Env): LoadedConfig {
     host,
     port,
     dbPath: databasePath(env),
-    backupDir: env.AGFLOW_BACKUP_DIR ?? 'data/backups',
+    backupDir,
     config,
   };
 }

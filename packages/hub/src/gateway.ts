@@ -8,6 +8,7 @@ import { markSent, pendingCommands, recordResult, toWireCommand } from './comman
 import { type HubContext, type RunnerLink, afterCommit, tx } from './context';
 import { acknowledgePosition, applyRunnerEvents } from './events-in';
 import { hubEpoch } from './hub-state';
+import { getProject } from './project';
 import { recordQuotaReports } from './quota';
 import { isAfterRestore, reconcileAfterRestore, reconcileOnHello } from './recovery';
 import {
@@ -318,6 +319,11 @@ export class Gateway implements RunnerLink {
             wipGraceMs: ctx.config.wipGraceMs,
           },
         };
+        // Protocol 2 schemas reject unknown keys: only a protocol 3 runner hears the project, and follows a reset.
+        if (hello.protocol >= 3) {
+          const { name, repo } = getProject(ctx);
+          welcome.message.project = { name, repo };
+        }
         return identity;
       });
     } catch (error) {
@@ -401,6 +407,10 @@ export class Gateway implements RunnerLink {
       if (connection.protocol < 2 && message.command.kind === 'update_settings') {
         const { answers: _answers, ...command } = message.command;
         this.send(connection, { ...message, command });
+      } else if (connection.protocol < 3 && message.command.kind === 'start_attempt') {
+        // Protocol 2 knows no tier: an older runner runs a strong task as a standard one.
+        const { tier: _tier, ...attempt } = message.command.attempt;
+        this.send(connection, { ...message, command: { ...message.command, attempt } });
       } else this.send(connection, message);
     }
   }

@@ -1,10 +1,13 @@
 // The submission rows of runner agents (design 6.13): reads, inserts, failures and the shas a push may adopt. The
 // modules that end attempts and record outcomes build on it, so it imports none of them.
-import { type Attempt, CommitShaSchema, type SubmissionRecord } from '@agflow/core';
+import { type Attempt, CommitShaSchema, type SubmissionCheck, type SubmissionRecord } from '@agflow/core';
 import { attemptSubject, findAttempt, listAttempts } from './attempt-store';
 import type { HubContext } from './context';
 import { nextId } from './db';
 import type { Emit } from './events';
+
+/** Who accepts a submission whose check passed, with AGFLOW_AUTO_ACCEPT (submissions.ts). */
+export const AUTO_ACCEPT = 'hub:auto-accept';
 
 export interface SubmissionRow {
   id: string;
@@ -18,6 +21,8 @@ export interface SubmissionRow {
   error: string | null;
   requested_at: number;
   decided_at: number | null;
+  /** The runner's check as JSON (SubmissionCheck); NULL where it reported none. */
+  check_result: string | null;
 }
 
 export function rowToSubmission(row: SubmissionRow): SubmissionRecord {
@@ -32,6 +37,7 @@ export function rowToSubmission(row: SubmissionRow): SubmissionRecord {
     error: row.error,
     requestedAt: row.requested_at,
     decidedAt: row.decided_at,
+    ...(row.check_result === null ? {} : { check: JSON.parse(row.check_result) as SubmissionCheck }),
   };
 }
 

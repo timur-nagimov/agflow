@@ -28,6 +28,7 @@ import {
   RunnerSettingsChangesSchema,
   RunnerVendorSchema,
   StopCauseSchema,
+  SubmissionCheckSchema,
   SubmissionIdSchema,
   VendorQuotaSchema,
   schemaFor,
@@ -37,8 +38,10 @@ import {
   HandoffInputSchema,
   ReasonInputSchema,
   RoleSchema,
+  SendMessageInputSchema,
   SubmitInputSchema,
   TaskIdSchema,
+  UpdateGoalInputSchema,
   VendorSchema,
 } from './schemas';
 import type {
@@ -295,6 +298,7 @@ export const SubmissionRecordSchema = schemaFor<SubmissionRecord>()(
       error: z.string().nullable(),
       requestedAt: NonNegativeInt,
       decidedAt: NonNegativeInt.nullable(),
+      check: SubmissionCheckSchema.optional(),
     })
     .refine((submission) => namesTask(submission.attemptId, submission.taskId), {
       error: 'expected the task its attempt id names',
@@ -345,7 +349,13 @@ export const PrepareRequestSchema = schemaFor<PrepareRequest>()(
 );
 
 export const ProjectSchema = schemaFor<Project>()(
-  z.strictObject({ name: Name, repo: Name, paused: z.boolean(), runnerLeads: z.boolean() }),
+  z.strictObject({
+    name: Name,
+    repo: Name,
+    paused: z.boolean(),
+    runnerLeads: z.boolean(),
+    deadlineAt: NonNegativeInt.nullable(),
+  }),
 );
 
 // ---------------------------------------------------------------------------
@@ -452,6 +462,46 @@ export const LeadHandoffInputSchema = HandoffInputSchema;
 
 /** PATCH /api/project: may the scheduler start leads on runners. */
 export const ProjectPatchInputSchema = z.strictObject({ runnerLeads: z.boolean() });
+
+/**
+ * PUT /api/project/deadline and PUT /api/operator/deadline: when the project must be done, as an ISO 8601 date and time
+ * with Z or an offset, so a laptop's time zone cannot shift it; null takes the deadline away.
+ */
+export const DeadlineInputSchema = z.strictObject({
+  deadline: z.iso
+    .datetime({ offset: true, error: 'expected an ISO 8601 date and time with Z or an offset, such as 2026-11-16T18:00:00+03:00' })
+    .nullable(),
+});
+
+/**
+ * POST /api/operator/project/reset (agflow start): the project that takes the place of the hub's current one. The
+ * deadline follows DeadlineInputSchema, or is null for none. The goal becomes goal v1, and each rule a standing rule
+ * for everyone, in order.
+ */
+export const ProjectResetInputSchema = z.strictObject({
+  name: z.string().min(1).max(200).regex(/^[^\p{Cc}\p{Zl}\p{Zp}]+$/u, 'expected one line'),
+  repo: z.string().min(1).max(2000).regex(/^[^\p{Cc}\p{Zl}\p{Zp}\s]+$/u, 'expected a repository URL'),
+  deadline: DeadlineInputSchema.shape.deadline,
+  goal: UpdateGoalInputSchema.shape.text,
+  rules: z.array(SendMessageInputSchema.shape.body).max(20),
+});
+
+/** What POST /api/operator/project/reset answers. */
+export interface ProjectResetResult {
+  project: Project;
+  /** The copy of the old project's database on the hub's server; null for a hub that keeps no backups. */
+  archive: string | null;
+  /** The hub epoch the reset moved to. */
+  epoch: number;
+  goalVersion: number;
+}
+
+/** What GET /api/operator/project answers: the project, and the branch its attempts start from. */
+export interface OperatorProject {
+  project: Project;
+  /** AGFLOW_MAIN_BRANCH, the branch agflow start puts the seed on. */
+  mainBranch: string;
+}
 
 /** POST /api/tasks/:id/fetch-grant: why the task needs data from outside; its event and the assignee's message quote it. */
 export const FetchGrantInputSchema = z.strictObject({ reason: z.string().min(1).max(500) });

@@ -12,6 +12,7 @@ import { type LockOwner, readLockOwner, type RunnerLock, type RunnerMode } from 
 import { tailLines } from './log';
 import type { NeedsLoginState } from './needs-login';
 import { type LastExit, ServiceRuns } from './runs';
+import { systemdServiceDisabled, unitPath } from './systemd';
 import { defaultExec, type Exec } from './system';
 
 /** Decimal gigabytes, as minFreeGb counts them. */
@@ -55,6 +56,9 @@ interface RunningStatus {
 interface OfflineStatus {
   running: false;
   bestEffort: true;
+  /** What runs the runner: a LaunchAgent on macOS, a systemd user unit on Linux. */
+  service: 'launchd' | 'systemd';
+  /** Whether the service's file is installed: the plist, or on Linux the unit. */
   plistInstalled: boolean;
   disabled: boolean | null;
   lastExit: LastExit | null;
@@ -210,20 +214,37 @@ export async function launchdDisabled(options: LaunchdStatusOptions = {}): Promi
   }
 }
 
+/** stop disables the systemd unit until install, as it does the LaunchAgent. */
+export const SYSTEMD_DISABLED_WARNING =
+  'systemd has the runner disabled: agflow runner stop does this; run agflow runner install to enable it again';
+
+/**
+ * launchd false (test mode) consults no service at all. On Linux (platform, process.platform by default) the service
+ * is the systemd unit, whose file stands for the plist.
+ */
 export async function offlineStatus(
-  options: LaunchdStatusOptions & { paths: RunnerPaths; home?: string; launchd?: boolean },
+  options: LaunchdStatusOptions & {
+    paths: RunnerPaths;
+    home?: string;
+    launchd?: boolean;
+    platform?: NodeJS.Platform;
+  },
 ): Promise<OfflineStatus> {
-  const disabled = options.launchd === false ? null : await launchdDisabled(options);
+  const linux = (options.platform ?? process.platform) === 'linux';
+  const consult = options.launchd !== false;
+  const disabled = !consult ? null : linux ? await systemdServiceDisabled(options) : await launchdDisabled(options);
+  const file = linux ? unitPath(options.home) : plistPath({ home: options.home, label: options.label });
   const owner = readLockOwner(options.paths);
   return {
     running: false,
     bestEffort: true,
-    plistInstalled: options.launchd !== false && existsSync(plistPath({ home: options.home, label: options.label })),
+    service: linux ? 'systemd' : 'launchd',
+    plistInstalled: consult && existsSync(file),
     disabled,
     lastExit: new ServiceRuns(options.paths).lastExit({ running: owner !== null }),
     lockHolder: owner === null ? null : { pid: owner.pid, mode: owner.mode },
     logLines: tailLines(options.paths, 20),
-    warnings: disabled ? [LOGIN_ITEMS_WARNING] : [],
+    warnings: disabled ? [linux ? SYSTEMD_DISABLED_WARNING : LOGIN_ITEMS_WARNING] : [],
   };
 }
 
@@ -293,8 +314,11 @@ export function formatStatus(report: RunnerStatusReport): string {
   } else {
     lines.push(
       'Runner is not running or not answering; best effort status.',
-      line('Plist', report.plistInstalled ? 'installed' : 'not installed'),
-      line('Launchd', report.disabled === null ? 'disabled state unknown' : report.disabled ? 'disabled' : 'enabled'),
+      line(report.service === 'systemd' ? 'Unit' : 'Plist', report.plistInstalled ? 'installed' : 'not installed'),
+      line(
+        report.service === 'systemd' ? 'systemd' : 'Launchd',
+        report.disabled === null ? 'disabled state unknown' : report.disabled ? 'disabled' : 'enabled',
+      ),
       line(
         'Last exit',
         report.lastExit === null

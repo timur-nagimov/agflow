@@ -350,19 +350,25 @@ async function captureTree(capture: Capture, head: string, afterListing?: () => 
   }
 }
 
-/** A runner-made commit in the vault on one parent, by the given identity at the given time. Gives its sha. */
+/**
+ * A runner-made commit in the vault on one parent, or two for a merge, by the given identity at the given time. Gives
+ * its sha.
+ */
 export async function commitTree(input: {
   vault: Vault;
   local: GitEnvironment;
   tree: string;
   parent: string;
+  /** A merge commit's second parent: the commit merged into parent. */
+  merged?: string;
   message: string;
   identity: { name: string; email: string };
   now: Date;
 }): Promise<string> {
   const date = `@${Math.floor(input.now.getTime() / 1000)} +0000`;
   const { name, email } = input.identity;
-  const args = [`--git-dir=${input.vault.path}`, 'commit-tree', input.tree, '-p', input.parent, '-m', input.message];
+  const parents = ['-p', input.parent, ...(input.merged === undefined ? [] : ['-p', input.merged])];
+  const args = [`--git-dir=${input.vault.path}`, 'commit-tree', input.tree, ...parents, '-m', input.message];
   const commit = await runGit(input.local, args, {
     env: {
       GIT_AUTHOR_NAME: name,

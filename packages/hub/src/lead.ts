@@ -49,7 +49,8 @@ function lastLeadEnding(ctx: HubContext): { endReason: AttemptEndReason; runnerI
 /**
  * Step 2 of a tick (design 6.11, Starting a runner lead): with the seat empty and runner leads on, a lead attempt
  * starts on the runner core's placeLead prefers (Claude, then AC power, then the most free slots), and takes the seat,
- * demoting any other lead row, in startRunnerAttempt's transaction. After a lead ended lost or crashed, another runner
+ * demoting any other lead row, in startRunnerAttempt's transaction. A lead takes no slot, so a full runner may take it,
+ * but not an account a lead's limit keeps leads off (setLimited). After a lead ended lost or crashed, another runner
  * is preferred, and the same one is used only when no other can take it; after a rotation, the same runner is
  * preferred. Its brief quotes the newest lead handoff. The tick skips this step while the project is paused. Returns
  * the attempt, or null when none started.

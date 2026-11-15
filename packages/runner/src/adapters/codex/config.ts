@@ -85,6 +85,9 @@ export function appServerEnv(input: {
   );
 }
 
+/** The reasoning effort of a strong task: above Codex's default, medium, and one every reasoning model takes. */
+export const CODEX_STRONG_EFFORT = 'high';
+
 /** What thread/start and thread/resume both receive (design 9.2). */
 export type CodexThreadOverrides = {
   cwd: string;
@@ -118,6 +121,8 @@ export type CodexThreadOverrides = {
       };
     };
     web_search: 'cached' | 'disabled';
+    /** Set for a strong task only; Codex's own default otherwise. */
+    model_reasoning_effort?: typeof CODEX_STRONG_EFFORT;
   };
 };
 
@@ -135,11 +140,16 @@ export function codexToolsNote(names: readonly string[]): string {
 /**
  * bridgeCwd is the bridge's working directory: the codex-user home, which app-server itself runs in. Codex would
  * otherwise start the bridge in the thread's cwd, the clone, and Bun loads a bunfig.toml (its preload) and a .env from
- * there: repository or agent content would run in the bridge, outside the sandbox, with the agent token.
+ * there: repository or agent content would run in the bridge, outside the sandbox, with the agent token. caches are
+ * the runner's shared package caches (paths.caches), which commands may write.
  */
 export function threadOverrides(
-  launch: Pick<AgentLaunch, 'clone' | 'model' | 'brief' | 'projectConfigVerified' | 'tmpDir' | 'bridge' | 'profile'>,
+  launch: Pick<
+    AgentLaunch,
+    'clone' | 'model' | 'tier' | 'brief' | 'projectConfigVerified' | 'tmpDir' | 'bridge' | 'profile'
+  >,
   bridgeCwd: string,
+  caches: readonly string[] = [],
 ): CodexThreadOverrides {
   const clone = realpathSync(launch.clone);
   // Match the bridge's positiveMs rule without importing the CLI package.
@@ -157,9 +167,10 @@ export function threadOverrides(
       // An explicit nested entry avoids implicit trust and loading unverified project configuration.
       projects: { [clone]: { trust_level: launch.projectConfigVerified ? 'trusted' : 'untrusted' } },
       sandbox_workspace_write: {
-        // Codex protects .git by default; the agent must be able to commit inside its own clone.
-        writable_roots: [join(clone, '.git')],
-        network_access: false,
+        // Codex protects .git by default; the agent must be able to commit inside its own clone. Only the open
+        // profile gives commands the network.
+        writable_roots: [join(clone, '.git'), ...caches],
+        network_access: launch.profile.name === 'open',
         exclude_slash_tmp: true,
         exclude_tmpdir_env_var: true,
       },
@@ -185,6 +196,7 @@ export function threadOverrides(
       },
       // Opt-in search stays cached; it does not enable network access for shell commands.
       web_search: launch.profile.webTools ? 'cached' : 'disabled',
+      ...(launch.tier === 'strong' ? { model_reasoning_effort: CODEX_STRONG_EFFORT } : {}),
     },
   } satisfies CodexThreadOverrides & ParamsOf<'thread/start'> & Omit<ParamsOf<'thread/resume'>, 'threadId'>;
 }

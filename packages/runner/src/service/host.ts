@@ -553,8 +553,9 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       hubUrl = credentials!.hubUrl;
     }
     adapters = options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow });
+    const open = config.profile === 'open';
     sandbox =
-      options.prepSandbox ?? new PrepSandbox({ allowedDomains: standardProfile.network.allowedDomains, logger });
+      options.prepSandbox ?? new PrepSandbox({ allowedDomains: standardProfile.network.allowedDomains, open, logger });
     preparer = await createDependencyPreparer({ paths, store, config: () => config, logger, sandbox });
     // A sample before the runner starts: the first admission and the first heartbeat already see the battery.
     await health.sample();
@@ -584,7 +585,10 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       outbox: new Outbox(db),
       journal: new Journal(db),
       store,
-      vaults: [runner.vault],
+      // Read at each sweep: a welcome that names another project gives the runner another vault.
+      get vaults() {
+        return runner ? [runner.vault] : [];
+      },
       adapters: new Map(adapters.map((adapter) => [adapter.vendor, adapter])),
       eventRetentionMs: config.timings.eventRetention,
       now: options.now,

@@ -69,7 +69,7 @@ sudoedit /etc/agflow/hub.env
 
 Replace every `REPLACE_*` field. Set both GitHub logins in `AGFLOW_ALLOWED_USERS`, project name/repo, and the public HTTPS URL. Use a repository URL that both Macs can fetch and push with their own git credentials. Keep the supplied host, port, database, backup and web-dist paths. The deployment validates these paths and refuses dev/test auth settings. Do not put secrets in the checkout, a release, cloud-init, shell arguments or Git. The file uses systemd EnvironmentFile syntax: `KEY=value`, quote spaces, one value per line, no `export` or inline comments. Do not shell-source it.
 
-All production environment variables read by `loadConfig` are documented in [hub.env.example](../deploy/hub/hub.env.example). `AGFLOW_WEB_DIST` is essential: without it the API runs but the UI is not served. Hub worker capacity defaults to four across the two Macs; this is separate from each runner's capacity (normally two).
+All production environment variables read by `loadConfig` are documented in [hub.env.example](../deploy/hub/hub.env.example). `AGFLOW_WEB_DIST` is essential: without it the API runs but the UI is not served. Hub worker capacity defaults to four across the two Macs; this is separate from each runner's capacity (normally two). Only workers take a runner's slots: a runner lead takes none, nor does a worker waiting for its quota, so a Mac runs its capacity of workers beside the lead, and its other vendor starts while one waits.
 
 On an already provisioned host, confirm `/opt/agflow/releases` exists, is root-owned/readable, and `/var/lib/agflow/{data,backups}` belong to `agflow`. The [unit](../deploy/hub/agflow-hub.service) uses a read-only filesystem except `/var/lib/agflow` and its private temporary directory. SQLite DB/WAL/SHM, PID lock, backup snapshots and restore side files stay under that state directory. Releases and `/etc` remain read-only to the hub. Bun's JIT requires executable memory, so `MemoryDenyWriteExecute` is deliberately absent. SIGTERM runs the hub's shutdown handler and WAL checkpoint with a 90-second stop allowance.
 
@@ -171,38 +171,78 @@ The allowlist is checked whenever a session verifies; removing a login invalidat
 
 ## Operator access
 
-M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. To run a
-project unattended, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
+M2 leaves merging to people: the lead accepts a task and a person merges its branch and marks it merged. With
+`AGFLOW_AUTO_MERGE=1` agflow merges accepted work itself ([Unattended operation](#unattended-operation)), and no
+script needs to. To run a project unattended without it, an operator script can do the bookkeeping. Set `AGFLOW_OPERATOR_TOKEN` (at least 32 characters,
 for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login the script acts as) in
-`/etc/agflow/hub.env` and restart. Four routes then accept the header `X-Agflow-Operator: <token>`:
+`/etc/agflow/hub.env` and restart. Seven routes then accept the header `X-Agflow-Operator: <token>`:
 
 | Route | Does |
 |---|---|
 | `PUT /api/operator/goal` `{ "text": string, "baseVersion": number }` | sets the project goal (the usual version check applies) |
+| `PUT /api/operator/deadline` `{ "deadline": string \| null }` | sets when the project must be done, as an ISO 8601 date and time with `Z` or an offset (`2026-11-16T18:00:00+03:00`); `null` takes it away |
 | `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
 | `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
 | `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
+| `GET /api/operator/project` | answers the project and the hub's main branch (`AGFLOW_MAIN_BRANCH`), where `agflow start` puts the seed |
+| `POST /api/operator/project/reset` `{ "name", "repo", "deadline": ISO 8601 or null, "goal", "rules": string[] }` | replaces the project with a new one ([Start a new project](#start-a-new-project)) |
 
-Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it. Without the token the routes
-do not exist. A person's CLI token, which runners hold, still cannot use people's controls. The events record the
-operator's person as the actor.
+Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it; `agflow start` is the one
+caller meant for a laptop. Without the token the routes do not exist. A person's CLI token, which runners hold, still
+cannot use people's controls. The events record the operator's person as the actor. A person signed in to the web UI
+can set the deadline too, with the same body on `PUT /api/project/deadline`. The reset takes its deadline by the same
+rule. The lead sees the deadline and the time left in every situation report, and plans only fixes in the last hour.
 
 With an operator that merges, also set `AGFLOW_DEPENDENCIES_NEED_MERGE=1`: a dependency then counts as done only once
 it is marked merged, so the hub releases dependent tasks after their dependencies are in `main`, not at acceptance.
 
+## Start a new project
+
+`agflow start` on the owner's Mac seeds a repository with a spec and calls `POST /api/operator/project/reset`, so a new
+project needs no ssh; the README's [Start a project](../README.md#start-a-project) shows the command. Store the operator
+token on that Mac once, with `agflow operator-token set < token-file` (the Keychain item `agflow-operator`). The token
+then lives on a laptop where agents run: whoever reads it can replace the project. Prefer the Keychain to
+`~/.agflow/operator-token`, which any process of the owner's can read.
+
+The reset, in one go:
+
+1. writes a copy of the whole database to `agflow-archive-<old project>-<time>.db` in the backup folder, which
+   retention never prunes;
+2. empties the old project: tasks, attempts, submissions, messages, events, goal versions and notes, lead and task
+   notes, approvals, deliveries, the runner commands about its work, internet grants and the record of agent fetches,
+   runner agents and their tokens, attempt logs, rejected runner events and the lead seat;
+3. keeps sessions, CLI sign-ins, people's live agents, runners and vendor accounts;
+4. sets the name, repository and deadline, unpauses, clears the worker target and the vendor preference, and raises
+   the epoch and the id counters as a restore does, so no new attempt, branch or ref collides with an old one; the
+   epoch also goes to the backup folder's `epoch` file, so a later restore of an older backup lands above it;
+5. sets goal v1 and posts the rules as standing rules, as the operator's person (event `project.reset`, and
+   `project.deadline_set` when there is a deadline);
+6. closes every runner link. Each runner says hello again, and the hub, which no longer knows the attempts it
+   reports, lists them in the welcome's stop list, as after a restore.
+
+Runners of this release hear the new project in the welcome and open its vault without a restart; the old project's
+last work goes to its own repository. A runner of an older release keeps the old repository until it restarts.
+`AGFLOW_PROJECT_NAME` and `AGFLOW_PROJECT_REPO` only name a new database's first project: after a reset, the
+database's project is the hub's.
+
+This replaces the manual procedure: drain the runners, stop the hub, move the database aside, start it, copy the
+sessions back, raise the epoch with the restore tool, set the goal and undrain. To go back to an archived project,
+restore its archive as a backup ([Backups and restore](#backups-and-restore)).
+
 ## Unattended operation
 
-By default a person merges accepted work, brings outside data into the repository and answers every approval request.
-Four opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
+By default a person merges accepted work, brings outside data into the repository and answers every approval request,
+and the lead reviews every submission. Seven opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
 after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
-- **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal, marking tasks
-  merged, unblocking and messaging the lead by hand. Risk: whoever reads the token acts as the operator's person on
-  those routes, so keep it on the server only.
+- **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal and the deadline,
+  marking tasks merged, unblocking, messaging the lead and starting a new project by hand. Risk: whoever reads the
+  token acts as the operator's person on those routes, the project reset included, so keep it on the server, or in the
+  owner's Keychain for `agflow start`.
 - **`AGFLOW_DEPENDENCIES_NEED_MERGE=1`.** Removes: checking that a dependency reached `main` before dependent work
   starts. Risk: if nothing marks accepted tasks merged, dependent tasks wait forever. Set it only together with an
-  operator that merges.
+  operator that merges. `AGFLOW_AUTO_MERGE=1` works this way by itself.
 - **`AGFLOW_AGENT_FETCH=1`.** Removes: fetching outside data for agents. The hub downloads one public URL at a time
   for a Claude agent, for the lead and for the tasks the lead granted internet access, and the agent's bridge saves
   the file inside its clone. Agents still have no network of their own. Risk: an agent that reads hostile text can
@@ -231,6 +271,49 @@ after a change. The details are in the
   every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
   owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
   removing the line and restarting the hub.
+- **`AGFLOW_AUTO_MERGE=1`.** Removes: merging accepted work by hand, and the operator script that did it. Accepting a
+  task moves it to `merging`, and the hub sends one merge at a time to a runner, the author's when it is online. The
+  runner merges the accepted head into `main` in its vault as a commit "Merge T-42: title" and pushes `main` leased on
+  the `main` it merged; when `main` moved meanwhile it fetches and tries again, up to 5 times. It pushes with its
+  owner's git credentials, the same ones that push the task branches, so **`main` must accept direct pushes from both
+  owners**: no branch protection, required reviews or required status checks on `main`. A conflict sends the task
+  back to its author through `rejected`, with the conflicting files as feedback. A merge that fails otherwise leaves
+  the task in `merging`, tells people once, and is tried again every tick, on another runner when one can take it; a
+  person who merges it by hand marks it merged. A dependency then counts as done only once merged, and accepted and
+  merging tasks keep their owned paths. Risk: work reaches `main` with no person looking at the merge, and the
+  repository's own CI runs after it landed.
+- **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
+  accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
+  woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
+  `.agflow/config.json` on `main`, such as `"check": "bun test"`; a submission without one goes to the lead as before.
+  So does a submission whose branch changes the check's own files, `.agflow/config.json` or a file the check command
+  names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. A runner gives a check
+  `checkMinutes` (10 by default, in `runner.json`) out of the 15 minutes it gives a whole submission, push included,
+  so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long. Risk: the check is the only review, so whatever it
+  does not test is accepted unseen.
+
+Two more settings are on by default:
+
+- **The idle nudge, `AGFLOW_IDLE_NUDGE_SECONDS` (60) and `AGFLOW_IDLE_NUDGE_MINUTES` (5).** Removes: a person noticing
+  that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the free worker
+  slots outnumber the ready tasks that can start, for `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub sends the
+  lead one message: the free slots, the ready, blocked, submitted and accepted tasks, each account's quota, the time
+  left to the deadline, and what to plan next (the spec until it is covered, then defects, missing tests, demo polish
+  and new features, and only fixes in the last hour). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
+  `lead.idle_nudged` records each one. None goes out before the goal is set, while worker dispatch is held (a paused
+  project, the churn guard), or once the deadline has passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk:
+  the lead keeps adding work until the deadline, so the subscriptions stay in use; pause the project, or set a lower
+  worker target, to stop it.
+- **The demo check, `AGFLOW_DEMO_CHECK_EVERY` (5).** Removes: a person trying the product by hand from time to time.
+  After every N tasks merged, the hub creates one demo-check task, created by `system`, unless one is still open.
+  Without `AGFLOW_AUTO_MERGE=1`, accepted tasks count until something marks a task merged. Its agent starts the
+  product from a clean checkout of `main` the way `AGENTS.md` says (`scripts/demo.sh` when present), walks every flow
+  in `SPEC.md`, saves a screenshot of every screen under `docs/qa/<time>/`, records each requirement in
+  `docs/STATUS.md` as working, broken or missing, and lists every defect with steps to reproduce in its submission. It
+  may change only those files and `scripts/demo.sh`, which no runner profile protects. It runs at priority 1,
+  preferably on the vendor that implemented fewer of the last N tasks. The lead reviews it, even with
+  `AGFLOW_AUTO_ACCEPT=1`, and turns its defects into fix tasks. `0` turns it off. Risk: none beyond an agent's usual
+  work; it costs one task's quota every N tasks.
 
 ### What agents fetched
 
@@ -258,7 +341,8 @@ What still needs a person:
 - **Approvals on a managed device.** Where the device's administrator manages the Codex policy, the lead can only
   decline. Approving stays with the owner, in the browser.
 - **Internet for Codex agents.** They never fetch, with or without a grant. Give outside-data tasks to Claude agents,
-  or commit the data.
+  or commit the data. On a runner with the open profile (`agflow runner setup --preset hackathon`) Codex commands
+  reach the network themselves ([README](../README.md#runner-permissions-and-risks)).
 - **Runner sign-in.** A person runs `agflow login` on each Mac and completes the Claude and Codex logins that
   `agflow runner setup` opens ([Joining from a Mac](#joining-from-a-mac)).
 - **Secrets.** API keys and other secrets are never handed out by the hub or by the lead. A person provides them.
@@ -266,6 +350,8 @@ What still needs a person:
 ## Joining from a Mac
 
 Requires Apple silicon macOS (`darwin-arm64`), Bun 1.3.11, git and working access to the project repo. Each person needs their own supported Claude/Codex subscription/login; authenticate git separately so fetches and pushes work. Vendor policy (including managed Codex policy) must permit the runner; agflow does not bypass it. These setup commands intentionally install a real per-user LaunchAgent and prompt for vendor login: the human runs them on their own Mac.
+
+A runner on a Linux VM keeps working while the Macs sleep; [linux-runner.md](linux-runner.md) creates and sets one up.
 
 Build from the same release as the hub (a source archive works; no server secrets are needed):
 
@@ -284,13 +370,15 @@ Compare the terminal verification code with the browser page before approving CL
 
 `setup` records machine identity, git identity, login-shell PATH/proxy/CA settings and capacity (default two). It installs pinned binaries in separate runner vendor homes, opens Claude subscription and Codex logins, and installs/starts the LaunchAgent. Checks run inside the service, including hub identity, repository fetch/push probe, vendor preflight and sandbox support. Setup never requires vendor credentials on the Linux host. `agflow runner setup --relogin` repeats vendor login; `agflow login --hub ...` renews an expired hub token, which the running runner will detect.
 
+Instead of building, you can download `agflow-darwin-arm64` from the repository's latest release into `~/.local/bin/agflow` and make it executable. For a hackathon, `agflow runner setup --preset hackathon --name <name>` asks no questions and sets capacity 6, ceilings 1, keep-awake always and the open profile, which gives agents the network and the greenfield files ([README](../README.md#runner-permissions-and-risks)).
+
 For explicit service installation after setup, run `agflow runner install` (also enables/starts it). For a foreground runner use `agflow runner setup --no-service`, then `agflow runner start`; do not start a second copy alongside the service. `agflow runner stop` drains, hands off and disables the service; `install` brings it back. `agflow runner restart` saves WIP and restarts an installed service. The owner can change capacity/drain/keep-awake in the web Runners page; keep the laptop awake and on AC for sustained work. Both laptops' capacity is also capped by the hub's `AGFLOW_MAX_WORKERS`.
 
 For live chats in a checkout, use `agflow join --role worker --vendor both`; see the [README](../README.md#connect-your-claude-code-and-codex-chats). Runner setup and live-chat joining are separate features. Updating the CLI: stop the runner, replace the binary at the same absolute path, then `agflow runner install` and check status.
 
 ## Backups and restore
 
-The hub writes consistent SQLite snapshots with `VACUUM INTO`: three start backups, 24 hourly backups and seven daily backups. The first hourly backup is an hour after start; a missing daily backup is written on startup. They live in `/var/lib/agflow/backups`, independent of releases. Check backup timestamps and the journal for failures; a full disk can leave the hub running without a new backup. Preserve the `epoch` file alongside backups after a restore.
+The hub writes consistent SQLite snapshots with `VACUUM INTO`: three start backups, 24 hourly backups and seven daily backups. The first hourly backup is an hour after start; a missing daily backup is written on startup. They live in `/var/lib/agflow/backups`, independent of releases. Check backup timestamps and the journal for failures; a full disk can leave the hub running without a new backup. Preserve the `epoch` file alongside backups after a restore or a project reset.
 
 Daily cloud disk snapshots protect against VM/disk loss, including the database, backups, configuration and Caddy certificates. Treat snapshots as sensitive (they contain session tokens and the OAuth secret). They are crash-consistent, not a replacement for application snapshots or a restore drill. Retain an additional known-good backup before schema changes. On a 10 GB disk, monitor `df -h /`, DB/WAL and backup sizes; 34 full SQLite copies plus three dependency trees can outgrow it. Expand the disk or move retained copies before it fills; do not delete live WAL/SHM files to free space.
 

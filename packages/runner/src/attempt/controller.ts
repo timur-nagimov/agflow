@@ -1,7 +1,9 @@
 // The attempt controller (design 13): one per attempt, owning everything about it that is not vendor-specific. Its
 // lifecycle and git work runs on the attempt's serial queue, one job at a time. A start is admitted first (X-3):
 // a draining runner, a full capacity, a vendor that is not ready and the health seam each refuse it with one of
-// core's START_REFUSALS, reported as attempt.failed_to_start with refused set, and nothing starts. An admitted
+// core's START_REFUSALS, reported as attempt.failed_to_start with refused set, and nothing starts. The capacity counts
+// what the hub counts (takesSlot): workers, but not one held after its submission, waiting for its quota or past its
+// reported exit; a lead takes no slot and meets no capacity check. A resume is no start and meets none. An admitted
 // start then prepares the clone (workspace.ts) and a worker's dependencies, in phase preparing, through the seam,
 // and verifies the clone's project config last. Any failure after admission, a clone that cannot be prepared or a
 // failed preparation say, releases what the start took and is one attempt.failed_to_start with refused null (X-40),
@@ -21,7 +23,8 @@
 // What the runner sends the agent on its own, continuations, vendor-error retries, quota waits and the one nudge
 // after an outage, is the turn policy's (turns.ts). A resume (resume.ts) stops a live process first, then prepares
 // the clone the attempt has and resumes its session with the new fence and token. A submission (submit.ts) harvests
-// the clone and pushes the task branch and the WIP ref together; a stop or hold arriving meanwhile ends its retries.
+// the clone, merges main into it and runs the project's check there, then pushes the task branch and the WIP ref
+// together; a stop or hold arriving meanwhile ends its retries.
 // An attempt the hub ended (welcome.stop) is stopped without a handoff turn, its new work going to a late-work ref; an
 // agent's prepare_dependencies runs the preparer in its clone under the request's id.
 // A take-over (takeover.ts) stops the agent with a handoff turn, pushes its work, and hands the clone to a person
@@ -33,6 +36,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  type AgentRole,
   type AttemptFacts,
   type AttemptPhase,
   type AttemptSpec,
@@ -43,6 +47,7 @@ import {
   type RunnerEvent,
   type StartRefusal,
   type StoppedBy,
+  type SubmissionCheck,
   lateWorkRef,
   localPinRefs,
   type Vendor,
@@ -63,12 +68,14 @@ import { diffFingerprint, FactsTracker } from '../facts';
 import { lsRemote, pushLateWork, pushSubmission, type PushResult, pushWip, type SubmitPushOutcome } from '../git/push';
 import { detectProtected, resolveRestoreBase, restoreProtected } from '../git/protect';
 import { type GitEnvironment, runGit } from '../git/run';
-import { cloneExists } from '../git/clone';
+import { cloneExists, moveTaskClone } from '../git/clone';
+import { changedFiles, isAncestor, mainOf, mergeMainInto } from '../git/merge';
 import type { Vault } from '../git/vault';
 import type { RunnerHubHttp } from '../hub-http';
 import type { Logger } from '../log';
 import type { NewEvent, Outbox } from '../outbox';
 import type { RunnerPaths } from '../paths';
+import { readPrepConfig } from '../prep/config';
 import type { SerialQueue } from '../queue';
 import { removeAgentTools } from '../run-dir';
 import { boundedWait, findCloneProcesses, type ProcessIdentity } from '../processes';
@@ -87,8 +94,16 @@ import {
   resumedSpec,
 } from './resume';
 import {
+  checkFailedDetail,
+  checkOf,
+  checkOwnFiles,
+  conflictDetail,
   dirtyDetail,
   isOwnBranch,
+  noCheck,
+  prepFailedCheck,
+  prepFailedDetail,
+  prepFailedNote,
   protectedDetail,
   pushSubmissionWithRetries,
   type SubmitCommand,
@@ -147,7 +162,7 @@ export interface ControllerDeps {
   preparer: DependencyPreparer;
   notifier: Notifier;
   logger: Logger;
-  /** The attempts that hold a capacity slot now (holdsSlot: a live process or a start under way), this one excluded. */
+  /** The attempts that take a capacity slot now (takesSlot), this one excluded. */
   liveAttempts(): number;
   /** Whether the vendor's last preflight found it ready. */
   vendorReady(vendor: Vendor): boolean;
@@ -309,6 +324,10 @@ export class AttemptController {
   /** Stops, holds and resumes that arrived so far; a submission's retries end when it moves. */
   private stopsArrived = 0;
   private readonly stopListeners = new Set<() => void>();
+  /** The role of the last start or resume: a lead takes no capacity slot. */
+  private role: AgentRole | null = null;
+  /** hold_attempt arrived at the current fence: the hub counts the attempt holding, so it takes no slot. */
+  private held = false;
 
   constructor(
     readonly attemptId: string,
@@ -341,11 +360,23 @@ export class AttemptController {
   }
 
   /**
-   * Whether the attempt holds a capacity slot: from the moment its start passes the core's checks, through its live
-   * process, until its exit. The runtime counts these for every other controller's admission.
+   * Whether a start, a live process or its exit work holds the attempt: from the moment its start passes the core's
+   * checks, through its live process, until its exit. The runner's own stops stop these.
    */
   get holdsSlot(): boolean {
     return this.currentPhase !== null;
+  }
+
+  /**
+   * Whether the attempt takes one of the runner's capacity slots, as the hub counts them (design 6.6): a worker that
+   * holdsSlot, unless its turn policy waits for its quota, which the hub hears as attempt.quota, or hold_attempt
+   * arrived, which the hub sends as it records the submission and frees the slot, or attempt.exited is reported, which
+   * frees the slot on the hub while the exit's cleanup still runs here. A lead takes none. The runtime counts these
+   * for every other start's admission.
+   */
+  get takesSlot(): boolean {
+    const waiting = this.live?.policy.waitingForQuota ?? false;
+    return this.holdsSlot && this.role !== 'lead' && !this.held && !waiting && !this.standing.exited;
   }
 
   /** The clone the last start prepared; null before one. */
@@ -464,7 +495,11 @@ export class AttemptController {
    * and session kept.
    */
   hold(command: { fence: Fence }): Promise<StopOutcome> {
-    if (this.isCurrentFence(command.fence)) this.stopArriving();
+    if (this.isCurrentFence(command.fence)) {
+      // The hub freed the slot as it recorded the submission: the next start finds it free here too.
+      this.held = true;
+      this.stopArriving();
+    }
     return this.enqueue(async () => {
       const live = this.liveAt(command.fence);
       if (!('pump' in live)) return live;
@@ -496,7 +531,11 @@ export class AttemptController {
    * and a live process is done already.
    */
   resume(command: ResumeInput): Promise<ResumeOutcome> {
-    if (this.currentFence === null || compareFence(command.fence, this.currentFence) > 0) this.stopArriving();
+    if (this.currentFence === null || compareFence(command.fence, this.currentFence) > 0) {
+      // The hub counts a resumed attempt from the moment it sends the resume, so it takes a slot again here too.
+      this.held = false;
+      this.stopArriving();
+    }
     return this.enqueue(async () => {
       const record = this.deps.store.get(this.attemptId);
       const current = this.currentFence ?? record?.fence ?? null;
@@ -513,6 +552,7 @@ export class AttemptController {
       }
       const spec = resumedSpec(record.spec, command);
       this.currentFence = spec.fence;
+      this.role = spec.role;
       this.currentPhase = 'starting';
       const { agentToken: _token, ...stored } = spec;
       this.current = stored;
@@ -944,7 +984,7 @@ export class AttemptController {
     }
     await this.recallPushedWork(workspace.startSha);
     const prep = await this.prepareDependencies(spec, workspace);
-    if (prep.error !== null) throw new Error(`dependency preparation failed: ${prep.error}`);
+    this.checkPreparation(prep.error);
     await startStep('cannot verify the clone', () =>
       finishWorkspace(this.deps, spec, workspace, { prepared: prep.ran }),
     );
@@ -980,6 +1020,9 @@ export class AttemptController {
     stops: number,
   ): Promise<SubmittedData> {
     const { vault, local, logger, store, wipGate } = this.deps;
+    // submitRetry is as long as the hub waits for the whole submission: the push gets what the merge, the preparation
+    // and the check leave of it.
+    const began = Date.now();
     const branch = command.branch;
     const refused = (fields: Pick<SubmittedData, 'error' | 'detail'> & Partial<SubmittedData>): SubmittedData => ({
       submissionId: command.submissionId,
@@ -1000,7 +1043,7 @@ export class AttemptController {
     } catch (error) {
       return refused({ error: 'remote', detail: `cannot harvest the clone: ${describe(error)}` });
     }
-    const headSha = work.head;
+    let headSha = work.head;
     // Every skipped file is an uncommitted change the snapshot left out: the submission would go without it.
     const dirty = [...new Set([...work.uncommitted, ...work.skipped])].sort();
     if (dirty.length > 0) return refused({ error: 'dirty', headSha, detail: dirtyDetail(dirty) });
@@ -1023,10 +1066,23 @@ export class AttemptController {
       sha = work.head;
       tree = (await runGit(local, [`--git-dir=${vault.path}`, 'rev-parse', `${sha}^{tree}`])).stdout.trim();
     }
+    let checked: Awaited<ReturnType<AttemptController['mergeAndCheck']>>;
+    try {
+      checked = await this.mergeAndCheck(spec, clone, branch, sha);
+    } catch (error) {
+      const detail = `cannot merge ${vault.mainBranch} into the branch: ${describe(error)}`;
+      return refused({ error: 'remote', headSha, detail });
+    }
+    const { check } = checked;
+    if (!checked.ok) return refused({ error: checked.error, headSha: checked.head, detail: checked.detail, check });
+    if (checked.merge !== null) {
+      ({ sha, tree } = checked.merge);
+      headSha = sha;
+    }
     const wipRef = spec.wipRef as string;
     const settled = () => this.standing.fenced || this.standing.ended || this.standing.exited;
     const pushed = await pushSubmissionWithRetries({
-      budgetMs: this.deps.config().timings.submitRetry,
+      budgetMs: this.deps.config().timings.submitRetry - (Date.now() - began),
       interrupted: () => this.stopsArrived !== stops,
       stopArrived: () => this.nextStop(),
       // Only the link's gate clears by itself; a fenced, ended or exited attempt never pushes again.
@@ -1058,16 +1114,134 @@ export class AttemptController {
       },
     });
     if (pushed === 'interrupted') {
-      return refused({ error: 'interrupted', headSha, detail: 'a stop or hold arrived while the push was retried' });
+      return refused({ error: 'interrupted', headSha, detail: 'a stop or hold arrived while the push was retried', check });
     }
     if (pushed.ok) {
       store.update(this.attemptId, { wipSha: sha, pushedSha: sha, lastPushAt: Date.now() });
-      this.lastWork = { head: work.head, tree };
+      this.lastWork = { head: headSha, tree };
       this.heldWork = null;
       this.deps.wipFailures.succeeded();
     }
     const { ok, remoteHead, error, detail } = pushed;
-    return { submissionId: command.submissionId, ok, headSha, remoteHead, error, detail };
+    return { submissionId: command.submissionId, ok, headSha, remoteHead, error, detail, check };
+  }
+
+  /**
+   * A submission's merge of main and its check (design 6.13). Unless the branch holds main already, main merges into
+   * it in the vault, and the clone moves to the merge commit while the agent's groups are paused; a conflict changes
+   * nothing. The project's check then runs in the clone, after the dependencies are prepared again when main merged
+   * in. A check that passed names the check's own files the branch changes (checkOwnFiles): the branch may have
+   * weakened it. Gives the merge commit and its tree, null when the branch held main, or the refusal: merge_conflict
+   * naming the files, or check_failed with the end of the output. Each gives what the check gave.
+   */
+  private async mergeAndCheck(
+    spec: Omit<AttemptSpec, 'agentToken'>,
+    clone: string,
+    branch: string,
+    head: string,
+  ): Promise<
+    | { ok: true; merge: { sha: string; tree: string } | null; check: SubmissionCheck }
+    | { ok: false; error: 'merge_conflict' | 'check_failed'; head: string; detail: string; check: SubmissionCheck | null }
+  > {
+    const { vault, local, store } = this.deps;
+    const config = this.deps.config();
+    const git = { vault, local };
+    const main = await mainOf(git);
+    let merge: { sha: string; tree: string } | null = null;
+    let mergedBase: string | null = null;
+    if (!(await isAncestor(git, main, head))) {
+      const message = `Merge ${vault.mainBranch} into ${branch}`;
+      const merged = await mergeMainInto({ ...git, head, main, message, identity: config.commitIdentity });
+      if (!merged.merged) {
+        const detail = conflictDetail(merged.files, vault.mainBranch);
+        return { ok: false, error: 'merge_conflict', head, detail, check: null };
+      }
+      const groups = this.live === null ? [] : [...store.processes(this.attemptId), ...this.live.pump.groups()];
+      const target = { vault, local, attemptId: this.attemptId, clone, branch, from: head, to: merged.sha };
+      await withPausedGroups(groups, () => moveTaskClone(target));
+      merge = { sha: merged.sha, tree: merged.tree };
+      // The pins moved: the restore base is the main that merged in, for the preparation below and any later one.
+      mergedBase = await resolveRestoreBase(vault, spec);
+      if (this.prepared !== null) this.prepared.base = mergedBase;
+    }
+    const timeoutMs = Math.max(1, Math.round(config.checkMinutes * 60_000));
+    const ran = await this.runCheck(spec, clone, main, timeoutMs, mergedBase);
+    if (ran.refusal !== null) {
+      return { ok: false, error: 'check_failed', head: merge?.sha ?? head, detail: ran.refusal, check: ran.check };
+    }
+    let check = ran.check;
+    if (check.status === 'passed' && check.command !== null) {
+      const own = checkOwnFiles(check.command, await changedFiles(git, main, merge?.sha ?? head));
+      if (own.length > 0) check = { ...check, ownFilesChanged: own };
+    }
+    return { ok: true, merge, check };
+  }
+
+  /**
+   * The project's check, read from .agflow/config.json on main, run in the clone by the preparer's sandbox with the
+   * agent's environment and no agent token. When main merged in, it may have changed what the dependencies need: they
+   * are prepared first, as at a start, at mergedBase, the restore base the merge gave. A preparation that fails
+   * refuses the submission, except under the open profile: there, as at a start, the agent can install for itself, so
+   * the check runs anyway and its tail ends with a note of the failure. A check that cannot run (no command, a config
+   * that does not read, a runner with no sandbox, a failure to start it) is none, with why in its tail: the submission
+   * goes on without it. Gives what the check gave, and the refusal's detail when the check, or the preparation before
+   * it, failed.
+   */
+  private async runCheck(
+    spec: Omit<AttemptSpec, 'agentToken'>,
+    clone: string,
+    main: string,
+    timeoutMs: number,
+    mergedBase: string | null,
+  ): Promise<{ check: SubmissionCheck; refusal: string | null }> {
+    const { preparer, vault, paths, store } = this.deps;
+    let command: string | undefined;
+    try {
+      command = (await readPrepConfig(vault, main))?.check;
+    } catch (error) {
+      return { check: noCheck(null, describe(error)), refusal: null };
+    }
+    if (command === undefined) return { check: noCheck(null, ''), refusal: null };
+    if (!preparer.available || preparer.check === undefined) {
+      const why = 'this runner cannot run it: it has no sandbox for preparation commands';
+      return { check: noCheck(command, why), refusal: null };
+    }
+    const env = buildAgentEnv({
+      vendor: spec.vendor,
+      spec: { ...spec, agentToken: '' },
+      clone,
+      tools: paths.agentTools(vault.project, this.attemptId),
+      tmpDir: this.prepared?.tmpDir ?? store.get(this.attemptId)?.tmpDir ?? null,
+      config: this.deps.config(),
+      paths,
+    });
+    delete env.AGFLOW_AGENT_TOKEN;
+    let note = '';
+    if (mergedBase !== null) {
+      const input = { attemptId: this.attemptId, vendor: spec.vendor, clone, vault, baseSha: mergedBase, env };
+      let prep: Omit<PrepareOutcome, 'ran'>;
+      try {
+        prep = await preparer.prepare({ ...input, requestId: null });
+      } catch (error) {
+        prep = { ok: false, error: describe(error), logTail: null };
+      }
+      if (!prep.ok && this.deps.config().profile !== 'open') {
+        const check = prepFailedCheck(command, prep);
+        return { check, refusal: prepFailedDetail(check, vault.mainBranch) };
+      }
+      if (!prep.ok) note = prepFailedNote(prep.error, vault.mainBranch);
+    }
+    const noted = (output: string) =>
+      note === '' ? output : [output.trimEnd(), note].filter((part) => part !== '').join('\n');
+    try {
+      const ran = await preparer.check({ clone, vault, command, env, timeoutMs });
+      const run = { ...ran, logTail: noted(ran.logTail) };
+      const check = checkOf(command, run);
+      const refusal = check.status === 'failed' ? checkFailedDetail(check, run, timeoutMs, vault.mainBranch) : null;
+      return { check, refusal };
+    } catch (error) {
+      return { check: noCheck(command, noted(`the runner could not run it: ${describe(error)}`)), refusal: null };
+    }
   }
 
   /** Resolves when the next stop, hold or resume arrives. */
@@ -1115,7 +1289,7 @@ export class AttemptController {
       for (const path of fresh) this.reported.add(path);
     }
     const prep = await this.prepareDependencies(spec, workspace);
-    if (prep.error !== null) throw new Error(`dependency preparation failed: ${prep.error}`);
+    this.checkPreparation(prep.error);
     await startStep('cannot verify the clone', () =>
       finishWorkspace(this.deps, spec, workspace, { prepared: prep.ran }),
     );
@@ -2084,6 +2258,16 @@ export class AttemptController {
     return { ran: true, error: ok ? null : (error ?? 'the preparation failed') };
   }
 
+  /**
+   * A failed preparation fails the start or resume. Under the open profile the agent starts anyway: it has the network
+   * and can install for itself, and a config an agent broke on main must not keep every worker from fixing it.
+   */
+  private checkPreparation(error: string | null): void {
+    if (error !== null && this.deps.config().profile !== 'open') {
+      throw new Error(`dependency preparation failed: ${error}`);
+    }
+  }
+
   /** attempt.failed_to_start for a start the runner tried: refused null, class infra, the error clipped. */
   private failedToStart(fence: Fence, error: string): Extract<StartOutcome, { started: false }> {
     this.currentPhase = null;
@@ -2092,11 +2276,14 @@ export class AttemptController {
     return { started: false, refused: null, error: clipped };
   }
 
-  /** The core's checks in order, then the health seam's; null admits the start. */
+  /**
+   * The core's checks in order, then the health seam's; null admits the start. A lead takes no slot, so it meets no
+   * capacity check: the runner runs its capacity of workers beside it.
+   */
   private async admit(spec: AttemptSpec): Promise<{ code: StartRefusal; error: string } | null> {
     const config = this.deps.config();
     if (config.draining) return { code: 'draining', error: 'the runner is draining and takes no new attempts' };
-    if (this.deps.liveAttempts() >= config.capacity) {
+    if (spec.role !== 'lead' && this.deps.liveAttempts() >= config.capacity) {
       return { code: 'at_capacity', error: `the runner is at its capacity of ${config.capacity} attempts` };
     }
     if (!this.deps.adapters.has(spec.vendor) || !this.deps.vendorReady(spec.vendor)) {
@@ -2105,6 +2292,7 @@ export class AttemptController {
     // The slot is taken before the seam is asked, with no await since the capacity check, so a start of another
     // attempt admitted meanwhile counts it; a refusal gives it back.
     const previous = this.currentPhase;
+    this.role = spec.role;
     this.currentPhase = 'starting';
     let code: StartRefusal | null;
     try {

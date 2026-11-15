@@ -36,10 +36,15 @@ export function parsePmsetSettings(output: string): { lowPowerMode: boolean; sle
   };
 }
 
+/** A Linux runner is a cloud machine: always on AC, with no battery and no low power mode. */
+export const LINUX_POWER: PowerSample = Object.freeze({ source: 'ac', batteryPercent: null, lowPowerMode: false });
+
 export async function samplePower(
   options: { exec?: Exec; platform?: NodeJS.Platform; timeoutMs?: number } = {},
 ): Promise<PowerSample | null> {
-  if ((options.platform ?? process.platform) !== 'darwin') return null;
+  const platform = options.platform ?? process.platform;
+  if (platform === 'linux') return { ...LINUX_POWER };
+  if (platform !== 'darwin') return null;
   const exec = options.exec ?? defaultExec;
   const timeoutMs = options.timeoutMs ?? 5_000;
   try {

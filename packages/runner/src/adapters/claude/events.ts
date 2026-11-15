@@ -9,7 +9,7 @@ import { clip } from '../../attempt/pump';
 import type { AgentEvent, TerminalTool } from '../types';
 import { isRecord } from './json';
 import { classifyResult } from './outcome';
-import { isPaidUsageNotice, QuotaBook } from './quota';
+import { isModelLimit, isPaidUsageNotice, QuotaBook } from './quota';
 import { splitShellCommands } from './shell-words';
 
 /** The longest tool input a tool_started carries, as JSON: enough to tell repeated calls apart (6.8). */
@@ -125,8 +125,12 @@ export class ClaudeEventMapper {
         break;
       case 'rate_limit_event': {
         const info = rateLimitInfo(frame.rate_limit_info);
-        if (info !== null) {
+        if (info === null) break;
+        if (!isModelLimit(info)) {
           events.push({ type: 'quota', accountId: this.accountId, quota: this.quota.rateLimit(this.accountId, info) });
+        } else if (info.status === 'rejected') {
+          // A limit of one model is not the account's: the hit names no account, so only this attempt waits on it.
+          events.push({ type: 'quota', accountId: null, quota: this.quota.modelLimit(info) });
         }
         break;
       }

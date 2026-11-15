@@ -110,9 +110,14 @@ describe('samplePower', () => {
     expect((await sample)?.source).toBe('ac');
   });
 
-  test('returns null off macOS without executing commands', async () => {
+  test('Linux is always on AC, and other platforms are unknown, without executing commands', async () => {
     const exec = pmset();
-    expect(await samplePower({ platform: 'linux', exec })).toBeNull();
+    expect(await samplePower({ platform: 'linux', exec })).toEqual({
+      source: 'ac',
+      batteryPercent: null,
+      lowPowerMode: false,
+    });
+    expect(await samplePower({ platform: 'win32', exec })).toBeNull();
     expect(exec.calls).toEqual([]);
   });
 

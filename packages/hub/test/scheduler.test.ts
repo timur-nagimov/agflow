@@ -1,5 +1,12 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { type AttemptFacts, type RawRunnerEvent, TEST_ACCOUNT_ID, type Vendor, type VendorQuota } from '@agflow/core';
+import {
+  type AttemptFacts,
+  type RawRunnerEvent,
+  TEST_ACCOUNT_ID,
+  type Vendor,
+  type VendorQuota,
+  restoreSet,
+} from '@agflow/core';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, requestStop, startRunnerAttempt } from '../src/attempts';
 import { pendingCommands } from '../src/commands';
@@ -10,7 +17,7 @@ import { seatHolderId, updateHubState } from '../src/hub-state';
 import { getProject, getStaffing, setPaused, setWorkerTarget } from '../src/project';
 import { clearOwnerAway, setOwnerAway, upsertAccountQuota } from '../src/quota';
 import { recordHeartbeatInfo, recordStartRefusal } from '../src/runners';
-import { Scheduler, replaceQuotaWaits, requestAgents, runTick } from '../src/scheduler';
+import { Scheduler, replaceQuotaWaits, requestAgents, runTick, withWaitReason } from '../src/scheduler';
 import { startHub } from '../src/server';
 import { requestSubmission } from '../src/submissions';
 import { getTask, writeTask } from '../src/task-store';
@@ -29,7 +36,7 @@ import { createTestHub } from './http-helpers';
 const MINUTE = 60_000;
 
 /**
- * A test context with runner leads off: a runner lead would take a runner slot in every tick, and the lead seat is
+ * A test context with runner leads off: a runner lead would start in the first tick, and the lead seat is
  * lead-runner.test.ts's to test.
  */
 function schedulerContext(overrides: Parameters<typeof createTestContext>[0] = {}) {
@@ -181,8 +188,11 @@ describe('dispatch', () => {
     // The runner has two slots, and neither task held its paths when the tick began.
     expect(tick(ctx)).toEqual([[first, runnerId, 'claude']]);
     expect(statusOf(ctx, second as string)).toBe('ready');
+    const reason = () => withWaitReason(ctx, getTask(ctx, second as string)).waitReason;
+    expect(reason()).toBe(`its owned paths overlap those of ${first}, which just started`);
     // Now the first holds them, so the next tick does not start the second either.
     expect(tick(ctx)).toEqual([]);
+    expect(reason()).toBe(`its owned paths overlap those of ${first}`);
   });
 
   test("request_agents' vendor steers placement until vendorPrefMs has passed", () => {
@@ -258,6 +268,37 @@ describe('dispatch', () => {
     markHubAlive(ctx);
     expect(tick(ctx)).toEqual([[hold, runnerId, 'claude']]);
     expect(statusOf(ctx, config as string)).toBe('ready');
+  });
+
+  test('a task that owns greenfield files goes to a runner with the open profile, which may change them', () => {
+    const { ctx } = schedulerContext();
+    const standard = addRunner(ctx);
+    const open = addRunner(ctx, { profile: 'open' });
+    const [ordinary, bunfig] = tasks(ctx, { title: 'Parser' }, { title: 'Bun config', ownedPaths: ['bunfig.toml'] });
+    expect(tick(ctx)).toEqual([
+      [ordinary, standard, 'claude'],
+      [bunfig, open, 'claude'],
+    ]);
+    const restore = (runnerId: string) => {
+      const start = pendingCommands(ctx, runnerId, 1).find((row) => row.command.kind === 'start_attempt')?.command;
+      if (start?.kind !== 'start_attempt') throw new Error('no start');
+      return start.attempt.restore.paths;
+    };
+    expect(restore(standard)).toContain('bunfig.toml');
+    expect(restore(open)).toEqual(restoreSet(getTask(ctx, bunfig as string), 'open'));
+    expect(restore(open)).not.toContain('bunfig.toml');
+    expect(restore(open)).toContain('.claude/**');
+  });
+
+  test('without a runner with the open profile, a task that owns greenfield files waits', () => {
+    const { ctx } = schedulerContext();
+    addRunner(ctx);
+    const [agents] = tasks(ctx, { title: 'Agent notes', ownedPaths: ['AGENTS.md'] });
+    expect(tick(ctx)).toEqual([]);
+    expect(statusOf(ctx, agents as string)).toBe('ready');
+    // It is not left to live chats: the first runner with the open profile takes it.
+    const open = addRunner(ctx, { profile: 'open' });
+    expect(tick(ctx)).toEqual([[agents, open, 'claude']]);
   });
 
   test('the ladder requirement and vendorHint steer the vendor', () => {
@@ -443,6 +484,7 @@ describe('the reconcile step', () => {
       probes: 1,
       quotaWaits: [],
       leadReview: false,
+      idleNudge: false,
       rotated: null,
     });
     expect(getAttempt(ctx, lost.attempt.id).endReason).toBe('lost');
@@ -530,7 +572,8 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     const { ctx, held } = replaceable();
     const lead = addRunnerLead(ctx);
     updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
-    addRunner(ctx, { vendors: ['claude'] });
+    // Another account for the lead: bob's.
+    addRunner(ctx, { owner: 'bob', vendors: ['claude'] });
     setPaused(ctx, true, 'user:alice');
     expect(replaceQuotaWaits(ctx)).toEqual([]);
     expect([getAttempt(ctx, held.attempt.id).stopRequested, getAttempt(ctx, lead.attempt.id).stopRequested]).toEqual([
@@ -546,7 +589,7 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     const { ctx, clock, held } = replaceable();
     const lead = addRunnerLead(ctx);
     updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
-    addRunner(ctx, { vendors: ['claude'] });
+    addRunner(ctx, { owner: 'bob', vendors: ['claude'] });
     updateHubState(ctx, { dispatchPausedUntil: ctx.now() + 60 * MINUTE });
     expect(replaceQuotaWaits(ctx)).toEqual([lead.attempt.id]);
     expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
@@ -559,7 +602,7 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     tx(ctx, () => setWorkerTarget(ctx, 0));
     expect(replaceQuotaWaits(ctx)).toEqual([]);
     expect(getAttempt(ctx, held.attempt.id).stopRequested).toBeNull();
-    // The successor takes the slot the wait frees.
+    // The wait takes no worker slot, so the one the target allows is free for its successor.
     tx(ctx, () => setWorkerTarget(ctx, 1));
     expect(replaceQuotaWaits(ctx)).toEqual([held.attempt.id]);
   });
@@ -577,13 +620,16 @@ describe('replaceQuotaWaits, when the successor cannot start', () => {
     expect(getAttempt(ctx, newer.attempt.id).stopRequested).toBeNull();
   });
 
-  test('a lead is replaced once another runner has room, and only with runner leads on', () => {
+  test('a lead is replaced at once, whatever its reset, when another account can take the seat, leads on', () => {
     const { ctx } = createTestContext();
     const lead = addRunnerLead(ctx);
-    updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: null });
-    // Its runner is full: the lead and a worker.
-    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    // A reset a minute away: a lead does not wait for it.
+    exhaust(ctx, 'claude', { resetsAt: ctx.now() + MINUTE });
+    updateAttempt(ctx, lead.attempt.id, { status: 'quota_wait', quotaResetsAt: ctx.now() + MINUTE });
+    // Another runner of alice's is on the account the lead waits on.
     addRunner(ctx);
+    expect(replaceQuotaWaits(ctx)).toEqual([]);
+    addRunner(ctx, { owner: 'bob' });
     ctx.db.run('UPDATE project SET runner_leads = 0 WHERE id = 1');
     expect(replaceQuotaWaits(ctx)).toEqual([]);
     ctx.db.run('UPDATE project SET runner_leads = 1 WHERE id = 1');

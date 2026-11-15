@@ -32,6 +32,8 @@ export interface CodexSessionOptions {
   /** The runner's CODEX_HOME and the app-server's HOME. */
   codexHome: string;
   userHome: string;
+  /** The runner's shared package caches (paths.caches), writable inside the sandbox. */
+  caches?: readonly string[];
   /** Passed by the adapter only in test mode. */
   testConfig?: RunnerTestBlock['codexConfig'] | null;
   /** test.skipAuthChecks, only in test mode: quota is then reported for core's TEST_ACCOUNT_ID, as preflight does. */
@@ -170,7 +172,13 @@ export class CodexSession implements AgentSession {
       unsubscribeStartup();
     };
     try {
-      const { thread, resumed } = await CodexSession.openThread(app, launch, options.userHome, options.logger);
+      const { thread, resumed } = await CodexSession.openThread(
+        app,
+        launch,
+        options.userHome,
+        options.caches ?? [],
+        options.logger,
+      );
       const tools = await CodexSession.checkThread(
         app,
         launch,
@@ -737,6 +745,7 @@ export class CodexSession implements AgentSession {
     app: AppServerProcess,
     launch: AgentLaunch,
     bridgeCwd: string,
+    caches: readonly string[],
     logger?: Logger,
   ): Promise<{ thread: ResultOf<'thread/start'> | ResultOf<'thread/resume'>; resumed: boolean }> {
     if (launch.resume !== null) {
@@ -744,7 +753,7 @@ export class CodexSession implements AgentSession {
         // Keep the RPC error intact until the never-ran case has been distinguished from other failures.
         const thread = await app.rpc.request('thread/resume', {
           threadId: launch.resume.sessionRef,
-          ...threadOverrides(launch, bridgeCwd),
+          ...threadOverrides(launch, bridgeCwd, caches),
           excludeTurns: true,
         });
         return { thread, resumed: true };
@@ -758,7 +767,7 @@ export class CodexSession implements AgentSession {
         });
       }
     }
-    return { thread: await request(app, 'thread/start', threadOverrides(launch, bridgeCwd)), resumed: false };
+    return { thread: await request(app, 'thread/start', threadOverrides(launch, bridgeCwd, caches)), resumed: false };
   }
 
   /** Checks required tools against the live bridge; returns sorted extra names to warn about. */
@@ -780,8 +789,14 @@ export class CodexSession implements AgentSession {
     if (thread.sandbox.type !== 'workspaceWrite') {
       throw new Error(`codex ${method} reported sandbox ${thread.sandbox.type}, expected workspaceWrite`);
     }
-    if (thread.sandbox.networkAccess !== false) {
-      throw new Error(`codex ${method} reported sandbox network access, expected no network`);
+    // Only the open profile gives commands the network (threadOverrides).
+    const network = launch.profile.name === 'open';
+    if (thread.sandbox.networkAccess !== network) {
+      throw new Error(
+        network
+          ? `codex ${method} reported no sandbox network access, expected network`
+          : `codex ${method} reported sandbox network access, expected no network`,
+      );
     }
     if (thread.cwd !== realpathSync(launch.clone)) {
       throw new Error(`codex ${method} reported cwd ${thread.cwd}, expected ${realpathSync(launch.clone)}`);

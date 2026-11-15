@@ -14,6 +14,7 @@ import { bootoutService, plistPath, serviceLoaded } from '@agflow/runner/src/ser
 import { acquireRunnerLock } from '@agflow/runner/src/service/lock';
 import { machineMismatch, readMachineId } from '@agflow/runner/src/service/machine';
 import { stopRunner } from '@agflow/runner/src/service/stop';
+import { removeSystemdService } from '@agflow/runner/src/service/systemd';
 import { defaultExec, type Exec } from '@agflow/runner/src/service/system';
 import { logoutClaude, logoutCodex } from '@agflow/runner/src/vendor/login';
 import { type PlatformPins, VENDOR_PINS, vendorBinary, vendorPlatform } from '@agflow/runner/src/vendor/pins';
@@ -31,8 +32,10 @@ export interface RunnerUninstallDeps {
   exec: Exec;
   pins: PlatformPins;
   platform: string;
-  /** The machine-id platform (ioreg on darwin). */
+  /** The machine-id platform (ioreg on darwin), which also picks the service: launchd, or systemd on Linux. */
   machinePlatform: NodeJS.Platform;
+  /** Linux's machine id file, /etc/machine-id by default. */
+  machineIdFile: string;
   home: string;
   uid: number;
   lockWaitMs: number;
@@ -109,9 +112,20 @@ export async function uninstallRunner(
   const env = deps.env ?? process.env;
   const paths = deps.paths ?? runnerPaths(agflowHome(env));
   const exec = deps.exec ?? defaultExec;
+  const machinePlatform = deps.machinePlatform ?? process.platform;
+  const linux = machinePlatform === 'linux';
   const launchctl = { exec, uid: deps.uid };
   const log = (line: string) => io.out(`${line}\n`);
-  const stopped = await stopRunner({ paths, env, ...launchctl, lockWaitMs: deps.lockWaitMs, pollMs: deps.pollMs });
+  const stopped = await stopRunner({
+    paths,
+    env,
+    ...launchctl,
+    // On Linux the unit lies in the home; macOS removes its plist below instead.
+    home: linux ? (deps.home ?? homedir()) : undefined,
+    platform: machinePlatform,
+    lockWaitMs: deps.lockWaitMs,
+    pollMs: deps.pollMs,
+  });
   log(stopped.wasRunning ? 'the runner stopped' : 'no runner was running');
   if (!stopped.wasRunning) {
     const lock = await acquireRunnerLock(paths, { mode: 'foreground', wait: false });
@@ -172,15 +186,15 @@ export async function uninstallRunner(
   } else {
     const config = loadRunnerConfig(paths.config, env);
     // A runner.json copied from another Mac (a restore, Migration Assistant) names that Mac's live runner.
-    const copied =
-      machineMismatch(config, await readMachineId({ exec, platform: deps.machinePlatform ?? process.platform })) !==
-      null;
+    const machineId = await readMachineId({ exec, platform: machinePlatform, machineIdFile: deps.machineIdFile });
+    const copied = machineMismatch(config, machineId) !== null;
     const platform = deps.platform ?? vendorPlatform();
     const pins = deps.pins ?? VENDOR_PINS[platform];
     for (const vendor of ['claude', 'codex'] as const) {
       const version = installedVersion(paths, vendor, pins?.[vendor].version);
       if (version === null) {
-        const kept = vendor === 'claude' ? '; its login stays in the login keychain' : '';
+        const login = linux ? `token stays in ${paths.envFile}` : 'login stays in the login keychain';
+        const kept = vendor === 'claude' ? `; its ${login}` : '';
         log(`${vendor}: no runner binary is installed, so the logout could not run${kept}`);
         continue;
       }
@@ -213,7 +227,9 @@ export async function uninstallRunner(
     }
   }
 
-  if (env.AGFLOW_TEST !== '1') {
+  if (env.AGFLOW_TEST !== '1' && linux) {
+    log(`removed ${await removeSystemdService({ exec, home: deps.home ?? homedir() })}`);
+  } else if (env.AGFLOW_TEST !== '1') {
     if (await serviceLoaded(launchctl)) {
       if (!(await bootoutService(launchctl)) && (await serviceLoaded(launchctl))) {
         throw new Error('launchctl bootout failed; the service is still loaded');

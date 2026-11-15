@@ -15,6 +15,7 @@ import { mountEventRoutes } from './event-routes';
 import { mountFetchRoutes } from './fetch-routes';
 import { mountGithubRoutes } from './github-routes';
 import { mountLeadRoutes } from './lead-routes';
+import { mountLoadRoutes } from './load-routes';
 import { mountMessageRoutes } from './message-routes';
 import { mountOperatorRoutes } from './operator-routes';
 import { mountProjectRoutes } from './project-routes';
@@ -151,6 +152,7 @@ export function createApp(ctx: HubContext, options: AppOptions = {}): App {
   mountOperatorRoutes(app, ctx);
   mountEventRoutes(app, ctx);
   mountRunnerRoutes(app, ctx, options.upgradeRunnerLink);
+  mountLoadRoutes(app, ctx);
   mountCliLoginPage(app, ctx);
   if (ctx.config.webDist) mountStatic(app, ctx.config.webDist);
   return app;

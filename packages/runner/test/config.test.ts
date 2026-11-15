@@ -74,6 +74,7 @@ describe('loadRunnerConfig', () => {
       allowPaidUsage: { claude: false, codex: false },
       minFreeGb: 10,
       batteryDrainPercent: 20,
+      checkMinutes: 10,
       homes: { claude: null, codex: null },
       connectivity: {},
     });

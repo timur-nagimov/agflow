@@ -109,13 +109,6 @@ describe('rejectTask of a runner submission', () => {
         ctx.db.query("UPDATE runners SET state = 'offline' WHERE id = $id").run({ id: held.runner.id });
       },
     ],
-    [
-      'its runner has no free slot',
-      (ctx, held) => {
-        addRunnerAttempt(ctx, { runnerId: held.runner.id });
-        addRunnerAttempt(ctx, { runnerId: held.runner.id });
-      },
-    ],
     ['its vendor is not usable there', (ctx, held) => markVendorNotReady(ctx, held.runner.id, 'claude')],
     ['it is not resumable', (ctx, held) => updateAttempt(ctx, held.attempt.id, { resumable: false })],
   ];
@@ -128,6 +121,18 @@ describe('rejectTask of a runner submission', () => {
       expect(getTask(ctx, taskId).status).toBe('ready');
     });
   }
+
+  test('a review resume needs no free slot: the author resumes on its full runner', () => {
+    const { ctx, held, taskId } = setup();
+    addRunnerAttempt(ctx, { runnerId: held.runner.id });
+    addRunnerAttempt(ctx, { runnerId: held.runner.id });
+    const task = rejectTask(ctx, taskId, 'user:alice', 'Again.');
+    expect(task).toMatchObject({ status: 'claimed', assignee: held.agent.id, currentAttempt: held.attempt.id });
+    expect(getAttempt(ctx, held.attempt.id)).toMatchObject({ status: 'starting', reviewRounds: 1 });
+    expect(commandsOf(ctx, held.runner.id)).toContainEqual(
+      expect.objectContaining({ kind: 'resume_attempt', attemptId: held.attempt.id }),
+    );
+  });
 
   test('no step 1 when only another vendor is usable on its runner', () => {
     const { ctx, held, taskId } = setup({ vendors: ['claude', 'codex'] });

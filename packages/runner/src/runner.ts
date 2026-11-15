@@ -6,7 +6,8 @@
 //   The project's name and repo come from GET /api/status and are cached in runner.db with the hub that gave them,
 //   so a runner that starts while its hub is down still finds its vault, which projectKey names; another hub's cache
 //   is never used. The vault's main branch is the one the hub's last start named (AttemptSpec.repo.mainBranch), kept
-//   in runner.db too. Every adapter's preflight runs, and the link says hello.
+//   in runner.db too. Every adapter's preflight runs, and the link says hello. A welcome that names another project
+//   (after a project reset on the hub) moves the runner to that project's vault without a restart (followProject).
 // - Every HTTP call goes to the hub this runner serves: after a login to another hub they fail as signed out, as the
 //   link's own connections do, so no transcript of one hub's project ever reaches another.
 // - hello: the protocol, the runner's identity, the confirmed settings snapshot (never a local edit, X-12), the
@@ -222,7 +223,10 @@ export interface RunnerHandle {
   resume(): void;
   /** Whether the hub acknowledged the event with this seq within timeoutMs; true at once if it has. */
   waitAcked(seq: number, timeoutMs: number): Promise<boolean>;
-  /** The project's vault, so M2c's daily consolidate shares its per-vault lock. */
+  /**
+   * The project's vault, so M2c's daily consolidate shares its per-vault lock. A welcome that names another project
+   * replaces it.
+   */
   readonly vault: Vault;
   /** Ends the link and the runner's timers. Agents keep running: a suspend or a stop ends them first. */
   close(): Promise<void>;
@@ -266,6 +270,17 @@ async function projectOf(
     logger.warn('cannot read the project from the hub; using the cached one', { error: describe(error) });
     return { name: cached.name, repo: cached.repo };
   }
+}
+
+/** The vault of one project of this hub, which projectKey names; its main branch is the one the last start named. */
+function projectVault(paths: RunnerPaths, db: RunnerDb, hubUrl: string, project: { name: string; repo: string }): Vault {
+  return new Vault({
+    paths,
+    project: projectKey(hubUrl, project.name),
+    // 'main' only until a start names the hub's main branch.
+    repo: { url: project.repo, mainBranch: db.meta('mainBranch') ?? 'main' },
+    mainBranchChanged: (mainBranch) => db.setMeta('mainBranch', mainBranch),
+  });
 }
 
 /** The facts of a start or resume still under way: no agent event yet, so nothing for a stall rule to read. */
@@ -343,13 +358,7 @@ export async function createRunner(options: RunnerOptions): Promise<RunnerHandle
     const http = new RunnerHubHttp({ credentials: pinned, fetch: options.fetch });
     const project = await projectOf(http, db, hubUrl, logger);
     ensureRunnerGitFiles(options.paths);
-    const vault = new Vault({
-      paths: options.paths,
-      project: projectKey(hubUrl, project.name),
-      // 'main' only until a start names the hub's main branch.
-      repo: { url: project.repo, mainBranch: db.meta('mainBranch') ?? 'main' },
-      mainBranchChanged: (mainBranch) => db.setMeta('mainBranch', mainBranch),
-    });
+    const vault = projectVault(options.paths, db, hubUrl, project);
     // A vault that cannot be made is reported in hello as git not ready; the starts that need it fail by themselves.
     const gitProblem = await vault.ensure().then(
       () => null,
@@ -357,7 +366,7 @@ export async function createRunner(options: RunnerOptions): Promise<RunnerHandle
     );
     if (gitProblem !== null) logger.error('cannot prepare the vault', { error: gitProblem });
     const preflights = await Promise.all(options.adapters.map(preflightOf));
-    const runtime = new Runtime({ options, logger, config, db, ownDb, hubUrl, http, vault, store });
+    const runtime = new Runtime({ options, logger, config, db, ownDb, hubUrl, http, project, vault, store });
     runtime.gitProblem = gitProblem;
     for (const preflight of preflights) runtime.preflights.set(preflight.result.facts.vendor, preflight);
     runtime.start();
@@ -377,6 +386,8 @@ interface RuntimeInput {
   ownDb: boolean;
   hubUrl: string;
   http: RunnerHubHttp;
+  /** The project the runner starts with, and its vault. */
+  project: { name: string; repo: string };
   vault: Vault;
   store: AttemptStore;
 }
@@ -392,8 +403,11 @@ class Runtime {
   private readonly logger: Logger;
   private readonly db: RunnerDb;
   private readonly ownDb: boolean;
+  private readonly hubUrl: string;
   private readonly http: RunnerHubHttp;
-  private readonly vault: Vault;
+  /** The hub's project and its vault: a welcome that names another project replaces both (followProject). */
+  private project: { name: string; repo: string };
+  private vault: Vault;
   private readonly store: AttemptStore;
   private readonly outbox: Outbox;
   private readonly local: GitEnvironment;
@@ -425,7 +439,9 @@ class Runtime {
     this.config = input.config;
     this.db = db;
     this.ownDb = input.ownDb;
+    this.hubUrl = input.hubUrl;
     this.http = input.http;
+    this.project = input.project;
     this.vault = input.vault;
     this.store = input.store;
     // The marks of settings echoes count once the snapshot the runner holds has their version (X-12); an Outbox
@@ -472,7 +488,7 @@ class Runtime {
         saveRunnerConfig(options.paths.config, config);
       },
       outbox: this.outbox,
-      vault: this.vault,
+      vault: () => this.vault,
       local: this.local,
       remote: () => this.remote(),
       wipRefPrefix: () => this.wipRefPrefix(),
@@ -510,6 +526,7 @@ class Runtime {
 
   /** The handle createRunner gives. */
   handle(): RunnerHandle {
+    const vault = () => this.vault;
     return {
       status: () => this.status(),
       changeSettings: async (patch) => this.changeSettings(patch),
@@ -519,7 +536,9 @@ class Runtime {
       pause: () => this.executor.pause(),
       resume: () => this.executor.resume(),
       waitAcked: (seq, timeoutMs) => this.outbox.waitAcked(seq, timeoutMs),
-      vault: this.vault,
+      get vault() {
+        return vault();
+      },
       close: () => this.close(),
       done: this.ended.promise,
     };
@@ -659,13 +678,15 @@ class Runtime {
 
   private deps(attemptId: string): ControllerDeps {
     const { options } = this;
+    // The vault of the project the attempt was made in, kept should the runner move to another project.
+    const vault = this.vault;
     return {
       config: () => this.config,
       paths: options.paths,
       store: this.store,
       outbox: this.outbox,
       queue: this.queue,
-      vault: this.vault,
+      vault,
       local: this.local,
       adapters: this.adapters,
       health: this.health,
@@ -673,14 +694,14 @@ class Runtime {
       notifier: options.notifier ?? silentNotifier,
       logger: this.logger,
       liveAttempts: () =>
-        [...this.controllers.values()].filter((other) => other.attemptId !== attemptId && other.holdsSlot).length,
+        [...this.controllers.values()].filter((other) => other.attemptId !== attemptId && other.takesSlot).length,
       vendorReady: (vendor) => this.preflights.get(vendor)?.result.facts.ready === true,
       wipRefPrefix: () => this.wipRefPrefix(),
       tmpRoot: options.tmpRoot ?? '/tmp',
       agflow: options.agflow,
       cliVersion: options.cliVersion ?? ((vendor) => pinnedCliVersion(vendor)),
       clock: this.clock,
-      remote: () => this.remote(),
+      remote: () => remoteGitEnv({ gitDir: vault.path }),
       wipGate: wipGateOf(this.link, this.clock),
       wipFailures: this.wipFailures,
       hub: this.http,
@@ -831,6 +852,8 @@ class Runtime {
         this.logger.error('a welcome failed for an attempt', fields);
       });
     }
+    // After the controllers above are made: those of the old project's attempts keep its vault.
+    if (welcome.project !== undefined) this.followProject(welcome.project);
     // A write that fails here is logged: the welcome's handling goes on, and the link replays the outbox after it.
     try {
       this.reportAfterReplay();
@@ -842,6 +865,51 @@ class Runtime {
     } catch (error) {
       this.logger.error('cannot send the settings edits after the welcome', { error: describe(error) });
     }
+  }
+
+  /**
+   * A welcome that names another project than the runner's (a project reset on the hub, protocol 3): the runner opens
+   * that project's vault, which new attempts and the runner's own commands use from now on, and caches the project for
+   * its next start. The old project's attempts are void at the hub, and the same welcome.stop ended them; their
+   * controllers keep the old vault, so what they push last goes to the old repository. (A new project of the same name
+   * shares the vault's directory, whose origin then moves to the new repository.) Nothing restarts.
+   */
+  private followProject(project: { name: string; repo: string }): void {
+    if (project.name === this.project.name && project.repo === this.project.repo) return;
+    this.logger.warn('the hub serves another project now; opening its vault', { name: project.name, repo: project.repo });
+    try {
+      this.db.setMeta('project', { hubUrl: this.hubUrl, ...project });
+    } catch (error) {
+      this.logger.error('cannot cache the project', { error: describe(error) });
+    }
+    // The git readiness the hub holds: the hello's, which this welcome answered, and the WIP pushes since.
+    const told = this.gitReport().ready;
+    const vault = projectVault(this.options.paths, this.db, this.hubUrl, project);
+    this.project = project;
+    this.vault = vault;
+    // The old repository's failures say nothing about the new one.
+    this.gitProblem = null;
+    this.wipFailures.succeeded();
+    // Taken now, so every fetch the new project's starts make waits behind it on the vault's lock.
+    vault
+      .ensure()
+      .then(
+        () => this.vaultOpened(vault, told, null),
+        (error) => this.vaultOpened(vault, told, `cannot prepare the vault: ${describe(error)}`),
+      )
+      .catch((error) => this.logger.error("cannot report the new project's git", { error: describe(error) }));
+  }
+
+  /**
+   * The new project's vault is ready, or cannot be made. The hub hears git readiness only in a hello or from a WIP
+   * push, which needs work it placed here first: when the readiness differs from what the hub holds (told), the runner
+   * says hello again, or the hub would keep the old repository's "git not ready" and place nothing here.
+   */
+  private vaultOpened(vault: Vault, told: boolean, problem: string | null): void {
+    if (this.vault !== vault) return;
+    this.gitProblem = problem;
+    if (problem !== null) this.logger.error('cannot prepare the vault', { error: problem });
+    if (this.gitReport().ready !== told) this.link.reconnectNow("the new project's git readiness");
   }
 
   /**

@@ -176,7 +176,7 @@ for (const offline of [false, true]) {
     }
     // The CLI's stop: the drain warnings come back to the person who asked, not only to the runner's log.
     const log: string[] = [];
-    await stopRunner({ env: {}, paths: s.paths, uid: 501, exec: launchctl(false), log: (line) => log.push(line), pollMs: 5 });
+    await stopRunner({ env: {}, platform: 'darwin', paths: s.paths, uid: 501, exec: launchctl(false), log: (line) => log.push(line), pollMs: 5 });
     expect(await s.service.exited).toMatchObject({ code: 0, clean: true });
     if (offline) {
       expect(log).toContain(
@@ -234,7 +234,7 @@ for (const loaded of [false, true]) {
       }
       const exec = launchctl(loaded);
       const log: string[] = [];
-      const result = await stopRunner({ env: {},
+      const result = await stopRunner({ env: {}, platform: 'darwin',
         paths: s.paths,
         uid: 501,
         exec: async (argv, options) => {
@@ -263,14 +263,14 @@ test('stop disables an installed plist that launchd has not loaded, so the next 
   const s = await setupTestService();
   const home = tempDir('agf-home-');
   const exec = launchctl(false);
-  expect(await stopRunner({ env: {}, paths: s.paths, uid: 501, exec, home })).toEqual({
+  expect(await stopRunner({ env: {}, platform: 'darwin', paths: s.paths, uid: 501, exec, home })).toEqual({
     wasRunning: false,
     bootedOut: false,
     disabled: false,
   });
   mkdirSync(dirname(plistPath({ home })), { recursive: true });
   writeFileSync(plistPath({ home }), 'installed');
-  expect(await stopRunner({ env: {}, paths: s.paths, uid: 501, exec, home })).toEqual({
+  expect(await stopRunner({ env: {}, platform: 'darwin', paths: s.paths, uid: 501, exec, home })).toEqual({
     wasRunning: false,
     bootedOut: false,
     disabled: true,
@@ -325,7 +325,7 @@ test('restart suspends, keeps the attempt open, and kickstarts only after lock r
   });
   await waitFor(() => s.service.runner!.status().attempts.some((a) => a.phase === 'idle'));
   const exec = launchctl();
-  await restartRunner({ env: {},
+  await restartRunner({ env: {}, platform: 'darwin',
     paths: s.paths,
     uid: 501,
     pollMs: 5,
@@ -347,8 +347,8 @@ test('restart suspends, keeps the attempt open, and kickstarts only after lock r
 test('restart without a loaded service leaves a running runner alone and explains install/start', async () => {
   const s = await startTestService();
   const exec = launchctl(false);
-  await expect(restartRunner({ env: {}, paths: s.paths, uid: 501, exec })).rejects.toThrow('agflow runner install');
-  await expect(restartRunner({ env: {}, paths: s.paths, uid: 501, exec })).rejects.toThrow('agflow runner start');
+  await expect(restartRunner({ env: {}, platform: 'darwin', paths: s.paths, uid: 501, exec })).rejects.toThrow('agflow runner install');
+  await expect(restartRunner({ env: {}, platform: 'darwin', paths: s.paths, uid: 501, exec })).rejects.toThrow('agflow runner start');
   expect(readLockOwner(s.paths)).not.toBeNull();
   expect(await controlRequest(s.paths, 'GET', '/health')).toBeDefined();
 });
@@ -358,14 +358,14 @@ test('unreachable lock holders and timed out stops name the pid without touching
   const lock = await acquireRunnerLock(s.paths, { mode: 'foreground' });
   afterThisTest(() => lock.release());
   const exec = launchctl();
-  await expect(stopRunner({ env: {}, paths: s.paths, exec })).rejects.toThrow(`pid ${process.pid}`);
+  await expect(stopRunner({ env: {}, platform: 'darwin', paths: s.paths, exec })).rejects.toThrow(`pid ${process.pid}`);
   const control = startControlServer({
     paths: s.paths,
     lock,
     routes: { 'GET /health': () => ({}), 'POST /stop': () => null },
   });
   afterThisTest(() => control.stop());
-  await expect(stopRunner({ env: {}, paths: s.paths, exec, lockWaitMs: 10, pollMs: 2 })).rejects.toThrow(`pid ${process.pid}`);
+  await expect(stopRunner({ env: {}, platform: 'darwin', paths: s.paths, exec, lockWaitMs: 10, pollMs: 2 })).rejects.toThrow(`pid ${process.pid}`);
   expect(exec.calls).toEqual([]);
 });
 
@@ -430,7 +430,7 @@ test('POST /stop answers while the handoff is pending and concurrent stops share
 test('restart kickstarts a loaded service with no running process, using its supplied label', async () => {
   const s = await setupTestService();
   const exec = recordingExec();
-  await restartRunner({ env: {}, paths: s.paths, exec, uid: 123, label: 'dev.agflow.scratch' });
+  await restartRunner({ env: {}, platform: 'darwin', paths: s.paths, exec, uid: 123, label: 'dev.agflow.scratch' });
   expect(exec.calls.map((call) => call.argv)).toEqual([
     ['launchctl', 'print', 'gui/123/dev.agflow.scratch'],
     ['launchctl', 'kickstart', '-k', 'gui/123/dev.agflow.scratch'],
@@ -440,7 +440,7 @@ test('restart kickstarts a loaded service with no running process, using its sup
 test('stop reports a failed bootout rather than claiming the job stopped', async () => {
   const s = await setupTestService();
   const exec = recordingExec([{ argv: ['launchctl', 'bootout', target], result: { exitCode: 1 } }]);
-  await expect(stopRunner({ env: {}, paths: s.paths, exec, uid: 501 })).rejects.toThrow('bootout failed');
+  await expect(stopRunner({ env: {}, platform: 'darwin', paths: s.paths, exec, uid: 501 })).rejects.toThrow('bootout failed');
   expect(exec.calls.some((call) => call.argv[1] === 'disable')).toBe(false);
 });
 
@@ -457,7 +457,7 @@ test('stop waits only for the runner it stopped, not for a service that takes th
   });
   afterThisTest(() => control.stop());
   const exec = launchctl();
-  expect(await stopRunner({ env: {}, paths: s.paths, exec, uid: 501, lockWaitMs: 50, pollMs: 2 })).toEqual({
+  expect(await stopRunner({ env: {}, platform: 'darwin', paths: s.paths, exec, uid: 501, lockWaitMs: 50, pollMs: 2 })).toEqual({
     wasRunning: true,
     bootedOut: true,
     disabled: true,

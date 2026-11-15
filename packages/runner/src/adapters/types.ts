@@ -1,7 +1,7 @@
 // The adapter interface (design 13, X-5). The Claude and Codex adapters implement it, and so does testkit's fake
 // adapter. The runner core owns everything that is not vendor-specific; an adapter starts and drives one vendor's
 // CLI and turns its output into AgentEvents.
-import type { AgentRole, Approval, RunnerVendor, Vendor, VendorQuota } from '@agflow/core';
+import type { AgentRole, Approval, RunnerVendor, TaskTier, Vendor, VendorQuota } from '@agflow/core';
 import type { RunnerConfig } from '../config';
 import type { RunnerPaths } from '../paths';
 import type { PermissionProfile } from '../profile';
@@ -57,6 +57,8 @@ export interface AgentLaunch {
   role: AgentRole;
   /** Resolved by the runner. */
   model: string;
+  /** The task's tier; absent: standard. A strong task asks the vendor's CLI for a higher reasoning effort. */
+  tier?: TaskTier;
   /** The pin at start; the attempt's recorded version on every resume (design 7.4, X-13). */
   cliVersion: string;
   /** The real path of the clone; the agent's cwd. */

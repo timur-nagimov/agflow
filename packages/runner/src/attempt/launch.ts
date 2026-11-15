@@ -4,7 +4,7 @@
 // own environment (X-32), the brief with the clone's path (X-17), the profile, the temporary directory and the
 // attempt log. registerProcess records the agent's group in runner.db; the controller reads no event before that
 // record is written.
-import type { AttemptSpec, Vendor } from '@agflow/core';
+import { type AttemptSpec, type Vendor, modelClass } from '@agflow/core';
 import { BRIDGE_TOOL_NAMES } from '../adapters/bridge-tools';
 import type { AgentLaunch, AgflowCommand } from '../adapters/types';
 import type { AttemptStore, ProcessRecord } from '../attempt-store';
@@ -24,9 +24,15 @@ export function pinnedCliVersion(vendor: Vendor, platform: string = vendorPlatfo
   return pins[vendor].version;
 }
 
-/** spec.model, or runner.json's models[vendor][role] when the hub left it to the runner. */
-export function resolveModel(spec: Pick<AttemptSpec, 'model' | 'vendor' | 'role'>, config: RunnerConfig): string {
-  return spec.model ?? config.models[spec.vendor][spec.role];
+/**
+ * spec.model, or runner.json's models[vendor][role] when the hub left it to the runner; a strong task gets the vendor's
+ * lead model whatever its role (core's modelClass, by which the hub also keeps a limit of one model).
+ */
+export function resolveModel(
+  spec: Pick<AttemptSpec, 'model' | 'vendor' | 'role' | 'tier'>,
+  config: RunnerConfig,
+): string {
+  return spec.model ?? config.models[spec.vendor][modelClass(spec.role, spec.tier)];
 }
 
 /**
@@ -108,6 +114,7 @@ export function buildLaunch(input: LaunchInput): AgentLaunch {
     attemptId: spec.attemptId,
     role: spec.role,
     model: resolveModel(spec, config),
+    tier: spec.tier ?? 'standard',
     cliVersion: input.cliVersion,
     clone: workspace.clone,
     baseCheckout: workspace.baseCheckout?.path ?? null,

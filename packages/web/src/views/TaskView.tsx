@@ -315,7 +315,8 @@ function Submissions({ submissions }: { submissions: SubmissionRecord[] }) {
 
 /** The mark of a task only live chats may take, with the owned paths that keep runner agents off it (design 6.6). */
 function LiveChatOnly({ task }: { task: Task }) {
-  const paths = runnerForbiddenPaths(task).map((entry) => entry.path);
+  // The paths no runner agent may change, not even under the open profile: those keep the task from every runner.
+  const paths = runnerForbiddenPaths(task, 'open').map((entry) => entry.path);
   return (
     <span
       className="chip tone-wait live-only"

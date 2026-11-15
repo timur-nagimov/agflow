@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { PassThrough, Writable } from 'node:stream';
 import { loadRunnerConfig, saveRunnerConfig } from '@agflow/runner/src/config';
 import { runnerPaths } from '@agflow/runner/src/paths';
 import { startControlServer } from '@agflow/runner/src/service/control';
 import { type RunnerService, startRunnerService } from '@agflow/runner/src/service/host';
 import { installRefusal, plistPath } from '@agflow/runner/src/service/launchd';
 import { acquireRunnerLock } from '@agflow/runner/src/service/lock';
+import { unitPath } from '@agflow/runner/src/service/systemd';
 import { defaultExec, type Exec } from '@agflow/runner/src/service/system';
 import { type PlatformPins, VENDOR_PINS, vendorBinary } from '@agflow/runner/src/vendor/pins';
 import { fixtureCliVersion } from '@agflow/runner/test/fixture';
@@ -21,11 +23,18 @@ import {
   packTarball,
   startOriginHub,
 } from '@agflow/runner/test/service-helpers';
-import { parseArgs } from '../src/args';
+import { parseArgs, UsageError } from '../src/args';
 import { deleteCredentials, saveCredentials } from '../src/credentials';
 import { HubClient } from '../src/hub-client';
 import { runnerCommand } from '../src/runner-command';
-import { type Prompt, runnerSetup, type RunnerSetupDeps } from '../src/runner-setup';
+import {
+  HACKATHON_PRESET,
+  type Prompt,
+  readSecret,
+  runnerSetup,
+  type RunnerSetupDeps,
+  setupChoices,
+} from '../src/runner-setup';
 import { shellQuote } from '../src/self';
 
 setDefaultTimeout(60_000);
@@ -49,7 +58,7 @@ interface VendorCall {
   env: Record<string, string>;
 }
 
-async function fixture(options: { failCheck?: boolean; noBootstrap?: boolean } = {}) {
+async function fixture(options: { failCheck?: boolean; noBootstrap?: boolean; linux?: boolean } = {}) {
   const root = realpathSync(mkdtempSync('/tmp/agf-su-'));
   afterThisTest(() => rmSync(root, { recursive: true, force: true }));
   const paths = runnerPaths(join(root, 'agflow'));
@@ -71,13 +80,18 @@ if (argv[0] === '--version') {
 }
 const home = vendor === 'claude' ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME;
 const marker = home + '/signed-in';
-if (JSON.stringify(argv) === JSON.stringify(vendor === 'claude' ? ['auth', 'login', '--claudeai'] : ['login'])) {
+const logins = vendor === 'claude' ? [['auth', 'login', '--claudeai']] : [['login'], ['login', '--device-auth']];
+if (logins.some((login) => JSON.stringify(argv) === JSON.stringify(login))) {
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(marker, 'ok');
   process.exit(0);
 }
 if (JSON.stringify(argv) !== JSON.stringify(vendor === 'claude' ? ['auth', 'status', '--json'] : ['login', 'status'])) {
   process.exit(99);
+}
+if (vendor === 'claude' && process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  console.log(JSON.stringify({ loggedIn: true, authMethod: 'oauth_token' }));
+  process.exit(0);
 }
 const ok = fs.existsSync(marker);
 console.log(vendor === 'claude' ? JSON.stringify({ loggedIn: ok, authMethod: 'claude.ai', subscriptionType: 'max' })
@@ -167,12 +181,36 @@ process.exit(ok ? 0 : 1);
       }
       return ok;
     }
+    if (argv[0] === 'loginctl') return ok;
+    if (argv[0] === 'systemctl') {
+      if (argv[2] === 'stop' && service) {
+        await service.stop('systemctl stop');
+        await service.exited;
+        service = undefined;
+      }
+      if (argv[2] === 'start') {
+        service = await startRunnerService({
+          ...fakeServiceOperations(),
+          paths,
+          configDir: dir,
+          mode: 'service',
+          agflow: { command: process.execPath, args: [] },
+          machineId: async () => machineId,
+          adapters: fakeServiceAdapters(),
+          cliVersion: fixtureCliVersion,
+          terminal: () => {},
+        });
+      }
+      return ok;
+    }
     if (argv[0] === 'tar' || argv[0]!.startsWith(paths.vendor + '/')) return defaultExec(argv, commandOptions);
     throw new Error(`unexpected command: ${argv.join(' ')}`);
   };
   const out: string[] = [];
   const err: string[] = [];
   const io = { out: (text: string) => void out.push(text), err: (text: string) => void err.push(text) };
+  const machineIdFile = join(root, 'machine-id');
+  writeFileSync(machineIdFile, `${machineId}\n`);
   const deps: Partial<RunnerSetupDeps> = {
     dir,
     paths,
@@ -180,7 +218,8 @@ process.exit(ok ? 0 : 1);
     exec,
     pins,
     platform: 'darwin-arm64',
-    machinePlatform: 'darwin',
+    machinePlatform: options.linux ? 'linux' : 'darwin',
+    machineIdFile,
     home,
     uid: 501,
     socketTimeoutMs: 5_000,
@@ -202,8 +241,8 @@ process.exit(ok ? 0 : 1);
           .map((line) => JSON.parse(line))
       : [];
   const logins = () =>
-    vendorCalls().filter((call) => call.argv.join(' ') === 'auth login --claudeai' || call.argv.join(' ') === 'login');
-  return { root, paths, dir, home, hub, pins, registry, env, calls, out, err, io, deps, run, logins };
+    vendorCalls().filter((call) => ['auth login --claudeai', 'login', 'login --device-auth'].includes(call.argv.join(' ')));
+  return { root, paths, dir, home, hub, pins, registry, env, calls, out, err, io, deps, run, logins, vendorCalls };
 }
 
 function answers(...values: string[]): Prompt {
@@ -329,6 +368,103 @@ test('--no-service stops after login with the foreground start instruction', asy
   expect(f.calls.some((call) => call.argv[0] === 'launchctl')).toBe(false);
 });
 
+test('on Linux Codex signs in with a device code, Claude with a token from the Mac, and systemd runs the service', async () => {
+  const f = await fixture({ linux: true });
+  expect(await f.run(['--yes'])).toBe(1);
+  const first = f.out.join('');
+  expect(first).toContain('claude: not logged in to Claude; this machine has no browser');
+  expect(first).toContain('on your Mac run: claude setup-token');
+  // --yes asks for nothing, the token included.
+  expect(first).toContain('run agflow runner setup here without --yes, and paste the token when it asks');
+  expect(first).toContain('codex: sign in with the code below');
+  expect(existsSync(f.paths.envFile)).toBe(false);
+  expect(f.logins().map((call) => call.argv.join(' '))).toEqual(['login --device-auth']);
+  expect(f.calls.filter((call) => call.options?.interactive)).toHaveLength(1);
+  expect(f.calls.some((call) => ['systemctl', 'loginctl', 'launchctl'].includes(call.argv[0]!))).toBe(false);
+  expect(loadRunnerConfig(f.paths.config).machineId).toBe(machineId);
+
+  // The owner puts the token from claude setup-token in the runner's environment file.
+  writeFileSync(f.paths.envFile, 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-setup\n', { mode: 0o644 });
+  f.out.length = 0;
+  expect(await f.run(['--yes'])).toBe(0);
+  expect(statSync(f.paths.envFile).mode & 0o777).toBe(0o600);
+  const second = f.out.join('');
+  expect(second).toContain('claude: signed in\n');
+  expect(second).toContain('codex: signed in\n');
+  expect(f.logins()).toHaveLength(1);
+  const status = f.vendorCalls().filter((call) => call.vendor === 'claude' && call.argv[0] === 'auth').at(-1)!;
+  expect(status.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-setup');
+  expect(readFileSync(unitPath(f.home), 'utf8')).toMatch(/^ExecStart=\S+ .* runner start --service$/m);
+  expect(
+    f.calls.map((call) => call.argv).filter((argv) => argv[0] === 'systemctl' || argv[0] === 'loginctl'),
+  ).toEqual([
+    ['loginctl', 'enable-linger', expect.any(String)],
+    ['systemctl', '--user', 'daemon-reload'],
+    ['systemctl', '--user', 'stop', 'agflow-runner.service'],
+    ['systemctl', '--user', 'enable', 'agflow-runner.service'],
+    ['systemctl', '--user', 'start', 'agflow-runner.service'],
+  ]);
+  expect(second).toContain(`installed ${unitPath(f.home)}; the runner starts as agflow-runner.service`);
+  expect(
+    second
+      .split('\n')
+      .filter((line) => /^(ok|warn|FAIL) /.test(line))
+      .map((line) => line.replace(/^(ok|warn|FAIL) /, '').split(':')[0]),
+  ).toEqual(checkNames);
+  expect(second).toContain('ok sleep: a Linux runner does not sleep');
+  expect(f.calls.some((call) => call.argv[0] === 'launchctl')).toBe(false);
+});
+
+test('on Linux setup asks for the Claude token, joins a wrapped paste, and refuses a paste of no token', async () => {
+  const f = await fixture({ linux: true });
+  const questions: string[] = [];
+  const paste = (text: string) => async (question: string) => {
+    questions.push(question);
+    return text;
+  };
+  // A terminal 80 columns wide breaks the token, and a copy of it keeps the break.
+  const token = `sk-ant-oat01-${'A'.repeat(67)}${'B'.repeat(28)}`;
+  const wrapped = `${token.slice(0, 80)}\n${token.slice(80)}\n`;
+  expect(await f.run(['--no-service'], { prompt: answers(), secret: paste(wrapped) })).toBe(0);
+  expect(questions).toEqual(['Token: ']);
+  expect(f.out.join('')).toContain('paste the token here, then press Enter on an empty line');
+  expect(f.out.join('')).toContain('claude: signed in\n');
+  expect(readFileSync(f.paths.envFile, 'utf8')).toBe(`CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+  expect(statSync(f.paths.envFile).mode & 0o777).toBe(0o600);
+  const status = f.vendorCalls().filter((call) => call.vendor === 'claude' && call.argv[0] === 'auth').at(-1)!;
+  expect(status.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(token);
+  expect(f.out.join('')).not.toContain(token.slice(13));
+
+  // A rerun keeps the token; --relogin asks for a new one, and a paste that is no such token leaves the old one.
+  await f.run(['--no-service'], { prompt: answers(), secret: paste('unused') });
+  expect(questions).toHaveLength(1);
+  await expect(
+    f.run(['--no-service', '--relogin'], { prompt: answers(), secret: paste('Your OAuth token (valid for 1 year)') }),
+  ).rejects.toThrow('that is not a token of claude setup-token, which starts with sk-ant-oat');
+  expect(questions).toHaveLength(2);
+  expect(readFileSync(f.paths.envFile, 'utf8')).toBe(`CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+});
+
+test('the token reader joins the lines up to an empty one or the end, and writes none of them', async () => {
+  for (const [text, read] of [
+    ['sk-ant-oat01-AAAA\nBBBB\n\nlater\n', 'sk-ant-oat01-AAAA\nBBBB'],
+    ['sk-ant-oat01-AAAA\r\nBBBB', 'sk-ant-oat01-AAAA\nBBBB'],
+    ['', ''],
+  ]) {
+    const input = new PassThrough();
+    input.end(text);
+    const written: string[] = [];
+    const output = new Writable({
+      write: (chunk, _encoding, done) => {
+        written.push(String(chunk));
+        done();
+      },
+    });
+    expect(await readSecret('Token: ', input, output)).toBe(read!);
+    expect(written.join('')).toBe('Token: \n');
+  }
+});
+
 test('test mode refuses service installation and explains the foreground flow', async () => {
   const f = await fixture();
   const env = { ...f.env, AGFLOW_TEST: '1' };
@@ -364,7 +500,7 @@ for (const capacity of ['0', '17', '2.5', 'many']) {
   });
 }
 
-test('a running runner keeps ownership of runner.json and setup asks nothing', async () => {
+test('a running runner keeps ownership of runner.json: setup asks nothing and refuses flags that would change it', async () => {
   const f = await fixture();
   await f.run();
   const before = readFileSync(f.paths.config, 'utf8');
@@ -374,6 +510,59 @@ test('a running runner keeps ownership of runner.json and setup asks nothing', a
   expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
   expect(f.out.join('')).toContain(`pid ${process.pid}`);
   expect(f.out.join('')).toContain('change capacity on the hub');
+  // Flags that would change runner.json fail setup, so a running standard runner never stays one unnoticed.
+  await expect(f.run(['--yes', '--no-service', '--preset', 'hackathon'])).rejects.toThrow(
+    `the runner (pid ${process.pid}) is running, so setup cannot change runner.json; stop it first (agflow runner stop)`,
+  );
+  await expect(f.run(['--yes', '--no-service', '--name', 'Other Mac'])).rejects.toThrow('agflow runner stop');
+  expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
+  // Flags that match it change nothing.
+  expect(await f.run(['--no-service', '--name', 'Test Mac', '--capacity', '2', '--profile', 'standard'])).toBe(0);
+});
+
+test('on Linux --preset hackathon asks for the Claude token and runs the systemd unit, whose runner then owns runner.json', async () => {
+  const f = await fixture({ linux: true });
+  const token = `sk-ant-oat01-${'A'.repeat(95)}`;
+  const questions: string[] = [];
+  const secret = async (question: string) => {
+    questions.push(question);
+    return token;
+  };
+  const systemctl = () =>
+    f.calls.filter((call) => call.argv[0] === 'systemctl').map((call) => call.argv.slice(2).join(' '));
+  expect(await f.run(['--preset', 'hackathon', '--capacity', '8', '--name', 'Cloud runner'], { secret })).toBe(0);
+  expect(questions).toEqual(['Token: ']);
+  expect(readFileSync(f.paths.envFile, 'utf8')).toBe(`CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+  expect(f.logins().map((call) => call.argv.join(' '))).toEqual(['login --device-auth']);
+  expect(loadRunnerConfig(f.paths.config)).toMatchObject({
+    name: 'Cloud runner',
+    capacity: 8,
+    keepAwake: 'always',
+    profile: 'open',
+    ceilings: { claude: { fiveHour: 1, weekly: 1 }, codex: { fiveHour: 1, weekly: 1 } },
+  });
+  expect(systemctl().slice(-2)).toEqual(['enable agflow-runner.service', 'start agflow-runner.service']);
+
+  // The unit's runner holds the lock: a flag that would change runner.json fails setup before it asks or installs.
+  const before = readFileSync(f.paths.config, 'utf8');
+  const calls = f.calls.length;
+  await expect(f.run(['--capacity', '12'], { prompt: answers(), secret })).rejects.toThrow(
+    'is running, so setup cannot change runner.json; stop it first (agflow runner stop)',
+  );
+  expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
+  expect(questions).toHaveLength(1);
+  expect(f.calls.slice(calls).some((call) => ['systemctl', 'loginctl'].includes(call.argv[0]!))).toBe(false);
+
+  // agflow runner stop stops the runner and the unit; setup then changes runner.json and starts the unit again.
+  process.env.AGFLOW_HOME = f.paths.home;
+  const deps = { env: f.env, exec: f.deps.exec, home: f.home, platform: 'linux' as const };
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), f.io, deps)).toBe(0);
+  expect(f.out.join('')).toContain('the runner stopped; the systemd unit was stopped and disabled');
+  expect(systemctl().at(-1)).toBe('disable --now agflow-runner.service');
+  expect(await f.run(['--capacity', '12'], { prompt: answers(), secret })).toBe(0);
+  expect(loadRunnerConfig(f.paths.config)).toMatchObject({ name: 'Cloud runner', capacity: 12, profile: 'open' });
+  expect(systemctl().slice(-2)).toEqual(['enable agflow-runner.service', 'start agflow-runner.service']);
+  expect(questions).toHaveLength(1);
 });
 
 test('socket timeout points to status and the runner log', async () => {
@@ -423,6 +612,68 @@ test('checks retry startup route errors within the socket deadline', async () =>
   expect(tries).toBe(3);
   expect(f.out.join('')).toContain('started');
   expect(f.logins()).toEqual([]);
+});
+
+test('setup flags choose the runner settings, and the hackathon preset chooses them all', () => {
+  const choices = (...flags: string[]) => setupChoices(parseArgs(['runner', 'setup', ...flags]));
+  expect(choices('--yes')).toEqual({});
+  expect(HACKATHON_PRESET).toEqual({ capacity: 6, ceiling: 1, keepAwake: 'always', profile: 'open' });
+  expect(choices('--preset', 'hackathon')).toEqual(HACKATHON_PRESET);
+  expect(choices('--preset', 'hackathon', '--capacity', '8', '--profile', 'standard')).toEqual({
+    ...HACKATHON_PRESET,
+    capacity: 8,
+    profile: 'standard',
+  });
+  expect(
+    choices('--name', ' Hack Mac ', '--capacity=16', '--ceiling', '0.5', '--keep-awake', 'off', '--profile', 'auto'),
+  ).toEqual({ name: 'Hack Mac', capacity: 16, ceiling: 0.5, keepAwake: 'off', profile: 'auto' });
+  for (const flags of [
+    ['--preset', 'party'],
+    ['--name', ' '],
+    ['--name'],
+    ['--capacity', '0'],
+    ['--capacity', '17'],
+    ['--capacity', '2.5'],
+    ['--capacity', 'many'],
+    ['--capacity'],
+    ['--ceiling', '0.4'],
+    ['--ceiling', '1.1'],
+    ['--ceiling', 'high'],
+    ['--keep-awake', 'never'],
+    ['--profile', 'wide'],
+  ]) {
+    expect(() => choices(...flags)).toThrow(UsageError);
+  }
+});
+
+test('--preset hackathon sets up a busy open runner without asking', async () => {
+  const f = await fixture();
+  expect(await f.run(['--preset', 'hackathon', '--name', 'Hack Mac', '--no-service'])).toBe(0);
+  const config = loadRunnerConfig(f.paths.config);
+  expect(config).toMatchObject({
+    name: 'Hack Mac',
+    capacity: 6,
+    keepAwake: 'always',
+    profile: 'open',
+    ceilings: { claude: { fiveHour: 1, weekly: 1 }, codex: { fiveHour: 1, weekly: 1 } },
+  });
+  expect(config.confirmedSettings).toMatchObject({ capacity: 6, keepAwake: 'always', version: 0 });
+});
+
+test('setup flags change a kept runner.json as local edits, and nothing when they match it', async () => {
+  const f = await fixture();
+  await f.run();
+  const initial = loadRunnerConfig(f.paths.config);
+  await f.run(['--yes', '--no-service', '--preset', 'hackathon', '--keep-awake', 'ac']);
+  const edited = loadRunnerConfig(f.paths.config);
+  expect(edited).toMatchObject({ runnerKey: initial.runnerKey, name: 'Test Mac', capacity: 6, keepAwake: 'ac' });
+  expect(edited.profile).toBe('open');
+  expect(edited.ceilings.codex).toEqual({ fiveHour: 1, weekly: 1 });
+  // The hub hears of the edits after its next welcome; the confirmed snapshot stays as it was.
+  expect(edited.confirmedSettings).toEqual(initial.confirmedSettings);
+  const before = statSync(f.paths.config).mtimeMs;
+  await f.run(['--no-service', '--name', 'Test Mac', '--capacity', '6', '--profile', 'open']);
+  expect(statSync(f.paths.config).mtimeMs).toBe(before);
 });
 
 test('runnerWhoami validates the response schema', async () => {

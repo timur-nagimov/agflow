@@ -2,13 +2,20 @@ import type { Project, Vendor } from '@agflow/core';
 import { type HubContext, tx } from './context';
 
 export function getProject(ctx: HubContext): Project {
-  const row = ctx.db.query('SELECT name, repo, paused, runner_leads FROM project WHERE id = 1').get() as {
+  const row = ctx.db.query('SELECT name, repo, paused, runner_leads, deadline_at FROM project WHERE id = 1').get() as {
     name: string;
     repo: string;
     paused: number;
     runner_leads: number;
+    deadline_at: number | null;
   };
-  return { name: row.name, repo: row.repo, paused: row.paused === 1, runnerLeads: row.runner_leads === 1 };
+  return {
+    name: row.name,
+    repo: row.repo,
+    paused: row.paused === 1,
+    runnerLeads: row.runner_leads === 1,
+    deadlineAt: row.deadline_at,
+  };
 }
 
 export function setPaused(ctx: HubContext, paused: boolean, actor: string): Project {
@@ -17,6 +24,20 @@ export function setPaused(ctx: HubContext, paused: boolean, actor: string): Proj
     if (before.paused === paused) return before;
     ctx.db.query('UPDATE project SET paused = $paused WHERE id = 1').run({ paused: paused ? 1 : 0 });
     emit({ type: paused ? 'project.paused' : 'project.resumed', actor });
+    return getProject(ctx);
+  });
+}
+
+/**
+ * PUT /api/project/deadline and PUT /api/operator/deadline: when the project must be done, in epoch ms, or null for no
+ * deadline. The lead reads it in its situation report and plans against it; repeating the same deadline is a no-op.
+ */
+export function setDeadline(ctx: HubContext, deadlineAt: number | null, actor: string): Project {
+  return tx(ctx, (emit) => {
+    const before = getProject(ctx);
+    if (before.deadlineAt === deadlineAt) return before;
+    ctx.db.query('UPDATE project SET deadline_at = $deadlineAt WHERE id = 1').run({ deadlineAt });
+    emit({ type: 'project.deadline_set', actor, data: { deadlineAt } });
     return getProject(ctx);
   });
 }

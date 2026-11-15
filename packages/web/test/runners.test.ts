@@ -547,6 +547,9 @@ describe('profile and order', () => {
         tone: 'wait',
       },
     ]);
+    expect(profileLines({ name: 'open', weakened: [], dependencyPrep: true })).toEqual([
+      { text: 'Open profile: agents have the network and may change the greenfield files', tone: 'done' },
+    ]);
   });
 
   test("the signed-in person's runners first, then online ones, then by id", () => {
