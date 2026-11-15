@@ -17,6 +17,7 @@ import type { HubContext } from './context';
 import { listEvents } from './events';
 import { clipGoal, currentGoalVersion, getCurrentGoal } from './goal';
 import { type LeadNoteRow, holdsSeat, leadNoteFromRow } from './hub-state';
+import { parkedTasks } from './main-check';
 import { listStandingRules, unreadFor } from './messages';
 import { getProject } from './project';
 import { REVIEW, type ReviewTarget, reviewTarget, tasksUnderReview } from './review';
@@ -693,12 +694,14 @@ const CANNOT_START_SHOWN = 8;
 /**
  * The ready tasks the scheduler's last tick could not start, with why it recorded (waitReasons): a path overlap, a
  * vendor out of quota, a full runner, no free worker slot. At most CANNOT_START_SHOWN of them, those with the same
- * reason on one line. None while dispatch is held, which the load lines say, and none the lines for live chats and the
- * open profile name.
+ * reason on one line. None while dispatch is held, which the load lines say, and none the lines for live chats, the
+ * open profile and the tasks parked while main's check fails (parkedTasks) name.
  */
 function cannotStartLines(ctx: HubContext, tasks: readonly Task[]): string[] {
   if (dispatchHold(ctx) !== null) return [];
-  const listed = (task: Task): boolean => liveChatOnlyReason(task) !== null || openProfileReason(task) !== null;
+  const parked = parkedTasks(ctx);
+  const listed = (task: Task): boolean =>
+    liveChatOnlyReason(task) !== null || openProfileReason(task) !== null || parked.has(task.id);
   const ready = new Set(tasks.filter((task) => task.status === 'ready' && !listed(task)).map((task) => task.id));
   const waiting = [...waitReasons(ctx)].filter(([id]) => ready.has(id));
   if (waiting.length === 0) return [];

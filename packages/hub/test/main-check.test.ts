@@ -591,6 +591,17 @@ describe('parking a task while main fails', () => {
     expect(nudge).toContain(`\n${line}\n`);
   });
 
+  test("the lead's report names a parked task on its parked line, not again among the ready tasks that cannot start", () => {
+    const { ctx, fix, worker } = waiting();
+    blockTask(ctx, worker.task.id, worker.agent, `waiting for ${fix.id}`);
+    exited(ctx, worker.attempt.id);
+    markHubAlive(ctx);
+    runTick(ctx);
+    const report = situationReport(ctx);
+    expect(report).toContain(`Parked until main's check passes (${fix.id} fixes it): ${worker.task.id}.`);
+    expect(report).not.toContain(`${worker.task.id}: it waits for main's check`);
+  });
+
   test("a review is never parked, and a parked task's first green submission is still reviewed", () => {
     const { ctx, runner } = setup({ autoAccept: true, review: true });
     const green = { ok: true, headSha: sha('8'), remoteHead: sha('8'), error: null, detail: null, check: passed };
