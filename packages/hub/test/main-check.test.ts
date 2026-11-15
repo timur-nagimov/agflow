@@ -572,18 +572,21 @@ describe('parking a task while main fails', () => {
     const report = situationReport(ctx);
     expect(report).toContain('Ready tasks: 2, 1 of them dispatchable now.');
     expect(report).toContain(`Accepted, not merged: 0.\n${line}\n`);
-    // Two free slots: one for the fix task, one the parked task takes by itself once main passes. No nudge.
-    tx(ctx, () => setWorkerTarget(ctx, 3));
-    expect(workerLoad(ctx)).toMatchObject({ running: 1, freeSlots: 2, ready: 2, dispatchable: 1 });
+    // Two worker slots, the running one and a free one: the fix task and the parked task, which takes a slot by itself
+    // once main passes, are as many. No nudge.
+    tx(ctx, () => setWorkerTarget(ctx, 2));
+    expect(workerLoad(ctx)).toMatchObject({ running: 1, freeSlots: 1, ready: 2, dispatchable: 1 });
     expect(nudgeIdleLead(ctx)).toBeNull();
     clock.advance(ctx.config.idleNudgeMs);
     expect(nudgeIdleLead(ctx)).toBeNull();
-    // A third free slot has nothing to start: the nudge goes out, and names the parked task.
-    tx(ctx, () => setWorkerTarget(ctx, 4));
+    // A third worker slot has no task behind it: the nudge goes out, and names the parked task.
+    tx(ctx, () => setWorkerTarget(ctx, 3));
     expect(nudgeIdleLead(ctx)).toBeNull();
     clock.advance(ctx.config.idleNudgeMs);
     const nudge = nudgeIdleLead(ctx)?.body ?? '';
-    expect(nudge).toStartWith('3 worker slot(s) are free, more than the 1 ready task(s) that can start now.');
+    expect(nudge).toStartWith(
+      'Only 1 ready task(s) are dispatchable and 1 parked, fewer than the 3 worker slot(s) (1 running, 2 free).',
+    );
     expect(nudge).toContain(`\n${line}\n`);
   });
 
