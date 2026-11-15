@@ -6,6 +6,7 @@ import {
   type Agent,
   type Attempt,
   FIXABLE_SUBMIT_ERRORS,
+  NO_TESTS_LINE,
   type RunnerEventData,
   type SubmissionCheck,
   type SubmissionRecord,
@@ -158,6 +159,10 @@ function whatToFix(error: FixableError, branch: string, main: string): string {
   }
 }
 
+/** Whether the check says it ran no tests, as agflow start's check does (NO_TESTS_LINE): a pass verified nothing. */
+const ranNoTests = (check: SubmissionCheck): boolean =>
+  check.tail.split('\n').some((line) => line.trim() === NO_TESTS_LINE);
+
 /** The runner's check in a message to the lead: what ran and how it went, or why none ran. */
 function checkLine(check: SubmissionCheck | null | undefined): string {
   if (!check) return '';
@@ -170,7 +175,8 @@ function checkLine(check: SubmissionCheck | null | undefined): string {
     ? `Its branch changes the check's own files (${check.ownFilesChanged.join(', ')}): read those changes before you ` +
       'accept it.\n'
     : '';
-  return `The runner's check \`${check.command}\` ${check.status} in ${seconds} s.\n${own}`;
+  const tests = ranNoTests(check) ? 'It ran no tests, so it verified nothing: review the work yourself.\n' : '';
+  return `The runner's check \`${check.command}\` ${check.status} in ${seconds} s.\n${own}${tests}`;
 }
 
 /** The runner's check, stored with its submission as it reported it. */
@@ -222,7 +228,7 @@ function recordable(task: Task, attempt: Attempt | null, submission: SubmissionR
  * its stop_attempt if the runner has not taken it; the requester of one held back for the submission is told. The lead
  * is told, as in M1, with the runner's check; with AGFLOW_AUTO_ACCEPT a submission whose check passed is accepted
  * instead, as a lead's accept would, and the lead hears of it in its next situation report. A branch that changes the
- * check's own files, and a demo check, go to the lead all the same.
+ * check's own files, a check that ran no tests, and a demo check go to the lead all the same.
  */
 function recordSuccess(
   ctx: HubContext,
@@ -271,12 +277,13 @@ function recordSuccess(
         `${submission.id} was recorded, and ${task.id} is up for review.`,
     });
   }
-  // A check the branch changed vouches for nothing, and a demo check, the only task the system creates, lists defects
-  // for the lead to turn into tasks: both go to the lead.
+  // A check the branch changed, or one that ran no tests, vouches for nothing, and a demo check, the only task the
+  // system creates, lists defects for the lead to turn into tasks: all of them go to the lead.
   const autoAccepted =
     ctx.config.autoAccept === true &&
     outcome.check?.status === 'passed' &&
     outcome.check.ownFilesChanged === undefined &&
+    !ranNoTests(outcome.check) &&
     task.createdBy !== 'system';
   if (!autoAccepted) {
     refreshLeadSubmission(ctx, task.id, branch);

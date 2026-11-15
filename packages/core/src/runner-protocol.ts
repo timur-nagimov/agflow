@@ -906,6 +906,12 @@ export const MainCheckResultSchema = schemaFor<MainCheckResult>()(
   z.strictObject({ sha: FullShaSchema, check: SubmissionCheckSchema }),
 );
 
+/**
+ * The line agflow start's scripts/check.sh prints when it ran no tests. A check that passed with this line in its tail
+ * verified nothing, so the hub never accepts such a submission by itself (AGFLOW_AUTO_ACCEPT): it goes to the lead.
+ */
+export const NO_TESTS_LINE = 'agflow-check: no tests ran';
+
 // The event table of design 6.3, in its order: one schema per type. Runners read shas from git, so every sha an
 // event reports is full.
 const EVENT_SCHEMAS = [

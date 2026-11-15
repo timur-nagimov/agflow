@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { PROTOCOL_VERSION, type RawRunnerEvent, type RunnerEventData, type SubmissionCheck } from '@agflow/core';
+import {
+  NO_TESTS_LINE,
+  PROTOCOL_VERSION,
+  type RawRunnerEvent,
+  type RunnerEventData,
+  type SubmissionCheck,
+} from '@agflow/core';
 import { getAttempt } from '../src/attempt-store';
 import { mintAgentToken } from '../src/auth';
 import { situationReport } from '../src/brief';
@@ -101,6 +107,21 @@ describe('AGFLOW_AUTO_ACCEPT', () => {
     const [told] = toLead(hub);
     expect(told?.body).toContain("The runner's check `bash scripts/check.sh` passed in 4 s.");
     expect(told?.body).toContain("Its branch changes the check's own files (scripts/check.sh): read those changes");
+  });
+
+  test('a passed check that ran no tests goes to the lead, which hears that it verified nothing', () => {
+    const hub = createTestHub({ autoAccept: true });
+    const tail = `no package.json yet: nothing to check\n${NO_TESTS_LINE}`;
+    const { held } = submit(hub, { ...passed, command: 'bash scripts/check.sh', tail });
+    expect(getTask(hub.ctx, held.task.id).status).toBe('submitted');
+    const [told] = toLead(hub);
+    expect(told?.body).toContain(
+      "The runner's check `bash scripts/check.sh` passed in 4 s.\nIt ran no tests, so it verified nothing: review the " +
+        'work yourself.',
+    );
+    // Only the line itself counts.
+    const quoted = submit(hub, { ...passed, tail: `12 pass\nthe check prints "${NO_TESTS_LINE}" when it has none` });
+    expect(getTask(hub.ctx, quoted.held.task.id).status).toBe('accepted');
   });
 
   test('a demo check whose check passed goes to the lead with its summary, which lists the defects', () => {

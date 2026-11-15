@@ -288,7 +288,9 @@ after a change. The details are in the
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
   `.agflow/config.json` on `main`, such as `"check": "bun test"`; a submission without one goes to the lead as before.
   So does a submission whose branch changes the check's own files, `.agflow/config.json` or a file the check command
-  names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. Nothing else is caught:
+  names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. So does one whose check
+  ran no tests: the check `agflow start` seeds prints `agflow-check: no tests ran` whenever it ran none, before the
+  project has a manifest or a test, and the lead reviews that work itself. Nothing else is caught:
   a branch that changes the `package.json` scripts the check runs, test configuration such as `tsconfig.json` or
   `pyproject.toml`, or the tests themselves is still accepted by the hub alone. The periodic demo check, which the
   lead reviews, is the backstop. A runner gives a check `checkMinutes` (10 by default, in `runner.json`) out of the 15

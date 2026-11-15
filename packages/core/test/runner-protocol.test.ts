@@ -19,6 +19,7 @@ import {
   LiveAttemptSchema,
   MainCheckResultSchema,
   MergeTaskResultSchema,
+  NO_TESTS_LINE,
   PROTOCOL_VERSION,
   type Parsed,
   ProfileSummarySchema,
@@ -591,6 +592,7 @@ describe('commands', () => {
     ]) {
       expect([bad, parses(bad)]).toEqual([bad, false]);
     }
+    expect(NO_TESTS_LINE).toBe('agflow-check: no tests ran');
   });
 
   test("merge_task's result is merged with main's full sha, or a conflict with its files", () => {
