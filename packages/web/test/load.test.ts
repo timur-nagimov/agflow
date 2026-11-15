@@ -6,6 +6,7 @@ import {
   accountStateText,
   accountTone,
   deadlineText,
+  mainText,
   overCeiling,
   queueText,
   resetText,
@@ -52,6 +53,7 @@ function project(overrides: Partial<ProjectLoad> = {}): ProjectLoad {
       mergedLastHour: 5,
     },
     deadline: { at: null, leftMs: null },
+    main: null,
     ...overrides,
   };
 }
@@ -93,6 +95,17 @@ describe('the Load page', () => {
       '19:20, 5 h 20 min left',
     );
     expect(deadlineText({ at: NOW - 10 * MINUTE, leftMs: -10 * MINUTE }, NOW)).toBe('13:50, passed 10 min ago');
+  });
+
+  test("main's check: where it passed and when, or where it fails since and the task that fixes it", () => {
+    const sha = '1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d';
+    expect(mainText({ status: 'passed', sha, at: NOW - 5 * MINUTE }, NOW)).toBe('check passed at 1a2b3c4, 13:55');
+    expect(mainText({ status: 'failed', since: sha, fixTask: 'T-9' }, NOW)).toBe(
+      'check fails since 1a2b3c4: T-9 fixes it',
+    );
+    expect(mainText({ status: 'failed', since: sha, fixTask: null }, NOW)).toBe(
+      'check fails since 1a2b3c4: no task fixes it yet',
+    );
   });
 
   test('the strip shows workers running of the cap, the ready tasks and the free slots', () => {

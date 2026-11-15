@@ -283,6 +283,15 @@ after a change. The details are in the
   person who merges it by hand marks it merged. A dependency then counts as done only once merged, and accepted and
   merging tasks keep their owned paths. Risk: work reaches `main` with no person looking at the merge, and the
   repository's own CI runs after it landed.
+
+  After each merge, one runner checks `main` as agflow merged it: a fresh clone at that commit, the dependencies
+  prepared and the project's check run there, as at a submission, apart from the merges, which never wait for it.
+  Two changes that each pass alone can still break `main`, and then every later submission fails its check. So a
+  failure creates one task at the top priority, "Fix main: the check fails after T-42", created by `system`, and tells
+  people and the lead; while `main` fails, an agent whose check fails hears which task fixes `main`, and keeps its own
+  change focused. A pass afterwards tells people and cancels that task if nobody has started it. The Load page shows
+  where the check of `main` passed, or since when it fails. Only runners of this release (runner protocol 4) check
+  `main`, so deploy the hub first, then update the runners: a hub older than its runners refuses them.
 - **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
   accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
@@ -290,7 +299,8 @@ after a change. The details are in the
   So does a submission whose branch changes the check's own files, `.agflow/config.json` or a file the check command
   names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. So does one whose check
   ran no tests: the check `agflow start` seeds prints `agflow-check: no tests ran` whenever it ran none, before the
-  project has a manifest or a test, and the lead reviews that work itself. Nothing else is caught:
+  project has a manifest or a test, and the lead reviews that work itself. agflow's own fix of `main` is accepted like
+  any other task. Nothing else is caught:
   a branch that changes the `package.json` scripts the check runs, test configuration such as `tsconfig.json` or
   `pyproject.toml`, or the tests themselves is still accepted by the hub alone. The periodic demo check, which the
   lead reviews, is the backstop. A runner gives a check `checkMinutes` (10 by default, in `runner.json`) out of the 15
@@ -356,13 +366,14 @@ AGFLOW_AUTO_APPROVALS=1
 - `AGFLOW_LEAD_REVIEW_MINUTES=10`: the lead looks over held and submitted work every 10 minutes, not every 45.
 - `AGFLOW_AUTO_ACCEPT=1`: a submission whose check passed does not wait for the lead.
 - `AGFLOW_AUTO_MERGE=1`: accepted work reaches `main` without a person, and dependent tasks wait for the merge, as
-  `AGFLOW_DEPENDENCIES_NEED_MERGE=1` would make them; leave that one out.
+  `AGFLOW_DEPENDENCIES_NEED_MERGE=1` would make them; leave that one out. A runner checks `main` after each merge, and
+  a failure gets a fix task at once.
 - `AGFLOW_IDLE_NUDGE_MINUTES=5` and `AGFLOW_DEMO_CHECK_EVERY=5`: the defaults, written out so that the idle nudge and
   the demo check, the backstop of auto accept, stay on.
 - `AGFLOW_AGENT_FETCH=1`, `AGFLOW_LEAD_APPROVALS=1` and `AGFLOW_AUTO_APPROVALS=1`: nobody has to fetch outside data or
   answer approval requests during the run. Read their risks above first.
 
-Before the run, check three things:
+Before the run, check four things:
 
 - `main` accepts direct pushes from every runner's owner: no branch protection, required reviews or required status
   checks, or auto merge cannot push it.
@@ -371,6 +382,8 @@ Before the run, check three things:
   `workflow` scope. Without it GitHub refuses such pushes, a merge into `main` included.
 - `hub.env` keeps one line per key: the deployment (`activate.sh`) refuses a file that sets a key twice, so change the
   line that is there, such as `AGFLOW_MAX_WORKERS=4`, rather than add another.
+- The hub and every runner run this release, the hub upgraded first: only runners of runner protocol 4 check `main`
+  after a merge.
 
 ### What agents fetched
 

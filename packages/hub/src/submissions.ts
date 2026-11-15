@@ -25,9 +25,11 @@ import {
 import { attemptData, requestStop } from './attempts';
 import { cancelPendingOfKind, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
+import { isDemoCheck } from './demo-check';
 import { badRequest, conflict, forbidden, notFound } from './errors';
 import type { Emit } from './events';
 import { refreshLeadSubmission, submissionReviewInstruction } from './lead-review';
+import { mainFailingHint } from './main-check';
 import { insertMessage } from './messages';
 import {
   AUTO_ACCEPT,
@@ -277,14 +279,14 @@ function recordSuccess(
         `${submission.id} was recorded, and ${task.id} is up for review.`,
     });
   }
-  // A check the branch changed, or one that ran no tests, vouches for nothing, and a demo check, the only task the
-  // system creates, lists defects for the lead to turn into tasks: all of them go to the lead.
+  // A check the branch changed, or one that ran no tests, vouches for nothing, and a demo check lists defects for the
+  // lead to turn into tasks: all of them go to the lead. The system's fix of main is accepted as any other task is.
   const autoAccepted =
     ctx.config.autoAccept === true &&
     outcome.check?.status === 'passed' &&
     outcome.check.ownFilesChanged === undefined &&
     !ranNoTests(outcome.check) &&
-    task.createdBy !== 'system';
+    !isDemoCheck(ctx, task.id);
   if (!autoAccepted) {
     refreshLeadSubmission(ctx, task.id, branch);
     insertMessage(ctx, emit, {
@@ -385,13 +387,10 @@ function recordRefusal(
   const error = outcome.error;
   if (error !== null && (FIXABLE_SUBMIT_ERRORS as readonly string[]).includes(error)) {
     const fix = whatToFix(error as FixableError, branch, ctx.config.mainBranch);
-    tellAgent(
-      ctx,
-      emit,
-      attempt,
-      task.id,
-      `Your submission ${submission.id} of ${task.id} was refused (${error}): ${fix}, then submit again.${detail}`,
-    );
+    // While main's own check fails, every check fails: the agent hears that a fix task mends main.
+    const hint = error === 'check_failed' ? mainFailingHint(ctx, task.id) : '';
+    const refused = `Your submission ${submission.id} of ${task.id} was refused (${error}): ${fix}, then submit again.`;
+    tellAgent(ctx, emit, attempt, task.id, `${refused}${hint}${detail}`);
     applyDeferredStop(ctx, attempt.id);
     return;
   }

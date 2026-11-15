@@ -1,7 +1,7 @@
 // What the Load page and the top strip say (GET /api/load). Free of the DOM, so the wording is unit-tested; the hub
 // computes every number, with core's placement rules for the accounts.
 import { type AccountLoad, type HubLoad, PLACEMENT_REFUSAL_WORDS, type ProjectLoad } from '@agflow/core';
-import { type Tone, VENDOR_NAMES, duration, percent } from './format';
+import { type Tone, VENDOR_NAMES, duration, percent, shortSha } from './format';
 import { clockTime } from './runners';
 
 /** An account's state: Ready when one of its runners can take an attempt now, else why placement passes it over. */
@@ -65,6 +65,13 @@ export function deadlineText(deadline: ProjectLoad['deadline'], now: number): st
   const at = clockTime(deadline.at, now);
   if (deadline.leftMs > 0) return `${at}, ${duration(deadline.leftMs)} left`;
   return `${at}, passed ${duration(-deadline.leftMs)} ago`;
+}
+
+/** main's check: "check passed at 1a2b3c4, 14:05", or "check fails since 1a2b3c4: T-9 fixes it". */
+export function mainText(main: NonNullable<ProjectLoad['main']>, now: number): string {
+  if (main.status === 'passed') return `check passed at ${shortSha(main.sha)}, ${clockTime(main.at, now)}`;
+  const fix = main.fixTask === null ? 'no task fixes it yet' : `${main.fixTask} fixes it`;
+  return `check fails since ${shortSha(main.since)}: ${fix}`;
 }
 
 /** What the strip shows: workers running of the cap, ready tasks (and how many can start now), free slots now. */

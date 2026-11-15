@@ -647,10 +647,10 @@ describe('never idle: the guides, the goal and the situation report', () => {
 
   test("the lead's guide says what the hub accepts and merges itself, only while those settings are on", () => {
     // A passed check that ran no tests or whose branch changes the check's own files, and a demo check, still come to
-    // the lead.
+    // the lead; agflow's fix of main does not.
     const accept =
-      "- The hub itself accepts a submission whose check passed, unless the check ran no tests, its branch changes the " +
-      "check's own files, or it is a demo check: those come to you with the others.";
+      "- The hub itself accepts a submission whose check passed, agflow's own fixes of main included, unless the check " +
+      "ran no tests, its branch changes the check's own files, or it is a demo check: those come to you with the others.";
     const merge = '- agflow merges accepted work into main itself; a conflict sends the task back to its author.';
     const guides = (config: { autoAccept?: boolean; autoMerge?: boolean }) => {
       const { ctx: live } = createTestContext(config);

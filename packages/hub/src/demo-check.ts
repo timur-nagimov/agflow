@@ -33,6 +33,17 @@ function demoChecks(ctx: HubContext): { task: Task; createdEvent: number }[] {
   });
 }
 
+/** Whether the task is a demo check: the system created it with a demo check's title, as demoChecks finds them. */
+export function isDemoCheck(ctx: HubContext, taskId: string): boolean {
+  const row = ctx.db
+    .query(
+      `SELECT 1 FROM events WHERE type = 'task.created' AND actor = 'system' AND subject = $taskId
+         AND json_extract(data, '$.title') LIKE $title`,
+    )
+    .get({ taskId, title: `${DEMO_CHECK_TITLE} %` });
+  return row !== null;
+}
+
 /**
  * The tasks that count as done for the demo check, each once with its latest such event, in the order they got done:
  * merged ones, or, without AGFLOW_AUTO_MERGE and while no task has ever been marked merged, accepted ones. With auto

@@ -32,12 +32,13 @@ import {
 } from './attempts';
 import { resolveAgentToken } from './auth';
 import { type CommandResult, type CommandRow, RESULT_HANDLERS, enqueueCommand } from './commands';
-import { type HubContext, tx } from './context';
+import { type HubContext, afterCommit, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
 import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { getHubState, updateHubState } from './hub-state';
+import { queueMainCheck } from './main-check';
 import { mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
@@ -916,6 +917,8 @@ function landMerge(ctx: HubContext, emit: Emit, task: Task, actor: string, sha: 
   else endLiveAttempt(ctx, task, 'accepted', actor);
   const merged = move(ctx, emit, task, 'merged', actor, { changes: { mergedSha: sha }, data: { sha } });
   refreshDependents(ctx, emit);
+  // main's check of the new main goes out at once, after the merge commits: a failure there cannot undo it.
+  afterCommit(ctx, () => queueMainCheck(ctx), 'main-check');
   return merged;
 }
 
