@@ -12,6 +12,7 @@ import { endAttempt, requestStop, startRunnerAttempt } from '../src/attempts';
 import { type HubContext, tx } from '../src/context';
 import { applyRunnerEvents } from '../src/events-in';
 import { seatHolderId } from '../src/hub-state';
+import { placementSnapshot } from '../src/placement';
 import { accountFor, upsertAccountQuota } from '../src/quota';
 import { getRunner } from '../src/runners';
 import { replaceQuotaWaits, runTick, runningWorkers } from '../src/scheduler';
@@ -171,6 +172,22 @@ describe('quota replacements', () => {
     endAttempt(ctx, { attemptId: held.attempt.id, trigger: 'quota' });
     const started = runTick(ctx).started.map((attempt) => [attempt.taskId, seatOf(ctx, attempt)]);
     expect(started).toEqual([[held.task.id, 'alice codex']]);
+  });
+
+  test("a strong worker's limit of one model is the lead's model: it keeps strong tasks off, not standard ones", () => {
+    const { ctx } = workersOnly();
+    const runnerId = addRunner(ctx);
+    const [design] = tasks(ctx, { title: 'Design', tier: 'strong' });
+    const held = addRunnerAttempt(ctx, { runnerId, taskId: design });
+    limitHit(ctx, held.attempt, ctx.now() + 24 * HOUR);
+    // A strong task runs on the vendor's lead model, so the limit is kept under lead.
+    const [slot] = placementSnapshot(ctx).runners.flatMap((runner) => runner.vendors);
+    expect(slot?.limitedUntil).toEqual({ lead: ctx.now() + 24 * HOUR });
+    // Another strong task may not start on the account; a standard one may.
+    const [strong, standard] = tasks(ctx, { title: 'Strong too', tier: 'strong' }, { title: 'Standard' });
+    const started = runTick(ctx).started.map((attempt) => attempt.taskId);
+    expect(started).toEqual([standard]);
+    expect(getTask(ctx, strong as string).status).toBe('ready');
   });
 
   test('a hinted task replaced for its quota starts on the other vendor at once: it waited for its vendor', () => {

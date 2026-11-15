@@ -24,6 +24,7 @@ import {
   StopCheckInputSchema,
   SubmitInputSchema,
   TaskPatchSchema,
+  TaskTierSchema,
   UpdateGoalInputSchema,
   VendorHintSchema,
 } from '../src/schemas';
@@ -94,6 +95,29 @@ describe('vendorHint', () => {
 
   test('a task created without a hint has none', () => {
     expect('vendorHint' in NewTaskSchema.parse(task)).toBe(false);
+  });
+});
+
+describe('tier', () => {
+  const task = { title: 't', objective: 'o', acceptance: [{ id: 'A1', assertion: 'a' }] };
+
+  test("new tasks and patches take 'standard' or 'strong'", () => {
+    for (const tier of ['standard', 'strong'] as const) {
+      expect(TaskTierSchema.parse(tier)).toBe(tier);
+      expect(NewTaskSchema.parse({ ...task, tier }).tier).toBe(tier);
+      expect(TaskPatchSchema.parse({ tier })).toEqual({ tier });
+    }
+  });
+
+  test('any other value is refused', () => {
+    for (const tier of ['high', 'Strong', '', null, 1]) {
+      expect([tier, NewTaskSchema.safeParse({ ...task, tier }).success]).toEqual([tier, false]);
+      expect([tier, TaskPatchSchema.safeParse({ tier }).success]).toEqual([tier, false]);
+    }
+  });
+
+  test('a task created without a tier stores none, which reads as standard', () => {
+    expect('tier' in NewTaskSchema.parse(task)).toBe(false);
   });
 });
 

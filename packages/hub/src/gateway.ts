@@ -407,6 +407,10 @@ export class Gateway implements RunnerLink {
       if (connection.protocol < 2 && message.command.kind === 'update_settings') {
         const { answers: _answers, ...command } = message.command;
         this.send(connection, { ...message, command });
+      } else if (connection.protocol < 3 && message.command.kind === 'start_attempt') {
+        // Protocol 2 knows no tier: an older runner runs a strong task as a standard one.
+        const { tier: _tier, ...attempt } = message.command.attempt;
+        this.send(connection, { ...message, command: { ...message.command, attempt } });
       } else this.send(connection, message);
     }
   }

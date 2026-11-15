@@ -3,8 +3,10 @@ import { TEST_ACCOUNT_ID } from '../src/runner-protocol';
 import { vendorRequirement } from '../src/ladder';
 import {
   type AccountView,
+  type DispatchContext,
   HINT_WAIT_MS,
   PLACEMENT_REFUSALS,
+  PLACEMENT_REFUSAL_WORDS,
   type PlacementRefusal,
   type PlacementSnapshot,
   type RunnerSlot,
@@ -13,15 +15,18 @@ import {
   candidateRunners,
   freeSlots,
   isDispatchable,
+  modelClass,
   orderReady,
   orderRunners,
   place,
   placeLead,
+  placementWords,
   preferredVendors,
   reportHolds,
   runnerToAvoid,
   usableVendors,
   utilization,
+  whyNotDispatchable,
   workerSlotsFree,
 } from '../src/scheduling';
 import type { AgentRole, Vendor, VendorQuota } from '../src/types';
@@ -437,6 +442,75 @@ describe('isDispatchable', () => {
   });
 });
 
+describe('whyNotDispatchable', () => {
+  const why = (overrides: Partial<TaskCandidate>, context: DispatchContext = dispatch) =>
+    whyNotDispatchable(candidate(overrides), context);
+
+  test('a task in the ready set has no reason', () => {
+    expect(why({})).toBeNull();
+    expect(why({ nextDispatchAt: NOW, dispatchHoldUntil: NOW - 1, counted: 2 })).toBeNull();
+  });
+
+  test('names the first rule the task fails, in the order the ready set checks them', () => {
+    expect(why({ status: 'claimed', dependenciesDone: false })).toBe('it is claimed');
+    expect(why({ dependenciesDone: false, openAttempt: true })).toBe('it waits for its dependencies');
+    expect(why({ openAttempt: true, counted: 3 })).toBe('its last attempt is still stopping');
+    expect(why({ ownedPaths: ['.claude/settings.json'] })).toBe(
+      'it owns paths runner agents may not change, so it waits for a live chat',
+    );
+    const holders = [{ id: 'T-2', ownedPaths: ['src/parser/lexer.ts'] }];
+    expect(why({}, { ...dispatch, pathHolders: holders })).toBe('its owned paths overlap those of T-2');
+    expect(why({ nextDispatchAt: NOW + 90_000 })).toBe('it waits 2 min after an infrastructure failure');
+    expect(why({ dispatchHoldUntil: NOW + 1 })).toBe("it waits up to 1 min for a runner's late work");
+    expect(why({ counted: 3 })).toBe('it used all 3 of its attempts');
+  });
+});
+
+describe('placementWords', () => {
+  const view = snapshot([runner()]);
+
+  test("names each runner passed over with its own refusal or its vendors'", () => {
+    const refused = [
+      { runnerId: 'R-1', vendor: null, refusal: 'full' },
+      { runnerId: 'R-2', vendor: 'claude', refusal: 'exhausted' },
+      { runnerId: 'R-2', vendor: 'codex', refusal: 'not_ready' },
+    ] as const;
+    expect(placementWords(view, candidate(), refused)).toBe(
+      'no runner can take it: R-1 full; R-2 claude quota used up, codex not ready',
+    );
+    expect(placementWords(view, candidate(), [])).toBe('no runner can take it: none offers a vendor');
+  });
+
+  test('names the vendor the retry ladder asks for', () => {
+    const required = candidate({ requirement: { step: 2, vendor: 'codex' } });
+    const away = [{ runnerId: 'R-1', vendor: 'codex', refusal: 'owner_away' }] as const;
+    const head = 'no runner can take it (the retry ladder asks for codex)';
+    expect(placementWords(view, required, away)).toBe(`${head}: R-1 codex owner away`);
+    expect(placementWords(view, required, [])).toBe(`${head}: none offers codex`);
+  });
+
+  test('a task that owns greenfield files says it needs a runner with the open profile', () => {
+    // An agent's task that owns AGENTS.md: only a runner with the open profile may take it.
+    const greenfield = candidate({ ownedPaths: ['AGENTS.md'], createdBy: 'agent:A-1' });
+    const standardOnly = snapshot([runner(), runner({ id: 'R-2', owner: 'bob' })], [account()]);
+    // place passes every runner over in silence: none has the profile.
+    expect(place(standardOnly, greenfield, { projectPref: null })).toEqual({ placement: null, refused: [] });
+    expect(placementWords(standardOnly, greenfield, [])).toBe(
+      'it needs a runner with the open profile (owns AGENTS.md), and no runner has that profile',
+    );
+    // With an open runner that cannot take it now, its refusal is named.
+    const busy = snapshot([runner(), runner({ id: 'R-2', profile: 'open', capacity: 1, openAttempts: 1 })]);
+    const { refused } = place(busy, greenfield, { projectPref: null });
+    expect(placementWords(busy, greenfield, refused)).toBe('no runner with the open profile can take it: R-2 full');
+  });
+
+  test('every refusal has its words', () => {
+    for (const refusal of PLACEMENT_REFUSALS) {
+      expect([refusal, PLACEMENT_REFUSAL_WORDS[refusal].length > 0]).toEqual([refusal, true]);
+    }
+  });
+});
+
 test('orderReady orders by priority, then age', () => {
   const tasks = [
     candidate({ id: 'T-1', priority: 5, createdAt: NOW - HOUR }),
@@ -745,6 +819,23 @@ describe('placeLead', () => {
     const view = snapshot([runner({ vendors: [limited, codexSlot] })], [account()]);
     expect(placeLead(view, { rotatingFrom: null }).placement).toMatchObject({ runnerId: 'R-1', vendor: 'codex' });
     expect(place(view, candidate({ vendorHint: 'claude' }), { projectPref: null }).placement?.vendor).toBe('claude');
+  });
+
+  test("a strong task runs on the lead's model, so the lead's limit holds for it and a worker's does not", () => {
+    const tiers = ['strong', 'standard', undefined] as const;
+    expect(tiers.map((tier) => modelClass('worker', tier))).toEqual(['lead', 'worker', 'worker']);
+    expect(tiers.map((tier) => modelClass('lead', tier))).toEqual(['lead', 'lead', 'lead']);
+    const strong = candidate({ vendorHint: 'claude', tier: 'strong' });
+    const standard = candidate({ vendorHint: 'claude' });
+    const leadLimited = snapshot([runner({ vendors: [vendorSlot({ limitedUntil: { lead: NOW + HOUR } })] })]);
+    expect(place(leadLimited, strong, { projectPref: null })).toEqual({
+      placement: null,
+      refused: [{ runnerId: 'R-1', vendor: 'claude', refusal: 'exhausted' }],
+    });
+    expect(place(leadLimited, standard, { projectPref: null }).placement?.vendor).toBe('claude');
+    const workerLimited = snapshot([runner({ vendors: [vendorSlot({ limitedUntil: { worker: NOW + HOUR } })] })]);
+    expect(place(workerLimited, strong, { projectPref: null }).placement?.vendor).toBe('claude');
+    expect(place(workerLimited, standard, { projectPref: null }).placement).toBeNull();
   });
 
   test('a lead takes no slot: a full runner takes it', () => {

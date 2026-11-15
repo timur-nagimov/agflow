@@ -410,6 +410,7 @@ label.inline select { width: auto; max-width: 340px; }
 .task-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font: 400 11.5px/1.4 var(--mono); color: var(--ink-2); }
 .priority { color: var(--ink); }
 .task-note { font-size: 12px; color: var(--ink-2); }
+.task-wait { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
 /* ---------- Task page ---------- */
 

@@ -71,7 +71,10 @@ export interface VendorHold {
   failedStarts: number;
   /** Set by two failed starts or an expired login; a vendor report with a later preflightAt clears it. */
   notReadySince: number | null;
-  /** Limit hits that left the account usable (setLimited), by role. Holds written before it existed have none. */
+  /**
+   * Limit hits that left the account usable (setLimited), by model (core's modelClass). Holds written before it existed
+   * have none.
+   */
   limitedUntil?: Partial<Record<AgentRole, number>>;
 }
 
@@ -787,10 +790,10 @@ export function setDegraded(ctx: HubContext, runnerId: string, vendor: Vendor): 
 }
 
 /**
- * A limit hit of the role that left the account usable (design 6.10): a limit of one model, or paid usage the runner
- * refuses. No new attempt of the role on the vendor's account until the reset, or for quotaUnknownMs when it is
- * unknown or past, as the runner's own wait does; core's usableVendors holds it on every runner of the owner logged in
- * to the same account.
+ * A limit hit that left the account usable (design 6.10): a limit of one model, or paid usage the runner refuses. role
+ * names the model that met it (core's modelClass: the attempt's role, or lead for a strong task's worker). No new
+ * attempt on that model on the vendor's account until the reset, or for quotaUnknownMs when it is unknown or past, as
+ * the runner's own wait does; core's usableVendors holds it on every runner of the owner logged in to the same account.
  */
 export function setLimited(
   ctx: HubContext,

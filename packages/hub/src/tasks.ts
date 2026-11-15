@@ -80,6 +80,7 @@ function contractOf(task: Task): TaskContract {
     priority: task.priority,
     // Undefined for a task that never had one; JSON leaves it out of the stored contract.
     vendorHint: task.vendorHint,
+    tier: task.tier,
   };
 }
 
@@ -117,7 +118,8 @@ function reaches(ctx: HubContext, from: string, target: string, seen = new Set<s
 
 const HOUR = 60 * 60_000;
 
-function creationGuard(ctx: HubContext, count: number): string | null {
+/** Why creating count more tasks would pass a safety limit, or null; the demo check asks before it creates its task. */
+export function creationGuard(ctx: HubContext, count: number): string | null {
   const open = (
     ctx.db
       .query("SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN ('accepted', 'merging', 'merged', 'cancelled', 'failed')")
@@ -233,6 +235,7 @@ export function createTasks(ctx: HubContext, inputs: NewTask[], actor: string): 
         dependsOn,
         priority: input.priority,
         vendorHint: input.vendorHint,
+        tier: input.tier,
       };
       const seq = nextId(ctx.db, 'task');
       const id = `T-${seq}`;
@@ -307,9 +310,11 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
         writeTask(ctx, id, { blockedReason: dependencyReason(ctx, waiting) });
       }
     }
-    // The vendor hint steers only the scheduler's next placement, so the holder has nothing to follow there.
+    // The vendor hint steers only the scheduler's next placement, and the tier the next attempt's model, so the holder
+    // has nothing to follow there.
     const changed = (Object.keys(patch) as (keyof TaskContract)[]).filter(
-      (field) => field !== 'vendorHint' && JSON.stringify(contract[field]) !== JSON.stringify(task[field]),
+      (field) =>
+        field !== 'vendorHint' && field !== 'tier' && JSON.stringify(contract[field]) !== JSON.stringify(task[field]),
     );
     if (isHeld(task.status) && task.assignee && changed.length > 0) {
       insertMessage(ctx, emit, {

@@ -585,6 +585,19 @@ describe('commands', () => {
     }
   });
 
+  test("protocol 3: an attempt spec may carry the task's tier, standard or strong, and nothing else", () => {
+    expect(PROTOCOL_VERSION).toBe(3);
+    for (const tier of ['standard', 'strong'] as const) {
+      expect(AttemptSpecSchema.parse({ ...spec, tier }).tier).toBe(tier);
+      expect(RunnerCommandSchema.safeParse({ kind: 'start_attempt', attempt: { ...spec, tier } }).success).toBe(true);
+    }
+    // Absent, as an older hub and every standard task send it.
+    expect('tier' in AttemptSpecSchema.parse(spec)).toBe(false);
+    for (const tier of ['high', 'Strong', '', null, 1]) {
+      expect([tier, AttemptSpecSchema.safeParse({ ...spec, tier }).success]).toEqual([tier, false]);
+    }
+  });
+
   test('start_attempt and resume_attempt carry an agent token', () => {
     const bare = { kind: 'start_attempt', attempt: without(spec, 'agentToken') };
     expect(RunnerCommandSchema.safeParse(bare).success).toBe(false);

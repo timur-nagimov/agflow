@@ -289,7 +289,7 @@ after a change. The details are in the
   submission, push included, so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long. Risk: the check is the
   only review, so whatever it does not test is accepted unseen.
 
-One more setting is on by default:
+Two more settings are on by default:
 
 - **The idle nudge, `AGFLOW_IDLE_NUDGE_SECONDS` (60) and `AGFLOW_IDLE_NUDGE_MINUTES` (5).** Removes: a person noticing
   that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the free worker
@@ -297,9 +297,19 @@ One more setting is on by default:
   lead one message: the free slots, the ready, blocked, submitted and accepted tasks, each account's quota, the time
   left to the deadline, and what to plan next (the spec until it is covered, then defects, missing tests, demo polish
   and new features, and only fixes in the last hour). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
-  `lead.idle_nudged` records each one. None goes out before the goal is set or once the deadline has passed, and
-  `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk: the lead keeps adding work until the deadline, so the
-  subscriptions stay in use; pause the project, or set a lower worker target, to stop it.
+  `lead.idle_nudged` records each one. None goes out before the goal is set, while worker dispatch is held (a paused
+  project, the churn guard), or once the deadline has passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk:
+  the lead keeps adding work until the deadline, so the subscriptions stay in use; pause the project, or set a lower
+  worker target, to stop it.
+- **The demo check, `AGFLOW_DEMO_CHECK_EVERY` (5).** Removes: a person trying the product by hand from time to time.
+  After every N tasks merged, the hub creates one demo-check task, created by `system`, unless one is still open.
+  Without `AGFLOW_AUTO_MERGE=1`, accepted tasks count until something marks a task merged. Its agent starts the
+  product from a clean checkout of `main` the way `AGENTS.md` says (`scripts/demo.sh` when present), walks every flow
+  in `SPEC.md`, saves a screenshot of every screen under `docs/qa/<time>/`, records each requirement in
+  `docs/STATUS.md` as working, broken or missing, and lists every defect with steps to reproduce in its submission. It
+  may change only those files and `scripts/demo.sh`, which no runner profile protects. It runs at priority 1,
+  preferably on the vendor that implemented fewer of the last N tasks, and the lead turns its defects into fix tasks.
+  `0` turns it off. Risk: none beyond an agent's usual work; it costs one task's quota every N tasks.
 
 ### What agents fetched
 

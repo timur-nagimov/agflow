@@ -260,4 +260,11 @@ describe('threadOverrides', () => {
     });
     expect(config.web_search).toBe('cached');
   });
+
+  test("a strong task asks for a high reasoning effort; a standard one leaves Codex's own", () => {
+    const launch = launchFixture();
+    expect(threadOverrides(launch, BRIDGE_CWD).config).not.toHaveProperty('model_reasoning_effort');
+    expect(threadOverrides({ ...launch, tier: 'standard' }, BRIDGE_CWD).config).not.toHaveProperty('model_reasoning_effort');
+    expect(threadOverrides({ ...launch, tier: 'strong' }, BRIDGE_CWD).config.model_reasoning_effort).toBe('high');
+  });
 });

@@ -10,6 +10,7 @@ import type {
   GoalNote,
   GoalVersion,
   HubEvent,
+  HubLoad,
   HubStatus,
   Message,
   MessageView,
@@ -177,6 +178,7 @@ export function createApi(fetchFn: FetchFn, onUnauthorized: () => void = () => {
     },
 
     runners: () => request<RunnerList>('GET', '/api/runners'),
+    load: () => request<HubLoad>('GET', '/api/load'),
     updateRunner: async (id: string, patch: RunnerPatch) =>
       (await request<{ runner: Runner }>('PATCH', `/api/runners/${encodeURIComponent(id)}`, patch)).runner,
     retireRunner: async (id: string): Promise<void> => {

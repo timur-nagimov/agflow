@@ -16,6 +16,7 @@ import {
   type TaskStatus,
 } from '@agflow/core';
 import type { HubContext } from '../context';
+import { withWaitReason } from '../scheduler';
 import { requestSubmission } from '../submissions';
 import { requestHandback, requestTakeover } from '../takeover';
 import {
@@ -42,20 +43,21 @@ import type { App } from './app';
 import { actor, agentOf, holderOf, human, intParam, leadBody, principal, readBody } from './util';
 
 export function mountTaskRoutes(app: App, ctx: HubContext): void {
+  // Each task says why the scheduler's last tick did not start it, while it is ready (waitReason).
   app.get('/api/tasks', (c) => {
     principal(c);
     const status = c.req.query('status');
-    return c.json({
-      tasks: listTasks(ctx, {
-        status: status ? (status.split(',') as TaskStatus[]) : undefined,
-        assignee: c.req.query('assignee') || undefined,
-      }),
+    const tasks = listTasks(ctx, {
+      status: status ? (status.split(',') as TaskStatus[]) : undefined,
+      assignee: c.req.query('assignee') || undefined,
     });
+    return c.json({ tasks: tasks.map((task) => withWaitReason(ctx, task)) });
   });
 
   app.get('/api/tasks/:id', (c) => {
     principal(c);
-    return c.json(getTaskDetail(ctx, c.req.param('id')));
+    const detail = getTaskDetail(ctx, c.req.param('id'));
+    return c.json({ ...detail, task: withWaitReason(ctx, detail.task) });
   });
 
   // The lead or a person.

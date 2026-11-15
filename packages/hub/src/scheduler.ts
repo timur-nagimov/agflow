@@ -22,21 +22,24 @@ import {
   candidateRunners,
   countedAttempts,
   freeSlots,
-  isDispatchable,
+  minutesUntil,
   orderReady,
   pathsOverlap,
   place,
   placeLead,
+  placementWords,
   runnerToAvoid,
   usableVendors,
+  whyNotDispatchable,
   workerSlotsFree,
 } from '@agflow/core';
 import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
+import { ensureDemoCheck } from './demo-check';
 import { currentGoalVersion } from './goal';
-import { churnPaused, inRecovery, leadSeat } from './hub-state';
+import { churnPaused, getHubState, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
 import { queueMerges } from './merges';
 import { insertMessage } from './messages';
@@ -83,12 +86,13 @@ function endedView(ctx: HubContext, task: Task, attempt: Attempt): EndedAttemptV
 }
 
 /**
- * What steers where a task's next attempt goes: the ladder's vendor, the task's hint, the runner to avoid, and the
- * paths it owns, since greenfield files need a runner with the open profile.
+ * What steers where a task's next attempt goes: the ladder's vendor, the task's hint, the runner to avoid, the paths it
+ * owns, since greenfield files need a runner with the open profile, and its tier, since a strong task runs on the
+ * lead's model, whose limits then hold.
  */
 type PlacementPrefs = Pick<
   TaskCandidate,
-  'vendorHint' | 'requirement' | 'avoidRunner' | 'ownedPaths' | 'kind' | 'createdBy'
+  'vendorHint' | 'requirement' | 'avoidRunner' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier'
 >;
 
 function placementPrefs(ctx: HubContext, task: Task, attempts: readonly Attempt[]): PlacementPrefs {
@@ -100,6 +104,7 @@ function placementPrefs(ctx: HubContext, task: Task, attempts: readonly Attempt[
     ownedPaths: task.ownedPaths,
     kind: task.kind,
     createdBy: task.createdBy,
+    tier: task.tier,
   };
 }
 
@@ -126,8 +131,11 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
   };
 }
 
-/** The ready set in dispatch order (design 6.6, step 3): by priority, then age. */
-export function readySet(ctx: HubContext): TaskCandidate[] {
+/**
+ * The ready set in dispatch order (design 6.6, step 3): by priority, then age. Each ready task left out goes into
+ * waiting, when given, with why.
+ */
+export function readySet(ctx: HubContext, waiting?: Map<string, string>): TaskCandidate[] {
   const tasks = listTasks(ctx);
   const columns = dispatchColumns(ctx);
   const pathHolders = tasks.filter((task) => isPathHolder(task, ctx.config.autoMerge === true));
@@ -136,7 +144,13 @@ export function readySet(ctx: HubContext): TaskCandidate[] {
     const stored = columns.get(task.id);
     return task.status === 'ready' && stored ? [candidateOf(ctx, task, stored)] : [];
   });
-  return orderReady(ready.filter((candidate) => isDispatchable(candidate, context)));
+  return orderReady(
+    ready.filter((candidate) => {
+      const why = whyNotDispatchable(candidate, context);
+      if (why !== null) waiting?.set(candidate.id, why);
+      return why === null;
+    }),
+  );
 }
 
 /** Counts a placement in the snapshot: an open attempt more on its account, and a worker's slot less on its runner. */
@@ -201,6 +215,15 @@ export interface DispatchResult {
   started: Attempt[];
   /** Ready tasks that no runner could take now. */
   unplaced: string[];
+  /** Every ready task that did not start, with why in one line; the board shows it (withWaitReason). */
+  waiting: Map<string, string>;
+}
+
+/** Why a task in the ready set waits once every worker slot is taken (design 6.6, step 4). */
+function slotWords(ctx: HubContext, workerTarget: number | null): string {
+  return workerTarget === null
+    ? `it waits for a worker slot: AGFLOW_MAX_WORKERS is ${ctx.config.maxWorkers}`
+    : `it waits for a worker slot: the worker target is ${workerTarget}`;
 }
 
 /**
@@ -208,7 +231,8 @@ export interface DispatchResult {
  * ready task in order is placed by core's place over the snapshot, then claimed and started in its own transaction
  * (startRunnerAttempt). A start that fails is logged and leaves the others standing. The path holders are read once,
  * before the loop, so a task whose paths overlap one started in this tick waits for the next. Ready work that waits
- * because an owner is away is reported to the lead once per away period.
+ * because an owner is away is reported to the lead once per away period. Why each ready task did not start is kept
+ * for the board until the next tick.
  */
 export function dispatch(ctx: HubContext): DispatchResult {
   const staffing = getStaffing(ctx);
@@ -217,22 +241,28 @@ export function dispatch(ctx: HubContext): DispatchResult {
     maxWorkers: ctx.config.maxWorkers,
     runningWorkers: runningWorkers(ctx),
   });
-  const result: DispatchResult = { started: [], unplaced: [] };
+  const result: DispatchResult = { started: [], unplaced: [], waiting: new Map() };
+  memoryOf(ctx).waiting = result.waiting;
+  const ready = readySet(ctx, result.waiting);
+  // A task in the ready set waits for a slot, unless the loop below starts it or finds another reason.
+  for (const task of ready) result.waiting.set(task.id, slotWords(ctx, staffing.workerTarget));
   if (free === 0) return result;
-  const ready = readySet(ctx);
   if (ready.length === 0) return result;
   const snapshot = placementSnapshot(ctx);
   const away: AwayRefusal[] = [];
   const started: Pick<Task, 'id' | 'ownedPaths'>[] = [];
   for (const task of ready) {
     if (free === 0) break;
-    if (started.some((one) => pathsOverlap(task.ownedPaths, one.ownedPaths))) {
+    const overlapping = started.find((one) => pathsOverlap(task.ownedPaths, one.ownedPaths));
+    if (overlapping) {
       result.unplaced.push(task.id);
+      result.waiting.set(task.id, `its owned paths overlap those of ${overlapping.id}, which just started`);
       continue;
     }
     const { placement, refused } = place(snapshot, task, { projectPref: staffing.vendorPref });
     if (!placement) {
       result.unplaced.push(task.id);
+      result.waiting.set(task.id, placementWords(snapshot, task, refused));
       away.push(...awayRefusals(snapshot, task.id, refused));
       continue;
     }
@@ -244,11 +274,13 @@ export function dispatch(ctx: HubContext): DispatchResult {
         vendor: placement.vendor,
       });
       result.started.push(attempt);
+      result.waiting.delete(task.id);
       started.push(task);
       recordPlacement(snapshot, placement, 'worker');
       free -= 1;
     } catch (error) {
       console.error(`starting ${task.id} on ${placement.runnerId} failed`, error);
+      result.waiting.set(task.id, `its start on ${placement.runnerId} failed; the next tick tries again`);
     }
   }
   if (away.length > 0) tellLeadOwnerAway(ctx, away);
@@ -410,19 +442,22 @@ export interface TickResult {
  * starts, while runners reconnect and replay (design 6.14); agents' bridge calls work meanwhile. The lead starts
  * before dispatch, so that dispatch sees the account it draws on; it takes no slot. A paused project skips the lead
  * seat and dispatch (steps 2 to 6); the agents already running go on under every stall, budget and lease rule. While
- * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts. Accepted work goes
+ * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts. These three holds
+ * are dispatchHold's, and a tick that one of them stops gives every ready task its reason (held). Accepted work goes
  * on merging into main whatever the project's state: the merge queue sends a merge that waits, and one that failed
- * again.
+ * again. Just before dispatch, the demo check may add its task (ensureDemoCheck).
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
-  if (inRecovery(ctx)) return { clock, recovering: true, reconciled: null, lead: null, started: [] };
+  if (inRecovery(ctx)) return held(ctx, { clock, recovering: true, reconciled: null, lead: null, started: [] });
   const reconciled = reconcile(ctx);
   duty('the merge queue', () => queueMerges(ctx), null);
-  if (getProject(ctx).paused) return { clock, recovering: false, reconciled, lead: null, started: [] };
+  if (getProject(ctx).paused) return held(ctx, { clock, recovering: false, reconciled, lead: null, started: [] });
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
   // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).
-  if (churnPaused(ctx)) return { clock, recovering: false, reconciled, lead, started: [] };
+  if (churnPaused(ctx)) return held(ctx, { clock, recovering: false, reconciled, lead, started: [] });
+  // Before dispatch, so that a new demo check can start in this tick.
+  duty('the demo check', () => ensureDemoCheck(ctx), null);
   return { clock, recovering: false, reconciled, lead, started: dispatch(ctx).started };
 }
 
@@ -466,9 +501,11 @@ export class Scheduler {
     return this.interval !== null;
   }
 
-  /** Runs one tick now. */
+  /** Runs one tick now, then samples the free slots for the Load page. */
   tick(): TickResult {
-    return runTick(this.ctx);
+    const result = runTick(this.ctx);
+    duty('the slot sample', () => sampleSlots(this.ctx), undefined);
+    return result;
   }
 
   /** Begins the timer and the extra ticks after events; nothing when it runs already. */
@@ -529,7 +566,7 @@ export function requestAgents(ctx: HubContext, request: StaffingRequest): { runn
 
 /** What the lead plans against: the workers, the slots dispatch could fill, and the tasks in each state. */
 export interface WorkerLoad {
-  /** Runner workers starting, running or in quota_wait (runningWorkers). */
+  /** Runner workers that take a slot (runningWorkers). */
   running: number;
   /** project.worker_target, which request_agents sets; null leaves the cap. */
   target: number | null;
@@ -537,24 +574,44 @@ export interface WorkerLoad {
   cap: number;
   /**
    * The workers dispatch could start now: the target or cap less the running workers, bounded by the free slots of the
-   * runners that can place a worker.
+   * runners that can place a worker (runnerSlots).
    */
   freeSlots: number;
   ready: number;
-  /** The ready tasks dispatch may start now (readySet). */
+  /** The ready tasks dispatch may start now (readySet): none while dispatch is held (dispatchHold). */
   dispatchable: number;
   blockedOnDependencies: number;
-  /** Submitted and waiting for the lead's verdict. */
+  /** Submitted and waiting for the lead's verdict (SUBMITTED). */
   submitted: number;
+  /** Accepted and not in main yet (ACCEPTED_NOT_MERGED). */
   acceptedNotMerged: number;
 }
 
-/** The free slots of the runners that could take a worker now: candidates with a usable vendor. */
-function placeableSlots(ctx: HubContext): number {
+/** A task submitted and waiting for the lead's verdict. */
+export const SUBMITTED: readonly TaskStatus[] = ['submitted', 'checking', 'reviewing'];
+
+/** A task accepted and not in main yet: merging too, which AGFLOW_AUTO_MERGE moves accepted work to. */
+export const ACCEPTED_NOT_MERGED: readonly TaskStatus[] = ['accepted', 'merging'];
+
+/**
+ * The slots of the runners that can take a worker now, or once one of their slots frees: placement refuses them
+ * nothing but a full runner (candidateRunners), and one of their vendors is usable for a worker (usableVendors). All
+ * their slots, the ones workers take (a lead and a quota wait take none: TAKES_SLOT_SQL), and the free ones. The
+ * lead's report, the idle nudge, the Load page and its strip count free slots this way.
+ */
+export function runnerSlots(ctx: HubContext): { capacity: number; busy: number; idle: number } {
   const snapshot = placementSnapshot(ctx);
-  return candidateRunners(snapshot)
-    .candidates.filter((runner) => usableVendors(snapshot, runner).usable.length > 0)
-    .reduce((sum, runner) => sum + freeSlots(runner), 0);
+  const { candidates, refused } = candidateRunners(snapshot);
+  const full = new Set(refused.filter((one) => one.refusal === 'full').map((one) => one.runnerId));
+  const slots = { capacity: 0, busy: 0, idle: 0 };
+  for (const runner of snapshot.runners) {
+    if (!candidates.includes(runner) && !full.has(runner.id)) continue;
+    if (usableVendors(snapshot, runner).usable.length === 0) continue;
+    slots.capacity += runner.capacity;
+    slots.busy += runner.openAttempts;
+    slots.idle += freeSlots(runner);
+  }
+  return slots;
 }
 
 /** The worker load now, as dispatch computes it. */
@@ -569,12 +626,13 @@ export function workerLoad(ctx: HubContext): WorkerLoad {
     running,
     target: workerTarget,
     cap: ctx.config.maxWorkers,
-    freeSlots: free === 0 ? 0 : Math.min(free, placeableSlots(ctx)),
+    freeSlots: free === 0 ? 0 : Math.min(free, runnerSlots(ctx).idle),
     ready: count(['ready']),
-    dispatchable: readySet(ctx).length,
+    // None while dispatch is held, whatever the ready set holds.
+    dispatchable: dispatchHold(ctx) === null ? readySet(ctx).length : 0,
     blockedOnDependencies: tasks.filter((task) => task.status === 'blocked' && task.blockedKind === 'deps').length,
-    submitted: count(['submitted', 'checking', 'reviewing']),
-    acceptedNotMerged: count(['accepted', 'merging']),
+    submitted: count(SUBMITTED),
+    acceptedNotMerged: count(ACCEPTED_NOT_MERGED),
   };
 }
 
@@ -595,7 +653,10 @@ function quotaLine(account: AccountQuota): string {
   return `- ${account.owner} ${account.vendor}: ${state}, ${use}, ${reset}`;
 }
 
-/** The worker load, one quota line per account and the deadline with the time left, as lines for the lead. */
+/**
+ * The worker load, why worker dispatch is held when it is, one quota line per account and the deadline with the time
+ * left, as lines for the lead.
+ */
 export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
   // Without a target of its own, the project's target is the cap.
   const lines = [
@@ -604,6 +665,8 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
     `Ready tasks: ${load.ready}, ${load.dispatchable} of them dispatchable now. Blocked on dependencies: ` +
       `${load.blockedOnDependencies}. Submitted: ${load.submitted}. Accepted, not merged: ${load.acceptedNotMerged}.`,
   ];
+  const hold = dispatchHold(ctx);
+  if (hold !== null) lines.push(`No worker starts now: ${hold}.`);
   const accounts = listAccounts(ctx);
   if (accounts.length === 0) lines.push('Quota: no account has reported yet.');
   else lines.push('Quota:', ...accounts.map(quotaLine));
@@ -647,15 +710,16 @@ function lastNudgeAt(ctx: HubContext): number | null {
  * The idle nudge: while a runner lead holds the seat and free worker slots outnumber the dispatchable ready tasks for
  * idleNudgeMs without a break, the lead gets one system message with the load, each account's quota, the deadline and
  * what to plan; then none before idleNudgeIntervalMs has passed since the last (lead.idle_nudged), and none at all
- * while it is 0. A paused project or a churn pause starts no worker, so neither nudges. Without a goal there is nothing
- * to plan, and the work is planned until the deadline, so none goes out before the goal is set or once the deadline
- * has passed. Part of the tick's reconcile step. Returns the message, or null.
+ * while it is 0. While worker dispatch is held (dispatchHold: a paused project, the churn guard) no worker starts, so
+ * none goes out. Without a goal there is nothing to plan, and the work is planned until the deadline, so none goes out
+ * before the goal is set or once the deadline has passed. Part of the tick's reconcile step. Returns the message, or
+ * null.
  */
 export function nudgeIdleLead(ctx: HubContext): Message | null {
   if (ctx.config.idleNudgeIntervalMs === 0) return null;
-  const { paused, deadlineAt } = getProject(ctx);
+  const { deadlineAt } = getProject(ctx);
   const due =
-    !paused && !churnPaused(ctx) && currentGoalVersion(ctx) > 0 && (deadlineAt === null || ctx.now() < deadlineAt);
+    dispatchHold(ctx) === null && currentGoalVersion(ctx) > 0 && (deadlineAt === null || ctx.now() < deadlineAt);
   const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
   if (load === null || load.freeSlots <= load.dispatchable) {
     idleSince.delete(ctx);
@@ -678,4 +742,91 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
         `now.\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// What the scheduler keeps between ticks: why ready tasks wait, and how many slots stood free
+// ---------------------------------------------------------------------------
+
+const HOUR = 60 * 60_000;
+
+/** The free slots after one tick. */
+interface SlotSample {
+  at: number;
+  idle: number;
+}
+
+/** Kept in memory only: a hub that restarts begins both afresh. */
+interface TickMemory {
+  /** Why each ready task did not start in the last tick (dispatch, or held when the tick started no worker). */
+  waiting: Map<string, string>;
+  /** The last hour's samples, oldest first. */
+  samples: SlotSample[];
+}
+
+const memories = new WeakMap<HubContext, TickMemory>();
+
+function memoryOf(ctx: HubContext): TickMemory {
+  let memory = memories.get(ctx);
+  if (!memory) {
+    memory = { waiting: new Map(), samples: [] };
+    memories.set(ctx, memory);
+  }
+  return memory;
+}
+
+/**
+ * Why no worker starts now, in one line for the board, the Load page and the lead; null when dispatch runs. Within the
+ * recovery window the tick does nothing, a paused project starts nothing, and the churn guard holds worker dispatch
+ * (runTick). The one rule for a held dispatch: the idle nudge and the dispatchable counts follow it too.
+ */
+export function dispatchHold(ctx: HubContext): string | null {
+  const now = ctx.now();
+  const { recoveryUntil, dispatchPausedUntil } = getHubState(ctx);
+  const minutes = (until: number | null): number => minutesUntil(until ?? now, now);
+  if (inRecovery(ctx)) {
+    return `the hub is recovering after downtime: nothing starts for up to ${minutes(recoveryUntil)} min`;
+  }
+  if (getProject(ctx).paused) return 'the project is paused';
+  if (churnPaused(ctx)) return `the churn guard holds worker dispatch for ${minutes(dispatchPausedUntil)} more min`;
+  return null;
+}
+
+/** A tick that starts no worker: the ready set waits for dispatchHold's reason, other ready tasks for their own. */
+function held(ctx: HubContext, result: TickResult): TickResult {
+  const waiting = new Map<string, string>();
+  const ready = readySet(ctx, waiting);
+  const why = dispatchHold(ctx);
+  if (why !== null) for (const task of ready) waiting.set(task.id, why);
+  memoryOf(ctx).waiting = waiting;
+  return result;
+}
+
+/** The task with its waitReason: why the last tick did not start it, while it is still ready; null otherwise. */
+export function withWaitReason(ctx: HubContext, task: Task): Task {
+  const reason = task.status === 'ready' ? memories.get(ctx)?.waiting.get(task.id) : undefined;
+  return { ...task, waitReason: reason ?? null };
+}
+
+/** Keeps a sample of the free slots now (runnerSlots), and drops the samples older than an hour. */
+export function sampleSlots(ctx: HubContext): void {
+  const now = ctx.now();
+  const memory = memoryOf(ctx);
+  memory.samples = memory.samples.filter((sample) => sample.at > now - HOUR);
+  memory.samples.push({ at: now, idle: runnerSlots(ctx).idle });
+}
+
+/**
+ * Free slot minutes in the hour before now, to a tenth: each sample's free slots until the next sample, the last one's
+ * until now, each for at most tickMs, so a stretch without ticks counts as one tick.
+ */
+export function idleSlotMinutes(ctx: HubContext): number {
+  const now = ctx.now();
+  const samples = memoryOf(ctx).samples.filter((sample) => sample.at > now - HOUR);
+  let slotMs = 0;
+  samples.forEach((sample, index) => {
+    const next = samples[index + 1]?.at ?? now;
+    slotMs += sample.idle * Math.min(Math.max(0, next - sample.at), ctx.config.tickMs);
+  });
+  return Math.round(slotMs / 6_000) / 10;
 }

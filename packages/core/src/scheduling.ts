@@ -5,7 +5,7 @@
 // functions. Pure, with no zod at run time, so the web UI may import it too (X-48).
 import type { VendorRequirement } from './ladder';
 import { pathsOverlap } from './paths';
-import { liveChatOnly, needsOpenProfile } from './protected-paths';
+import { liveChatOnly, needsOpenProfile, openProfileReason } from './protected-paths';
 import type { StartRefusal } from './runner-protocol';
 import type {
   AccountQuota,
@@ -15,6 +15,7 @@ import type {
   Runner,
   RunnerState,
   Task,
+  TaskTier,
   Vendor,
 } from './types';
 
@@ -28,7 +29,7 @@ import type {
  * - full: the workers that take a slot fill its capacity (a worker's placement only: a lead takes no slot);
  * - not_ready: the vendor is not ready there, by the runner's report or by a hub mark;
  * - degraded: continuous vendor errors marked the vendor degraded there;
- * - exhausted: the vendor's account has no quota left until its reset, or none for the role (limitedUntil);
+ * - exhausted: the vendor's account has no quota left until its reset, or none for the model (limitedUntil);
  * - paid_usage: work would draw on paid usage, which the runner does not allow;
  * - owner_away: an approval of the runner's owner timed out (design 6.10);
  * - ceiling: the account's utilization reached the runner's ceiling for the vendor.
@@ -49,6 +50,22 @@ export const PLACEMENT_REFUSALS = [
 ] as const;
 export type PlacementRefusal = (typeof PLACEMENT_REFUSALS)[number];
 
+/** Each refusal in a few words, for the board's wait reasons and the Load page. */
+export const PLACEMENT_REFUSAL_WORDS: Readonly<Record<PlacementRefusal, string>> = {
+  offline: 'offline',
+  draining: 'draining',
+  git: 'git not ready',
+  accepting: 'not taking work yet',
+  refused_start: 'refused a start',
+  full: 'full',
+  not_ready: 'not ready',
+  degraded: 'degraded',
+  exhausted: 'quota used up',
+  paid_usage: 'would use paid usage',
+  owner_away: 'owner away',
+  ceiling: 'at its quota ceiling',
+};
+
 /** A vendor on a runner, as placement sees it. */
 export interface VendorSlot {
   vendor: Vendor;
@@ -60,7 +77,8 @@ export interface VendorSlot {
   degradedUntil: number | null;
   /**
    * The hub's marks of limit hits that left the account usable (a limit of one model, or paid usage the runner
-   * refuses), by the role that met them here: no attempt of that role on the account before this time (design 6.10).
+   * refuses), by the model that met them here (modelClass): no attempt on that model on the account before this time
+   * (design 6.10).
    */
   limitedUntil: Partial<Record<AgentRole, number>>;
   /** The account the vendor is logged in to; null when the runner does not know it. */
@@ -204,18 +222,26 @@ export function utilization(account: AccountView | null, holds: boolean): { five
 }
 
 /**
- * Until when a limit hit that left the account usable keeps the role off the vendor (design 6.10): the latest mark of
- * the role on this slot, or on the vendor of any runner of the owner logged in to the same account, as an exhaustion
- * of the account holds on all of them. 0 for none.
+ * Which of the runner's models an attempt runs on (runner.json's models[vendor]): the lead's for a lead and for a
+ * strong task's worker, the worker's otherwise. A limit of one model is kept, and checked, under it (limitedUntil).
  */
-function limitedUntil(snapshot: PlacementSnapshot, runner: RunnerSlot, slot: VendorSlot, role: AgentRole): number {
+export function modelClass(role: AgentRole, tier: TaskTier | undefined): AgentRole {
+  return tier === 'strong' ? 'lead' : role;
+}
+
+/**
+ * Until when a limit hit that left the account usable keeps the model (modelClass) off the vendor (design 6.10): the
+ * latest mark of the model on this slot, or on the vendor of any runner of the owner logged in to the same account, as
+ * an exhaustion of the account holds on all of them. 0 for none.
+ */
+function limitedUntil(snapshot: PlacementSnapshot, runner: RunnerSlot, slot: VendorSlot, model: AgentRole): number {
   const sameAccount = (other: RunnerSlot, each: VendorSlot): boolean =>
     slot.accountId !== null &&
     other.owner === runner.owner &&
     each.vendor === slot.vendor &&
     each.accountId === slot.accountId;
   const shared = snapshot.runners.flatMap((other) => other.vendors.filter((each) => sameAccount(other, each)));
-  return Math.max(slot.limitedUntil[role] ?? 0, ...shared.map((each) => each.limitedUntil[role] ?? 0));
+  return Math.max(slot.limitedUntil[model] ?? 0, ...shared.map((each) => each.limitedUntil[model] ?? 0));
 }
 
 function vendorRefusal(
@@ -223,13 +249,13 @@ function vendorRefusal(
   runner: RunnerSlot,
   slot: VendorSlot,
   account: AccountView | null,
-  role: AgentRole,
+  model: AgentRole,
 ): PlacementRefusal | null {
   if (!slot.ready || slot.notReadySince !== null) return 'not_ready';
   if (slot.degradedUntil !== null && snapshot.now < slot.degradedUntil) return 'degraded';
   // An exhaustion and paid usage in use lapse with their report.
   const quota = account !== null && reportHolds(snapshot, account) ? account.quota : null;
-  if (quota?.state === 'exhausted' || snapshot.now < limitedUntil(snapshot, runner, slot, role)) return 'exhausted';
+  if (quota?.state === 'exhausted' || snapshot.now < limitedUntil(snapshot, runner, slot, model)) return 'exhausted';
   if (quota?.paidUsage === 'in_use' && !slot.allowPaidUsage) return 'paid_usage';
   if (account?.ownerAway) return 'owner_away';
   const { fiveHour, weekly } = utilization(account, quota !== null);
@@ -238,24 +264,24 @@ function vendorRefusal(
 }
 
 /**
- * The vendors on a runner that may take an attempt of the role (design 6.6, step 5, and 6.10): ready, without a
- * not-ready mark or a current degraded mark; on an account that is not exhausted, nor limited for the role
- * (limitedUntil), draws no paid usage unless the runner allows it and whose owner is not away; and below the runner's
- * ceilings, with unknown utilization counted as 0, so a ceiling of 0 keeps the vendor off; once a report no longer
- * holds, only its limiting window counts as unknown. A vendor without an account id, or on an account without a quota
- * report, meets no rule of a report. Every other vendor comes with its first refusal. The runner itself is
- * candidateRunners' to judge.
+ * The vendors on a runner that may take an attempt on the model (modelClass; a standard worker's by default; design
+ * 6.6, step 5, and 6.10): ready, without a not-ready mark or a current degraded mark; on an account that is not
+ * exhausted, nor limited for the model (limitedUntil), draws no paid usage unless the runner allows it and whose owner
+ * is not away; and below the runner's ceilings, with unknown utilization counted as 0, so a ceiling of 0 keeps the
+ * vendor off; once a report no longer holds, only its limiting window counts as unknown. A vendor without an account
+ * id, or on an account without a quota report, meets no rule of a report. Every other vendor comes with its first
+ * refusal. The runner itself is candidateRunners' to judge.
  */
 export function usableVendors(
   snapshot: PlacementSnapshot,
   runner: RunnerSlot,
-  role: AgentRole = 'worker',
+  model: AgentRole = 'worker',
 ): { usable: UsableVendor[]; refused: RefusedPlacement[] } {
   const usable: UsableVendor[] = [];
   const refused: RefusedPlacement[] = [];
   for (const slot of runner.vendors) {
     const account = accountOf(snapshot, runner, slot);
-    const refusal = vendorRefusal(snapshot, runner, slot, account, role);
+    const refusal = vendorRefusal(snapshot, runner, slot, account, model);
     if (refusal === null) usable.push({ slot, account });
     else refused.push({ runnerId: runner.id, vendor: slot.vendor, refusal });
   }
@@ -266,8 +292,8 @@ export function usableVendors(
 // The ready set (design 6.6, step 3)
 // ---------------------------------------------------------------------------
 
-/** The task's own fields the ready set and its order read. */
-type CandidateFields = 'id' | 'status' | 'priority' | 'createdAt' | 'ownedPaths' | 'kind' | 'createdBy';
+/** The task's own fields the ready set, its order and its placement read. */
+type CandidateFields = 'id' | 'status' | 'priority' | 'createdAt' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier';
 
 /** A ready task as the scheduler reads it: its own fields and what the hub knows about its attempts. */
 export interface TaskCandidate extends Pick<Task, CandidateFields | 'nextDispatchAt'> {
@@ -299,23 +325,38 @@ export interface DispatchContext {
   pathHolders: readonly Pick<Task, 'id' | 'ownedPaths'>[];
 }
 
+/** Whole minutes from now until a time, at least 1, for a reason people read. */
+export const minutesUntil = (at: number, now: number): number => Math.max(1, Math.ceil((at - now) / 60_000));
+
 /**
- * Whether a task is in the ready set (design 6.6, step 3): ready with its dependencies done; no open attempt; no path
- * that no runner agent may change (such a task stays ready for live chats); no overlap with a path holder;
- * next_dispatch_at and dispatch_hold_until come; and counted attempts below the ladder's limit.
+ * Why a task is not in the ready set (design 6.6, step 3), in one line for the board; null when it is. The ready set
+ * holds a task that is ready with its dependencies done; with no open attempt; with no path that no runner agent may
+ * change (such a task stays ready for live chats); with no overlap with a path holder; whose next_dispatch_at and
+ * dispatch_hold_until have come; and with counted attempts below the ladder's limit. The first rule it fails is why.
  */
-export function isDispatchable(task: TaskCandidate, context: DispatchContext): boolean {
+export function whyNotDispatchable(task: TaskCandidate, context: DispatchContext): string | null {
   const { now } = context;
-  return (
-    task.status === 'ready' &&
-    task.dependenciesDone &&
-    !task.openAttempt &&
-    !liveChatOnly(task) &&
-    !context.pathHolders.some((holder) => holder.id !== task.id && pathsOverlap(task.ownedPaths, holder.ownedPaths)) &&
-    (task.nextDispatchAt === null || task.nextDispatchAt <= now) &&
-    (task.dispatchHoldUntil === null || task.dispatchHoldUntil <= now) &&
-    task.counted < context.maxAttempts
+  if (task.status !== 'ready') return `it is ${task.status}`;
+  if (!task.dependenciesDone) return 'it waits for its dependencies';
+  if (task.openAttempt) return 'its last attempt is still stopping';
+  if (liveChatOnly(task)) return 'it owns paths runner agents may not change, so it waits for a live chat';
+  const holder = context.pathHolders.find(
+    (other) => other.id !== task.id && pathsOverlap(task.ownedPaths, other.ownedPaths),
   );
+  if (holder) return `its owned paths overlap those of ${holder.id}`;
+  if (task.nextDispatchAt !== null && task.nextDispatchAt > now) {
+    return `it waits ${minutesUntil(task.nextDispatchAt, now)} min after an infrastructure failure`;
+  }
+  if (task.dispatchHoldUntil !== null && task.dispatchHoldUntil > now) {
+    return `it waits up to ${minutesUntil(task.dispatchHoldUntil, now)} min for a runner's late work`;
+  }
+  if (task.counted >= context.maxAttempts) return `it used all ${context.maxAttempts} of its attempts`;
+  return null;
+}
+
+/** Whether a task is in the ready set (design 6.6, step 3): whyNotDispatchable has nothing against it. */
+export function isDispatchable(task: TaskCandidate, context: DispatchContext): boolean {
+  return whyNotDispatchable(task, context) === null;
 }
 
 /** The ready set in dispatch order: by priority (0 the most urgent), then age, oldest first. A new array. */
@@ -445,18 +486,20 @@ interface Option {
 
 /**
  * Every usable vendor on every candidate runner for the role, and every refusal met on the way, among the given runners
- * (all of the snapshot's by default). Vendors are judged against the whole snapshot: a limit of the role holds on every
+ * (all of the snapshot's by default). The role decides whether a slot is needed; the model (modelClass, the role's own
+ * by default) which limits hold. Vendors are judged against the whole snapshot: a limit of the model holds on every
  * runner of the owner logged in to the account (limitedUntil), the runners left out included.
  */
 function options(
   snapshot: PlacementSnapshot,
   role: AgentRole,
   runners: RunnerSlot[] = snapshot.runners,
+  model: AgentRole = role,
 ): { options: Option[]; refused: RefusedPlacement[] } {
   const { candidates, refused } = candidateRunners({ ...snapshot, runners }, role);
   const found: Option[] = [];
   for (const runner of candidates) {
-    const vendors = usableVendors(snapshot, runner, role);
+    const vendors = usableVendors(snapshot, runner, model);
     refused.push(...vendors.refused);
     for (const usable of vendors.usable) found.push({ runner, usable });
   }
@@ -526,20 +569,21 @@ function runnersFor(
 /**
  * Places a ready task (design 6.6, step 5): the first tier of vendors (preferredVendors) usable on some candidate
  * runner, on its best option (orderOptions, avoiding task.avoidRunner); a task that owns greenfield files only on a
- * runner with the open profile (runnersFor). Without a preference that is the account with the fewest open attempts,
- * so a tick's placements spread over every account at once. With no placement, refused names every runner and vendor
- * passed over among those the task may go to, owner_away included, which the scheduler tells the lead about.
+ * runner with the open profile (runnersFor); a strong task only where the lead's model is not limited (modelClass).
+ * Without a preference that is the account with the fewest open attempts, so a tick's placements spread over every
+ * account at once. With no placement, refused names every runner and vendor passed over among those the task may go
+ * to, owner_away included, which the scheduler tells the lead about.
  */
 export function place(
   snapshot: PlacementSnapshot,
   task: Pick<
     TaskCandidate,
-    'vendorHint' | 'requirement' | 'avoidRunner' | 'readySince' | 'ownedPaths' | 'kind' | 'createdBy'
+    'vendorHint' | 'requirement' | 'avoidRunner' | 'readySince' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier'
   >,
   project: { projectPref: VendorPreferenceInput['projectPref'] },
 ): PlaceResult {
   const runners = runnersFor(snapshot, task);
-  const found = options(snapshot, 'worker', runners);
+  const found = options(snapshot, 'worker', runners, modelClass('worker', task.tier));
   const tiers = preferredVendors({
     requirement: task.requirement,
     vendorHint: task.vendorHint,
@@ -554,6 +598,33 @@ export function place(
     if (best) return { placement: toPlacement(best), refused: found.refused };
   }
   return { placement: null, refused: found.refused };
+}
+
+/**
+ * Why place found no runner for a task, in one line for the board: each runner passed over, with its own refusal or
+ * its vendors'. A usable vendor has no refusal, so when the retry ladder asks for one vendor, the line names it. A task
+ * that owns greenfield files looks only at runners with the open profile (runnersFor), and says so; with none in the
+ * snapshot, it names the files that need one.
+ */
+export function placementWords(
+  snapshot: PlacementSnapshot,
+  task: Pick<TaskCandidate, 'requirement' | 'ownedPaths' | 'kind' | 'createdBy'>,
+  refused: readonly RefusedPlacement[],
+): string {
+  const open = openProfileReason(task);
+  if (open !== null && runnersFor(snapshot, task).length === 0) return `it ${open}, and no runner has that profile`;
+  const needed = task.requirement?.vendor ?? null;
+  const runners = open === null ? 'no runner' : 'no runner with the open profile';
+  const ladder = needed === null ? '' : ` (the retry ladder asks for ${needed})`;
+  const head = `${runners} can take it${ladder}`;
+  const byRunner = new Map<string, string[]>();
+  for (const one of refused) {
+    const words = PLACEMENT_REFUSAL_WORDS[one.refusal];
+    const said = byRunner.get(one.runnerId) ?? [];
+    byRunner.set(one.runnerId, [...said, one.vendor === null ? words : `${one.vendor} ${words}`]);
+  }
+  if (byRunner.size === 0) return `${head}: none offers ${needed ?? 'a vendor'}`;
+  return `${head}: ${[...byRunner].map(([runnerId, words]) => `${runnerId} ${words.join(', ')}`).join('; ')}`;
 }
 
 /**

@@ -7,14 +7,16 @@ import {
   RUNNER_COMMAND_KINDS,
   type RunnerCommandKind,
 } from '@agflow/core';
+import { startRunnerAttempt } from '../src/attempts';
 import { SESSION_TTL, createSession, sessionHashOf } from '../src/auth';
 import { RESULT_HANDLERS, type StoredCommand, enqueueCommand, findCommand, pendingCommands } from '../src/commands';
 import { tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { BAD_MESSAGE_CLOSE, Gateway, type GatewayOptions, HUB_ERROR_CLOSE, type LinkSocket } from '../src/gateway';
 import { findRunnerRow, getRunner, identifyRunner, markRetired, markVendorNotReady } from '../src/runners';
+import { createTasks } from '../src/tasks';
 import { type AnswerHooks, FakeConnection, FakeRunner, connectFakeRunner, settle } from './fake-runner';
-import { addRunnerAttempt, createTestContext, sampleCommands, testVendor } from './helpers';
+import { addRunnerAttempt, createTestContext, newTask, sampleCommands, testVendor } from './helpers';
 
 type Ctx = ReturnType<typeof createTestContext>['ctx'];
 
@@ -796,6 +798,20 @@ test.each([1, 2])('hub-first upgrade: protocol %i receives only settings fields 
   expect(echo).toMatchObject({ kind: 'update_settings', settings: { draining: true }, version: 2 });
   if (protocol === 1) expect(echo).not.toHaveProperty('answers');
   else expect(echo).toHaveProperty('answers', { seq: 1, outboxEpoch: 'outbox-1' });
+});
+
+test.each([2, 3])("hub-first upgrade: protocol %i gets a strong task's tier only from protocol 3", async (protocol) => {
+  const { ctx, gateway, token } = setup();
+  const runner = await connectFakeRunner(ctx, gateway, { token, protocol });
+  const [task] = createTasks(ctx, [newTask({ title: 'Design the storage', tier: 'strong' })], 'user:alice');
+  if (!task) throw new Error('no task');
+  startRunnerAttempt(ctx, { runnerId: 'R-1', taskId: task.id, role: 'worker', vendor: 'claude' });
+  await settle();
+  const start = runner.commands.at(-1)?.command;
+  if (start?.kind !== 'start_attempt') throw new Error('no start reached the runner');
+  expect(start.attempt.taskId).toBe(task.id);
+  if (protocol === 2) expect(start.attempt).not.toHaveProperty('tier');
+  else expect(start.attempt.tier).toBe('strong');
 });
 
 test.each([false, true])('gateway persists hello adoption before replay and acknowledges the skipped settings tail (sparse=%s)', async (sparse) => {

@@ -39,12 +39,13 @@ AGFLOW_PROJECT_NAME=demo AGFLOW_PROJECT_REPO=https://github.com/you/demo bun run
 
 Open `http://localhost:8787` and sign in. Its pages:
 
-- **Board.** Tasks by status, and a form for new tasks.
+- **Board.** Tasks by status, and a form for new tasks. A ready task that did not start says why in one line, as the scheduler's last tick found it: no free worker slot, no runner that can take it, its dependencies, another task holding its paths, a paused project, the churn guard, and so on.
 - **Task page.** Contract, submissions and their outcomes, notes, thread and history; accept, reject, mark merged, unblock and cancel. Runner tasks add attempts (vendor/model, runner, status, end reason, WIP ref/SHA and times), attempt logs, handoff/restatement/late-work notes, and Take over / Hand back with commands. Protected tasks are marked "live chat only".
 - **Goal.** Edit the goal, read lead notes and messages, pause or resume work, and toggle **Runner leads**. The lead seat shows whether a live chat or a runner holds it, with wake-ups since rotation.
 - **Agents.** Runner, attempt and phase, with Interrupt, Stop, Stop and hold, Replace and Take over where applicable. Stop replaces Release for runner work. A runner lead offers Interrupt, Stop and Replace; it has no Hold or Take over action.
 - **Runners.** Owner, state and why, capacity/free slots, power, disk, keep-awake, git readiness and last push. Vendor details show readiness, binary versions, plan, managed policy, quota windows, ceilings, paid usage and owner-away state; profiles show weakened items. Only the owner can edit capacity, keep-awake, drain, ceilings and paid usage, or retire a runner.
 - **Approvals** (`#/approvals`). Your pending requests, with a badge in the navigation, full command, working directory, reason, any manifest diff and time left. Read the escalation warning before approving or declining.
+- **Load.** One row per account (owner and vendor): plan, slots taken on the owner's runners, 5-hour and weekly use against the ceilings, reset time and state. Below it the project's numbers: workers running against the target and the cap, ready and startable tasks, tasks waiting on dependencies, submitted and accepted-not-merged tasks with the oldest age, merges in the last hour, the deadline and the free slot minutes of the last hour. The top strip shows workers running against the cap, ready tasks and free slots on every page.
 - **Messages.** Steer the lead and the agents; mark a message as a standing rule.
 - **Timeline.** Everything that happened, live, including runner and attempt events and filters.
 - **Knowledge.** Standing rules, and search across tasks, messages and the goal.
@@ -238,6 +239,7 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_AUTO_APPROVALS` | `0` | `1`: the hub approves every approval request itself the moment it arrives, on any runner whose device policy does not reserve approvals to its owner: every command an agent asks to run outside the sandbox runs there, and no one reads it first. |
 | `AGFLOW_AUTO_MERGE` | `0` | `1`: agflow merges accepted work into main itself. A runner merges one accepted task at a time and pushes main with its owner's git credentials, so main must accept direct pushes; a conflict sends the task back to its author. Dependencies then wait for the merge, and accepted work keeps its owned paths until it is merged. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
 | `AGFLOW_AUTO_ACCEPT` | `0` | `1`: the hub accepts a runner submission whose check passed (`check` in `.agflow/config.json`) the moment it is recorded, without waking the lead; the lead's next situation report lists these tasks. A submission with no check goes to the lead as before. |
+| `AGFLOW_DEMO_CHECK_EVERY` | `5` | After every this many tasks merged (or accepted, without `AGFLOW_AUTO_MERGE` and while nothing marks tasks merged) the hub creates a demo-check task: an agent runs the product from `main`, walks the flows in `SPEC.md`, saves screenshots under `docs/qa/` and records each requirement in `docs/STATUS.md`. `0` turns it off. See [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
 | `AGFLOW_LEASE_MINUTES` | `120` | How long a claim survives without agent activity |
 | `AGFLOW_REMINDER_MINUTES` | `30` | Minimum time between "you hold a task" reminders |
 | `AGFLOW_MAX_OPEN_TASKS` | `200` | Guard: refuse new tasks beyond this many open tasks |

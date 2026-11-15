@@ -171,6 +171,19 @@ describe('AttemptController: launching the agent', () => {
     ]);
   });
 
+  test("a strong task's worker runs on runner.json's lead model, and its launch carries the tier", async () => {
+    const f = await createRunnerFixture();
+    f.config.models = {
+      claude: { lead: 'claude-lead-model', worker: 'claude-worker-model' },
+      codex: { lead: 'codex-lead-model', worker: 'codex-worker-model' },
+    };
+    await f.controller('T-5-a1').start(f.spec({ attemptId: 'T-5-a1', taskId: 'T-5', vendor: 'codex', tier: 'strong' }));
+    const [spawned] = await waitFor(() => f.events('attempt.spawned').length === 1 && f.events('attempt.spawned'));
+    expect(spawned?.data.model).toBe('codex-lead-model');
+    // The adapter reads the tier for the reasoning effort.
+    expect(f.fakes.codex?.launches.map((launch) => launch.tier)).toEqual(['strong']);
+  });
+
   test("the agent's process is in the registry before its first event is read", async () => {
     let release: () => void = () => {};
     const released = new Promise<void>((resolve) => {

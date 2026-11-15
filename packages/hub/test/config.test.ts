@@ -304,6 +304,18 @@ describe('the unattended options', () => {
       expect(() => loadConfig({ ...base, AGFLOW_AUTO_APPROVALS: value })).toThrow('AGFLOW_AUTO_APPROVALS must be 0 or 1');
     }
   });
+
+  test('AGFLOW_DEMO_CHECK_EVERY is 5 unless set, 0 turns the demo check off, and anything else refuses to start', () => {
+    expect(loadConfig(base).config.demoCheckEvery).toBe(5);
+    expect(loadConfig({ ...base, AGFLOW_DEMO_CHECK_EVERY: '' }).config.demoCheckEvery).toBe(5);
+    expect(loadConfig({ ...base, AGFLOW_DEMO_CHECK_EVERY: '0' }).config.demoCheckEvery).toBe(0);
+    expect(loadConfig({ ...base, AGFLOW_DEMO_CHECK_EVERY: '12' }).config.demoCheckEvery).toBe(12);
+    for (const value of ['-1', '2.5', 'often', 'Infinity']) {
+      expect(() => loadConfig({ ...base, AGFLOW_DEMO_CHECK_EVERY: value })).toThrow(
+        'AGFLOW_DEMO_CHECK_EVERY must be 0 or a positive integer',
+      );
+    }
+  });
 });
 
 describe('makeConfig', () => {

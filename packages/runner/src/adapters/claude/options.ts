@@ -131,6 +131,12 @@ export function claudeBinary(paths: Pick<RunnerPaths, 'runner'>, version: string
   return join(paths.runner, vendorBinary('claude', version));
 }
 
+/**
+ * The effort of a strong task: above the CLI's usual default. The CLI lowers it, without an error, for a model that
+ * does not take it.
+ */
+export const CLAUDE_STRONG_EFFORT = 'xhigh';
+
 /** acceptEdits, or auto for the auto profile on an account that offers it (7.6, X-29). */
 export function effectivePermissionMode(profile: PermissionProfile, autoOffered: boolean): PermissionMode {
   return profile.name === 'auto' && autoOffered ? 'auto' : 'acceptEdits';
@@ -227,6 +233,8 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
     env: claudeEnv(launch.env, emptyDir, deps.platform ?? process.platform),
     ...session,
     model: launch.model,
+    // A standard task keeps the CLI's own effort.
+    ...(launch.tier === 'strong' ? { effort: CLAUDE_STRONG_EFFORT } : {}),
     systemPrompt: { type: 'preset', preset: 'claude_code', append: CLAUDE_BASH_NOTE },
     settingSources: ['project'],
     projectConfigRoot: launch.baseCheckout,
