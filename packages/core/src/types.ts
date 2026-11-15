@@ -682,7 +682,8 @@ export interface ProjectLoad {
 
 /**
  * main's check as its newest result that passed or failed left it: passed at a sha, or failing since the first failure
- * after the last pass, with the open task that fixes it, if any.
+ * after the last pass, with the open task that fixes it, if any. A failure counts only at the sha agflow had merged
+ * last when it came.
  */
 export type MainHealth =
   | { status: 'passed'; sha: string; at: number }

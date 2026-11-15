@@ -77,9 +77,10 @@ describe("main's check, after each merge", () => {
     answer(ctx, runner, passed);
     expect(queueMainCheck(ctx)).toBeNull();
     const recorded = { status: 'passed', command, tail: '12 pass', durationMs: 58_000, runnerId: runner };
+    // a's result came once b had merged: a was no longer main as agflow last merged it.
     expect(checkedEvents(ctx).map((event) => [event.actor, event.data])).toEqual([
-      [`runner:${runner}`, { sha: sha('a'), ...recorded }],
-      [`runner:${runner}`, { sha: sha('b'), ...recorded }],
+      [`runner:${runner}`, { sha: sha('a'), ...recorded, newest: false }],
+      [`runner:${runner}`, { sha: sha('b'), ...recorded, newest: true }],
     ]);
     expect(mainHealth(ctx)).toEqual({ status: 'passed', sha: sha('b'), at: ctx.now() });
   });
@@ -161,10 +162,10 @@ describe('when main fails', () => {
     answer(ctx, runner, passed);
     const second = merge(ctx, sha('b'), 'Print the config');
     const third = merge(ctx, sha('c'), 'Lint the config');
-    // b is no longer the newest main: c's check, which may find it fixed, decides.
+    // b is no longer the newest main: c's check, which may find it fixed, decides, and b's failure counts for nothing.
     answer(ctx, runner, failed);
     expect([openFixTask(ctx), told(ctx, 'lead')]).toEqual([null, []]);
-    expect(mainHealth(ctx)).toEqual({ status: 'failed', since: sha('b'), fixTask: null });
+    expect(mainHealth(ctx)).toEqual({ status: 'passed', sha: sha('a'), at: ctx.now() });
     queueMainCheck(ctx);
     answer(ctx, runner, failed);
     const fix = openFixTask(ctx);
@@ -200,13 +201,26 @@ describe('when main fails', () => {
         ],
       ]);
     }
-    expect(mainHealth(ctx)).toEqual({ status: 'failed', since: sha('b'), fixTask: fix.id });
+    expect(mainHealth(ctx)).toEqual({ status: 'failed', since: sha('c'), fixTask: fix.id });
     // Another failure while the fix task is open creates no other, and tells nobody again.
     merge(ctx, sha('d'), 'Format the config');
     answer(ctx, runner, failed);
     expect(openFixTask(ctx)?.id).toBe(fix.id);
     expect(createdBySystem(ctx)).toHaveLength(1);
     expect([told(ctx, 'humans'), told(ctx, 'lead')].map((messages) => messages.length)).toEqual([1, 1]);
+  });
+
+  test('a failure of a sha merged over before its result tells nobody, so the next pass is no news either', () => {
+    const { ctx, runner } = setup();
+    merge(ctx, sha('a'));
+    answer(ctx, runner, passed);
+    merge(ctx, sha('b'), 'Print the config');
+    merge(ctx, sha('c'), 'Lint the config');
+    answer(ctx, runner, failed);
+    queueMainCheck(ctx);
+    answer(ctx, runner, passed);
+    expect([told(ctx, 'humans'), told(ctx, 'lead')]).toEqual([[], []]);
+    expect(mainHealth(ctx)).toEqual({ status: 'passed', sha: sha('c'), at: ctx.now() });
   });
 
   test("the fix task's objective stays within its limits whatever the check printed", () => {

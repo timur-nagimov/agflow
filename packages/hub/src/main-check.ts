@@ -174,23 +174,27 @@ export function openFixTask(ctx: HubContext): Task | null {
 
 /**
  * main's check as its newest result that passed or failed left it: passed at a sha, or failing since the first failure
- * after the last pass, with the open fix task. Null without AGFLOW_AUTO_MERGE, and until a check passed or failed.
+ * after the last pass, with the open fix task. A failure counts only at the sha agflow had merged last when it came:
+ * one at an older sha waits for the newest's check, and nobody hears of it. Null without AGFLOW_AUTO_MERGE, and until
+ * a check passed or failed.
  */
 export function mainHealth(ctx: HubContext): MainHealth | null {
   if (!ctx.config.autoMerge) return null;
-  const decisive = "type = 'main.checked' AND json_extract(data, '$.status')";
+  const status = "json_extract(data, '$.status')";
+  const passed = `type = 'main.checked' AND ${status} = 'passed'`;
+  const failed = `type = 'main.checked' AND ${status} = 'failed' AND json_extract(data, '$.newest') = 1`;
   const newest = ctx.db
     .query(
-      `SELECT ts, json_extract(data, '$.sha') AS sha, json_extract(data, '$.status') AS status FROM events
-       WHERE ${decisive} IN ('passed', 'failed') ORDER BY id DESC LIMIT 1`,
+      `SELECT ts, json_extract(data, '$.sha') AS sha, ${status} AS status FROM events
+       WHERE (${passed}) OR (${failed}) ORDER BY id DESC LIMIT 1`,
     )
     .get() as { ts: number; sha: string; status: 'passed' | 'failed' } | null;
   if (newest === null) return null;
   if (newest.status === 'passed') return { status: 'passed', sha: newest.sha, at: newest.ts };
   const first = ctx.db
     .query(
-      `SELECT json_extract(data, '$.sha') AS sha FROM events WHERE ${decisive} = 'failed'
-         AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE ${decisive} = 'passed')
+      `SELECT json_extract(data, '$.sha') AS sha FROM events
+       WHERE ${failed} AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE ${passed})
        ORDER BY id LIMIT 1`,
     )
     .get() as { sha: string };
@@ -343,9 +347,9 @@ function mainPassesAgain(ctx: HubContext, emit: Emit, sha: string, since: string
 }
 
 /**
- * check_main's result (AGFLOW_AUTO_MERGE): main.checked records what the check gave, and a failure or a pass after one
- * is dealt with. A command that failed, or data agflow cannot read, records nothing: the tick asks again
- * MAIN_CHECK_RETRY_MS later.
+ * check_main's result (AGFLOW_AUTO_MERGE): main.checked records what the check gave and whether its sha was still the
+ * one agflow merged last (newest); then a failure, or a pass after one, is dealt with. A command that failed, or data
+ * agflow cannot read, records nothing: the tick asks again MAIN_CHECK_RETRY_MS later.
  */
 function onMainCheckResult(ctx: HubContext, emit: Emit, command: CommandRow, result: CommandResult): void {
   if (command.command.kind !== 'check_main' || !ctx.config.autoMerge) return;
@@ -363,6 +367,7 @@ function onMainCheckResult(ctx: HubContext, emit: Emit, command: CommandRow, res
       tail: lastChars(check.tail, EVENT_TAIL_MAX),
       durationMs: check.durationMs,
       runnerId: command.runnerId,
+      newest: mergedMain(ctx)?.sha === sha,
     },
   });
   if (check.status === 'failed') mainFailed(ctx, emit, sha, check);
