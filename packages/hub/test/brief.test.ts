@@ -301,6 +301,39 @@ describe('lead brief', () => {
     expect(brief.length).toBeLessThanOrEqual(BRIEF_LIMIT);
     expect(brief).toMatch(ENDS_WITH_MESSAGES);
   });
+
+  test('keeps its whole situation report, live or on a runner, with a long handoff, a long goal and full rules', () => {
+    // A long goal, more standing rules than fit, and a deadline.
+    const crowded = (): HubContext => {
+      const { ctx } = createTestContext();
+      updateGoal(ctx, { text: 'g'.repeat(50_000), baseVersion: 0 }, 'user:alice');
+      for (let i = 0; i < 20; i++) sendMessage(ctx, { from: 'user:alice', to: 'all', body: 'r'.repeat(600), standingRule: true });
+      setDeadline(ctx, ctx.now() + 2 * 60 * 60_000, 'user:alice');
+      return ctx;
+    };
+    const live = crowded();
+    const liveBrief = buildBrief(live, addAgent(live, 'alice', 'lead'));
+    // A successor runner lead, whose predecessor wrote a lead handoff of 3,000 characters.
+    const runner = crowded();
+    const first = addRunnerLead(runner);
+    updateAttempt(runner, first.attempt.id, { status: 'ended', endReason: 'rotated', endedAt: runner.now() });
+    addLeadNote(runner, { author: `agent:${first.agent.id}`, attemptId: first.attempt.id, body: 'h'.repeat(3000) });
+    const next = addRunnerLead(runner);
+    expect(isSuccessor(next.attempt)).toBe(true);
+    const runnerBrief = buildBrief(runner, next.agent);
+    expect(section(runnerBrief, '## Lead handoff from the previous lead')).toContain(`> ${'h'.repeat(2990)}`);
+    for (const [ctx, brief] of [
+      [live, liveBrief],
+      [runner, runnerBrief],
+    ] as const) {
+      expect(brief).toContain(`\n\n${situationReport(ctx)}\n\n## Messages`);
+      expect(brief).toContain('Deadline: 2026-10-26 14:00 UTC, 2 h 0 min left.');
+      expect(brief.length).toBeLessThanOrEqual(BRIEF_LIMIT);
+      // The goal keeps its floor, and the rules count the ones left out.
+      expect(section(brief, '## Goal (v1)').length).toBeGreaterThan(500);
+      expect(section(brief, '## Standing rules from people')).toContain('did not fit in this brief. Ask a person for them.');
+    }
+  });
 });
 
 /** The first attempt ends and its task goes back to ready; a new runner attempt takes it, as a successor. */

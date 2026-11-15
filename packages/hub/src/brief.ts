@@ -30,7 +30,10 @@ const RULES_LIMIT = 4000;
 /** The most of one standing rule a brief shows. */
 const RULE_LIMIT = 600;
 const GOAL_LIMIT = 2500;
-/** The least of the goal a runner brief keeps however many standing rules there are: its start and the cut line. */
+/**
+ * The least of the goal a runner brief or a lead's brief keeps, however many standing rules there are and however long
+ * the lead's situation report is: its start and the cut line.
+ */
 const GOAL_FLOOR = 500;
 const OWNED_PATHS_SHOWN = 20;
 /** The most of a handoff note a successor's brief quotes (design 10). */
@@ -126,15 +129,19 @@ export function buildBrief(ctx: HubContext, agent: Agent, options: BriefOptions 
     );
   }
   if (project.paused) parts.push(PAUSED);
-  parts.push(lead ? leadGuide(ctx, LEAD_GUIDE) : WORKER_GUIDE);
-  parts.push(goalSection(ctx, GOAL_LIMIT));
-  parts.push(standingRules(ctx));
   const messages = messagesSection(ctx, agent);
   const room = BRIEF_LIMIT - messages.length - 2;
+  if (lead) {
+    parts.push(leadGuide(ctx, LEAD_GUIDE));
+    // The report comes last, but its room is counted first: the goal and the rules cannot push it out.
+    const report = situationReport(ctx);
+    const { goal, rules } = goalAndRules(ctx, room - [...parts, report].join('\n\n').length);
+    return `${clip([...parts, goal, rules, report].join('\n\n'), room)}\n\n${messages}`;
+  }
+  parts.push(WORKER_GUIDE, goalSection(ctx, GOAL_LIMIT), standingRules(ctx));
   const head = parts.join('\n\n');
-  const section =
-    lead ? situationReport(ctx) : yourTask(ctx, agent, Math.min(BRIEF_TASK_LIMIT, room - head.length - 2));
-  return `${clip(`${head}\n\n${section}`, room)}\n\n${messages}`;
+  const task = yourTask(ctx, agent, Math.min(BRIEF_TASK_LIMIT, room - head.length - 2));
+  return `${clip(`${head}\n\n${task}`, room)}\n\n${messages}`;
 }
 
 /** The goal, cut to the limit; a cut one ends by naming get_goal, which has all of it. */
@@ -145,11 +152,24 @@ function goalSection(ctx: HubContext, limit: number): string {
 }
 
 /**
+ * The goal and the standing rules, in what the brief's other parts leave of its room (left, their separators counted):
+ * the rules take up to RULES_LIMIT, keeping GOAL_FLOOR for the goal; the goal takes the rest, up to GOAL_LIMIT, and
+ * never less than GOAL_FLOOR.
+ */
+function goalAndRules(ctx: HubContext, left: number): { goal: string; rules: string } {
+  // The goal's heading, and the separators before the goal and the rules.
+  const fixed = '## Goal (v000)\n'.length + 4;
+  const rules = standingRules(ctx, Math.min(RULES_LIMIT, left - fixed - GOAL_FLOOR));
+  const goal = goalSection(ctx, Math.max(GOAL_FLOOR, Math.min(GOAL_LIMIT, left - fixed - rules.length)));
+  return { goal, rules };
+}
+
+/**
  * The brief of a runner agent (design 10): no hello code, the task assigned rather than claimed, its branch and the
  * task pack, and what the agent before it handed over. It names no path of the clone: the hub does not know it, and
- * the runner adds the working directory. The standing rules take the room the handoff leaves, up to their limit,
- * keeping GOAL_FLOOR for the goal; the goal takes the room the other sections leave, up to its usual limit, and a
- * lead's situation report comes last: each wake-up delivers a fresh one anyway.
+ * the runner adds the working directory. The goal and the standing rules share the room the other parts leave
+ * (goalAndRules). A lead's situation report comes last, but its room is counted first: a lead's first turn is no
+ * wake-up when nothing is unread, so the brief may be the only report it gets.
  */
 function runnerBrief(ctx: HubContext, agent: Agent): string {
   const project = getProject(ctx);
@@ -166,18 +186,11 @@ function runnerBrief(ctx: HubContext, agent: Agent): string {
   if (!lead) before.push(runnerTask(ctx, attempt));
   const successor = attempt !== null && isSuccessor(attempt);
   const handoff = lead ? leadHandoffSection(ctx) : successor ? handoffSection(ctx, attempt) : null;
+  const after = [handoff, lead ? situationReport(ctx) : null].filter((part) => part !== null);
   const messages = messagesSection(ctx, agent);
   const room = BRIEF_LIMIT - messages.length - 2;
-  // The rules get what the other parts leave once the goal's heading, its two separators and GOAL_FLOOR are kept.
-  const others = [...before, handoff ?? ''].join('\n\n').length + 4 + '## Goal (v000)\n'.length;
-  const after = [standingRules(ctx, Math.min(RULES_LIMIT, room - others - GOAL_FLOOR))];
-  if (handoff) after.push(handoff);
-  // The goal's text gets what is left once its heading and separator are counted.
-  const fixed = [...before, ...after].join('\n\n').length + 2 + '## Goal (v000)\n'.length;
-  const goal = goalSection(ctx, Math.min(GOAL_LIMIT, room - fixed));
-  const parts = [...before, goal, ...after];
-  if (lead) parts.push(situationReport(ctx));
-  return `${clip(parts.join('\n\n'), room)}\n\n${messages}`;
+  const { goal, rules } = goalAndRules(ctx, room - [...before, ...after].join('\n\n').length);
+  return `${clip([...before, goal, rules, ...after].join('\n\n'), room)}\n\n${messages}`;
 }
 
 /** The runner worker's task: what it is, where its contract is, and the branch the runner pushes. */
