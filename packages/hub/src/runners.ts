@@ -830,3 +830,13 @@ export function recordFailedStart(ctx: HubContext, runnerId: string, vendor: Ven
 export function resetFailedStarts(ctx: HubContext, runnerId: string, vendor: Vendor): void {
   changeHold(ctx, runnerId, vendor, (hold) => ({ ...hold, failedStarts: 0 }));
 }
+
+/**
+ * A project reset (reset.ts) ends every runner's run of failed starts: those were the old project's. The other holds
+ * stay: a limit is its account's (limitedUntil), and a not-ready or degraded mark the vendor's on that runner.
+ */
+export function forgetFailedStarts(ctx: HubContext): void {
+  for (const row of findRunnerRows(ctx)) {
+    for (const vendor of Object.keys(vendorHolds(row)) as Vendor[]) resetFailedStarts(ctx, row.id, vendor);
+  }
+}

@@ -229,12 +229,16 @@ export function setOwnerAway(ctx: HubContext, emit: Emit, input: OwnerAwayInput)
 
 /**
  * Clears every owner-away mark of the owner, when they act (X-39): any approval decision of theirs, or a PATCH of one
- * of their runners (task 52). Returns how many accounts it cleared.
+ * of their runners (task 52). Without an owner, every owner's: a project reset (reset.ts) starts with everyone present.
+ * Returns how many accounts it cleared.
  */
-export function clearOwnerAway(ctx: HubContext, owner: string): number {
+export function clearOwnerAway(ctx: HubContext, owner?: string): number {
   return ctx.db
-    .query('UPDATE vendor_accounts SET owner_away = $present WHERE owner = $owner AND owner_away != $present')
-    .run({ owner, present: OWNER_PRESENT }).changes;
+    .query(
+      `UPDATE vendor_accounts SET owner_away = $present
+       WHERE ($owner IS NULL OR owner = $owner) AND owner_away != $present`,
+    )
+    .run({ owner: owner ?? null, present: OWNER_PRESENT }).changes;
 }
 
 /**

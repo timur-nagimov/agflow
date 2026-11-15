@@ -211,7 +211,8 @@ The reset, in one go:
 2. empties the old project: tasks, attempts, submissions, messages, events, goal versions and notes, lead and task
    notes, approvals, deliveries, the runner commands about its work, internet grants and the record of agent fetches,
    runner agents and their tokens, attempt logs, rejected runner events and the lead seat;
-3. keeps sessions, CLI sign-ins, people's live agents, runners and vendor accounts;
+3. keeps sessions, CLI sign-ins, people's live agents, runners and vendor accounts with their quota limits, but
+   clears every owner-away mark (left by an approval that expired) and the runners' counts of failed starts;
 4. sets the name, repository and deadline, unpauses, clears the worker target and the vendor preference, and raises
    the epoch and the id counters as a restore does, so no new attempt, branch or ref collides with an old one; the
    epoch also goes to the backup folder's `epoch` file, so a later restore of an older backup lands above it;

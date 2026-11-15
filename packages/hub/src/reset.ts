@@ -12,8 +12,10 @@ import { updateGoal } from './goal';
 import { hubEpoch, updateHubState } from './hub-state';
 import { sendMessage } from './messages';
 import { getProject } from './project';
+import { clearOwnerAway } from './quota';
 import { advanceIds } from './restore';
-import { forgetIdleSince } from './scheduler';
+import { forgetFailedStarts } from './runners';
+import { forgetSchedulerMemory } from './scheduler';
 
 /** The project a reset sets up. */
 export interface ProjectReset {
@@ -58,13 +60,16 @@ const PROJECT_TABLES = [
  *   live agents hold no task any more;
  * - the project takes the new name, repository and deadline, unpaused, with no worker target or vendor preference;
  *   the lead seat, the churn guard, the review clock and the restore mark are cleared;
+ * - every owner-away mark is cleared, and every runner's failed starts (forgetFailedStarts); the vendor accounts'
+ *   quotas and limits stay;
  * - the epoch rises and the id counters advance as after a restore (advanceIds), so no new attempt id, branch or ref
  *   collides with what runners' journals and the repository already hold;
  * - project.reset is recorded, and project.deadline_set when there is a deadline, as the deadline routes record it; the
  *   goal is set and the rules are posted, as the operator's goal and message routes do.
- * Once it commits, the idle nudge's clock (in memory) starts afresh and every runner's link is closed. Each runner says
- * hello again: the hub knows none of the attempts it reports, so welcome.stop ends them, as after a restore, and the
- * welcome names the new project, whose vault the runner opens.
+ * Once it commits, what the scheduler keeps in memory (why tasks wait, the free slot samples, the idle nudge's clock)
+ * starts afresh and every runner's link is closed. Each runner says hello again: the hub knows none of the attempts it
+ * reports, so welcome.stop ends them, as after a restore, and the welcome names the new project, whose vault the
+ * runner opens.
  */
 export function resetProject(ctx: HubContext, input: ProjectReset, actor: string): ProjectResetResult {
   const archive = ctx.config.backupDir ? archiveDatabase(ctx, ctx.config.backupDir, getProject(ctx).name) : null;
@@ -91,6 +96,11 @@ export function resetProject(ctx: HubContext, input: ProjectReset, actor: string
       lastLeadReviewAt: null,
       restoredAt: null,
     });
+    // An owner the old project marked away would keep the new one off their accounts until they answer an approval or
+    // change a runner, which may never come (with AGFLOW_AUTO_APPROVALS they answer none). The failed starts were the
+    // old project's too.
+    clearOwnerAway(ctx);
+    forgetFailedStarts(ctx);
     // Nothing was replaced: the ids move past this database's own.
     advanceIds(ctx.db, { events: 0, messages: 0 });
     const project: Project = getProject(ctx);
@@ -107,7 +117,7 @@ export function resetProject(ctx: HubContext, input: ProjectReset, actor: string
     // The restore tool's floor (restore.ts), so a backup taken before the reset is restored at a higher epoch.
     const { backupDir } = ctx.config;
     if (backupDir) afterCommit(ctx, () => writeFileSync(join(backupDir, 'epoch'), `${epoch}\n`));
-    afterCommit(ctx, () => forgetIdleSince(ctx));
+    afterCommit(ctx, () => forgetSchedulerMemory(ctx));
     const runners = ctx.db.query('SELECT id FROM runners WHERE connection_id IS NOT NULL').all() as { id: string }[];
     afterCommit(ctx, () => {
       for (const { id } of runners) ctx.link.closeRunner(id, GOING_AWAY_CLOSE, 'the project was reset; say hello again');
