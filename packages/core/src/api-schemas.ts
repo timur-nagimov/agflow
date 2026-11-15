@@ -473,13 +473,13 @@ export const DeadlineInputSchema = z.strictObject({
 
 /**
  * POST /api/operator/project/reset (agflow start): the project that takes the place of the hub's current one. The
- * deadline is an ISO 8601 time with its offset, or null for none. The goal becomes goal v1, and each rule a standing
- * rule for everyone, in order.
+ * deadline follows DeadlineInputSchema, or is null for none. The goal becomes goal v1, and each rule a standing rule
+ * for everyone, in order.
  */
 export const ProjectResetInputSchema = z.strictObject({
   name: z.string().min(1).max(200).regex(/^[^\p{Cc}\p{Zl}\p{Zp}]+$/u, 'expected one line'),
   repo: z.string().min(1).max(2000).regex(/^[^\p{Cc}\p{Zl}\p{Zp}\s]+$/u, 'expected a repository URL'),
-  deadline: z.iso.datetime({ offset: true }).nullable(),
+  deadline: DeadlineInputSchema.shape.deadline,
   goal: UpdateGoalInputSchema.shape.text,
   rules: z.array(SendMessageInputSchema.shape.body).max(20),
 });

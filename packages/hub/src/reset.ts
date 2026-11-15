@@ -59,7 +59,8 @@ const PROJECT_TABLES = [
  *   the lead seat, the churn guard, the review clock and the restore mark are cleared;
  * - the epoch rises and the id counters advance as after a restore (advanceIds), so no new attempt id, branch or ref
  *   collides with what runners' journals and the repository already hold;
- * - project.reset is recorded, the goal is set and the rules are posted, as the operator's goal and message routes do.
+ * - project.reset is recorded, and project.deadline_set when there is a deadline, as the deadline routes record it; the
+ *   goal is set and the rules are posted, as the operator's goal and message routes do.
  * Once it commits, every runner's link is closed. Each runner says hello again: the hub knows none of the attempts it
  * reports, so welcome.stop ends them, as after a restore, and the welcome names the new project, whose vault the
  * runner opens.
@@ -97,6 +98,9 @@ export function resetProject(ctx: HubContext, input: ProjectReset, actor: string
       actor,
       data: { name: input.name, repo: input.repo, deadlineAt: input.deadlineAt, previous, epoch, archive },
     });
+    // The same event as the deadline routes (setDeadline), so the timeline and the lead's report show it.
+    const { deadlineAt } = input;
+    if (deadlineAt !== null) emit({ type: 'project.deadline_set', actor, data: { deadlineAt } });
     const goal = updateGoal(ctx, { text: input.goal, baseVersion: 0 }, actor);
     for (const rule of input.rules) sendMessage(ctx, { from: actor, to: 'all', body: rule, standingRule: true });
     // The restore tool's floor (restore.ts), so a backup taken before the reset is restored at a higher epoch.

@@ -4,7 +4,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { OperatorProject, ProjectResetResult } from '@agflow/core';
+import { DeadlineInputSchema, type OperatorProject, type ProjectResetResult } from '@agflow/core';
 import { type ParsedArgs, UsageError, listFlag, stringFlag } from './args';
 import { loadCredentials } from './credentials';
 import type { FetchFn } from './hub-client';
@@ -14,9 +14,12 @@ import { configDir } from './paths';
 import { type SeedFile, describeStack, seedFiles } from './seed';
 import { type SpecFile, isUrl, readSpec, uniqueNames } from './spec';
 
+/** A deadline as the hub takes it: an ISO 8601 date and time with a zone. */
+const DEADLINE_EXAMPLE = '2026-11-16T18:00:00+03:00';
+
 export const START_HELP = `  agflow start --spec <file or URL> [--spec ...] --repo <owner/name or URL> [--create]
                [--collaborator <login>] [--name <project>] [--stack python|typescript|<any text>]
-               [--deadline <ISO 8601 or +36h>] [--hub <url>]
+               [--deadline <ISO 8601 with a zone, e.g. ${DEADLINE_EXAMPLE}, or +36h>] [--hub <url>]
                                 Seed a repository with the spec and make it the hub's project
 `;
 
@@ -57,16 +60,22 @@ export function repoOf(given: string): RepoRef {
 
 const UNIT_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000 };
 
-/** --deadline as an ISO 8601 time in UTC: an ISO 8601 time, or +36h (also +90m, +2d) from now; null without one. */
+/**
+ * --deadline as an ISO 8601 time in UTC: a date and time with a zone, checked by the hub's rule (DeadlineInputSchema)
+ * with the seconds optional, or +36h (also +90m, +2d) from now; null without one. A time without a zone is refused, as
+ * the hub refuses it.
+ */
 export function parseDeadline(value: string | undefined, now: number): string | null {
   if (value === undefined) return null;
   const relative = value.match(/^\+(\d+(?:\.\d+)?)([mhd])$/);
   if (relative) return new Date(now + Number(relative[1]) * (UNIT_MS[relative[2] as string] as number)).toISOString();
-  const time = Date.parse(value);
-  if (!/^\d{4}-\d{2}-\d{2}/.test(value) || Number.isNaN(time)) {
-    throw new UsageError('--deadline must be an ISO 8601 time, such as 2026-11-16T18:00+03:00, or +36h');
+  const iso = value.replace(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?=Z|[+-])/, '$1:00');
+  if (!DeadlineInputSchema.shape.deadline.safeParse(iso).success) {
+    throw new UsageError(
+      `--deadline must be an ISO 8601 date and time with a zone, such as ${DEADLINE_EXAMPLE}, or +36h`,
+    );
   }
-  return new Date(time).toISOString();
+  return new Date(iso).toISOString();
 }
 
 const readable = (deadline: string | null): string =>

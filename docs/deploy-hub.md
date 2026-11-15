@@ -189,8 +189,8 @@ for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login
 Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it; `agflow start` is the one
 caller meant for a laptop. Without the token the routes do not exist. A person's CLI token, which runners hold, still
 cannot use people's controls. The events record the operator's person as the actor. A person signed in to the web UI
-can set the deadline too, with the same body on `PUT /api/project/deadline`. The lead sees the deadline and the time
-left in every situation report, and plans only fixes in the last hour.
+can set the deadline too, with the same body on `PUT /api/project/deadline`. The reset takes its deadline by the same
+rule. The lead sees the deadline and the time left in every situation report, and plans only fixes in the last hour.
 
 With an operator that merges, also set `AGFLOW_DEPENDENCIES_NEED_MERGE=1`: a dependency then counts as done only once
 it is marked merged, so the hub releases dependent tasks after their dependencies are in `main`, not at acceptance.
@@ -214,7 +214,8 @@ The reset, in one go:
 4. sets the name, repository and deadline, unpauses, clears the worker target and the vendor preference, and raises
    the epoch and the id counters as a restore does, so no new attempt, branch or ref collides with an old one; the
    epoch also goes to the backup folder's `epoch` file, so a later restore of an older backup lands above it;
-5. sets goal v1 and posts the rules as standing rules, as the operator's person (event `project.reset`);
+5. sets goal v1 and posts the rules as standing rules, as the operator's person (event `project.reset`, and
+   `project.deadline_set` when there is a deadline);
 6. closes every runner link. Each runner says hello again, and the hub, which no longer knows the attempts it
    reports, lists them in the welcome's stop list, as after a restore.
 
@@ -234,10 +235,10 @@ Four opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. 
 after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
-- **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal, marking tasks
-  merged, unblocking, messaging the lead and starting a new project by hand. Risk: whoever reads the token acts as the
-  operator's person on those routes, the project reset included, so keep it on the server, or in the owner's Keychain
-  for `agflow start`.
+- **Operator token and routes** ([Operator access](#operator-access)). Removes: setting the goal and the deadline,
+  marking tasks merged, unblocking, messaging the lead and starting a new project by hand. Risk: whoever reads the
+  token acts as the operator's person on those routes, the project reset included, so keep it on the server, or in the
+  owner's Keychain for `agflow start`.
 - **`AGFLOW_DEPENDENCIES_NEED_MERGE=1`.** Removes: checking that a dependency reached `main` before dependent work
   starts. Risk: if nothing marks accepted tasks merged, dependent tasks wait forever. Set it only together with an
   operator that merges.

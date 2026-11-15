@@ -227,6 +227,9 @@ describe('the project reset', () => {
       epoch: epoch + 1,
       archive,
     });
+    // The deadline's own event, as the deadline routes record it.
+    expect(events[1]).toMatchObject({ type: 'project.deadline_set', actor: 'user:alice' });
+    expect(JSON.parse(events[1]?.data as string)).toEqual({ deadlineAt: Date.parse('2026-11-16T15:00:00Z') });
     const created = await hub.call('POST', '/api/tasks', {
       user: 'alice',
       via: 'web',
@@ -251,6 +254,7 @@ describe('the project reset', () => {
     expect(reset.status).toBe(200);
     expect(reset.json).toMatchObject({ archive: null, epoch: 2, goalVersion: 1 });
     expect(hub.ctx.db.query('SELECT deadline_at FROM project').get()).toEqual({ deadline_at: null });
+    expect(hub.ctx.db.query("SELECT type FROM events WHERE type = 'project.deadline_set'").all()).toEqual([]);
     // What agflow start reads first: the branch the seed goes on.
     expect((await hub.call('GET', '/api/operator/project', op())).json).toMatchObject({
       project: { name: 'afisha', repo: 'https://github.com/acme/afisha', paused: false },
@@ -265,7 +269,12 @@ describe('the project reset', () => {
     expect((await hub.call('GET', '/api/operator/project', op(`${TOKEN}x`))).status).toBe(401);
     expect((await hub.call('POST', path, { ...op(`${TOKEN}x`), body: RESET })).status).toBe(401);
     expect((await hub.call('POST', path, { user: 'alice', via: 'cli', body: RESET })).status).toBe(401);
-    expect((await hub.call('POST', path, { ...op(), body: { ...RESET, deadline: '2026-11-16T18:00' } })).status).toBe(400);
+    // The deadline rule is the deadline routes' own (DeadlineInputSchema).
+    for (const deadline of ['2026-11-16T18:00', '2026-11-16T18:00:00']) {
+      const refused = await hub.call('POST', path, { ...op(), body: { ...RESET, deadline } });
+      expect(refused.status).toBe(400);
+      expect(refused.json.message).toContain('such as 2026-11-16T18:00:00+03:00');
+    }
     expect((await hub.call('POST', path, { ...op(), body: { ...RESET, name: 'two\nlines' } })).status).toBe(400);
     expect(count(hub.ctx, 'tasks')).toBe(1);
     expect(hubEpoch(hub.ctx)).toBe(1);

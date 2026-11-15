@@ -140,8 +140,9 @@ agflow start --spec brief.pdf --spec https://example.com/rules.html --repo acme/
 - **The hub.** The project is named `--name`, or after the repository. The hub writes an archive of its database to
   its backup folder, empties the old project (tasks, attempts, messages, events, the goal, approvals), keeps sign-ins,
   runners and vendor accounts, and sets the goal: implement SPEC.md, then keep improving the product until the
-  deadline. A standing rule names the stack. `--deadline` is an ISO 8601 time or a span such as `+36h`. The hub is the
-  one `agflow login` signed in to, or `--hub <url>`.
+  deadline. A standing rule names the stack. `--deadline` is an ISO 8601 date and time with a zone, such as
+  `2026-11-16T18:00:00+03:00`, or a span such as `+36h`. The hub is the one `agflow login` signed in to, or
+  `--hub <url>`.
 
 The operator token is read from `AGFLOW_OPERATOR_TOKEN`, then from the Keychain item `agflow-operator`, then from
 `~/.agflow/operator-token` (mode 600). Whoever holds it can replace the hub's project, so prefer the Keychain. A

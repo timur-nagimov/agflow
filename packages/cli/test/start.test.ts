@@ -201,12 +201,17 @@ describe('the arguments', () => {
     expect(repoOf('/srv/git/afisha.git')).toEqual({ url: '/srv/git/afisha.git', slug: null, name: 'afisha' });
   });
 
-  test('a deadline is an ISO 8601 time or a span from now', () => {
+  test('a deadline is an ISO 8601 date and time with a zone or a span from now, sent in UTC', () => {
     expect(parseDeadline(undefined, NOW)).toBeNull();
     expect(parseDeadline('+36h', NOW)).toBe('2026-11-16T21:00:00.000Z');
     expect(parseDeadline('+90m', NOW)).toBe('2026-11-15T10:30:00.000Z');
+    expect(parseDeadline('2026-11-16T18:00:00+03:00', NOW)).toBe('2026-11-16T15:00:00.000Z');
+    // The seconds may be left out; the zone may not, as the hub refuses a time without one.
     expect(parseDeadline('2026-11-16T18:00+03:00', NOW)).toBe('2026-11-16T15:00:00.000Z');
-    expect(() => parseDeadline('tomorrow', NOW)).toThrow(UsageError);
+    expect(parseDeadline('2026-11-16T15:00Z', NOW)).toBe('2026-11-16T15:00:00.000Z');
+    for (const given of ['2026-11-16T18:00', '2026-11-16T18:00:00', '2026-11-16', 'tomorrow']) {
+      expect(() => parseDeadline(given, NOW)).toThrow(UsageError);
+    }
   });
 });
 
