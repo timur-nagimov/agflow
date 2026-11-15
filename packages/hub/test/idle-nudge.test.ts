@@ -7,6 +7,7 @@ import { updateHubState } from '../src/hub-state';
 import { listMessages } from '../src/messages';
 import { setDeadline, setPaused } from '../src/project';
 import { upsertAccountQuota } from '../src/quota';
+import { resetProject } from '../src/reset';
 import { nudgeIdleLead, runTick, workerLoad } from '../src/scheduler';
 import { createTasks } from '../src/tasks';
 import { addAgent, addRunner, addRunnerLead, createTestContext, markHubAlive, newTask } from './helpers';
@@ -215,6 +216,19 @@ describe('the idle nudge', () => {
     nudgeIdleLead(ctx);
     clock.advance(ctx.config.idleNudgeMs);
     expect(nudgeIdleLead(ctx)?.body).toContain('59 min left.');
+  });
+
+  test("a project reset starts the idle clock afresh: the old project's idle time does not count", () => {
+    const { ctx, clock } = idleProject();
+    nudgeIdleLead(ctx);
+    clock.advance(ctx.config.idleNudgeMs);
+    const next = { name: 'next', repo: 'https://github.com/acme/next', deadlineAt: null, goal: 'Ship it.', rules: [] };
+    resetProject(ctx, next, 'user:alice');
+    // Even with a runner lead in the seat before any tick, the new project waits idleNudgeMs of its own.
+    addRunnerLead(ctx);
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    clock.advance(ctx.config.idleNudgeMs);
+    expect(nudgeIdleLead(ctx)).not.toBeNull();
   });
 
   test('the tick runs it in its reconcile step', () => {

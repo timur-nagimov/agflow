@@ -617,6 +617,11 @@ const NUDGE_PLAN =
  */
 const idleSince = new WeakMap<HubContext, number>();
 
+/** Forgets when the slots went idle, so a new project (a reset) starts the idle clock afresh. */
+export function forgetIdleSince(ctx: HubContext): void {
+  idleSince.delete(ctx);
+}
+
 /** When the newest idle nudge went to the lead, or null. */
 function lastNudgeAt(ctx: HubContext): number | null {
   const row = ctx.db
