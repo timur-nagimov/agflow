@@ -367,7 +367,7 @@ export const workerTools: ToolDef[] = [
   ),
   defineTool(
     'write_handoff',
-    'Leave a handoff note for whoever continues your task: what is done, what remains, commands run and results, decisions, failed approaches, the next step.',
+    'Leave a handoff note for whoever continues your task: the next step and what remains first, then what is done, commands run and results, decisions, failed approaches.',
     { task_id: TaskIdSchema, note: z.string().min(1).max(16_000) },
     async ({ task_id, note }, ctx) => {
       await asAgent(ctx).handoff(task_id, note);

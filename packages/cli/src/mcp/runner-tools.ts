@@ -283,7 +283,7 @@ const replaceAgent = defineTool(
  */
 const leadHandoff = defineTool(
   'write_handoff',
-  "Leave your lead handoff for the next lead: the plan's state, decisions, what you are waiting for, the next step. A lead holds no task, so task_id is refused: for a note on a task, use send_message to \"task:T-<n>\".",
+  "Leave your lead handoff for the next lead: the next step and what you are waiting for first, then the plan's state and decisions. A lead holds no task, so task_id is refused: for a note on a task, use send_message to \"task:T-<n>\".",
   { note: z.string().min(1).max(16_000), task_id: TaskIdSchema.optional() },
   async ({ note, task_id }, ctx) => {
     if (task_id) {

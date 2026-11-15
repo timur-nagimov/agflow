@@ -219,6 +219,13 @@ describe('the tool schemas as an agent reads them', () => {
   test('stop_agent has no hold: only a person holds a task', async () => {
     expect(Object.keys((await inputSchema(runnerLeadTools, 'stop_agent'))?.properties ?? {})).toEqual(['agent_id', 'reason']);
   });
+
+  test("write_handoff asks for the next step first, as a successor's brief quotes only the start of a note", () => {
+    const handoff = (tools: ToolDef[]) => tools.find((tool) => tool.name === 'write_handoff')?.description;
+    expect(handoff(runnerWorkerTools)).toStartWith('Leave a handoff note for whoever continues your task: the next step and what remains first,');
+    expect(handoff(workerTools)).toBe(handoff(runnerWorkerTools));
+    expect(handoff(runnerLeadTools)).toStartWith('Leave your lead handoff for the next lead: the next step and what you are waiting for first,');
+  });
 });
 
 describe("the unattended options' tools against the hub", () => {
