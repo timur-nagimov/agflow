@@ -43,7 +43,7 @@ import { ensureDemoCheck } from './demo-check';
 import { currentGoalVersion } from './goal';
 import { churnPaused, getHubState, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
-import { queueMerges } from './merges';
+import { failedMerges, queueMerges } from './merges';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
@@ -822,8 +822,16 @@ function held(ctx: HubContext, result: TickResult): TickResult {
   return result;
 }
 
-/** The task with its waitReason: why the last tick did not start it, while it is still ready; null otherwise. */
+/**
+ * The task with its waitReason: why the last tick did not start it, while it is still ready; while it is merging and
+ * its last merge failed, how many of its merges failed and the newest error (failedMerges); null otherwise.
+ */
 export function withWaitReason(ctx: HubContext, task: Task): Task {
+  if (task.status === 'merging') {
+    const failed = failedMerges(ctx, task.id);
+    const times = failed?.count === 1 ? 'time' : 'times';
+    return { ...task, waitReason: failed && `merge failed ${failed.count} ${times}: ${failed.lastError}` };
+  }
   const reason = task.status === 'ready' ? memories.get(ctx)?.waiting.get(task.id) : undefined;
   return { ...task, waitReason: reason ?? null };
 }

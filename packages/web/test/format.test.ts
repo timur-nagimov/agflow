@@ -38,6 +38,7 @@ import {
   leadBanner,
   leadSeatSummary,
   mergeEvents,
+  mergeFailing,
   NOTE_LABELS,
   NOTE_TONES,
   percent,
@@ -140,7 +141,7 @@ describe('blocked kinds', () => {
   test("the column hints mention people's take-overs and holds", () => {
     const hints = Object.fromEntries(COLUMNS.map((column) => [column.key, column.hint]));
     expect(hints.doing).toBe('Claimed by an agent, or taken over by a person.');
-    expect(hints.attention).toBe('Blocked, paused, rejected or stale.');
+    expect(hints.attention).toBe('Blocked, paused, rejected, stale, or failing to merge into main.');
   });
 });
 
@@ -158,6 +159,30 @@ describe('board columns', () => {
     expect(columnOf(task({ status: 'submitted' }))).toBe('review');
     expect(columnOf(task({ status: 'merged' }))).toBe('done');
     expect(columnOf(task({ status: 'cancelled' }))).toBe('closed');
+  });
+
+  test('a merging task whose merges keep failing needs attention, with the error and what to do', () => {
+    const merging = task({ status: 'merging', waitReason: null });
+    const failing = task({ status: 'merging', waitReason: 'merge failed 5 times: remote: GH006: Protected branch' });
+    expect([mergeFailing(merging), columnOf(merging), toneOf('merging', null, mergeFailing(merging))]).toEqual([
+      false,
+      'done',
+      'done',
+    ]);
+    expect([mergeFailing(failing), columnOf(failing), toneOf('merging', null, mergeFailing(failing))]).toEqual([
+      true,
+      'attention',
+      'trouble',
+    ]);
+    // A ready task's waitReason is why it has not started, not a failed merge.
+    expect(mergeFailing(task({ status: 'ready', waitReason: 'it waits for a worker slot' }))).toBe(false);
+    expect(groupTasks([merging, failing]).attention).toEqual([failing]);
+    expect(actionHint(failing)).toBe(
+      'agflow cannot merge this into main and keeps trying. Fix what the error says (a main that does not accept ' +
+        "direct pushes, or a runner's git credentials), or merge its branch yourself and mark it merged.",
+    );
+    expect(actionHint(merging)).toBe('agflow is merging this into main. Mark it merged only if you merged it yourself.');
+    expect(actionsFor(failing)).toEqual(['merged']);
   });
 
   test('open columns sort by priority (0 first), finished ones by recency', () => {
