@@ -16,6 +16,7 @@
 // are retried with a doubling delay until submitRetry has passed since the submission began (remote) or a stop or
 // hold for the attempt arrives (interrupted); a refusal that cannot clear (the attempt was fenced, ended or exited)
 // ends the retries at once. The outcome is the outbox event attempt.submitted, and the command result repeats it.
+import { posix } from 'node:path';
 import { type AttemptSpec, CHECK_TAIL_MAX, isTaskBranch, type RunnerEvent, type SubmissionCheck } from '@agflow/core';
 import { doublingDelay } from '../backoff';
 import { mergeBase } from '../git/protect';
@@ -155,12 +156,15 @@ export function checkOf(command: string, run: CheckRun): SubmissionCheck {
 
 /**
  * The check's own files among those a branch changes: .agflow/config.json, which names the check, and any file the
- * command names as a word, such as scripts/check.sh in `bash scripts/check.sh`. Files the check reaches only another
- * way, such as a script that check.sh calls or a test, are not among them.
+ * command names as a word, such as scripts/check.sh in `bash scripts/check.sh`, also when the word spells it
+ * ./scripts//check.sh, a/../scripts/check.sh or $PWD/scripts/check.sh (${PWD}/ and $(pwd)/ too). Files the check
+ * reaches only another way, such as a script that check.sh calls or a test, are not among them.
  */
 export function checkOwnFiles(command: string, changed: readonly string[]): string[] {
-  const words = new Set(command.split(/[\s;&|()<>'"`]+/).map((word) => word.replace(/^(?:\.\/)+/, '')));
-  return changed.filter((path) => path === PREP_CONFIG_PATH || words.has(path));
+  // $(pwd) becomes $PWD first, which the split keeps whole.
+  const words = command.replaceAll('$(pwd)', '$PWD').split(/[\s;&|()<>'"`]+/);
+  const paths = new Set(words.map((word) => posix.normalize(word.replace(/^\$(?:PWD|\{PWD\})\/+/, ''))));
+  return changed.filter((path) => path === PREP_CONFIG_PATH || paths.has(path));
 }
 
 /** check_failed's detail: how the check failed, what the agent does about it, and the end of its output. */
