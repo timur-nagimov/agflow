@@ -756,7 +756,7 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
       data: { feedback: clip(feedback, 500) },
     });
     const attempt = openRunnerAttempt(ctx, task);
-    if (attempt) return rejectRunnerAttempt(ctx, emit, rejected, attempt, { actor, feedback });
+    if (attempt) return rejectRunnerAttempt(ctx, emit, rejected, attempt, { actor, feedback, conflict: conflicted });
     const author = task.assignee
       ? (ctx.db.query('SELECT id, origin, last_seen_at FROM agents WHERE id = $id').get({ id: task.assignee }) as {
           id: string;

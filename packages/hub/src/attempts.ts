@@ -1002,16 +1002,19 @@ export function authorCanResume(ctx: HubContext, task: Task, attempt: Attempt): 
 }
 
 export interface RejectionInput {
-  /** Who rejected it: the lead or a person. */
+  /** Who rejected it: the lead or a person, or the hub when its merge conflicts. */
   actor: string;
   feedback: string;
+  /** A merge conflict (AGFLOW_AUTO_MERGE), which is no review: it neither needs nor uses a review round. */
+  conflict?: boolean | undefined;
 }
 
 /**
  * A rejection of a runner attempt's submission, in the transaction that moved the task to rejected with its feedback
  * (design 6.9). At ladder step 1 the task goes back to claimed for its author (current_attempt unchanged), the attempt
- * gets one more review round and resumes at a new fence with the quoted feedback as its prompt. Otherwise the attempt
- * ends rejected (review) and the ladder moves the task on. Returns the task afterwards.
+ * gets one more review round, unless a merge conflict sent it back, and resumes at a new fence with the quoted
+ * feedback as its prompt. Otherwise the attempt ends rejected (review) and the ladder moves the task on. Returns the
+ * task afterwards.
  */
 export function rejectRunnerAttempt(
   ctx: HubContext,
@@ -1020,11 +1023,12 @@ export function rejectRunnerAttempt(
   attempt: Attempt,
   input: RejectionInput,
 ): Task {
+  const reviewRounds = input.conflict ? 0 : attempt.reviewRounds;
   const step = ladderStep({
     counted: 0,
     ladderFloor: ladderFloor(ctx, task.id),
     maxAttempts: ctx.config.maxAttempts,
-    rejection: { authorCanResume: authorCanResume(ctx, task, attempt), reviewRounds: attempt.reviewRounds },
+    rejection: { authorCanResume: authorCanResume(ctx, task, attempt), reviewRounds },
   });
   if (step !== 1) {
     const ending = endAttempt(ctx, { attemptId: attempt.id, trigger: 'rejected', actor: input.actor });
@@ -1037,7 +1041,7 @@ export function rejectRunnerAttempt(
     data: { to: attempt.agentId, attemptId: attempt.id, ladderStep: 1 },
   });
   setAgentTask(ctx, attempt.agentId, task.id);
-  updateAttempt(ctx, attempt.id, { reviewRounds: attempt.reviewRounds + 1 });
+  if (!input.conflict) updateAttempt(ctx, attempt.id, { reviewRounds: attempt.reviewRounds + 1 });
   resumeAttempt(ctx, {
     attemptId: attempt.id,
     cause: 'review',
