@@ -288,10 +288,12 @@ after a change. The details are in the
   prepared and the project's check run there, as at a submission, apart from the merges, which never wait for it.
   Two changes that each pass alone can still break `main`, and then every later submission fails its check. So a
   failure creates one task at the top priority, "Fix main: the check fails after T-42", created by `system`, and tells
-  people and the lead; while `main` fails, an agent whose check fails hears which task fixes `main`, and keeps its own
-  change focused. A pass afterwards tells people and cancels that task if nobody has started it. The Load page shows
-  where the check of `main` passed, or since when it fails. Only runners of this release (runner protocol 4) check
-  `main`, so deploy the hub first, then update the runners: a hub older than its runners refuses them.
+  people and the lead (when the task limits refuse it, agflow creates it once they allow); while `main` fails, an
+  agent whose check fails hears which task fixes `main`, and keeps its own change focused. A pass afterwards tells
+  people and cancels that task if nobody has started it. The Load page shows where the check of `main` passed, or
+  since when it fails. Only runners of this release (runner protocol 4) that can prepare dependencies, as
+  `agflow runner status` shows, check `main`, so deploy the hub first, then update the runners: a hub older than its
+  runners refuses them.
 - **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
   accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
@@ -383,7 +385,7 @@ Before the run, check four things:
 - `hub.env` keeps one line per key: the deployment (`activate.sh`) refuses a file that sets a key twice, so change the
   line that is there, such as `AGFLOW_MAX_WORKERS=4`, rather than add another.
 - The hub and every runner run this release, the hub upgraded first: only runners of runner protocol 4 check `main`
-  after a merge.
+  after a merge, and only those whose `agflow runner status` shows the dependencies available.
 
 ### What agents fetched
 

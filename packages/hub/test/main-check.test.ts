@@ -5,13 +5,20 @@ import { type CommandRow, findCommand, pendingCommands, recordResult } from '../
 import { type HubContext, tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
-import { FIX_MAIN_TITLE, MAIN_CHECK_RETRY_MS, mainHealth, openFixTask, queueMainCheck } from '../src/main-check';
+import {
+  FIX_MAIN_TITLE,
+  MAIN_CHECK_RETRY_MS,
+  mainHealth,
+  openFixTask,
+  queueMainCheck,
+  retryFixTask,
+} from '../src/main-check';
 import { listMessages } from '../src/messages';
 import { setPaused } from '../src/project';
 import { runTick } from '../src/scheduler';
 import { requestSubmission } from '../src/submissions';
 import { getTask, move } from '../src/task-store';
-import { createTasks, markMerged } from '../src/tasks';
+import { cancelTask, createTasks, markMerged } from '../src/tasks';
 import { type RunnerAttempt, addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
 
 const sha = (char: string) => char.repeat(40);
@@ -21,7 +28,7 @@ const failed: SubmissionCheck = { status: 'failed', command, durationMs: 61_000,
 const passed: SubmissionCheck = { status: 'passed', command, durationMs: 58_000, tail: '12 pass' };
 
 /** A hub with auto merge, and a runner of this release, which speaks the protocol that knows check_main. */
-function setup(config: { autoAccept?: boolean } = {}) {
+function setup(config: { autoAccept?: boolean; maxTasksPerHour?: number } = {}) {
   const { ctx, clock } = createTestContext({ autoMerge: true, ...config });
   return { ctx, clock, runner: current(ctx) };
 }
@@ -117,6 +124,16 @@ describe("main's check, after each merge", () => {
     ctx.db.query('UPDATE runners SET protocol = 3 WHERE id = $id').run({ id: small });
     expect(queueMainCheck(ctx)).toBeNull();
     expect(findCommand(ctx, moved?.id as string)?.status).toBe('cancelled');
+  });
+
+  test('never goes to a runner that cannot prepare dependencies, whose answer would be none for good', () => {
+    const { ctx, runner } = setup();
+    const bare = current(ctx);
+    const noPrep = "json_set(info, '$.profile.dependencyPrep', json('false'))";
+    ctx.db.query(`UPDATE runners SET capacity = 8, info = ${noPrep} WHERE id = $id`).run({ id: bare });
+    merge(ctx, sha('a'));
+    expect(checks(ctx, bare)).toEqual([]);
+    expect(checks(ctx, runner).map((row) => row.command)).toEqual([{ kind: 'check_main', sha: sha('a') }]);
   });
 
   test('the tick checks main while the project is paused, and only with AGFLOW_AUTO_MERGE', () => {
@@ -237,6 +254,61 @@ describe('when main fails', () => {
     expect(told(ctx, 'humans')[0]?.body).toBe(
       `main's check passes again at ${short('c')}; it had failed since ${short('b')}.`,
     );
+  });
+
+  test('a fix task the task limits refused is created by the tick once they allow it, and only once', () => {
+    const { ctx, clock, runner } = setup({ maxTasksPerHour: 1 });
+    const first = merge(ctx, sha('a'));
+    answer(ctx, runner, failed);
+    const failure = `main's check \`${command}\` fails at ${short('a')}, after ${first} merged.`;
+    expect(openFixTask(ctx)).toBeNull();
+    expect(told(ctx, 'lead').map((message) => message.body)).toEqual([
+      `${failure} agflow could not create a task to fix it: creating 1 more task(s) would exceed the limit of 1 new ` +
+        'tasks per hour.',
+    ]);
+    expect(retryFixTask(ctx)).toBeNull();
+    clock.advance(60 * 60_000);
+    setPaused(ctx, true, 'user:alice');
+    markHubAlive(ctx);
+    runTick(ctx);
+    const fix = openFixTask(ctx);
+    if (fix === null) throw new Error('the tick created no fix task');
+    expect(fix.title).toBe(`${FIX_MAIN_TITLE} the check fails after ${first}`);
+    for (const to of ['humans', 'lead']) {
+      // The newest first.
+      expect(told(ctx, to).map((message) => [message.taskId, message.body])[0]).toEqual([
+        fix.id,
+        `${failure} agflow created ${fix.id} ("${fix.title}") to fix it, at the top priority. The lead should not ` +
+          'create another task for it.',
+      ]);
+    }
+    expect(retryFixTask(ctx)).toBeNull();
+    // One created since the failure, even if a person cancelled it, is not created again.
+    cancelTask(ctx, fix.id, 'alice mends main herself', 'user:alice');
+    clock.advance(60 * 60_000);
+    expect(retryFixTask(ctx)).toBeNull();
+    expect(createdBySystem(ctx)).toHaveLength(1);
+  });
+
+  test('a failure after a pass gets a fix task of its own, while an agent still works on the one from before', () => {
+    const { ctx, runner } = setup();
+    merge(ctx, sha('a'));
+    answer(ctx, runner, failed);
+    const old = openFixTask(ctx) as NonNullable<ReturnType<typeof openFixTask>>;
+    tx(ctx, (emit) => move(ctx, emit, old, 'claimed', 'system'));
+    merge(ctx, sha('b'), 'Print the config');
+    answer(ctx, runner, passed);
+    // It fixed a failure that is gone.
+    expect(openFixTask(ctx)).toBeNull();
+    const third = merge(ctx, sha('c'), 'Lint the config');
+    answer(ctx, runner, { ...failed, tail: 'FAIL src/lint.test.ts' });
+    const fix = openFixTask(ctx);
+    if (fix === null) throw new Error('the later failure got no fix task');
+    expect(fix.title).toBe(`${FIX_MAIN_TITLE} the check fails after ${third}`);
+    expect(fix.objective).toEndWith('> FAIL src/lint.test.ts');
+    expect(getTask(ctx, old.id).status).toBe('claimed');
+    expect(told(ctx, 'lead').map((message) => message.taskId)).toEqual([fix.id, old.id]);
+    expect(mainHealth(ctx)).toEqual({ status: 'failed', since: sha('c'), fixTask: fix.id });
   });
 });
 

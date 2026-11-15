@@ -100,11 +100,20 @@ function checked(ctx: HubContext, sha: string): boolean {
   );
 }
 
-/** The runner that checks main: online, its git ready, speaking protocol 4, with the most free slots. */
+/**
+ * The runner that checks main: online, its git ready, speaking protocol 4, able to prepare dependencies (one with no
+ * sandbox for them answers none, which is final for the sha), with the most free slots.
+ */
 function checkRunner(ctx: HubContext): string | null {
-  const able = findRunnerRows(ctx).filter(
-    (row) => row.state === 'online' && row.protocol >= COMMAND_MIN_PROTOCOL.check_main && runnerInfo(row).git.ready,
-  );
+  const able = findRunnerRows(ctx).filter((row) => {
+    const info = runnerInfo(row);
+    return (
+      row.state === 'online' &&
+      row.protocol >= COMMAND_MIN_PROTOCOL.check_main &&
+      info.git.ready &&
+      info.profile.dependencyPrep
+    );
+  });
   const free = (row: (typeof able)[number]) => row.capacity - row.active_attempts;
   return able.sort((a, b) => free(b) - free(a))[0]?.id ?? null;
 }
@@ -134,20 +143,33 @@ export function queueMainCheck(ctx: HubContext): CommandRow | null {
   });
 }
 
-/** The fix-main tasks, newest first, found by the title in their task.created event, which update_task leaves. */
-function fixTasks(ctx: HubContext): Task[] {
+/**
+ * The fix-main tasks created after the event of that id, newest first, found by the title in their task.created event,
+ * which update_task leaves.
+ */
+function fixTasks(ctx: HubContext, after: number): Task[] {
   const rows = ctx.db
     .query(
       `SELECT subject AS id FROM events
-       WHERE type = 'task.created' AND actor = 'system' AND json_extract(data, '$.title') LIKE $title ORDER BY id DESC`,
+       WHERE type = 'task.created' AND actor = 'system' AND json_extract(data, '$.title') LIKE $title AND id > $after
+       ORDER BY id DESC`,
     )
-    .all({ title: `${FIX_MAIN_TITLE}%` }) as { id: string }[];
+    .all({ title: `${FIX_MAIN_TITLE}%`, after }) as { id: string }[];
   return rows.flatMap((row) => findTask(ctx, row.id) ?? []);
 }
 
-/** The fix-main task whose work is not in main yet, if any: neither merged, cancelled nor failed. */
+/**
+ * The fix-main task of main's failure now, if any: created since main's check last passed, and neither merged,
+ * cancelled nor failed. One created before that pass fixed an older failure, even while an agent still works on it.
+ */
 export function openFixTask(ctx: HubContext): Task | null {
-  return fixTasks(ctx).find((task) => !['merged', 'cancelled', 'failed'].includes(task.status)) ?? null;
+  const passed = ctx.db
+    .query(
+      `SELECT COALESCE(MAX(id), 0) AS id FROM events
+       WHERE type = 'main.checked' AND json_extract(data, '$.status') = 'passed'`,
+    )
+    .get() as { id: number };
+  return fixTasks(ctx, passed.id).find((task) => !['merged', 'cancelled', 'failed'].includes(task.status)) ?? null;
 }
 
 /**
@@ -256,11 +278,16 @@ export function fixMainContract(input: {
 /**
  * main's check failed at the sha agflow merged last: unless a fix task is open, one is created, at the top priority,
  * and people and the lead hear of it once, so the lead creates no other. A failure at an older sha waits for the check
- * of the newest, which the next merge's work may have fixed.
+ * of the newest, which the next merge's work may have fixed. Gives the task it created, or null.
  */
-function mainFailed(ctx: HubContext, emit: Emit, sha: string, check: SubmissionCheck): void {
+function mainFailed(
+  ctx: HubContext,
+  emit: Emit,
+  sha: string,
+  check: Pick<SubmissionCheck, 'command' | 'tail'>,
+): Task | null {
   const main = mergedMain(ctx);
-  if (main?.sha !== sha || openFixTask(ctx) !== null) return;
+  if (main?.sha !== sha || openFixTask(ctx) !== null) return null;
   const branch = ctx.config.mainBranch;
   const merged = mergedSincePass(ctx, sha);
   const refusal = creationGuard(ctx, 1);
@@ -273,15 +300,35 @@ function mainFailed(ctx: HubContext, emit: Emit, sha: string, check: SubmissionC
       'create another task for it.'
     : `${failed} agflow could not create a task to fix it: ${refusal}.`;
   for (const to of ['humans', 'lead']) insertMessage(ctx, emit, { from: 'system', to, taskId: task?.id, body });
+  return task ?? null;
 }
 
 /**
- * main's check passes again: people hear of it, and the fix task is cancelled while it was never claimed: ready or
- * blocked, with no attempt.
+ * The fix task the task limits kept mainFailed from creating, created once they allow it: main's check failed at the
+ * sha agflow merged last, and no fix task was created since. People and the lead hear of it as from mainFailed, so the
+ * lead, told that agflow could not create one, creates no other. Called by every tick; gives the task, or null.
  */
-function mainPassesAgain(ctx: HubContext, emit: Emit, sha: string, since: string): void {
+export function retryFixTask(ctx: HubContext): Task | null {
+  const main = ctx.config.autoMerge ? mergedMain(ctx) : null;
+  if (main === null) return null;
+  const newest = ctx.db
+    .query(
+      `SELECT id, json_extract(data, '$.status') AS status, json_extract(data, '$.command') AS command,
+         json_extract(data, '$.tail') AS tail
+       FROM events WHERE type = 'main.checked' AND json_extract(data, '$.sha') = $sha ORDER BY id DESC LIMIT 1`,
+    )
+    .get({ sha: main.sha }) as { id: number; status: string; command: string | null; tail: string } | null;
+  if (newest?.status !== 'failed' || fixTasks(ctx, newest.id).length > 0 || creationGuard(ctx, 1) !== null) return null;
+  return tx(ctx, (emit) => mainFailed(ctx, emit, main.sha, newest));
+}
+
+/**
+ * main's check passes again: people hear of it, and the failure's fix task, found before the pass was recorded (after
+ * it, openFixTask finds none), is cancelled while it was never claimed: ready or blocked, with no attempt.
+ */
+function mainPassesAgain(ctx: HubContext, emit: Emit, sha: string, since: string, fixTask: string | null): void {
   const main = ctx.config.mainBranch;
-  const fix = openFixTask(ctx);
+  const fix = fixTask === null ? null : findTask(ctx, fixTask);
   const unclaimed =
     fix !== null && fix.currentAttempt === null && (fix.status === 'ready' || fix.status === 'blocked');
   if (unclaimed) cancelTask(ctx, fix.id, `${main}'s check passes again at ${short(sha)}: no fix is needed.`, 'system');
@@ -319,7 +366,9 @@ function onMainCheckResult(ctx: HubContext, emit: Emit, command: CommandRow, res
     },
   });
   if (check.status === 'failed') mainFailed(ctx, emit, sha, check);
-  else if (check.status === 'passed' && before?.status === 'failed') mainPassesAgain(ctx, emit, sha, before.since);
+  else if (check.status === 'passed' && before?.status === 'failed') {
+    mainPassesAgain(ctx, emit, sha, before.since, before.fixTask);
+  }
 }
 
 RESULT_HANDLERS.check_main = onMainCheckResult;
