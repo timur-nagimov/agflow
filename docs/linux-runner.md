@@ -22,9 +22,12 @@ them: `--folder-id`, `--zone`, `--subnet-id`, plus `--name` (the VM and the runn
 The VM costs money until you delete it. Its cloud-init:
 
 - creates the user with your SSH key and passwordless sudo, for upkeep;
-- installs git, bubblewrap, socat, ripgrep, lsof and curl;
+- installs git, bubblewrap, socat, ripgrep, lsof, curl, unzip and build-essential;
 - sets `kernel.apparmor_restrict_unprivileged_userns = 0` in `/etc/sysctl.d`, because Ubuntu 24.04 otherwise keeps
   bubblewrap, and so the Claude and Codex sandboxes, from starting;
+- installs uv into `/usr/local/bin` and Bun 1.3.11 into `/usr/local`, so both are on every login shell's PATH: the
+  scripts that `agflow start` seeds for a python or typescript project run them, in dependency preparation and in the
+  check of each submission;
 - downloads the released agflow binary to `/usr/local/bin/agflow`;
 - turns on lingering for the user, so the runner runs with nobody logged in and starts at boot.
 

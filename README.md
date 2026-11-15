@@ -152,6 +152,11 @@ agflow start --spec brief.pdf --spec https://example.com/rules.html --repo acme/
   gets scripts that say what to fill in. The seed goes on the hub's main branch (`AGFLOW_MAIN_BRANCH`, `main` by
   default), the one its attempts start from: the first commit of an empty repository, or a new commit on top of that
   branch, which starts from the default branch where the repository has none. Nothing is force-pushed.
+- **The stack's tools.** Dependency preparation and the check run the scripts with the PATH that `agflow runner setup`
+  recorded from the runner's login shell, so every runner of the project needs the `--stack` tools there: uv for
+  python; Bun for typescript, and npm too once the project has a `package-lock.json`. On a runner set up before they
+  were installed, stop the runner and rerun `agflow runner setup`, which records the PATH again. The Linux VM gets uv
+  and Bun from its cloud-init ([A Linux runner](docs/linux-runner.md#create-the-vm)).
 - **`--create`** makes the repository with `gh repo create --private`, and each `--collaborator <login>` is invited
   with write access. Both need `--repo owner/name`. A colleague accepts the invitation at
   `https://github.com/<owner>/<name>/invitations`; until then their runner cannot fetch the repository.

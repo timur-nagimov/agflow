@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Creates a Yandex Cloud VM for a Linux agflow runner (docs/linux-runner.md): Ubuntu 24.04, 16 vCPU, 32 GB RAM and a
-# 200 GB SSD. cloud-init installs git, bubblewrap, socat, ripgrep, lsof and curl, lets bubblewrap build its sandboxes
-# and puts the released agflow binary in /usr/local/bin. It prints the steps that need a person.
+# 200 GB SSD. cloud-init installs git, bubblewrap, socat, ripgrep, lsof, curl, unzip and build-essential, then uv and
+# Bun, the tools of the seeded python and typescript stacks; it lets bubblewrap build its sandboxes and puts the
+# released agflow binary in /usr/local/bin. It prints the steps that need a person.
 # Needs an authenticated yc CLI and jq. It creates a billable VM; it is not idempotent.
 set -euo pipefail
 
@@ -79,6 +80,8 @@ packages:
   - ripgrep
   - lsof
   - curl
+  - unzip
+  - build-essential
 users:
   - name: $user
     shell: /bin/bash
@@ -96,6 +99,10 @@ write_files:
       kernel.apparmor_restrict_unprivileged_userns = 0
 runcmd:
   - [sysctl, --system]
+  # The seeded stacks' tools, on every login shell's PATH: uv (python) and Bun (typescript), each on its own line so
+  # that one failing leaves the others. runcmd may run with no HOME, which both installers read.
+  - [bash, -c, 'set -o pipefail; curl --fail --silent --show-error --location --retry 3 https://astral.sh/uv/install.sh | env HOME=/root UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh']
+  - [bash, -c, 'set -o pipefail; curl --fail --silent --show-error --location --retry 3 https://bun.sh/install | env HOME=/root BUN_INSTALL=/usr/local bash -s bun-v1.3.11']
   - [curl, --fail, --location, --retry, '3', --output, /usr/local/bin/agflow, 'https://github.com/timur-nagimov/agflow/releases/latest/download/agflow-linux-x64']
   - [chmod, '0755', /usr/local/bin/agflow]
   # The runner's systemd user unit then runs with nobody logged in, and starts at boot.
