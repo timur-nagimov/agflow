@@ -33,10 +33,13 @@ export const REVIEW_TITLE = 'Review of';
 /** Who applies a reviewer's verdict. */
 export const REVIEW = 'hub:review';
 
-/** A review with no attempt this long after it was created lets the hub accept as before. */
+/**
+ * A review with no attempt this long after it was created, or after the project last ran again (lastResumed), lets
+ * the hub accept its task as before.
+ */
 export const REVIEW_START_MS = 5 * 60_000;
 
-/** A review with no verdict this long after it was created lets the hub accept as before. */
+/** The same for a review with no verdict this long after it was created, or after the project last ran again. */
 export const REVIEW_FINISH_MS = 20 * 60_000;
 
 /** core's limit on a title. */
@@ -429,11 +432,25 @@ function hasVerdict(ctx: HubContext, reviewId: string): boolean {
   return row !== null;
 }
 
-/** Why a review its task still waits for will give no verdict, or null while it may. */
-function unfinished(ctx: HubContext, review: Review, now: number): string | null {
+/**
+ * When the project last ran again: its newest resume after a pause, or the end of the hub's recovery window after
+ * downtime; 0 when neither happened. No review can start during a pause or downtime.
+ */
+function lastResumed(ctx: HubContext): number {
+  const row = ctx.db
+    .query("SELECT MAX(ts) AS ts FROM events WHERE type IN ('project.resumed', 'system.recovery_ended')")
+    .get() as { ts: number | null };
+  return row.ts ?? 0;
+}
+
+/**
+ * Why a review its task still waits for will give no verdict, or null while it may. Its times count from its creation,
+ * or from when the project last ran again if that came later, so that a pause or downtime uses none of them up.
+ */
+function unfinished(ctx: HubContext, review: Review, now: number, resumed: number): string | null {
   if (isClosed(review.status)) return hasVerdict(ctx, review.id) ? null : 'it was closed without a verdict';
   if (review.status === 'blocked') return 'it is blocked';
-  const age = now - review.createdAt;
+  const age = now - Math.max(review.createdAt, resumed);
   if (!review.started && age >= REVIEW_START_MS) return `it did not start within ${REVIEW_START_MS / 60_000} minutes`;
   if (age >= REVIEW_FINISH_MS) return `it gave no verdict within ${REVIEW_FINISH_MS / 60_000} minutes`;
   return null;
@@ -444,16 +461,18 @@ function unfinished(ctx: HubContext, review: Review, now: number): string | null
  * waits on the submission it reviews (the lead or a person decided, the task was submitted again or cancelled) is
  * cancelled. While the task waits, a review closed without a verdict, a blocked one, one with no attempt
  * REVIEW_START_MS after it was created and one REVIEW_FINISH_MS old let the hub accept the task as before, and an
- * open one is cancelled. Each review in its own transaction. Returns how many it settled.
+ * open one is cancelled; both times count from when the project last ran again instead, if that came later
+ * (lastResumed). Each review in its own transaction. Returns how many it settled.
  */
 export function expireReviews(ctx: HubContext): number {
   const waiting = waitingSubmissions(ctx);
   const now = ctx.now();
+  const resumed = lastResumed(ctx);
   let settled = 0;
   for (const review of reviews(ctx)) {
     const open = !isClosed(review.status);
     const waits = waiting.get(review.taskId) === review.submissionId;
-    const why = waits ? unfinished(ctx, review, now) : null;
+    const why = waits ? unfinished(ctx, review, now, resumed) : null;
     if (waits ? why === null : !open) continue;
     try {
       tx(ctx, () => {

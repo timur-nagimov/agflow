@@ -19,6 +19,7 @@ import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
 import { listMessages } from '../src/messages';
 import { setPaused } from '../src/project';
+import { checkClock } from '../src/recovery';
 import {
   REVIEW_FINISH_MS,
   REVIEW_START_MS,
@@ -449,20 +450,48 @@ describe('AGFLOW_REVIEW: a review that does not finish', () => {
     expect(expireReviews(hub.ctx)).toBe(0);
   });
 
-  test('the tick does nothing of it while the project is paused, and settles it once the project runs', () => {
+  test('a pause stops its clock: the tick leaves it alone, and its times count from the resume', () => {
     const hub = createTestHub({ autoAccept: true, review: true });
-    const { held, review } = reviewed(hub);
     setPaused(hub.ctx, true, 'user:alice');
+    // Running agents go on submitting while the project is paused, but no review can start.
+    const { held, review } = reviewed(hub);
     hub.clock.advance(REVIEW_FINISH_MS + 60_000);
     markHubAlive(hub.ctx);
     runTick(hub.ctx);
     expect(getTask(hub.ctx, held.task.id).status).toBe('submitted');
     expect(getTask(hub.ctx, review.id).status).toBe('ready');
     setPaused(hub.ctx, false, 'user:alice');
+    hub.clock.advance(REVIEW_START_MS - 1);
+    expect(expireReviews(hub.ctx)).toBe(0);
+    // The first tick after the resume starts the review on the free runner, and accepts nothing.
     markHubAlive(hub.ctx);
     runTick(hub.ctx);
+    expect(getTask(hub.ctx, held.task.id).status).toBe('submitted');
+    expect(getTask(hub.ctx, review.id)).toMatchObject({ status: 'claimed', currentAttempt: `${review.id}-a1` });
+    hub.clock.advance(REVIEW_FINISH_MS - REVIEW_START_MS);
+    expect(expireReviews(hub.ctx)).toBe(0);
+    hub.clock.advance(1);
+    expect(expireReviews(hub.ctx)).toBe(1);
+    expect(accepted(hub, held.task.id).map((event) => event.actor)).toEqual(['hub:auto-accept']);
+  });
+
+  test("the hub's downtime stops its clock too: its times count from the end of the recovery window", () => {
+    const hub = createTestHub({ autoAccept: true, review: true });
+    const { held, review } = reviewed(hub);
+    markHubAlive(hub.ctx);
+    // The hub was down for half an hour: its next clock check opens the recovery window, which nothing runs in.
+    hub.clock.advance(30 * 60_000);
+    expect(checkClock(hub.ctx).downtime).toBe(true);
+    hub.clock.advance(hub.ctx.config.recoveryMs);
+    markHubAlive(hub.ctx);
+    expect(checkClock(hub.ctx).recoveryEnded).toBe(true);
+    expect(expireReviews(hub.ctx)).toBe(0);
+    hub.clock.advance(REVIEW_START_MS - 1);
+    expect(expireReviews(hub.ctx)).toBe(0);
+    hub.clock.advance(1);
+    expect(expireReviews(hub.ctx)).toBe(1);
     expect(getTask(hub.ctx, held.task.id).status).toBe('accepted');
-    expect(getTask(hub.ctx, review.id).status).toBe('cancelled');
+    expect(taskEvents(hub, review.id).at(-1)?.data.reason).toContain('did not start within 5 minutes');
   });
 });
 
