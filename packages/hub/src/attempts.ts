@@ -113,6 +113,7 @@ import {
   move,
   overlappingPathHolder,
   setAgentTask,
+  strandedDependents,
   writeTask,
 } from './task-store';
 import { refreshLeadSubmission } from './lead-review';
@@ -883,9 +884,9 @@ function blockForReplan(ctx: HubContext, emit: Emit, task: Task, attempt: Attemp
  * The retry ladder after an ending (design 6.9), in the ending's transaction. Call it once the ending moved the task
  * to ready, or once a rejection without a resume marked it rejected. A counted failure takes its step: 2 and 3 leave
  * the task ready (ladderRequirement then steers the vendor), 4 blocks it for a re-plan and tells the lead, 5 fails it
- * and tells people. An infra ending delays the task's next dispatch by the infra backoff, and the third with one
- * failure signature since the last re-plan blocks it for a re-plan and tells the lead and people. A rejected task
- * that stays on the ladder goes back to ready.
+ * and tells people and the lead, with the open tasks that depend on it. An infra ending delays the task's next
+ * dispatch by the infra backoff, and the third with one failure signature since the last re-plan blocks it for a
+ * re-plan and tells the lead and people. A rejected task that stays on the ladder goes back to ready.
  */
 export function applyLadder(ctx: HubContext, emit: Emit, input: LadderInput): LadderOutcome {
   const { attempt, trigger } = input;
@@ -921,14 +922,13 @@ export function applyLadder(ctx: HubContext, emit: Emit, input: LadderInput): La
       });
     } else if (step === 5) {
       task = move(ctx, emit, task, 'failed', 'system', { data: { attemptId: attempt.id, ladderStep: 5 } });
-      insertMessage(ctx, emit, {
-        from: 'system',
-        to: 'humans',
-        taskId: task.id,
-        body:
-          `${named(task)} failed: ${counted} more of its attempts failed after its re-plan, so agflow will not try it ` +
-          'again. Look at its attempts and decide what to do with the work.',
-      });
+      const body =
+        `${named(task)} failed: ${counted} more of its attempts failed after its re-plan, so agflow will not try it ` +
+        'again. Look at its attempts and decide what to do with the work.';
+      insertMessage(ctx, emit, { from: 'system', to: 'humans', taskId: task.id, body });
+      // A failed task is never done, so the lead hears of it too, with the open tasks that depend on it.
+      const stranded = strandedDependents(ctx, task.id);
+      insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: task.id, body: [body, ...stranded].join('\n') });
     }
   } else if (attempt.failureSignature !== null) {
     const signature = attempt.failureSignature;

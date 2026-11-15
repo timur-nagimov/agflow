@@ -6,6 +6,7 @@ import {
   type RunnerEventData,
   type StallLimits,
   type StopCause,
+  type Vendor,
   type VendorOutcomeKind,
   formatFence,
   judgeStall,
@@ -208,6 +209,12 @@ function outcomeReason(kind: VendorOutcomeKind, detail: string | null): string {
   return detail === null ? text[kind] : `${text[kind]}: ${clip(detail, 500)}`;
 }
 
+/** What the lead may do about a worker's task that the vendor refused under its usage policy. */
+const policySteps = (vendor: Vendor): string =>
+  `The vendor was ${vendor}. Reword the task with update_task, or set its vendorHint to ` +
+  `${vendor === 'claude' ? 'codex' : 'claude'} there, then unblock it with unblock_task; or cancel it with ` +
+  'cancel_task.';
+
 /** What people are told of a policy refusal, from what the stop actually did to the attempt and its task. */
 function policyNotice(ctx: HubContext, attempt: Attempt, reason: string): string {
   if (attempt.taskId === null) return `The lead attempt ${attempt.id} is stopping: ${reason}.`;
@@ -228,7 +235,8 @@ function policyNotice(ctx: HubContext, attempt: Attempt, reason: string): string
 /**
  * attempt.vendor_outcome (design 6.4): auth stops the attempt crashed (infra, no handoff) and marks the vendor not
  * ready on the runner until a preflight passes; context replaces it with a handoff; policy blocks the task as policy
- * at once and tells people; denials and session_budget stop it as stall_budget. A stop already recorded follows the
+ * at once and tells people, and for a worker the lead too, with the vendor and what it may do (a lead's own refusal
+ * ends that lead); denials and session_budget stop it as stall_budget. A stop already recorded follows the
  * second-request rules (requestStop). While a submission is pending its outcome decides (design 6.13): the stop is
  * recorded deferred, so it neither interrupts the push's retries nor replaces a stop already held back for it. An
  * attempt with no process is left alone: a holding worker's session and clone are its author's for a review return,
@@ -254,5 +262,9 @@ export function onVendorOutcome(
   if (data.kind === 'policy' && (result.outcome === 'requested' || result.outcome === 'replaced')) {
     const body = policyNotice(ctx, attempt, reason);
     insertMessage(ctx, emit, { from: 'system', to: 'humans', taskId: attempt.taskId, body });
+    if (attempt.taskId !== null) {
+      const lead = `${body}\n${policySteps(attempt.vendor)}`;
+      insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: attempt.taskId, body: lead });
+    }
   }
 }

@@ -257,7 +257,7 @@ describe('vendor outcomes', () => {
     expect(eventsOf(ctx, 'agent.replaced')).toHaveLength(1);
   });
 
-  test('policy blocks the task as policy at once and tells people', () => {
+  test('policy blocks the task as policy at once and tells people, and the lead with the vendor and what to do', () => {
     const { ctx, held } = setup();
     report(ctx, held, 'policy', 'The request was refused under the usage policy.');
     expect(getAttempt(ctx, held.attempt.id).stopRequested).toMatchObject({ cause: 'policy', handoff: false });
@@ -265,6 +265,23 @@ describe('vendor outcomes', () => {
     const told = listMessages(ctx, { target: 'humans' });
     expect(told.map((message) => [message.from, message.taskId])).toEqual([['system', held.task.id]]);
     expect(told[0]?.body).toContain('The request was refused under the usage policy.');
+    const toLead = listMessages(ctx, { target: 'lead' });
+    expect(toLead.map((message) => [message.from, message.taskId])).toEqual([['system', held.task.id]]);
+    expect(toLead[0]?.body).toBe(
+      `${told[0]?.body}\nThe vendor was claude. Reword the task with update_task, or set its vendorHint to codex ` +
+        'there, then unblock it with unblock_task; or cancel it with cancel_task.',
+    );
+  });
+
+  test("a lead's own policy refusal tells people only: it ends that lead", () => {
+    const { ctx } = createTestContext();
+    const lead = addRunnerLead(ctx);
+    tx(ctx, (emit) => onVendorOutcome(ctx, emit, getAttempt(ctx, lead.attempt.id), { kind: 'policy', detail: null }));
+    expect(getAttempt(ctx, lead.attempt.id).stopRequested?.cause).toBe('policy');
+    expect(listMessages(ctx, { target: 'humans' }).map((message) => message.body)).toEqual([
+      `The lead attempt ${lead.attempt.id} is stopping: the vendor refused the work under its usage policy.`,
+    ]);
+    expect(listMessages(ctx, { target: 'lead' })).toEqual([]);
   });
 
   test('denials and session_budget stop it as stall_budget', () => {

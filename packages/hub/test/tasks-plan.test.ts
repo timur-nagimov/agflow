@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test';
+import { tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { updateGoal } from '../src/goal';
 import { listMessages } from '../src/messages';
+import { dependencyReason, move } from '../src/task-store';
 import {
   acceptTask,
   cancelTask,
@@ -182,6 +184,18 @@ describe('updating and cancelling', () => {
         'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
       ].join('\n'),
     );
+  });
+
+  test('a failed dependency asks for a decision as a cancelled one does', () => {
+    const { ctx } = createTestContext();
+    const [a, b, c] = createTasks(ctx, [newTask({ title: 'A' }), newTask({ title: 'B' }), newTask({ title: 'C' })], 'user:alice');
+    tx(ctx, (emit) => move(ctx, emit, getTask(ctx, b.id), 'failed', 'system'));
+    expect(dependencyReason(ctx, [b.id, c.id])).toBe(`${b.id} failed; amend or cancel this task`);
+    cancelTask(ctx, a.id, 'Not needed.', 'user:alice');
+    expect(dependencyReason(ctx, [a.id, b.id, c.id])).toBe(
+      `${a.id} was cancelled and ${b.id} failed; amend or cancel this task`,
+    );
+    expect(dependencyReason(ctx, [c.id])).toBe(`waiting on ${c.id}`);
   });
 
   test('a task whose dependency was cancelled stays blocked until it is amended', () => {

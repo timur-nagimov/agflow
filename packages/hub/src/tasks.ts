@@ -52,11 +52,11 @@ import {
   findTask,
   getTask,
   listTaskNotes,
-  listTasks,
   move,
   overlappingPathHolder,
   rowToTask,
   setAgentTask,
+  strandedDependents,
   unmetDependencies,
   waitingReason,
   writeTask,
@@ -369,24 +369,14 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
       });
     }
     // A cancelled task is never done, so the open tasks that depend on it need the lead's decision.
-    const dependents = listTasks(ctx).filter((other) => !isClosed(other.status) && other.dependsOn.includes(id));
-    for (const dependent of dependents) {
-      if (dependent.status === 'blocked' && dependent.blockedKind === 'deps') {
-        writeTask(ctx, dependent.id, { blockedReason: dependencyReason(ctx, unmetDependencies(ctx, dependent.dependsOn)) });
-      }
-    }
-    if (dependents.length > 0) {
+    const stranded = strandedDependents(ctx, id);
+    if (stranded.length > 0) {
+      const cancelled = `${id} ("${clip(task.title, 120)}") was cancelled by ${actor}.`;
       insertMessage(ctx, emit, {
         from: 'system',
         to: 'lead',
         taskId: id,
-        body: [
-          `${id} ("${clip(task.title, 120)}") was cancelled by ${actor}.`,
-          wrote(actor, clip(reason, 500)),
-          `${dependents.length === 1 ? 'This open task depends' : 'These open tasks depend'} on it:`,
-          ...dependents.map((dependent) => `- ${dependent.id} ("${clip(dependent.title, 80)}") [${dependent.status}]`),
-          'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
-        ].join('\n'),
+        body: [cancelled, wrote(actor, clip(reason, 500)), ...stranded].join('\n'),
       });
     }
     return getTask(ctx, id);
