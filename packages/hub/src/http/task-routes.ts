@@ -43,7 +43,8 @@ import type { App } from './app';
 import { actor, agentOf, holderOf, human, intParam, leadBody, principal, readBody } from './util';
 
 export function mountTaskRoutes(app: App, ctx: HubContext): void {
-  // Each task says why the scheduler's last tick did not start it, while it is ready (waitReason).
+  // Each task says why the scheduler's last tick did not start it, while it is ready, or why agflow has not merged it
+  // yet, while it is merging and its merges failed (waitReason).
   app.get('/api/tasks', (c) => {
     principal(c);
     const status = c.req.query('status');

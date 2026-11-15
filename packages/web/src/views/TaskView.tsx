@@ -60,6 +60,7 @@ import {
   concernsTask,
   duration,
   evidenceText,
+  mergeFailing,
   threadTarget,
   toneOf,
   who,
@@ -94,7 +95,7 @@ export function TaskView({ id }: { id: string }) {
       <header className="task-head">
         <div className="task-head-top">
           <span className="task-id big">{task.id}</span>
-          <StatusChip status={task.status} blockedKind={task.blockedKind} />
+          <StatusChip status={task.status} blockedKind={task.blockedKind} mergeFailed={mergeFailing(task)} />
           {liveChatOnly(task) ? <LiveChatOnly task={task} /> : null}
         </div>
         <h1 className="page-title">{task.title}</h1>
@@ -337,6 +338,14 @@ function Attention({ task }: { task: Task }) {
             <Linked text={task.blockedReason} />
           </p>
         ) : null}
+      </div>
+    );
+  }
+  if (mergeFailing(task)) {
+    return (
+      <div className="card attention tone-trouble">
+        <h2>agflow cannot merge this into main</h2>
+        <p className="pre">{task.waitReason}</p>
       </div>
     );
   }

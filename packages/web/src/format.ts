@@ -70,7 +70,16 @@ export function statusLabel(status: TaskStatus, blockedKind: BlockedKind | null 
   return status === 'blocked' && blockedKind ? BLOCKED_LABELS[blockedKind] : STATUS_LABELS[status];
 }
 
-export function toneOf(status: TaskStatus, blockedKind: BlockedKind | null = null): Tone {
+/**
+ * Whether agflow's merges of this merging task into main keep failing (AGFLOW_AUTO_MERGE): the hub then gives it a
+ * waitReason, the newest error. It needs a person, so it shows under Needs attention.
+ */
+export function mergeFailing(task: Pick<Task, 'status' | 'waitReason'>): boolean {
+  return task.status === 'merging' && Boolean(task.waitReason);
+}
+
+/** A status's tone; a merging task whose merges keep failing (mergeFailing) is in trouble. */
+export function toneOf(status: TaskStatus, blockedKind: BlockedKind | null = null, mergeFailed = false): Tone {
   switch (status) {
     case 'draft':
     case 'ready':
@@ -82,8 +91,9 @@ export function toneOf(status: TaskStatus, blockedKind: BlockedKind | null = nul
     case 'checking':
     case 'reviewing':
       return 'review';
-    case 'accepted':
     case 'merging':
+      return mergeFailed ? 'trouble' : 'done';
+    case 'accepted':
     case 'merged':
       return 'done';
     case 'blocked':
@@ -104,12 +114,17 @@ export const COLUMNS: { key: ColumnKey; label: string; tone: Tone; hint: string 
   { key: 'todo', label: 'To do', tone: 'wait', hint: 'Ready to claim, or waiting on other tasks.' },
   { key: 'doing', label: 'In progress', tone: 'active', hint: 'Claimed by an agent, or taken over by a person.' },
   { key: 'review', label: 'In review', tone: 'review', hint: 'Submitted and waiting for the lead or a person.' },
-  { key: 'attention', label: 'Needs attention', tone: 'trouble', hint: 'Blocked, paused, rejected or stale.' },
+  {
+    key: 'attention',
+    label: 'Needs attention',
+    tone: 'trouble',
+    hint: 'Blocked, paused, rejected, stale, or failing to merge into main.',
+  },
   { key: 'done', label: 'Done', tone: 'done', hint: 'Accepted or merged.' },
   { key: 'closed', label: 'Closed', tone: 'closed', hint: 'Cancelled or failed.' },
 ];
 
-export function columnOf(task: Pick<Task, 'status' | 'blockedKind'>): ColumnKey {
+export function columnOf(task: Pick<Task, 'status' | 'blockedKind' | 'waitReason'>): ColumnKey {
   switch (task.status) {
     case 'draft':
     case 'ready':
@@ -126,8 +141,9 @@ export function columnOf(task: Pick<Task, 'status' | 'blockedKind'>): ColumnKey 
     case 'rejected':
     case 'stale':
       return 'attention';
-    case 'accepted':
     case 'merging':
+      return mergeFailing(task) ? 'attention' : 'done';
+    case 'accepted':
     case 'merged':
       return 'done';
     case 'cancelled':
@@ -261,7 +277,7 @@ const BLOCKED_HINTS: Partial<Record<BlockedKind, string>> = {
 
 /** One line telling a person what the actions are for in the task's current status. */
 export function actionHint(
-  task: Pick<Task, 'status' | 'blockedKind' | 'assignee' | 'submission'>,
+  task: Pick<Task, 'status' | 'blockedKind' | 'assignee' | 'submission' | 'waitReason'>,
   holder?: TaskHolder,
 ): string {
   switch (task.status) {
@@ -270,7 +286,10 @@ export function actionHint(
     case 'accepted':
       return 'Accepted. Merge its branch, then mark it merged.';
     case 'merging':
-      return 'agflow is merging this into main. Mark it merged only if you merged it yourself.';
+      return mergeFailing(task)
+        ? 'agflow cannot merge this into main and keeps trying. Fix what the error says (a main that does not accept ' +
+            "direct pushes, or a runner's git credentials), or merge its branch yourself and mark it merged."
+        : 'agflow is merging this into main. Mark it merged only if you merged it yourself.';
     case 'blocked':
       return (
         (task.blockedKind && BLOCKED_HINTS[task.blockedKind]) ?? 'Unblock it once the problem is solved, or cancel it.'

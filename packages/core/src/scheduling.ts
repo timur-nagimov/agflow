@@ -632,15 +632,24 @@ export function placementWords(
     hintLeft > 0
       ? `it waits up to ${Math.ceil(hintLeft / 1000)} s for its preferred vendor ${hint}`
       : `${runners} can take it${ladder}`;
+  const shown = hintLeft > 0 ? refused.filter((one) => one.vendor === null || one.vendor === hint) : refused;
+  const words = refusalWords(shown);
+  if (words === '') return hintLeft > 0 ? head : `${head}: none offers ${needed ?? 'a vendor'}`;
+  return `${head}: ${words}`;
+}
+
+/**
+ * Each runner passed over, with its own refusal or its vendors', in PLACEMENT_REFUSAL_WORDS: "R-1 offline; R-2 claude
+ * quota used up, codex not ready". Empty for none.
+ */
+export function refusalWords(refused: readonly RefusedPlacement[]): string {
   const byRunner = new Map<string, string[]>();
   for (const one of refused) {
-    if (hintLeft > 0 && one.vendor !== null && one.vendor !== hint) continue;
     const words = PLACEMENT_REFUSAL_WORDS[one.refusal];
     const said = byRunner.get(one.runnerId) ?? [];
     byRunner.set(one.runnerId, [...said, one.vendor === null ? words : `${one.vendor} ${words}`]);
   }
-  if (byRunner.size === 0) return hintLeft > 0 ? head : `${head}: none offers ${needed ?? 'a vendor'}`;
-  return `${head}: ${[...byRunner].map(([runnerId, words]) => `${runnerId} ${words.join(', ')}`).join('; ')}`;
+  return [...byRunner].map(([runnerId, words]) => `${runnerId} ${words.join(', ')}`).join('; ');
 }
 
 /**

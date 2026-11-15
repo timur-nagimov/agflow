@@ -112,7 +112,7 @@ export interface Task extends TaskContract {
   fetchGranted: boolean;
   /**
    * Why the scheduler's last tick did not start this ready task, in one line, as GET /api/tasks gives it; null when
-   * that tick said nothing about it.
+   * that tick said nothing about it. A merging task whose last merge failed says how many failed, and the newest error.
    */
   waitReason?: string | null;
 }

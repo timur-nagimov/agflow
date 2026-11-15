@@ -161,6 +161,8 @@ export interface ControllerDeps {
   health: RunnerHealth;
   preparer: DependencyPreparer;
   notifier: Notifier;
+  /** How long an approval request waits unanswered before its owner is notified: the pump's default unless set. */
+  approvalNotifyGraceMs?: number | undefined;
   logger: Logger;
   /** The attempts that take a capacity slot now (takesSlot), this one excluded. */
   liveAttempts(): number;
@@ -1354,6 +1356,7 @@ export class AttemptController {
       adapter,
       store,
       notifier: this.deps.notifier,
+      notifyGraceMs: this.deps.approvalNotifyGraceMs,
       logger,
       clone: workspace.clone,
       vault: vault.path,

@@ -17,6 +17,7 @@ import {
   type SubmissionRecord,
   type SubmitError,
   TaskIdSchema,
+  type TaskStatus,
   VendorSchema,
   quoteLines,
   splitSubmitError,
@@ -91,6 +92,16 @@ async function pollUntilDecided<T>(ask: () => Promise<T>, decided: (answer: T) =
 
 const SUBMISSION_PENDING = 'submission pending; do not submit again; the result will arrive as a message';
 
+/**
+ * What becomes of work the hub accepted as it recorded the submission (AGFLOW_AUTO_ACCEPT, when the project's check
+ * passed), by the task's status then; a task in any other status waits for the lead's review.
+ */
+const AUTO_ACCEPTED: Partial<Record<TaskStatus, string>> = {
+  accepted: 'people merge it into main',
+  merging: 'merges it into main',
+  merged: 'it is in main',
+};
+
 type FixableSubmitError = (typeof FIXABLE_SUBMIT_ERRORS)[number];
 
 /** Core's list of the refusals the agent fixes, the one the hub's messages follow too. */
@@ -162,7 +173,15 @@ const submit = defineTool(
         : submission;
     if (!decided) return `${SUBMISSION_PENDING} (${submission.id} of ${task_id}).`;
     if (decided.status === 'failed') throw new ToolError(submissionRefusal(decided));
-    return `${decided.taskId} submitted at ${decided.headSha ?? 'an unknown commit'} (${decided.id}). The lead will review it; your work on it is done, so end your turn.`;
+    const done = `${decided.taskId} submitted at ${decided.headSha ?? 'an unknown commit'} (${decided.id}).`;
+    // The hub accepts a submission whose check passed as it records it (AGFLOW_AUTO_ACCEPT): the task's status says.
+    const status = await client.task(decided.taskId).then(({ task }) => task.status, () => null);
+    if (status === null) return `${done} Your work on it is done, so end your turn.`;
+    const accepted = AUTO_ACCEPTED[status];
+    if (accepted) {
+      return `${done} agflow accepted it because the project's check passed, and ${accepted}. Your work on it is done, so end your turn.`;
+    }
+    return `${done} The lead will review it; your work on it is done, so end your turn.`;
   },
 );
 

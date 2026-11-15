@@ -117,6 +117,11 @@ export function listTasks(ctx: HubContext, filter: TaskFilter = {}): Task[] {
     );
 }
 
+/** How many tasks the project has, in any status. */
+export function countTasks(ctx: HubContext): number {
+  return (ctx.db.query('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n;
+}
+
 export function listTaskNotes(ctx: HubContext, taskId: string): TaskNote[] {
   const rows = ctx.db.query('SELECT * FROM task_notes WHERE task_id = $taskId ORDER BY id').all({ taskId }) as {
     id: number;

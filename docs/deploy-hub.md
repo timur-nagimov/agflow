@@ -184,7 +184,7 @@ for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login
 | `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
 | `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
 | `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
-| `GET /api/operator/project` | answers the project and the hub's main branch (`AGFLOW_MAIN_BRANCH`), where `agflow start` puts the seed |
+| `GET /api/operator/project` | answers the project, its number of tasks, and the hub's main branch (`AGFLOW_MAIN_BRANCH`), where `agflow start` puts the seed |
 | `POST /api/operator/project/reset` `{ "name", "repo", "deadline": ISO 8601 or null, "goal", "rules": string[] }` | replaces the project with a new one ([Start a new project](#start-a-new-project)) |
 
 Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it; `agflow start` is the one
@@ -202,7 +202,8 @@ it is marked merged, so the hub releases dependent tasks after their dependencie
 project needs no ssh; the README's [Start a project](../README.md#start-a-project) shows the command. Store the operator
 token on that Mac once, with `agflow operator-token set < token-file` (the Keychain item `agflow-operator`). The token
 then lives on a laptop where agents run: whoever reads it can replace the project. Prefer the Keychain to
-`~/.agflow/operator-token`, which any process of the owner's can read.
+`~/.agflow/operator-token`, which any process of the owner's can read. When the hub's project has tasks,
+`agflow start` asks before it seeds or resets anything, and without a terminal it refuses unless given `--yes`.
 
 The reset, in one go:
 
@@ -268,7 +269,8 @@ after a change. The details are in the
   browser restricts those and says nothing about approvals. The Runners card shows both facts.
 - **`AGFLOW_AUTO_APPROVALS=1`.** Removes: anyone, person or agent, reading each request before it is answered. The hub
   approves every approval request the moment it arrives, recorded as `hub:auto-approvals` in the attempt's log and the
-  event. Only a request from a runner whose device policy reserves approvals to its owner waits for the owner. Risk:
+  event. Only a request from a runner whose device policy reserves approvals to its owner waits for the owner, and a
+  runner notifies its owner only of a request still unanswered 10 seconds after relaying it. Risk:
   every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
   owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
   removing the line and restarting the hub.
@@ -279,10 +281,11 @@ after a change. The details are in the
   owner's git credentials, the same ones that push the task branches, so **`main` must accept direct pushes from both
   owners**: no branch protection, required reviews or required status checks on `main`. A conflict sends the task
   back to its author through `rejected`, with the conflicting files as feedback. A merge that fails otherwise leaves
-  the task in `merging`, tells people once, and is tried again every tick, on another runner when one can take it; a
-  person who merges it by hand marks it merged. A dependency then counts as done only once merged, and accepted and
-  merging tasks keep their owned paths. Risk: work reaches `main` with no person looking at the merge, and the
-  repository's own CI runs after it landed.
+  the task in `merging`, tells people at the first and fifth failure, and is tried again after 15 seconds, then twice
+  as long after each failure up to 10 minutes, on another runner when one can take it; a person who merges it by hand
+  marks it merged. A dependency then counts as done only once merged, and accepted and merging tasks keep their owned
+  paths. Risk: work reaches `main` with no person looking at the merge, and the repository's own CI runs after it
+  landed.
 
   After each merge, one runner checks `main` as agflow merged it: a fresh clone at that commit, the dependencies
   prepared and the project's check run there, as at a submission, apart from the merges, which never wait for it.
@@ -418,6 +421,24 @@ What still needs a person:
 - **Runner sign-in.** A person runs `agflow login` on each Mac and completes the Claude and Codex logins that
   `agflow runner setup` opens ([Joining from a Mac](#joining-from-a-mac)).
 - **Secrets.** API keys and other secrets are never handed out by the hub or by the lead. A person provides them.
+
+### When the hub writes to people
+
+Work that stops on its own reaches people as a message from agflow on the Messages page:
+
+- **No lead.** While the project runs and the lead seat has been empty for 2 minutes, one message says that no lead
+  is running and why: each runner and vendor that cannot take the seat, in the board's words
+  (`R-1 offline; R-2 claude quota used up, codex not ready`), or that runner leads are off and no live chat holds
+  the seat. It also says what to do: get a runner able to take the seat, and agflow starts a lead there by itself,
+  or lead from a chat with `agflow join --role lead`. The next such message comes only after a lead has held the
+  seat again. A live chat's seat counts as empty once the chat has gone unseen for
+  `AGFLOW_LIVE_LEAD_GRACE_MINUTES` (120).
+- **A merge that keeps failing** (`AGFLOW_AUTO_MERGE=1`). Its next try waits 15 seconds, then twice as long after
+  each failure, up to 10 minutes, and the other merges go on meanwhile. People hear of the first failure and again
+  of the fifth, with the likely cause when the error names one: a `main` that is protected or requires checks, or a
+  runner's git credentials that cannot push `.github/workflows` changes ([Hackathon settings](#hackathon-settings)
+  lists both checks). Until it is merged, the board shows the task under Needs attention with the number of failed
+  merges and the last error; a person who merges it by hand marks it merged.
 
 ## Joining from a Mac
 

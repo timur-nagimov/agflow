@@ -39,9 +39,9 @@ AGFLOW_PROJECT_NAME=demo AGFLOW_PROJECT_REPO=https://github.com/you/demo bun run
 
 Open `http://localhost:8787` and sign in. Its pages:
 
-- **Board.** Tasks by status, and a form for new tasks. A ready task that did not start says why in one line, as the scheduler's last tick found it: no free worker slot, no runner that can take it, its dependencies, another task holding its paths, a paused project, the churn guard, and so on.
+- **Board.** Tasks by status, and a form for new tasks. A ready task that did not start says why in one line, as the scheduler's last tick found it: no free worker slot, no runner that can take it, its dependencies, another task holding its paths, a paused project, the churn guard, and so on. A task agflow keeps failing to merge into `main` (`AGFLOW_AUTO_MERGE`) shows under Needs attention with how many merges failed and the last error.
 - **Task page.** Contract, submissions and their outcomes, notes, thread and history; accept, reject, mark merged, unblock and cancel. Runner tasks add attempts (vendor/model, runner, status, end reason, WIP ref/SHA and times), attempt logs, handoff/restatement/late-work notes, and Take over / Hand back with commands. Protected tasks are marked "live chat only".
-- **Goal.** Edit the goal, read lead notes and messages, pause or resume work, and toggle **Runner leads**. The lead seat shows whether a live chat or a runner holds it, with wake-ups since rotation.
+- **Goal.** Edit the goal, read lead notes and messages, pause or resume work, and toggle **Runner leads**. The lead seat shows whether a live chat or a runner holds it, with wake-ups since rotation. When the seat has been empty for 2 minutes while the project runs, people get one message saying why no lead can start and what to do ([details](docs/deploy-hub.md#when-the-hub-writes-to-people)).
 - **Agents.** Runner, attempt and phase, with Interrupt, Stop, Stop and hold, Replace and Take over where applicable. Stop replaces Release for runner work. A runner lead offers Interrupt, Stop and Replace; it has no Hold or Take over action.
 - **Runners.** Owner, state and why, capacity/free slots, power, disk, keep-awake, git readiness and last push. Vendor details show readiness, binary versions, plan, managed policy, quota windows, ceilings, paid usage and owner-away state; profiles show weakened items. Only the owner can edit capacity, keep-awake, drain, ceilings and paid usage, or retire a runner.
 - **Approvals** (`#/approvals`). Your pending requests, with a badge in the navigation, full command, working directory, reason, any manifest diff and time left. Read the escalation warning before approving or declining.
@@ -166,6 +166,10 @@ agflow start --spec brief.pdf --spec https://example.com/rules.html --repo acme/
   deadline. A standing rule names the stack. `--deadline` is an ISO 8601 date and time with a zone, such as
   `2026-11-16T18:00:00+03:00`, or a span such as `+36h`. The hub is the one `agflow login` signed in to, or
   `--hub <url>`.
+- **A project with tasks.** Before it changes anything, `agflow start` asks
+  `This replaces the hub's project <name> (<n> tasks); its database is archived. Continue? [y/N]`. Without a
+  terminal it refuses, unless `--yes` is given, which also skips the question. A project with no task is replaced
+  without asking.
 
 The operator token is read from `AGFLOW_OPERATOR_TOKEN`, then from the Keychain item `agflow-operator`, then from
 `~/.agflow/operator-token` (mode 600). Whoever holds it can replace the hub's project, so prefer the Keychain. A
@@ -184,7 +188,7 @@ Agents run as the laptop owner's user. Four boundaries apply to their tools:
 
 On a Linux runner, under every profile, Claude's commands, dependency preparation and the submission check run under the sandbox's seccomp filter, which refuses them unix sockets: the user's systemd manager listens on one and would start any command outside the sandbox. The user's runtime directory (`/run/user/<uid>`), where it listens, is hidden from them too. Preparation and the check refuse to run without the filter, and the runner's dependency preparation check fails. Local ports work there within one command only: a server that one command starts is out of the next one's reach. A Codex command under the open profile may still reach the systemd manager's socket and get out of its sandbox ([A Linux runner](docs/linux-runner.md#what-differs-from-a-mac)).
 
-The runner never auto-approves an escalation: requests go to the owner. Approving a Codex escalation runs that command **outside the sandbox**, with network and the owner's full write access. M2 has no mid-turn Claude approval relay; a refused operation needs human intervention. Managed device policies remain in force: agflow does not bypass MDM or weaken the vendor's policy. The `auto` Claude profile can classify Bash commands within its sandbox; that is not permission to escape it.
+The runner never approves an escalation by itself: each request goes to the hub, for its owner to answer, or the lead with `AGFLOW_LEAD_APPROVALS=1`. With `AGFLOW_AUTO_APPROVALS=1` the hub approves every request the moment it arrives, unless the runner's device policy reserves approvals to its owner, and the owner's notification comes only for a request still unanswered after 10 seconds. Approving a Codex escalation runs that command **outside the sandbox**, with network and the owner's full write access. M2 has no mid-turn Claude approval relay; a refused operation needs human intervention. Managed device policies remain in force: agflow does not bypass MDM or weaken the vendor's policy. The `auto` Claude profile can classify Bash commands within its sandbox; that is not permission to escape it.
 
 These boundaries do not provide complete read isolation. Codex can read most owner-readable files; both sandboxes allow same-user process arguments/environment to be read, so attempts on one laptop trust each other. Claude denies credential paths and other runner data, and sandbox checks cover keychain access. Registry requests remain an exfiltration risk. Trusted base/project hooks and configuration can execute outside the sandbox; review agent configuration on main. Claude's shell snapshot can source the owner's profile outside the sandbox, and its CLI makes some cache/config writes into the owner's HOME despite a separate config directory. Lifecycle scripts can execute code from manifests agents edit. See [the security model](docs/superpowers/specs/2026-10-28-m2-runners-design.md#5-security-model-for-runner-agents) for the full boundaries and residual risks.
 
@@ -336,4 +340,4 @@ bun run live-run                          # caffeinate -i bun scripts/live-run.t
 bun run live-run --takeover claude,codex  # M2 exit run, including both TTY resume checks
 ```
 
-Follow the [M2 live-run runbook](docs/m2-live-run.md) for prerequisites, the throwaway repository, options and the Results table. The live exit gate remains pending until those results are recorded.
+Follow the [M2 live-run runbook](docs/m2-live-run.md) for prerequisites, the throwaway repository, options and the Results table, which records the run of 2026-11-12 that passed the live exit gate.

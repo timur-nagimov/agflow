@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { Attempt, AttemptFacts, Message, RawRunnerEvent, RunnerEventData } from '@agflow/core';
+import { touchAgent } from '../src/agents';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, renewLeases, requestStop } from '../src/attempts';
 import { type CommandRow, pendingCommands } from '../src/commands';
@@ -7,16 +8,16 @@ import { type HubContext, tx } from '../src/context';
 import { DELIVERY_CHAR_LIMIT, flushDeliveries, injectedMessage } from '../src/delivery';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
-import { getHubState, insertLeadNote, seatHolderId } from '../src/hub-state';
+import { emptySeat, getHubState, insertLeadNote, seatHolderId } from '../src/hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue, wakeHoldingLead } from '../src/lead';
 import { listMessages, markDelivered, sendMessage } from '../src/messages';
 import { setPaused } from '../src/project';
-import { setLimited } from '../src/runners';
+import { markVendorNotReady, setLimited } from '../src/runners';
 import { runTick } from '../src/scheduler';
 import { startHub } from '../src/server';
 import { getTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
-import { addAgent, addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
+import { type TestClock, addAgent, addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
 
 const MINUTE = 60_000;
 
@@ -181,6 +182,94 @@ describe('starting a runner lead', () => {
       expect([status, result.lead, result.reconciled?.quotaWaits]).toEqual([status, null, []]);
       expect(getAttempt(ctx, lead.id).stopRequested).toBeNull();
     }
+  });
+});
+
+describe('an empty lead seat', () => {
+  const toPeople = (ctx: HubContext) => listMessages(ctx, { target: 'humans' }).map((message) => message.body);
+
+  /** The clock moves on as if the hub had ticked all along, and the tick runs. */
+  function tickAfter(ctx: HubContext, clock: TestClock, ms: number) {
+    clock.advance(ms);
+    markHubAlive(ctx);
+    return runTick(ctx);
+  }
+
+  test('two minutes into an empty spell people hear once why no runner can take it; again after a lead held it', () => {
+    const { ctx, clock } = createTestContext();
+    const mac = addRunner(ctx);
+    const vm = addRunner(ctx, { owner: 'bob', vendors: ['claude', 'codex'] });
+    ctx.db.query("UPDATE runners SET state = 'offline' WHERE id = $id").run({ id: mac });
+    setLimited(ctx, vm, { vendor: 'claude', role: 'lead', resetsAt: ctx.now() + 60 * MINUTE });
+    markVendorNotReady(ctx, vm, 'codex');
+    const told =
+      `No lead is running: no runner can take the lead seat (${mac} offline; ${vm} claude quota used up, codex not ` +
+      'ready). agflow starts a runner lead by itself once a runner can take it: online, with a vendor that is ready ' +
+      "and has quota left. Until then a person can lead from a live chat: run `agflow join --role lead` in the project's " +
+      'repository.';
+    expect(runTick(ctx).lead).toBeNull();
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([]);
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    tickAfter(ctx, clock, 10 * MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    // A lead takes the seat and crashes: a new spell starts, and people hear of it two minutes later.
+    ctx.db.query("UPDATE runners SET state = 'online' WHERE id = $id").run({ id: mac });
+    const lead = tickLead(ctx);
+    ctx.db.query("UPDATE runners SET state = 'offline' WHERE id = $id").run({ id: mac });
+    endAttempt(ctx, { attemptId: lead.id, trigger: 'crashed', error: 'the agent exited' });
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([told, told]);
+  });
+
+  test('with runner leads off and no live chat in the seat, people are told to lead from a chat; never while paused', () => {
+    const { ctx, clock } = createTestContext();
+    addRunner(ctx);
+    ctx.db.run('UPDATE project SET runner_leads = 0 WHERE id = 1');
+    setPaused(ctx, true, 'user:alice');
+    tickAfter(ctx, clock, 3 * MINUTE);
+    expect(toPeople(ctx)).toEqual([]);
+    // Unpaused, the seat has been empty for three minutes already.
+    setPaused(ctx, false, 'user:alice');
+    tickAfter(ctx, clock, 0);
+    const told =
+      'No lead is running: runner leads are off and no live chat holds the seat. Run `agflow join --role lead` in the ' +
+      "project's repository and start a chat there, or turn Runner leads on, on the Goal page.";
+    expect(toPeople(ctx)).toEqual([told]);
+    // A live lead holds the seat, and leaves it.
+    const live = addAgent(ctx, 'alice', 'lead');
+    tickAfter(ctx, clock, 5 * MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    tx(ctx, (emit) => emptySeat(ctx, emit, 'user:alice', live.id));
+    tickAfter(ctx, clock, 2 * MINUTE);
+    expect(toPeople(ctx)).toEqual([told, told]);
+  });
+
+  test("a live lead's seat lapses and is held again with no event: each lapse is told two minutes after it", () => {
+    const { ctx, clock } = createTestContext();
+    ctx.db.run('UPDATE project SET runner_leads = 0 WHERE id = 1');
+    const live = addAgent(ctx, 'alice', 'lead');
+    const told =
+      'No lead is running: runner leads are off and no live chat holds the seat. Run `agflow join --role lead` in the ' +
+      "project's repository and start a chat there, or turn Runner leads on, on the Goal page.";
+    // Unseen for liveLeadGraceMs, it no longer holds the seat; the spell starts then, not when it took the seat.
+    tickAfter(ctx, clock, ctx.config.liveLeadGraceMs);
+    expect(seatHolderId(ctx)).toBeNull();
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([]);
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    // The same chat is seen again and holds the seat; its next lapse is a new spell, told in its turn.
+    touchAgent(ctx, live.id);
+    expect(seatHolderId(ctx)).toBe(live.id);
+    tickAfter(ctx, clock, ctx.config.liveLeadGraceMs + MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([told, told]);
+    expect(listEvents(ctx.db).filter((event) => event.type === 'lead.seat_changed')).toHaveLength(1);
   });
 });
 

@@ -8,7 +8,7 @@ import { listEvents } from '../src/events';
 import { queueMerges } from '../src/merges';
 import { listMessages } from '../src/messages';
 import { markGitNotReady } from '../src/runners';
-import { readySet } from '../src/scheduler';
+import { readySet, withWaitReason } from '../src/scheduler';
 import { getTask, move, overlappingPathHolder } from '../src/task-store';
 import { acceptTask, createTasks, markMerged } from '../src/tasks';
 import { type RunnerAttempt, addRunner, addRunnerAttempt, createTestContext, newTask } from './helpers';
@@ -117,23 +117,101 @@ describe('accepting with AGFLOW_AUTO_MERGE', () => {
     expect(getAttempt(ctx, held.attempt.id)).toMatchObject({ status: 'starting', reviewRounds: 1 });
   });
 
-  test('a failed merge stays merging, is recorded, tells people once, and goes out again on the next tick', () => {
-    const { ctx, held, taskId } = setup();
+  test('a failed merge stays merging, is recorded, and goes out again 15 s later, then twice as long after each failure, up to 10 min', () => {
+    const { ctx, clock, held, taskId } = setup();
     acceptTask(ctx, taskId, 'user:alice');
-    for (const attempt of [1, 2]) {
+    const fail = (error = 'remote: denied'): void => {
       const [merge] = merges(ctx, held.runner.id);
-      recordResult(ctx, held.runner.id, { commandId: merge?.id as string, ok: false, error: 'remote: denied' });
-      expect([attempt, getTask(ctx, taskId).status, merges(ctx, held.runner.id)]).toEqual([attempt, 'merging', []]);
+      expect(merge?.command).toMatchObject({ kind: 'merge_task', taskId });
+      recordResult(ctx, held.runner.id, { commandId: merge?.id as string, ok: false, error });
+    };
+    fail();
+    expect([getTask(ctx, taskId).status, merges(ctx, held.runner.id)]).toEqual(['merging', []]);
+    for (const [index, seconds] of [15, 30, 60, 120, 240, 480, 600, 600].entries()) {
+      clock.advance(seconds * 1_000 - 1);
+      expect([index, queueMerges(ctx)]).toEqual([index, null]);
+      clock.advance(1);
       expect(queueMerges(ctx)?.command).toMatchObject({ kind: 'merge_task', taskId });
+      fail();
     }
     const failures = listEvents(ctx.db, { subject: taskId }).filter((event) => event.type === 'task.merge_failed');
-    expect(failures.map((event) => event.data)).toEqual([
-      { runnerId: held.runner.id, error: 'remote: denied' },
-      { runnerId: held.runner.id, error: 'remote: denied' },
+    expect(failures).toHaveLength(9);
+    expect(failures[0]?.data).toEqual({ runnerId: held.runner.id, error: 'remote: denied' });
+  });
+
+  test('a merge that waits to be tried again holds up no other', () => {
+    const { ctx, held, taskId } = setup();
+    const second = another(ctx, held, 'Print the config');
+    acceptTask(ctx, taskId, 'user:alice');
+    acceptTask(ctx, second.task.id, 'user:alice');
+    const [first] = merges(ctx, held.runner.id);
+    recordResult(ctx, held.runner.id, { commandId: first?.id as string, ok: false, error: 'remote: denied' });
+    // The failed task waits; the other one's merge goes out at once.
+    const [next] = merges(ctx, held.runner.id);
+    expect(next?.command).toMatchObject({ kind: 'merge_task', taskId: second.task.id });
+    recordResult(ctx, held.runner.id, { commandId: next?.id as string, ok: true, data: { status: 'merged', sha: sha('f') } });
+    expect(getTask(ctx, second.task.id).status).toBe('merged');
+    expect(merges(ctx, held.runner.id)).toEqual([]);
+  });
+
+  test('people hear of the first failure and the fifth, with the likely cause when the error names one', () => {
+    const told = (error: string): string[] => {
+      const { ctx, clock, held, taskId } = setup();
+      acceptTask(ctx, taskId, 'user:alice');
+      for (let failures = 1; failures <= 6; failures++) {
+        if (failures > 1) {
+          clock.advance(10 * 60_000);
+          queueMerges(ctx);
+        }
+        const [merge] = merges(ctx, held.runner.id);
+        recordResult(ctx, held.runner.id, { commandId: merge?.id as string, ok: false, error });
+      }
+      return listMessages(ctx, { target: 'humans' })
+        .reverse()
+        .map((message) => message.body);
+    };
+    const named = 'T-1 ("Parse the config") into main';
+    const retries = [
+      'agflow tries again after 15 s, then twice as long after each failure, up to 10 min.',
+      'agflow keeps trying, up to 10 min apart.',
+    ];
+    const tail = ' If you merge it yourself, mark it merged.';
+    expect(told('remote: denied')).toEqual([
+      `agflow could not merge ${named}: runner R-1 said: remote: denied\n${retries[0]}${tail}`,
+      `agflow is still failing to merge ${named} after 5 tries: runner R-1 said: remote: denied\n${retries[1]}${tail}`,
     ]);
-    const told = listMessages(ctx, {}).filter((message) => message.to === 'humans');
-    expect(told).toHaveLength(1);
-    expect(told[0]?.body).toContain('remote: denied');
+    const protectedMain = 'cannot push main: remote: error: GH006: Protected branch update failed for refs/heads/main.';
+    const pushes = 'Likely cause: main is protected or requires checks, and AGFLOW_AUTO_MERGE needs a main that accepts ' +
+      "direct pushes from the runners' owners.";
+    expect(told(protectedMain)).toEqual([
+      `agflow could not merge ${named}: runner R-1 said: ${protectedMain}\n${pushes}\n${retries[0]}${tail}`,
+      `agflow is still failing to merge ${named} after 5 tries: runner R-1 said: ${protectedMain}\n${pushes}\n${retries[1]}${tail}`,
+    ]);
+    const workflow =
+      'cannot push main: refusing to allow a Personal Access Token to create or update workflow ' +
+      '`.github/workflows/ci.yml` without `workflow` scope';
+    expect(told(workflow)[0]).toContain(
+      "\nLikely cause: the runner's git credentials cannot push changes to .github/workflows. A fine-grained token " +
+        'needs Workflows write; a classic token or an OAuth login needs the workflow scope.\n',
+    );
+  });
+
+  test('a merging task whose last merge failed tells the board how many failed and the newest error', () => {
+    const { ctx, clock, held, taskId } = setup();
+    acceptTask(ctx, taskId, 'user:alice');
+    const reason = () => withWaitReason(ctx, getTask(ctx, taskId)).waitReason;
+    expect(reason()).toBeNull();
+    const [merge] = merges(ctx, held.runner.id);
+    recordResult(ctx, held.runner.id, { commandId: merge?.id as string, ok: false, error: 'remote: denied' });
+    expect(reason()).toBe('merge failed 1 time: remote: denied');
+    clock.advance(15_000);
+    queueMerges(ctx);
+    const [again] = merges(ctx, held.runner.id);
+    recordResult(ctx, held.runner.id, { commandId: again?.id as string, ok: false, error: 'remote: not now' });
+    expect(reason()).toBe('merge failed 2 times: remote: not now');
+    // A person merged it by hand: it is no longer waiting.
+    markMerged(ctx, taskId, 'user:alice');
+    expect(reason()).toBeNull();
   });
 
   test("goes to another current runner when the author's is offline, never to an older one, and moves off a runner that went offline", () => {
@@ -155,7 +233,7 @@ describe('accepting with AGFLOW_AUTO_MERGE', () => {
   });
 
   test('after a failed merge the next try goes to another able runner, and back once it failed there too', () => {
-    const { ctx, held, taskId } = setup();
+    const { ctx, clock, held, taskId } = setup();
     const other = addRunner(ctx, { owner: 'bob' });
     current(ctx, other);
     acceptTask(ctx, taskId, 'user:alice');
@@ -163,11 +241,13 @@ describe('accepting with AGFLOW_AUTO_MERGE', () => {
       const [merge] = merges(ctx, runnerId);
       recordResult(ctx, runnerId, { commandId: merge?.id as string, ok: false, error: 'remote: denied' });
     };
-    // The first merge goes to the author's runner. It fails there, so the tick sends the next try to the other runner.
+    // The first merge goes to the author's runner. It fails there, so the next try goes to the other runner.
     fail(held.runner.id);
+    clock.advance(15_000);
     expect(queueMerges(ctx)).toMatchObject({ runnerId: other, command: { kind: 'merge_task', taskId } });
     // Once it failed on both, it goes where it failed longest ago.
     fail(other);
+    clock.advance(30_000);
     expect(queueMerges(ctx)).toMatchObject({ runnerId: held.runner.id, command: { kind: 'merge_task', taskId } });
   });
 

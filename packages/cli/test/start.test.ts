@@ -2,10 +2,12 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { NO_TESTS_LINE } from '@agflow/core';
+import { PassThrough } from 'node:stream';
+import { NO_TESTS_LINE, NewTaskSchema } from '@agflow/core';
 import { getCurrentGoal } from '@agflow/hub/src/goal';
 import { listStandingRules } from '@agflow/hub/src/messages';
 import { getProject } from '@agflow/hub/src/project';
+import { createTasks } from '@agflow/hub/src/tasks';
 import { PrepConfigSchema } from '@agflow/runner/src/prep/config';
 import { UsageError, parseArgs } from '../src/args';
 import { saveCredentials } from '../src/credentials';
@@ -13,7 +15,7 @@ import { KEYCHAIN_SERVICE, findOperatorToken, operatorTokenCommand } from '../sr
 import { type RunCommand, runCommand } from '../src/run';
 import { describeStack, seedFiles } from '../src/seed';
 import type { SpecFile } from '../src/spec';
-import { type StartDeps, parseDeadline, repoOf, startCommand } from '../src/start';
+import { type StartDeps, askTerminal, parseDeadline, repoOf, startCommand } from '../src/start';
 import { HUB_URL, hubFixture } from './fixture';
 
 const TOKEN = 'op-0123456789abcdef0123456789abcdef';
@@ -255,7 +257,8 @@ describe('agflow start', () => {
     const configDir = join(root, 'config');
     saveCredentials({ hubUrl: HUB_URL, token: 'cli-token', user: 'alice' }, configDir);
     const env: Record<string, string | undefined> = { ...CLEAN_GIT, HOME: root, AGFLOW_OPERATOR_TOKEN: TOKEN };
-    const deps: StartDeps = { env, home: root, run: runCommand, fetch: hub.fetch, configDir, now: () => NOW };
+    // No terminal: a project with tasks is replaced only with --yes.
+    const deps: StartDeps = { env, home: root, run: runCommand, fetch: hub.fetch, configDir, now: () => NOW, ask: null };
     const spec = join(root, 'brief.md');
     writeFileSync(spec, '# Afisha\nA poster of the week.\n');
     const mockup = join(root, 'mockup.png');
@@ -388,5 +391,56 @@ describe('agflow start', () => {
     await expect(start(['--spec', s.spec, '--repo', s.origin], tokenless)).rejects.toThrow(/no operator token/);
     // This hub has no operator token, so it has no operator routes.
     await expect(start(['--spec', s.spec, '--repo', s.origin])).rejects.toThrow(/no operator routes/);
+  });
+
+  test('asks before it replaces a project that has tasks, and without a terminal goes on only with --yes', async () => {
+    const s = await setup();
+    createTasks(s.hub.ctx, [NewTaskSchema.parse({ title: 'Old work', objective: 'Keep it', acceptance: [{ id: 'A1', assertion: 'kept' }] })], 'user:alice');
+    const { io, text } = capture();
+    const argv = ['start', '--spec', s.spec, '--repo', s.origin];
+    const unchanged = async () => {
+      expect(getProject(s.hub.ctx).name).toBe('demo');
+      // Nothing was seeded either.
+      expect(runCommand(['git', 'rev-parse', '--verify', '--quiet', 'refs/heads/main'], { env: CLEAN_GIT, cwd: s.origin }).code).not.toBe(0);
+    };
+    await expect(startCommand(parseArgs(argv), io, s.deps)).rejects.toThrow(
+      "this replaces the hub's project demo (1 task), and there is no terminal to ask: give --yes to go on",
+    );
+    await unchanged();
+    const questions: string[] = [];
+    const answering = (answer: string): StartDeps => ({ ...s.deps, ask: async (question) => (questions.push(question), answer) });
+    expect(await startCommand(parseArgs(argv), io, answering('n'))).toBe(1);
+    expect(questions).toEqual(["This replaces the hub's project demo (1 task); its database is archived. Continue? [y/N] "]);
+    expect(text()).toContain("Stopped: the hub's project is still demo.");
+    await unchanged();
+    expect(await startCommand(parseArgs(argv), io, answering('y'))).toBe(0);
+    expect(getProject(s.hub.ctx).name).toBe('afisha');
+    // The new project has no task: the next start asks nothing.
+    expect(await startCommand(parseArgs(argv), io, s.deps)).toBe(0);
+    expect(questions).toHaveLength(2);
+  });
+
+  test('--yes replaces a project that has tasks without asking', async () => {
+    const s = await setup();
+    createTasks(s.hub.ctx, [NewTaskSchema.parse({ title: 'Old work', objective: 'Keep it', acceptance: [{ id: 'A1', assertion: 'kept' }] })], 'user:alice');
+    const { io } = capture();
+    expect(await startCommand(parseArgs(['start', '--spec', s.spec, '--repo', s.origin, '--yes']), io, s.deps)).toBe(0);
+    expect(getProject(s.hub.ctx).name).toBe('afisha');
+  });
+});
+
+describe('the question at the terminal', () => {
+  /** askTerminal's answer after these keys, at a terminal: its output is a TTY, so the reader takes keys as one does. */
+  function answerTo(keys: string): Promise<string> {
+    const input = new PassThrough();
+    const answer = askTerminal('Continue? [y/N] ', input, Object.assign(new PassThrough(), { isTTY: true }));
+    input.write(keys);
+    return answer;
+  }
+
+  test('Ctrl-C or Ctrl-D answers it with nothing, a no; a typed line is the answer', async () => {
+    expect(await answerTo('\x03')).toBe('');
+    expect(await answerTo('\x04')).toBe('');
+    expect(await answerTo('y\r')).toBe('y');
   });
 });

@@ -1,9 +1,11 @@
 // agflow start: a hackathon project in minutes. It makes SPEC.md from the spec files, commits the seed (the spec, the
 // agents' instructions and the project's scripts) to the repository, creating it with gh when asked, and resets the
-// hub's project to it through the operator route. The runners follow the hub to the new project by themselves.
+// hub's project to it through the operator route. The runners follow the hub to the new project by themselves. A hub
+// project that has tasks is replaced only once a person says yes, or with --yes.
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { DeadlineInputSchema, type OperatorProject, type ProjectResetResult } from '@agflow/core';
 import { type ParsedArgs, UsageError, listFlag, stringFlag } from './args';
 import { loadCredentials } from './credentials';
@@ -19,8 +21,9 @@ const DEADLINE_EXAMPLE = '2026-11-16T18:00:00+03:00';
 
 export const START_HELP = `  agflow start --spec <file or URL> [--spec ...] --repo <owner/name or URL> [--create]
                [--collaborator <login>] [--name <project>] [--stack python|typescript|<any text>]
-               [--deadline <ISO 8601 with a zone, e.g. ${DEADLINE_EXAMPLE}, or +36h>] [--hub <url>]
-                                Seed a repository with the spec and make it the hub's project
+               [--deadline <ISO 8601 with a zone, e.g. ${DEADLINE_EXAMPLE}, or +36h>] [--hub <url>] [--yes]
+                                Seed a repository with the spec and make it the hub's project; --yes replaces
+                                a hub project that has tasks without asking
 `;
 
 export interface StartDeps extends OperatorTokenDeps {
@@ -28,6 +31,27 @@ export interface StartDeps extends OperatorTokenDeps {
   /** The CLI's configuration directory, with the saved login whose hub is used unless --hub is given. */
   configDir: string;
   now: () => number;
+  /** Asks the person at the terminal and gives the line they answer; null without a terminal. */
+  ask: ((question: string) => Promise<string>) | null;
+}
+
+/**
+ * One question on output (standard error), and the line typed after it on input (standard input). Ctrl-C or Ctrl-D at
+ * the question closes the reader before a line comes, which answers '', a no.
+ */
+export function askTerminal(
+  question: string,
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stderr,
+): Promise<string> {
+  return new Promise((resolve) => {
+    const reader = createInterface({ input, output });
+    reader.once('close', () => resolve(''));
+    reader.question(question, (answer) => {
+      resolve(answer);
+      reader.close();
+    });
+  });
 }
 
 export const defaultStartDeps = (): StartDeps => ({
@@ -35,6 +59,7 @@ export const defaultStartDeps = (): StartDeps => ({
   fetch: (input, init) => fetch(input, init),
   configDir: configDir(),
   now: () => Date.now(),
+  ask: process.stdin.isTTY ? askTerminal : null,
 });
 
 /** The repository as given: owner/name on GitHub, or a URL (or path) git can clone. */
@@ -182,6 +207,21 @@ function seedRepository(
   return { branch, sha: git('rev-parse', 'HEAD'), committed: staged };
 }
 
+/**
+ * Whether the hub's project may be replaced: at once when it has no task or --yes was given; otherwise only when the
+ * person at the terminal says yes, since the reset archives its database and empties it. Without a terminal it throws.
+ */
+async function mayReplace(current: OperatorProject, yes: boolean, deps: StartDeps): Promise<boolean> {
+  // A hub of an older release does not count its tasks, so its project may have some.
+  const tasks: number | undefined = current.tasks;
+  if (yes || tasks === 0) return true;
+  const count = tasks === undefined ? '' : ` (${tasks} task${tasks === 1 ? '' : 's'})`;
+  const project = `the hub's project ${current.project.name}${count}`;
+  if (deps.ask === null) throw new Error(`this replaces ${project}, and there is no terminal to ask: give --yes to go on`);
+  const answer = await deps.ask(`This replaces ${project}; its database is archived. Continue? [y/N] `);
+  return /^y(es)?$/i.test(answer.trim());
+}
+
 /** An operator route with the operator token: a GET, or a POST of the body. */
 async function operatorCall<T>(
   deps: StartDeps,
@@ -231,8 +271,14 @@ export async function startCommand(args: ParsedArgs, io: Io, deps: StartDeps = d
   const deadline = parseDeadline(stringFlag(args, 'deadline'), deps.now());
   const stack = stringFlag(args, 'stack')?.trim() || null;
   const name = stringFlag(args, 'name')?.trim() || repo.name;
-  // Asked before anything is made: the seed goes on the branch the hub's attempts start from (AGFLOW_MAIN_BRANCH).
-  const { mainBranch } = await operatorCall<OperatorProject>(deps, hub, token, '/api/operator/project');
+  // Asked before anything is made: the seed goes on the branch the hub's attempts start from (AGFLOW_MAIN_BRANCH), and
+  // a project with tasks is replaced only with a person's yes.
+  const current = await operatorCall<OperatorProject>(deps, hub, token, '/api/operator/project');
+  if (!(await mayReplace(current, args.flags.yes === true, deps))) {
+    io.out(`Stopped: the hub's project is still ${current.project.name}.\n`);
+    return 1;
+  }
+  const { mainBranch } = current;
 
   const tmp = mkdtempSync(join(tmpdir(), 'agflow-start-'));
   try {
