@@ -10,15 +10,23 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { restoreSet } from '@agflow/core';
 import { verifyPrepMain } from '../../scripts/verify-prep';
 import { prepareWorkspace } from '../../src/attempt/workspace';
 import { memoryLogger } from '../../src/log';
 import { createDependencyPreparer } from '../../src/prep/preparer';
-import { prepLayout, prepToolConfig } from '../../src/prep/plan';
+import { PrepState, prepLayout, prepToolConfig } from '../../src/prep/plan';
 import { PrepSandbox, type PrepRunSpec, type SandboxBackend } from '../../src/prep/sandbox';
 import { standardProfile } from '../../src/profile';
 import type { PrepareInput } from '../../src/seams';
-import { cleanupRunnerFixtures, createRunnerFixture, fixtureAgentToken, type RunnerFixture, waitFor } from '../fixture';
+import {
+  cleanupRunnerFixtures,
+  createRunnerFixture,
+  FIXTURE_PROJECT,
+  fixtureAgentToken,
+  type RunnerFixture,
+  waitFor,
+} from '../fixture';
 
 afterEach(cleanupRunnerFixtures);
 
@@ -108,6 +116,17 @@ describe('DependencyPreparer seam', () => {
     expect(result).toEqual({ ran: true, ok: true, error: null, logTail: files()['.npmrc'] });
     expect(d.command.calls).toHaveLength(4);
     expect(readFileSync(join(d.clone, 'runs'), 'utf8')).toBe('run\nsecond\nrun\nsecond\n');
+  }, 30_000);
+
+  test("a fresh clone's preparation, main's check's, runs every entry each time, restores, and keeps no state", async () => {
+    const d = await direct(files([entry('echo agent override > .npmrc; echo run >> runs'), entry('cat .npmrc')]));
+    const { clone, vault, baseSha, env } = d.input;
+    const fresh = { clone, vault, baseSha, env, restore: restoreSet(null) };
+    const prepared = { ran: true, ok: true, error: null, logTail: files()['.npmrc'] };
+    expect(await d.preparer.prepareFresh?.(fresh)).toEqual(prepared);
+    expect(await d.preparer.prepareFresh?.(fresh)).toEqual(prepared);
+    expect(readFileSync(join(d.clone, 'runs'), 'utf8')).toBe('run\nrun\n');
+    expect(new PrepState(d.f.paths.prep(FIXTURE_PROJECT)).attempts()).toEqual([]);
   }, 30_000);
 
   test('protected paths are restored again before an entry that follows one that ran', async () => {

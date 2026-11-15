@@ -51,6 +51,17 @@ export interface PrepareInput {
   requestId: string | null;
 }
 
+/** A fresh clone's preparation, main's check's: no attempt, so the restore set comes with it. */
+export interface FreshPrepareInput {
+  clone: string;
+  vault: Vault;
+  /** The commit the clone is at: the config is read there, and the protected paths are restored to it. */
+  baseSha: string;
+  env: Record<string, string>;
+  /** The protected-path patterns restored before each entry, as AttemptSpec.restore.paths are. */
+  restore: readonly string[];
+}
+
 /** What attempt.prepared reports; ran is false when the project configures no preparation. */
 export interface PrepareOutcome {
   ran: boolean;
@@ -84,6 +95,8 @@ export interface DependencyPreparer {
   /** Whether this runner can prepare dependencies at all; it feeds hello's profile.dependencyPrep. */
   readonly available: boolean;
   prepare(input: PrepareInput): Promise<PrepareOutcome>;
+  /** Runs every entry in a fresh clone, for main's check; absent where the runner has no sandbox. */
+  prepareFresh?(input: FreshPrepareInput): Promise<PrepareOutcome>;
   /** Runs a submission's check in the preparation's sandbox; absent where the runner has none. */
   check?(input: CheckInput): Promise<CheckRun>;
 }

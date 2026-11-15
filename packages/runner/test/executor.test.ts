@@ -11,7 +11,7 @@ import { CommandExecutor, RESTARTABLE_COMMANDS } from '../src/executor';
 import { Journal } from '../src/journal';
 import type { CommandMessage, WelcomeMessage } from '../src/link';
 import { Outbox } from '../src/outbox';
-import type { PrepareInput } from '../src/seams';
+import type { DependencyPreparer, PrepareInput } from '../src/seams';
 import { vendorReport } from '../src/vendors';
 import {
   cleanupRunnerFixtures,
@@ -117,6 +117,8 @@ function executor(f: RunnerFixture, overrides: Partial<ControllerDeps> = {}) {
     local: f.local,
     remote: deps.remote,
     wipRefPrefix: () => FIXTURE_WIP_PREFIX,
+    paths: f.paths,
+    preparer: deps.preparer,
     adapters: f.adapters,
     preflighted: (result: PreflightResult) => preflights.set(result.facts.vendor, { result, at: Date.now() }),
     vendors: () => {
@@ -170,6 +172,8 @@ function commands(f: RunnerFixture): RunnerCommand[] {
     { kind: 'preflight', vendor: 'claude' },
     // main already holds its head, so it merges with no push.
     { kind: 'merge_task', taskId: 'T-4', title: 'Tidy the app', branch: 'agflow/T-4-tidy', headSha: f.origin.mainSha },
+    // main names no check, so there is nothing to run.
+    { kind: 'check_main', sha: f.origin.mainSha },
   ];
 }
 
@@ -538,6 +542,50 @@ describe('CommandExecutor', () => {
       data: { status: 'conflict', files: ['src/app.ts'] },
     });
     expect(await gitIn(f.origin.path, ['rev-parse', 'refs/heads/main'])).toBe(main);
+  });
+
+  test('check_main runs on a queue of its own: a merge never waits for a check, nor a check for a merge', async () => {
+    const config = JSON.stringify({ check: 'bun test' });
+    const f = await createRunnerFixture({ files: { 'README.md': '# demo\n', '.agflow/config.json': config } });
+    const checking = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const nothing = { ran: false, ok: true, error: null, logTail: null };
+    const preparer: DependencyPreparer = {
+      available: true,
+      prepare: async () => nothing,
+      prepareFresh: async () => nothing,
+      check: async () => {
+        checking.resolve();
+        await release.promise;
+        return { code: 0, signal: null, timedOut: false, logTail: '1 pass', durationMs: 1_000 };
+      },
+    };
+    const run = new CommandExecutor({ ...executor(f).options, preparer });
+    const sha = f.origin.mainSha;
+    const check = { status: 'passed', command: 'bun test', durationMs: 1_000, tail: '1 pass' };
+    const passed = { ok: true, data: { sha, check } };
+    const checked = run.onCommand(message({ kind: 'check_main', sha }));
+    await checking.promise;
+    // main holds the head already, so the merge pushes nothing: it is done while the check still runs.
+    const branch = 'agflow/T-4-tidy';
+    const merge = { kind: 'merge_task', taskId: 'T-4', title: 'Tidy the app', branch, headSha: sha } as const;
+    expect(await run.onCommand(message(merge, 2))).toEqual({ ok: true, data: { status: 'merged', sha } });
+    release.resolve();
+    expect(await checked).toEqual(passed);
+    // A merge in progress does not hold a check back either.
+    const merging = Promise.withResolvers<void>();
+    const unblock = Promise.withResolvers<void>();
+    const refresh = f.vault.refresh.bind(f.vault);
+    spyOn(f.vault, 'refresh').mockImplementation(async (taskId, refs, prefix) => {
+      merging.resolve();
+      await unblock.promise;
+      return refresh(taskId, refs, prefix);
+    });
+    const held = run.onCommand(message(merge, 3));
+    await merging.promise;
+    expect(await run.onCommand(message({ kind: 'check_main', sha }, 4))).toEqual(passed);
+    unblock.resolve();
+    expect(await held).toEqual({ ok: true, data: { status: 'merged', sha } });
   });
 
   test('refreshes the vault, reports preflight, deletes with exact leases, and persists a settings echo with pending drain', async () => {
@@ -1161,6 +1209,7 @@ describe('CommandExecutor', () => {
       'preflight',
       'prepare_dependencies',
       'merge_task',
+      'check_main',
     ];
     expect([...RESTARTABLE_COMMANDS].sort()).toEqual(restartable.sort());
     // A hub restored without it would never send it again: it waits for the hub, and runs then.

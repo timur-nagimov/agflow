@@ -1,6 +1,7 @@
 // DependencyPreparer (design 7.7, X-40): trusted config, restored protected paths, and serialized per-attempt runs.
 // A submission's check runs here too, in the same sandbox and environment as a preparation command, with scripts
-// allowed and the attempt's own caches.
+// allowed and the attempt's own caches. main's check prepares its fresh clone here as well, every entry, with no
+// attempt and no state kept.
 import { lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -11,8 +12,15 @@ import { type Logger, noopLogger } from '../log';
 import { ensureSharedCaches, type RunnerPaths } from '../paths';
 import { profileOf } from '../profile';
 import { runDirOf } from '../run-dir';
-import type { CheckInput, CheckRun, DependencyPreparer, PrepareInput, PrepareOutcome } from '../seams';
-import { readPrepConfig } from './config';
+import type {
+  CheckInput,
+  CheckRun,
+  DependencyPreparer,
+  FreshPrepareInput,
+  PrepareInput,
+  PrepareOutcome,
+} from '../seams';
+import { type PrepConfig, readPrepConfig } from './config';
 import { prepEntryKey, prepEnv, prepLayout, prepPolicy, PrepState, whenFingerprint, writePrepToolConfig } from './plan';
 import { checkPrepSandbox, PrepSandbox, type PrepRunResult, type PrepRunSpec } from './sandbox';
 
@@ -122,6 +130,8 @@ async function makeRunDirectories(clone: string, prep: string, env: Record<strin
   }
 }
 
+type PrepEntry = PrepConfig['dependencies'][number];
+
 function runError(argv: string[], result: PrepRunResult, timeoutMs: number): string | null {
   const command = argv.join(' ');
   if (result.timedOut) {
@@ -153,14 +163,19 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
   const commandRun = run;
   const pending = new Map<string, Promise<void>>();
 
-  async function prepare(input: PrepareInput): Promise<PrepareOutcome> {
-    if (!available) return { ran: false, ok: false, error: 'not available on this runner', logTail: null };
+  /**
+   * The dependency entries of .agflow/config.json at baseSha, run in the clone in order, each after the protected paths
+   * (restore) are restored to baseSha. state, when given, skips the entries that ran already for the clone's files, and
+   * records each that ran.
+   */
+  async function runEntries(
+    input: Pick<PrepareInput, 'clone' | 'vault' | 'baseSha' | 'env'>,
+    restorePaths: readonly string[],
+    state: { done(key: string, entry: PrepEntry): boolean; record(key: string, entry: PrepEntry): void } | null,
+  ): Promise<PrepareOutcome> {
     let logTail: string | null = null;
     let ran = false;
     try {
-      const record = options.store.get(input.attemptId);
-      if (!record) throw new Error(`no attempt record for ${input.attemptId}`);
-      if (record.spec.role !== 'worker') return { ran, ok: true, error: null, logTail };
       const config = await readPrepConfig(input.vault, input.baseSha);
       if (!config?.dependencies.length) return { ran, ok: true, error: null, logTail };
       // restoreProtected resolves a linked clone and would write through it.
@@ -168,11 +183,10 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
       const restore = () =>
         restoreProtected(
           { vault: input.vault, local: input.vault.local },
-          { clone: input.clone, base: input.baseSha, paths: record.spec.restore.paths },
+          { clone: input.clone, base: input.baseSha, paths: restorePaths },
         );
       const prep = options.paths.prep(input.vault.project);
       const layout = prepLayout(prep);
-      const state = new PrepState(prep);
       writePrepToolConfig(prep);
       let restored = false;
       for (const entry of config.dependencies) {
@@ -182,8 +196,7 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
           restored = true;
         }
         const key = prepEntryKey(entry);
-        if (input.requestId === null && !state.needs(input.attemptId, key, whenFingerprint(input.clone, entry.when)))
-          continue;
+        if (state?.done(key, entry)) continue;
         ran = true;
         restored = false;
         const settings = options.config();
@@ -220,7 +233,7 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
           logTail = result.logTail;
           const error = runError(entry.run, result, settings.timings.prep);
           if (error) return { ran, ok: false, error, logTail };
-          state.record(input.attemptId, key, whenFingerprint(input.clone, entry.when));
+          state?.record(key, entry);
         } finally {
           rmSync(tmpDir, { recursive: true, force: true });
         }
@@ -229,6 +242,31 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
     } catch (error) {
       return { ran: true, ok: false, error: error instanceof Error ? error.message : String(error), logTail };
     }
+  }
+
+  async function prepare(input: PrepareInput): Promise<PrepareOutcome> {
+    if (!available) return { ran: false, ok: false, error: 'not available on this runner', logTail: null };
+    let record: ReturnType<AttemptStore['get']>;
+    try {
+      record = options.store.get(input.attemptId);
+      if (!record) throw new Error(`no attempt record for ${input.attemptId}`);
+    } catch (error) {
+      return { ran: true, ok: false, error: error instanceof Error ? error.message : String(error), logTail: null };
+    }
+    if (record.spec.role !== 'worker') return { ran: false, ok: true, error: null, logTail: null };
+    const state = new PrepState(options.paths.prep(input.vault.project));
+    const fingerprint = (entry: PrepEntry) => whenFingerprint(input.clone, entry.when);
+    return runEntries(input, record.spec.restore.paths, {
+      // The agent's prepare_dependencies runs every entry again.
+      done: (key, entry) => input.requestId === null && !state.needs(input.attemptId, key, fingerprint(entry)),
+      record: (key, entry) => state.record(input.attemptId, key, fingerprint(entry)),
+    });
+  }
+
+  /** A fresh clone's preparation, for main's check: no attempt, and nothing ran there yet, so every entry runs. */
+  async function prepareFresh(input: FreshPrepareInput): Promise<PrepareOutcome> {
+    if (!available) return { ran: false, ok: false, error: 'not available on this runner', logTail: null };
+    return runEntries(input, input.restore, null);
   }
 
   /**
@@ -275,6 +313,7 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
   return Object.freeze({
     available,
     check,
+    prepareFresh,
     prepare(input: PrepareInput): Promise<PrepareOutcome> {
       const result = (pending.get(input.attemptId) ?? Promise.resolve()).then(() => prepare(input));
       const settled = result.then(

@@ -7,7 +7,8 @@
 // - Ordering: an attempt's lifecycle and git commands go to its controller, whose serial queue runs them in arrival
 //   order, which is the hub's seq order; deliver, interrupt and decide_approval act on the live session at once.
 //   Different attempts run concurrently; the runner's own commands (refresh_vault, preflight, delete_refs,
-//   update_settings, merge_task) run one at a time.
+//   update_settings, merge_task) run one at a time. check_main runs apart from them, one check at a time: a check may
+//   take checkMinutes, and must never hold a merge back.
 // - welcome.stop is applied before any command that follows the welcome: each attempt named there is marked ended at
 //   once, a live process is stopped without a handoff turn (its new work goes to a late-work ref), and later commands
 //   for it answer attempt_ended, except those that outlive an attempt: cleanup_attempt, upload_transcript and
@@ -36,8 +37,11 @@ import type { Vault } from './git/vault';
 import type { CommandResult, Journal, JournaledCommand, JournalEntry } from './journal';
 import type { CommandMessage, WelcomeMessage } from './link';
 import type { Logger } from './log';
+import { checkMain } from './main-check';
 import type { Outbox } from './outbox';
+import type { RunnerPaths } from './paths';
 import { SerialQueue } from './queue';
+import type { DependencyPreparer } from './seams';
 import { SettingsSync } from './settings-sync';
 import type { VendorReport } from './vendors';
 
@@ -54,6 +58,7 @@ export const RESTARTABLE_COMMANDS: ReadonlySet<RunnerCommandKind> = new Set<Runn
   'preflight',
   'prepare_dependencies',
   'merge_task',
+  'check_main',
 ]);
 
 /** The commands that outlive their attempt: the hub keeps them when it ends one, and the runner runs them then too. */
@@ -79,6 +84,10 @@ export interface CommandExecutorOptions {
   /** The remote environment of the vault's pushes. */
   remote(): Promise<GitEnvironment>;
   wipRefPrefix(): string;
+  /** Where main's check makes its clone. */
+  paths: RunnerPaths;
+  /** What prepares the dependencies of main's check and runs it. */
+  preparer: DependencyPreparer;
   adapters: ReadonlyMap<Vendor, VendorAdapter>;
   /** Told each preflight a preflight command ran, so the runner's vendor readiness follows it. */
   preflighted?(result: PreflightResult): void;
@@ -380,6 +389,8 @@ export class CommandExecutor {
   ): Promise<CommandResult | Waits | null> {
     const attemptId = attemptOf(command);
     if (attemptId === null) {
+      // On a queue of its own: the runner's other commands, merge_task among them, never wait for a check.
+      if (command.kind === 'check_main') return this.runnerQueue.run('main-check', () => this.checkMain(command));
       return this.runnerQueue.run('runner', () => this.runnerCommand(commandId, command, execution));
     }
     // A command held by a pause meets a welcome.stop that came meanwhile.
@@ -484,6 +495,20 @@ export class CommandExecutor {
       default:
         return { ok: false, error: 'unsupported' };
     }
+  }
+
+  /** check_main: main's check at the sha; the result's data is a MainCheckResult. */
+  private async checkMain(command: Extract<RunnerCommand, { kind: 'check_main' }>): Promise<CommandResult> {
+    const result = await checkMain({
+      sha: command.sha,
+      vault: this.options.vault(),
+      local: this.options.local,
+      paths: this.options.paths,
+      preparer: this.options.preparer,
+      config: this.options.config(),
+      wipRefPrefix: this.options.wipRefPrefix(),
+    });
+    return { ok: true, data: result };
   }
 
   /**
