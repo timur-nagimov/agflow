@@ -175,7 +175,7 @@ export function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 <a
                   className="readout"
                   href={routeHref({ view: 'load' })}
-                  title={`${numbers.dispatchable} of them can start now`}
+                  title={`${numbers.dispatchable} of them dispatchable now`}
                 >
                   Ready <b>{numbers.ready}</b>
                 </a>
