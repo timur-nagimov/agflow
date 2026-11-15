@@ -64,6 +64,16 @@ bun run build:cli
 cp dist/agflow ~/.local/bin/agflow
 ```
 
+Or download the binary for your machine from the latest release: `agflow-darwin-arm64` for a Mac with Apple silicon, `agflow-linux-x64` or `agflow-linux-arm64` for Linux.
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/agflow https://github.com/timur-nagimov/agflow/releases/latest/download/agflow-darwin-arm64
+chmod +x ~/.local/bin/agflow
+```
+
+A tag `v*` publishes a release; `.github/workflows/release.yml` builds the three binaries and attaches them.
+
 Sign this computer in to your team's hub. A browser page opens; approve it after checking that it shows the same code as your terminal:
 
 ```bash
@@ -94,6 +104,12 @@ agflow runner status
 ```
 
 Setup records the machine identity, login-shell PATH, proxy/certificate settings and git commit identity in `~/.agflow/runner/runner.json` (mode 0600). Defaults include capacity 2, keep-awake on AC and paid usage off. It installs pinned vendor binaries into its own vendor directory, logs in to separate runner vendor homes, and installs the service: the macOS LaunchAgent, or a systemd user unit on Linux, where Codex signs in with a device code and Claude with a `claude setup-token` token ([Linux runner](docs/linux-runner.md)). It leaves your own vendor installations alone. `--relogin` repeats vendor logins; `--no-service` omits service installation; `--yes` accepts setup defaults.
+
+Flags answer setup's questions and set the rest of `runner.json`: `--name <name>`, `--capacity <1-16>`, `--ceiling <0.5-1>` (both quota windows of both vendors), `--keep-awake always|ac|off` and `--profile standard|auto|open`. `--preset hackathon` means capacity 6, ceilings 1, keep-awake always and the open profile; a flag given beside it wins. Rerunning setup with flags changes a kept `runner.json` as local edits, which the hub hears at the runner's next connection. While the runner runs, setup refuses flags that would change `runner.json`: stop it first with `agflow runner stop`.
+
+```bash
+agflow runner setup --preset hackathon --name hack-mac
+```
 
 Checks run **inside the service**: hub identity, repository access (`git ls-remote`), a fenced create/delete push to a probe ref, both vendor preflights (including the expected MCP surface), the dependency sandbox, and sleep settings. The runner needs your git credentials for vault fetches and pushes. It captures connectivity settings because a LaunchAgent does not inherit an interactive shell. A missing pinned binary at start is a preflight failure; start never downloads one.
 
@@ -153,9 +169,11 @@ runner of an older agflow, which does not hear the project from the hub, keeps t
 Agents run as the laptop owner's user. Four boundaries apply to their tools:
 
 1. **Network:** Claude commands reach only allowlisted package registries; Codex commands have no network. Web search, account apps/connectors and extra MCP servers are disabled or refused at startup. Tools cannot reach the hub or git host directly.
-2. **Writes:** tools write only inside the attempt clone and its private temporary directory. Claude's Edit/Write tools also have guards.
+2. **Writes:** tools write only inside the attempt clone, its private temporary directory and the runner's shared pip and uv caches (`~/.agflow/cache`). Claude's Edit/Write tools also have guards.
 3. **Authority:** only the agflow bridge carries a scoped agent token to allowed hub routes. Lead authority requires the lead seat; an owner's CLI token cannot impersonate a runner agent.
 4. **Git:** agents have no push credentials or route to the host. The runner alone fetches and pushes through its protected vault, with fenced updates, and never trusts the clone's git configuration during harvest.
+
+**The open profile** (`"profile": "open"` in `runner.json`, or `--preset hackathon`) is for a hackathon on a laptop that runs only your own project. Claude's sandboxed commands reach any host: the registries without asking, and any other host the CLI asks about, which the runner allows. They may bind and reach local ports and use every unix socket, Docker's included. Claude keeps WebFetch and WebSearch, Codex commands get the network, and dependency preparation reaches any host and local ports. Agents may change the greenfield files listed below. Boundaries 1 and 4 no longer hold: commands reach the hub and the git host directly, and the unix sockets Claude's commands may use include the owner's ssh-agent, so an agent can push with the owner's SSH keys. An agent misled by what it reads can send whatever its sandbox lets it read to any host.
 
 The runner never auto-approves an escalation: requests go to the owner. Approving a Codex escalation runs that command **outside the sandbox**, with network and the owner's full write access. M2 has no mid-turn Claude approval relay; a refused operation needs human intervention. Managed device policies remain in force: agflow does not bypass MDM or weaken the vendor's policy. The `auto` Claude profile can classify Bash commands within its sandbox; that is not permission to escape it.
 
@@ -184,7 +202,7 @@ People configure preparation in a committed `.agflow/config.json`:
 }
 ```
 
-Without the file, nothing is prepared. The runner reads it from the vault at the protected restore base, never from agent-edited working files. Worker starts/resumes prepare when the listed files change; workers can also request `prepare_dependencies`. Leads get no preparation. Commands run in a sandbox with registry-only network, no owner credentials and writes confined to the clone and preparation cache, with a 15-minute timeout. Private registries are outside M2. Lifecycle scripts are disabled by default; an entry that needs them declares `"scripts": true` and uses a per-attempt cache (remove `--ignore-scripts` from that command). Go and Cargo always use per-attempt caches. If the sandbox check fails, preparation is unavailable on that runner.
+Without the file, nothing is prepared. The runner reads it from the vault at the protected restore base, never from agent-edited working files. Worker starts/resumes prepare when the listed files change; workers can also request `prepare_dependencies`. Leads get no preparation. A failed preparation fails the start or resume, but on a runner with the open profile the agent starts anyway and installs what it needs itself. Commands run in a sandbox with registry-only network, no owner credentials and writes confined to the clone and preparation cache, with a 15-minute timeout. Private registries are outside M2. Lifecycle scripts are disabled by default; an entry that needs them declares `"scripts": true` and uses a per-attempt cache (remove `--ignore-scripts` from that command). Go and Cargo always use per-attempt caches. pip and uv use the runner's shared caches in `~/.agflow/cache/`, which agents and every preparation on that runner write. If the sandbox check fails, preparation is unavailable on that runner.
 
 Protected paths are matched case-insensitively. The runner restores them before starts, resumes, preparation and take-over, strips unauthorized changes from WIP, and refuses a submission containing them:
 
@@ -193,6 +211,8 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | Agent configuration | `.claude/**`, `.codex/**`, `.mcp.json`, `.agents/**`, `.agflow/**` (except untracked `.agflow/run/`), `.husky/**`, `.pre-commit-config.yaml`, `lefthook.yml`, `.envrc`, `.devcontainer/**`, `.vscode/**`, `.idea/**`, `.npmrc`, `.yarnrc*`, `bunfig.toml`, `.tool-versions` | None for runner agents; tasks owning these paths are for people/live chats. |
 | People only | `.github/workflows/**`, `.gitlab-ci.yml`, `.gitlab/**`, `.env*`, `*.pem`, `*.key`, `.gitmodules`, `.gitattributes` | A person created the task and its owned paths explicitly include them. |
 | Curators only | `AGENTS.md`, `CLAUDE.md` at any depth | A task of kind `curation`. |
+
+**Greenfield files.** On a runner with the open profile, agents may change `.env*` files, `.gitattributes`, `.github/workflows/**`, `bunfig.toml`, `.npmrc`, `.tool-versions`, `.agflow/config.json`, `AGENTS.md` and `CLAUDE.md` in any task. The rest of `.agflow/` stays protected. A task whose owned paths include these files goes only to such a runner, instead of to live chats.
 
 ## Configuration
 

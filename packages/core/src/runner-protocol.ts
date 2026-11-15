@@ -467,7 +467,7 @@ export const VendorQuotaSchema = schemaFor<VendorQuota>()(
 );
 
 export const ProfileSummarySchema = schemaFor<ProfileSummary>()(
-  z.strictObject({ name: z.enum(['standard', 'auto']), weakened: z.array(Name), dependencyPrep: z.boolean() }),
+  z.strictObject({ name: z.enum(['standard', 'auto', 'open']), weakened: z.array(Name), dependencyPrep: z.boolean() }),
 );
 
 export const AccountQuotaReportSchema = schemaFor<AccountQuotaReport>()(

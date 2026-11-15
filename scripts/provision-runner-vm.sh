@@ -119,6 +119,7 @@ Next, on the VM (ssh $user@$ip), following docs/linux-runner.md:
   give git access to the project's repository (an SSH key or a token; see docs/linux-runner.md)
   agflow login --hub https://YOUR-HUB
   agflow runner setup
+    For a hackathon: agflow runner setup --preset hackathon --capacity 8 (no --yes: it asks for the Claude token).
     Claude: on your Mac run claude setup-token, and paste the token when setup asks for it.
     Codex: setup shows a link and a code; open the link in a browser on your Mac and enter the code.
     Setup then installs and starts the systemd unit.

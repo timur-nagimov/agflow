@@ -485,7 +485,8 @@ export interface AccountQuota {
 }
 
 export interface ProfileSummary {
-  name: 'standard' | 'auto';
+  /** open: the hackathon profile, with network for agents and the greenfield files theirs to change. */
+  name: 'standard' | 'auto' | 'open';
   /** Boundaries this laptop cannot enforce. */
   weakened: string[];
   /** The sandbox for dependency preparation works here. */

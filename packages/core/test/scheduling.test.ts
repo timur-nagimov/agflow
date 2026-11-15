@@ -57,6 +57,7 @@ function runner(overrides: Partial<RunnerSlot> = {}): RunnerSlot {
     capacity: 2,
     openAttempts: 0,
     power: { source: 'ac', batteryPercent: null, lowPowerMode: false },
+    profile: 'standard',
     vendors: [vendorSlot()],
     ...overrides,
   };
@@ -420,6 +421,9 @@ describe('isDispatchable', () => {
     // Times that have come qualify.
     expect(isDispatchable(candidate({ nextDispatchAt: NOW, dispatchHoldUntil: NOW - 1 }), dispatch)).toBe(true);
     expect(isDispatchable(candidate({ counted: 2 }), dispatch)).toBe(true);
+    // Greenfield files wait for a runner with the open profile, not for a live chat.
+    const workflow = candidate({ ownedPaths: ['.github/workflows/ci.yml'], createdBy: 'agent:A-1' });
+    expect(isDispatchable(workflow, dispatch)).toBe(true);
   });
 
   test('a path holder with overlapping paths keeps the task out; the task itself and other paths do not', () => {
@@ -588,6 +592,45 @@ describe('place', () => {
     expect(place(view, candidate(), noPref)).toEqual({
       placement: null,
       refused: [{ runnerId: 'R-1', vendor: null, refusal: 'full' }],
+    });
+  });
+
+  test('a task that owns greenfield files goes only to a runner with the open profile', () => {
+    const owner = candidate({ ownedPaths: ['.env.example', 'src/**'], createdBy: 'agent:A-1' });
+    // R-1 has more free slots, so an ordinary task goes there.
+    const view = snapshot([runner({ id: 'R-1', capacity: 8 }), runner({ id: 'R-2', profile: 'open' })], [account()]);
+    expect(place(view, candidate(), noPref).placement?.runnerId).toBe('R-1');
+    expect(place(view, owner, noPref).placement?.runnerId).toBe('R-2');
+    // Without an open runner it waits, refused by nothing on the others.
+    expect(place(snapshot([runner()], [account()]), owner, noPref)).toEqual({ placement: null, refused: [] });
+    const full = snapshot([runner(), runner({ id: 'R-2', profile: 'open', openAttempts: 2 })], [account()]);
+    expect(place(full, owner, noPref)).toEqual({
+      placement: null,
+      refused: [{ runnerId: 'R-2', vendor: null, refusal: 'full' }],
+    });
+  });
+
+  test("open runners take a greenfield task in the accounts' order, and a role's limit on any runner holds", () => {
+    const owner = candidate({ ownedPaths: ['AGENTS.md'], createdBy: 'agent:A-1' });
+    const runners = [
+      runner({ id: 'R-1', profile: 'open' }),
+      runner({ id: 'R-2', owner: 'bob', profile: 'open' }),
+      runner({ id: 'R-3', capacity: 8 }),
+    ];
+    // ann's account has an open attempt and bob's none, so bob's open runner takes it before ann's R-1.
+    const view = snapshot(runners, [account({ openAttempts: 1 }), account({ owner: 'bob' })]);
+    expect(place(view, owner, noPref).placement?.runnerId).toBe('R-2');
+    // A worker's limit met on ann's standard runner holds on her open one, which is logged in to the same account.
+    const limited = snapshot(
+      [
+        runner({ id: 'R-1', vendors: [vendorSlot({ limitedUntil: { worker: NOW + 1 } })] }),
+        runner({ id: 'R-2', profile: 'open' }),
+      ],
+      [account()],
+    );
+    expect(place(limited, owner, noPref)).toEqual({
+      placement: null,
+      refused: [{ runnerId: 'R-2', vendor: 'claude', refusal: 'exhausted' }],
     });
   });
 });

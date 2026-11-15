@@ -69,6 +69,7 @@ export class CodexAdapter implements VendorAdapter {
       runnerDir: paths.runner,
       codexHome,
       userHome,
+      caches: Object.values(paths.caches),
       testConfig: codexConfig,
       skipAuthChecks,
       logger,

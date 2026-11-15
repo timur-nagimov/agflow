@@ -23,11 +23,18 @@ import {
   packTarball,
   startOriginHub,
 } from '@agflow/runner/test/service-helpers';
-import { parseArgs } from '../src/args';
+import { parseArgs, UsageError } from '../src/args';
 import { deleteCredentials, saveCredentials } from '../src/credentials';
 import { HubClient } from '../src/hub-client';
 import { runnerCommand } from '../src/runner-command';
-import { type Prompt, readSecret, runnerSetup, type RunnerSetupDeps } from '../src/runner-setup';
+import {
+  HACKATHON_PRESET,
+  type Prompt,
+  readSecret,
+  runnerSetup,
+  type RunnerSetupDeps,
+  setupChoices,
+} from '../src/runner-setup';
 import { shellQuote } from '../src/self';
 
 setDefaultTimeout(60_000);
@@ -493,7 +500,7 @@ for (const capacity of ['0', '17', '2.5', 'many']) {
   });
 }
 
-test('a running runner keeps ownership of runner.json and setup asks nothing', async () => {
+test('a running runner keeps ownership of runner.json: setup asks nothing and refuses flags that would change it', async () => {
   const f = await fixture();
   await f.run();
   const before = readFileSync(f.paths.config, 'utf8');
@@ -503,6 +510,59 @@ test('a running runner keeps ownership of runner.json and setup asks nothing', a
   expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
   expect(f.out.join('')).toContain(`pid ${process.pid}`);
   expect(f.out.join('')).toContain('change capacity on the hub');
+  // Flags that would change runner.json fail setup, so a running standard runner never stays one unnoticed.
+  await expect(f.run(['--yes', '--no-service', '--preset', 'hackathon'])).rejects.toThrow(
+    `the runner (pid ${process.pid}) is running, so setup cannot change runner.json; stop it first (agflow runner stop)`,
+  );
+  await expect(f.run(['--yes', '--no-service', '--name', 'Other Mac'])).rejects.toThrow('agflow runner stop');
+  expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
+  // Flags that match it change nothing.
+  expect(await f.run(['--no-service', '--name', 'Test Mac', '--capacity', '2', '--profile', 'standard'])).toBe(0);
+});
+
+test('on Linux --preset hackathon asks for the Claude token and runs the systemd unit, whose runner then owns runner.json', async () => {
+  const f = await fixture({ linux: true });
+  const token = `sk-ant-oat01-${'A'.repeat(95)}`;
+  const questions: string[] = [];
+  const secret = async (question: string) => {
+    questions.push(question);
+    return token;
+  };
+  const systemctl = () =>
+    f.calls.filter((call) => call.argv[0] === 'systemctl').map((call) => call.argv.slice(2).join(' '));
+  expect(await f.run(['--preset', 'hackathon', '--capacity', '8', '--name', 'Cloud runner'], { secret })).toBe(0);
+  expect(questions).toEqual(['Token: ']);
+  expect(readFileSync(f.paths.envFile, 'utf8')).toBe(`CLAUDE_CODE_OAUTH_TOKEN=${token}\n`);
+  expect(f.logins().map((call) => call.argv.join(' '))).toEqual(['login --device-auth']);
+  expect(loadRunnerConfig(f.paths.config)).toMatchObject({
+    name: 'Cloud runner',
+    capacity: 8,
+    keepAwake: 'always',
+    profile: 'open',
+    ceilings: { claude: { fiveHour: 1, weekly: 1 }, codex: { fiveHour: 1, weekly: 1 } },
+  });
+  expect(systemctl().slice(-2)).toEqual(['enable agflow-runner.service', 'start agflow-runner.service']);
+
+  // The unit's runner holds the lock: a flag that would change runner.json fails setup before it asks or installs.
+  const before = readFileSync(f.paths.config, 'utf8');
+  const calls = f.calls.length;
+  await expect(f.run(['--capacity', '12'], { prompt: answers(), secret })).rejects.toThrow(
+    'is running, so setup cannot change runner.json; stop it first (agflow runner stop)',
+  );
+  expect(readFileSync(f.paths.config, 'utf8')).toBe(before);
+  expect(questions).toHaveLength(1);
+  expect(f.calls.slice(calls).some((call) => ['systemctl', 'loginctl'].includes(call.argv[0]!))).toBe(false);
+
+  // agflow runner stop stops the runner and the unit; setup then changes runner.json and starts the unit again.
+  process.env.AGFLOW_HOME = f.paths.home;
+  const deps = { env: f.env, exec: f.deps.exec, home: f.home, platform: 'linux' as const };
+  expect(await runnerCommand(parseArgs(['runner', 'stop']), f.io, deps)).toBe(0);
+  expect(f.out.join('')).toContain('the runner stopped; the systemd unit was stopped and disabled');
+  expect(systemctl().at(-1)).toBe('disable --now agflow-runner.service');
+  expect(await f.run(['--capacity', '12'], { prompt: answers(), secret })).toBe(0);
+  expect(loadRunnerConfig(f.paths.config)).toMatchObject({ name: 'Cloud runner', capacity: 12, profile: 'open' });
+  expect(systemctl().slice(-2)).toEqual(['enable agflow-runner.service', 'start agflow-runner.service']);
+  expect(questions).toHaveLength(1);
 });
 
 test('socket timeout points to status and the runner log', async () => {
@@ -552,6 +612,68 @@ test('checks retry startup route errors within the socket deadline', async () =>
   expect(tries).toBe(3);
   expect(f.out.join('')).toContain('started');
   expect(f.logins()).toEqual([]);
+});
+
+test('setup flags choose the runner settings, and the hackathon preset chooses them all', () => {
+  const choices = (...flags: string[]) => setupChoices(parseArgs(['runner', 'setup', ...flags]));
+  expect(choices('--yes')).toEqual({});
+  expect(HACKATHON_PRESET).toEqual({ capacity: 6, ceiling: 1, keepAwake: 'always', profile: 'open' });
+  expect(choices('--preset', 'hackathon')).toEqual(HACKATHON_PRESET);
+  expect(choices('--preset', 'hackathon', '--capacity', '8', '--profile', 'standard')).toEqual({
+    ...HACKATHON_PRESET,
+    capacity: 8,
+    profile: 'standard',
+  });
+  expect(
+    choices('--name', ' Hack Mac ', '--capacity=16', '--ceiling', '0.5', '--keep-awake', 'off', '--profile', 'auto'),
+  ).toEqual({ name: 'Hack Mac', capacity: 16, ceiling: 0.5, keepAwake: 'off', profile: 'auto' });
+  for (const flags of [
+    ['--preset', 'party'],
+    ['--name', ' '],
+    ['--name'],
+    ['--capacity', '0'],
+    ['--capacity', '17'],
+    ['--capacity', '2.5'],
+    ['--capacity', 'many'],
+    ['--capacity'],
+    ['--ceiling', '0.4'],
+    ['--ceiling', '1.1'],
+    ['--ceiling', 'high'],
+    ['--keep-awake', 'never'],
+    ['--profile', 'wide'],
+  ]) {
+    expect(() => choices(...flags)).toThrow(UsageError);
+  }
+});
+
+test('--preset hackathon sets up a busy open runner without asking', async () => {
+  const f = await fixture();
+  expect(await f.run(['--preset', 'hackathon', '--name', 'Hack Mac', '--no-service'])).toBe(0);
+  const config = loadRunnerConfig(f.paths.config);
+  expect(config).toMatchObject({
+    name: 'Hack Mac',
+    capacity: 6,
+    keepAwake: 'always',
+    profile: 'open',
+    ceilings: { claude: { fiveHour: 1, weekly: 1 }, codex: { fiveHour: 1, weekly: 1 } },
+  });
+  expect(config.confirmedSettings).toMatchObject({ capacity: 6, keepAwake: 'always', version: 0 });
+});
+
+test('setup flags change a kept runner.json as local edits, and nothing when they match it', async () => {
+  const f = await fixture();
+  await f.run();
+  const initial = loadRunnerConfig(f.paths.config);
+  await f.run(['--yes', '--no-service', '--preset', 'hackathon', '--keep-awake', 'ac']);
+  const edited = loadRunnerConfig(f.paths.config);
+  expect(edited).toMatchObject({ runnerKey: initial.runnerKey, name: 'Test Mac', capacity: 6, keepAwake: 'ac' });
+  expect(edited.profile).toBe('open');
+  expect(edited.ceilings.codex).toEqual({ fiveHour: 1, weekly: 1 });
+  // The hub hears of the edits after its next welcome; the confirmed snapshot stays as it was.
+  expect(edited.confirmedSettings).toEqual(initial.confirmedSettings);
+  const before = statSync(f.paths.config).mtimeMs;
+  await f.run(['--no-service', '--name', 'Test Mac', '--capacity', '6', '--profile', 'open']);
+  expect(statSync(f.paths.config).mtimeMs).toBe(before);
 });
 
 test('runnerWhoami validates the response schema', async () => {

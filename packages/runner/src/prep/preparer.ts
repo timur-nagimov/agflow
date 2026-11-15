@@ -6,7 +6,7 @@ import type { AttemptStore } from '../attempt-store';
 import { type RunnerConfig, vendorHomes } from '../config';
 import { removeInClone, restoreProtected } from '../git/protect';
 import { type Logger, noopLogger } from '../log';
-import type { RunnerPaths } from '../paths';
+import { ensureSharedCaches, type RunnerPaths } from '../paths';
 import { profileOf } from '../profile';
 import { runDirOf } from '../run-dir';
 import type { DependencyPreparer, PrepareInput, PrepareOutcome } from '../seams';
@@ -106,13 +106,12 @@ async function cleanUserConfig(clone: string): Promise<void> {
 async function makeRunDirectories(clone: string, prep: string, env: Record<string, string>): Promise<void> {
   const cache = prepLayout(prep).cache;
   mkdirSync(cache, { recursive: true, mode: 0o700 });
+  // pip's and uv's caches are the runner's shared ones, which ensureSharedCaches makes.
   for (const name of [
     'HOME',
     'BUN_INSTALL_CACHE_DIR',
     'npm_config_cache',
     'npm_config_store_dir',
-    'PIP_CACHE_DIR',
-    'UV_CACHE_DIR',
     'GOMODCACHE',
     'CARGO_HOME',
   ]) {
@@ -140,9 +139,10 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
   if (run) {
     available = options.available ?? true;
   } else {
+    const profile = profileOf(options.config());
     const sandbox =
       options.sandbox ??
-      new PrepSandbox({ allowedDomains: profileOf(options.config()).network.allowedDomains, logger });
+      new PrepSandbox({ allowedDomains: profile.network.allowedDomains, open: profile.name === 'open', logger });
     const checked = await checkPrepSandbox({ sandbox });
     available = checked.works;
     if (!available) logger.warn('dependency preparation unavailable', { reason: checked.reason });
@@ -189,8 +189,16 @@ export async function createDependencyPreparer(options: DependencyPreparerOption
         const tmpDir = mkdtempSync(join(layout.tmp, 'run-'));
         try {
           await cleanUserConfig(input.clone);
-          const env = prepEnv({ agentEnv: input.env, clone: input.clone, prep, tmpDir, entry });
+          const env = prepEnv({
+            agentEnv: input.env,
+            clone: input.clone,
+            prep,
+            tmpDir,
+            entry,
+            caches: options.paths.caches,
+          });
           await makeRunDirectories(input.clone, prep, env);
+          ensureSharedCaches(options.paths);
           const result = await commandRun({
             argv: entry.run,
             cwd: input.clone,

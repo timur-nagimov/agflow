@@ -385,6 +385,21 @@ describe('AttemptController: preparing the clone for a start', () => {
     expect(f.fakes.claude?.launches).toEqual([]);
   });
 
+  test('under the open profile a failed preparation is reported and the agent starts anyway, to install for itself', async () => {
+    const f = await createRunnerFixture({ files: FILES, config: { profile: 'open' } });
+    // A config an agent wrote without its schema, merged to main: every preparation from main fails to read it.
+    const error = '.agflow/config.json: dependencies.0.when: Invalid input: expected array, received undefined';
+    const prep = recordingPreparer({ ok: false, error }, () => null);
+    const controller = f.controller('T-4-a1', { preparer: prep.preparer });
+    expect(await controller.start(f.spec())).toEqual({ started: true });
+    expect(f.events('attempt.prepared').map((event) => event.data)).toEqual([
+      { requestId: null, ok: false, error, logTail: 'npm ERR!' },
+    ]);
+    expect(f.events('attempt.failed_to_start')).toEqual([]);
+    expect(f.fakes.claude?.launches).toHaveLength(1);
+    await waitFor(() => f.events('attempt.spawned').length > 0);
+  });
+
   test('a clone that cannot be prepared reports attempt.failed_to_start and nothing else', async () => {
     const f = await createRunnerFixture({ files: FILES });
     const controller = f.controller('T-6-a1');

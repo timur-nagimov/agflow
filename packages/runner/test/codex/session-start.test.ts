@@ -192,6 +192,29 @@ describe('CodexSession.start', () => {
     });
   }
 
+  test('an open profile thread gets the network and the shared caches, and must report the network', async () => {
+    const open = (f: SessionFixture) => {
+      f.launch.profile = { ...f.launch.profile, name: 'open', webTools: true };
+      f.options.caches = ['/h/cache/pip', '/h/cache/uv'];
+      return f;
+    };
+    const f = open(setup());
+    const session = await CodexSession.start(f.launch, f.options);
+    await session.close();
+    const start = readCodexRecord(f.bin)[0]!.requests.find((request) => request.method === 'thread/start');
+    expect(start!.params).toEqual(threadOverrides(f.launch, f.options.userHome, f.options.caches));
+    expect(start!.params).toMatchObject({
+      config: { sandbox_workspace_write: { network_access: true }, web_search: 'cached' },
+    });
+    // A thread that reports no network is not what the open profile asked for.
+    const refused = open(setup());
+    refused.answers['thread/start'] = {
+      result: m.threadStartResult({ thread: m.thread({ id: FAKE_THREAD_ID, cwd: refused.launch.clone }) }),
+    };
+    refused.write();
+    await rejected(refused, 'reported no sandbox network access, expected network');
+  });
+
   for (const names of [[], ['other\n server'], ['agflow', 'other'], ['agflow', 'agflow']]) {
     test(`rejects unexpected MCP inventory ${JSON.stringify(names)}`, async () => {
       await rejected(setup({ 'mcpServerStatus/list': { result: mcp(names) } }), 'MCP servers');

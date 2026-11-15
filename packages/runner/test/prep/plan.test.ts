@@ -217,6 +217,7 @@ function environment(vendor: 'claude' | 'codex') {
     agentEnv,
     secrets,
     tmpDir: join(prep, 'tmp/a1'),
+    caches: paths.caches,
   };
 }
 
@@ -306,11 +307,13 @@ describe('prepEnv', () => {
     for (const [key, name] of Object.entries({
       BUN_INSTALL_CACHE_DIR: 'bun',
       npm_config_cache: 'npm',
-      PIP_CACHE_DIR: 'pip',
-      UV_CACHE_DIR: 'uv',
       npm_config_store_dir: 'pnpm',
     }))
       expect(env[key]).toBe(join(cache, name));
+    // pip and uv always use the runner's shared caches, as agents do.
+    expect(env.PIP_CACHE_DIR).toBe(join(input.paths.home, 'cache', 'pip'));
+    expect(env.UV_CACHE_DIR).toBe(join(input.paths.home, 'cache', 'uv'));
+    expect([env.PIP_CACHE_DIR, env.UV_CACHE_DIR]).toEqual([input.agentEnv.PIP_CACHE_DIR, input.agentEnv.UV_CACHE_DIR]);
     expect(env.GOMODCACHE).toBe(join(perAttempt, 'go-mod'));
     expect(env.CARGO_HOME).toBe(join(perAttempt, 'cargo'));
     const scripts = 'scripts' in entry && entry.scripts;
@@ -368,7 +371,8 @@ describe('prepPolicy', () => {
     const policy = prepPolicy({ ...input, vendorHomes: homes, entry, profile });
     const runtimeConfig: Partial<SandboxRuntimeConfig> = policy;
     expect(runtimeConfig).toBe(policy);
-    const allowed = shared ? [input.clone, layout.cache, input.tmpDir] : [input.clone, input.tmpDir];
+    const caches = [input.paths.caches.pip, input.paths.caches.uv];
+    const allowed = [input.clone, ...(shared ? [layout.cache] : []), input.tmpDir, ...caches];
     const scripts = 'scripts' in entry && entry.scripts;
     expect(policy.filesystem).toEqual({
       allowWrite: allowed,

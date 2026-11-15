@@ -34,6 +34,7 @@ function runnerSlot(row: RunnerRow): RunnerSlot {
     capacity: row.capacity,
     openAttempts: row.active_attempts,
     power: info.power,
+    profile: info.profile.name,
     vendors,
   };
 }

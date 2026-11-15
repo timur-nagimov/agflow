@@ -69,16 +69,22 @@ describe('lead tools', () => {
     expect(getTask(hub.ctx, 'T-1').priority).toBe(1);
   });
 
-  test("create_tasks names the tasks no runner agent will run, with the owned path that keeps each from them", async () => {
+  test("create_tasks names the tasks no runner agent will run, and those only an open runner will, with the paths", async () => {
     const hub = hubFixture();
     const lead = as(hub.liveAgent('alice', 'lead'), 'lead');
     const skeleton = NewTaskSchema.parse({ ...spec('Skeleton'), ownedPaths: ['package.json', 'AGENTS.md'] });
     const curated = NewTaskSchema.parse({ ...spec('Conventions'), kind: 'curation', ownedPaths: ['AGENTS.md'] });
-    const created = await call('create_tasks', { tasks: [skeleton, curated, NewTaskSchema.parse(spec('Parser'))] }, lead);
+    const settings = NewTaskSchema.parse({ ...spec('Settings'), ownedPaths: ['.claude/settings.json'] });
+    const created = await call(
+      'create_tasks',
+      { tasks: [skeleton, curated, NewTaskSchema.parse(spec('Parser')), settings] },
+      lead,
+    );
     expect(created).toBe(
-      'Created:\nT-1 [ready] p5 Skeleton\nT-2 [ready] p5 Conventions\nT-3 [ready] p5 Parser\n' +
+      'Created:\nT-1 [ready] p5 Skeleton\nT-2 [ready] p5 Conventions\nT-3 [ready] p5 Parser\nT-4 [ready] p5 Settings\n' +
         "No runner agent will run these; they wait for a person's live chat, since they own paths runner agents may not change:\n" +
-        '- T-1: AGENTS.md (only a task of kind curation may change it)',
+        '- T-4: .claude/settings.json (agent configuration, which no runner agent may change)\n' +
+        'T-1 needs a runner with the open profile (owns AGENTS.md).',
     );
   });
 

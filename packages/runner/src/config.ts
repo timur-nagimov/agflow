@@ -135,7 +135,8 @@ export const RunnerConfigSchema = z
     allowPaidUsage: z.strictObject({ claude: paidUsage(), codex: paidUsage() }).prefault({}),
     /** The snapshot of the settings the hub last confirmed; a new runner.json confirms its own at version 0. */
     confirmedSettings: RunnerSettingsSchema.optional(),
-    profile: z.enum(['standard', 'auto']).default('standard'),
+    /** open is the hackathon profile (profile.ts); setup's --preset hackathon chooses it. */
+    profile: z.enum(['standard', 'auto', 'open']).default('standard'),
     models: z
       .strictObject({
         claude: models('claude-opus-5-5', 'claude-sonnet-5-5'),

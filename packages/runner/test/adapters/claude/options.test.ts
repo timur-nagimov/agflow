@@ -25,6 +25,7 @@ import {
   CLAUDE_BRIEF_HOOK_TIMEOUT_S,
   CLAUDE_BUILTIN_TOOLS,
   CLAUDE_LINUX_SHELL,
+  CLAUDE_NETWORK_ASK,
   CLAUDE_SHELL,
   claudeBinary,
   claudeEmptyDir,
@@ -33,6 +34,7 @@ import {
   effectivePermissionMode,
   ensureClaudeEmptyDir,
   inDirectory,
+  openProfilePrompts,
 } from '../../../src/adapters/claude/options';
 import { claudeProjectDir } from '../../../src/adapters/claude/paths';
 import { claudePermissionRules, claudeSandboxSettings } from '../../../src/adapters/claude/rules';
@@ -205,6 +207,26 @@ describe('buildQueryOptions', () => {
     expect(options.permissionPrompts).toBe('none');
     expect(options.canUseTool).toBeUndefined();
     expect(options.allowDangerouslySkipPermissions).toBeUndefined();
+  });
+
+  test('the open profile answers the sandbox network asks with yes, and every other prompt with no', async () => {
+    const open: PermissionProfile = { ...standardProfile, name: 'open', webTools: true };
+    const options = buildQueryOptions(launch({ profile: open }), deps({ autoOffered: true }));
+    expect(options.permissionMode).toBe('acceptEdits');
+    expect(options.permissionPrompts).toBe('host');
+    expect(options.canUseTool).toBe(openProfilePrompts);
+    expect(options.allowDangerouslySkipPermissions).toBeUndefined();
+    expect(options.tools).toEqual([...CLAUDE_BUILTIN_TOOLS, 'WebFetch', 'WebSearch']);
+    expect(options.sandbox?.network).toMatchObject({ strictAllowlist: false, allowLocalBinding: true });
+    const context = { signal: new AbortController().signal, toolUseID: 'toolu_1', requestId: 'request-1' };
+    expect(CLAUDE_NETWORK_ASK).toBe('SandboxNetworkAccess');
+    expect(await openProfilePrompts(CLAUDE_NETWORK_ASK, { host: 'api.example.com' }, context)).toEqual({
+      behavior: 'allow',
+      updatedInput: { host: 'api.example.com' },
+    });
+    for (const tool of ['Bash', 'Edit', 'Write', 'mcp__other__tool']) {
+      expect(await openProfilePrompts(tool, {}, context)).toMatchObject({ behavior: 'deny' });
+    }
   });
 
   test('project settings come only from the base checkout, and a launch without one is refused', () => {

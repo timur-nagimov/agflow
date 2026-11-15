@@ -8,6 +8,7 @@ import {
   type Task,
   type TaskStatus,
   liveChatOnlyReason,
+  openProfileReason,
   quoteLines,
 } from '@agflow/core';
 import { findAttempt, listAttempts, unpushedHead } from './attempt-store';
@@ -460,7 +461,8 @@ const REPORT_LIMIT = 2500;
 
 /**
  * The lead's situation report, at every wake-up: the board, the worker load with each account's quota and the
- * deadline, the ready tasks no runner agent will run, the work waiting on the lead, and as many recent events as fit.
+ * deadline, the ready tasks no runner agent will run and those only a runner with the open profile will, the work
+ * waiting on the lead, and as many recent events as fit.
  */
 export function situationReport(ctx: HubContext): string {
   const tasks = listTasks(ctx);
@@ -476,6 +478,11 @@ export function situationReport(ctx: HubContext): string {
   if (liveOnly.length > 0) {
     lines.push('Ready tasks left to live chats (no runner agent may change these owned paths):', ...liveOnly.slice(0, 10));
   }
+  const openOnly = tasks.flatMap((task) => {
+    const why = task.status === 'ready' ? openProfileReason(task) : null;
+    return why === null ? [] : [`${task.id} ${why}.`];
+  });
+  lines.push(...openOnly.slice(0, 10));
   const submitted = tasks.filter((task) => task.status === 'submitted');
   if (submitted.length > 0) {
     lines.push(

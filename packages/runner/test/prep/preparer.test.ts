@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { verifyPrepMain } from '../../scripts/verify-prep';
 import { prepareWorkspace } from '../../src/attempt/workspace';
@@ -342,10 +351,16 @@ describe('DependencyPreparer seam', () => {
     );
     for (const call of [scripts, python]) {
       expect(call?.env.BUN_INSTALL_CACHE_DIR).toBe(join(perAttempt, 'bun'));
-      expect(call?.env.PIP_CACHE_DIR).toBe(join(perAttempt, 'pip'));
       expect(call?.policy.filesystem.allowWrite).not.toContain(shared);
       expect(call?.policy.filesystem.allowRead).not.toContain(shared);
     }
+    // pip and uv use the runner's shared caches, which every preparation may write and the preparer makes.
+    for (const call of [normal, scripts, python]) {
+      expect(call?.env.PIP_CACHE_DIR).toBe(d.f.paths.caches.pip);
+      expect(call?.env.UV_CACHE_DIR).toBe(d.f.paths.caches.uv);
+      expect(call?.policy.filesystem.allowWrite).toEqual(expect.arrayContaining(Object.values(d.f.paths.caches)));
+    }
+    for (const cache of Object.values(d.f.paths.caches)) expect(statSync(cache).isDirectory()).toBe(true);
     expect(scripts?.env.npm_config_ignore_scripts).toBeUndefined();
     expect(scripts?.env.XDG_CONFIG_HOME).toBe(prepToolConfig(prep, true));
     expect(python?.env.npm_config_ignore_scripts).toBe('true');

@@ -247,8 +247,9 @@ describe('buildAgentEnv', () => {
     expect(env).toMatchObject({
       BUN_INSTALL_CACHE_DIR: `${RUN}/cache/bun`,
       npm_config_cache: `${RUN}/cache/npm`,
-      PIP_CACHE_DIR: `${RUN}/cache/pip`,
-      UV_CACHE_DIR: `${RUN}/cache/uv`,
+      // pip and uv share the runner's caches with every attempt and preparation.
+      PIP_CACHE_DIR: '/h/cache/pip',
+      UV_CACHE_DIR: '/h/cache/uv',
       GOMODCACHE: `${RUN}/cache/go-mod`,
       CARGO_HOME: `${RUN}/cache/cargo`,
       PATH: `${TOOLS}/bin:/opt/homebrew/bin:/usr/bin:/bin`,
@@ -356,6 +357,8 @@ describe('the permission profile', () => {
     expect(auto).toEqual({ ...standardProfile, name: 'auto' });
     auto.network.allowedDomains.push('example.com');
     expect(standardProfile.network.allowedDomains).not.toContain('example.com');
+    // The open profile keeps the web tools; its sandboxes render the rest from its name.
+    expect(profileOf(config({ profile: 'open' }))).toEqual({ ...standardProfile, name: 'open', webTools: true });
   });
 });
 

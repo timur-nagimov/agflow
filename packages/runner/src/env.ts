@@ -42,12 +42,10 @@ export function userVariables(base: Env): Record<string, string> {
   return env;
 }
 
-/** The package managers' caches, per attempt inside the clone. */
+/** The package managers' caches, per attempt inside the clone; pip's and uv's are the runner's shared ones. */
 const CACHES = {
   BUN_INSTALL_CACHE_DIR: 'bun',
   npm_config_cache: 'npm',
-  PIP_CACHE_DIR: 'pip',
-  UV_CACHE_DIR: 'uv',
   GOMODCACHE: 'go-mod',
   CARGO_HOME: 'cargo',
 } as const;
@@ -106,6 +104,8 @@ export function buildAgentEnv(input: AgentEnvInput): Record<string, string> {
   }
   env.DISABLE_AUTOUPDATER = '1';
   for (const [name, dir] of Object.entries(CACHES)) env[name] = join(runDir.cache, dir);
+  env.PIP_CACHE_DIR = input.paths.caches.pip;
+  env.UV_CACHE_DIR = input.paths.caches.uv;
   env.PATH = `${runDir.bin}:${input.config.capturedPath}`;
   Object.assign(env, agentGitEnv(runDir));
   Object.assign(env, {

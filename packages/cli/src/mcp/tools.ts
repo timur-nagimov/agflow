@@ -13,6 +13,7 @@ import {
   isHeld,
   isTaskBranch,
   liveChatOnlyReason,
+  openProfileReason,
   quoteLines,
   taskBranchName,
 } from '@agflow/core';
@@ -507,15 +508,21 @@ export const leadTools: ToolDef[] = [
     { tasks: z.array(NewTaskSchema).min(1).max(20) },
     async ({ tasks }, ctx) => {
       const created = await asAgent(ctx).createTasks(tasks);
-      // A task that owns a path no runner agent may change waits for a person's live chat (design 7.3).
+      // A task that owns a path no runner agent may change waits for a person's live chat (design 7.3); one that owns
+      // greenfield files waits for a runner with the open profile.
       const kept = created.tasks.flatMap((task) => {
         const why = liveChatOnlyReason(task);
         return why === null ? [] : [`- ${task.id}: ${why}`];
+      });
+      const open = created.tasks.flatMap((task) => {
+        const why = openProfileReason(task);
+        return why === null ? [] : [`${task.id} ${why}.`];
       });
       return lines([
         `Created:\n${created.tasks.map(taskLine).join('\n')}`,
         kept.length > 0 &&
           `No runner agent will run these; they wait for a person's live chat, since they own paths runner agents may not change:\n${kept.join('\n')}`,
+        ...open,
       ]);
     },
   ),

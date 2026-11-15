@@ -1,4 +1,5 @@
 // Runner setup (design 7.1): verify sign-in before writes, then reuse the runner's config, pins, logins and service.
+// Flags answer its questions and set runner.json's ceilings, keep-awake and profile; --preset hackathon sets them all.
 import { chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface, type Interface } from 'node:readline/promises';
@@ -24,7 +25,7 @@ import { defaultExec, type Exec } from '@agflow/runner/src/service/system';
 import { ensurePinnedVendors } from '@agflow/runner/src/vendor/install';
 import { claudeLoginStatus, codexLoginStatus, loginClaude, loginCodex } from '@agflow/runner/src/vendor/login';
 import { type PlatformPins, VENDOR_PINS, vendorPlatform } from '@agflow/runner/src/vendor/pins';
-import type { ParsedArgs } from './args';
+import { type ParsedArgs, UsageError, stringFlag } from './args';
 import { loadCredentials } from './credentials';
 import { type FetchFn, HubClient, HubClientError } from './hub-client';
 import type { Io } from './io';
@@ -103,6 +104,80 @@ export interface RunnerSetupDeps {
   pollMs: number;
 }
 
+/**
+ * What setup's flags choose, so it asks nothing about them (design 7.1): the name, the capacity, one ceiling for both
+ * windows of both vendors, keep-awake and the profile. A flag given beside --preset wins over the preset.
+ */
+export interface SetupChoices {
+  name?: string;
+  capacity?: number;
+  ceiling?: number;
+  keepAwake?: RunnerConfig['keepAwake'];
+  profile?: RunnerConfig['profile'];
+}
+
+/** --preset hackathon: every slot busy, no ceiling, the laptop always awake, and the open profile. */
+export const HACKATHON_PRESET: Readonly<SetupChoices> = {
+  capacity: 6,
+  ceiling: 1,
+  keepAwake: 'always',
+  profile: 'open',
+};
+
+const KEEP_AWAKE: readonly RunnerConfig['keepAwake'][] = ['always', 'ac', 'off'];
+const PROFILES: readonly RunnerConfig['profile'][] = ['standard', 'auto', 'open'];
+
+/** A capacity as runner.json takes it, a whole number from 1 to 16; null for anything else. */
+function capacityOf(text: string): number | null {
+  const capacity = Number(text);
+  return Number.isInteger(capacity) && capacity >= 1 && capacity <= 16 ? capacity : null;
+}
+
+function usage(message: string): never {
+  throw new UsageError(message);
+}
+
+/** One ceiling for both windows. */
+const both = (ceiling: number) => ({ fiveHour: ceiling, weekly: ceiling });
+
+/** Setup's flags; a value out of range is a usage error, before anything is asked or written. */
+export function setupChoices(args: ParsedArgs): SetupChoices {
+  // A flag given twice counts with its last value, as everywhere in the CLI.
+  const flag = (name: string): string | undefined =>
+    args.flags[name] === true ? usage(`--${name} needs a value`) : stringFlag(args, name);
+  const oneOf = <T extends string>(name: string, values: readonly T[]): T | undefined => {
+    const value = flag(name);
+    if (value === undefined || (values as readonly string[]).includes(value)) return value as T | undefined;
+    return usage(`--${name} must be one of: ${values.join(', ')}`);
+  };
+  const choices: SetupChoices = oneOf('preset', ['hackathon']) ? { ...HACKATHON_PRESET } : {};
+  const name = flag('name')?.trim();
+  if (name !== undefined) choices.name = name || usage('--name must not be empty');
+  const capacity = flag('capacity');
+  if (capacity !== undefined) {
+    choices.capacity = capacityOf(capacity) ?? usage('--capacity must be a whole number from 1 to 16');
+  }
+  const ceiling = flag('ceiling');
+  if (ceiling !== undefined) {
+    const value = Number(ceiling);
+    choices.ceiling = value >= 0.5 && value <= 1 ? value : usage('--ceiling must be a number from 0.5 to 1');
+  }
+  const keepAwake = oneOf('keep-awake', KEEP_AWAKE);
+  if (keepAwake !== undefined) choices.keepAwake = keepAwake;
+  const profile = oneOf('profile', PROFILES);
+  if (profile !== undefined) choices.profile = profile;
+  return choices;
+}
+
+/** The config with the choices laid over it, the settings among them as local edits; null when they change nothing. */
+function withChoices(config: RunnerConfig, choices: SetupChoices): RunnerConfig | null {
+  const { name = config.name, profile = config.profile, capacity, keepAwake, ceiling } = choices;
+  const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
+  const edited = editLocalSettings(config, { capacity, keepAwake, ceilings });
+  if (name === config.name && profile === config.profile && Object.keys(edited.changed).length === 0) return null;
+  return { ...edited.config, name, profile };
+}
+
 async function configure(
   paths: RunnerPaths,
   env: RunnerSetupDeps['env'],
@@ -110,6 +185,7 @@ async function configure(
   machine: { platform: NodeJS.Platform; machineIdFile?: string },
   prompt: Prompt,
   log: (line: string) => void,
+  choices: SetupChoices = {},
 ): Promise<RunnerConfig> {
   const machineId = await readMachineId({ exec, ...machine });
   let lock: RunnerLock;
@@ -117,11 +193,19 @@ async function configure(
     lock = await acquireRunnerLock(paths, { mode: 'foreground', wait: false });
   } catch (error) {
     if (!(error instanceof AlreadyRunningError)) throw error;
+    const running = loadRunnerConfig(paths.config, env);
+    // The running runner owns runner.json: flags that would change it fail setup rather than go unheard.
+    if (withChoices(running, choices) !== null) {
+      throw new Error(
+        `the runner (pid ${error.pid ?? 'unknown'}) is running, so setup cannot change runner.json; ` +
+          'stop it first (agflow runner stop), then run setup again',
+      );
+    }
     log(
       `the runner (pid ${error.pid ?? 'unknown'}) is running, so runner.json stays as it is; ` +
         'change capacity on the hub, or stop the runner and run setup again',
     );
-    return loadRunnerConfig(paths.config, env);
+    return running;
   }
   try {
     // Re-read under the lock: a service may have saved settings while setup checked sign-in.
@@ -132,18 +216,21 @@ async function configure(
     const kept = mismatch ? null : previous;
     const defaultName = kept?.name ?? (await readComputerName(exec));
     const defaultCapacity = kept?.capacity ?? 2;
-    const name = (await prompt.ask('Runner name', defaultName)).trim() || defaultName;
-    const answer = (await prompt.ask('Capacity', String(defaultCapacity))).trim();
-    const capacity = Number(answer || defaultCapacity);
+    // A flag answers its question, so setup does not ask it.
+    const name = choices.name ?? ((await prompt.ask('Runner name', defaultName)).trim() || defaultName);
+    const answer = choices.capacity === undefined ? (await prompt.ask('Capacity', String(defaultCapacity))).trim() : '';
+    const capacity = choices.capacity ?? Number(answer || defaultCapacity);
     if (!Number.isInteger(capacity) || capacity < 1 || capacity > 16) {
       throw new Error('capacity must be a whole number from 1 to 16');
     }
     if (kept) {
-      if (name === kept.name && capacity === kept.capacity) return kept;
-      const next = { ...editLocalSettings(kept, { capacity }).config, name };
+      const next = withChoices(kept, { ...choices, name, capacity });
+      if (next === null) return kept;
       saveRunnerConfig(paths.config, next);
       return next;
     }
+    const { ceiling, keepAwake, profile } = choices;
+    const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
     const captured = await captureLoginShellEnv({ env, exec });
     const config = createRunnerConfig(
       {
@@ -154,7 +241,7 @@ async function configure(
         commitIdentity: await readGitIdentity(exec),
         homes: { claude: canonicalHome(paths.homes.claude), codex: canonicalHome(paths.homes.codex) },
       },
-      { name, capacity },
+      { name, capacity, keepAwake, ceilings, profile },
     );
     saveRunnerConfig(paths.config, config);
     if (mismatch) log('assigned a new runner key because runner.json came from another Mac');
@@ -223,6 +310,7 @@ async function serviceChecks(paths: RunnerPaths, socketTimeoutMs: number, checks
 }
 
 export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<RunnerSetupDeps> = {}): Promise<number> {
+  const choices = setupChoices(args);
   const env = deps.env ?? process.env;
   const paths = deps.paths ?? runnerPaths(agflowHome(env));
   const credentials = loadCredentials(deps.dir ?? configDir());
@@ -253,6 +341,7 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
       { platform: machinePlatform, machineIdFile: deps.machineIdFile },
       args.flags.yes === true ? { ask: async (_question, fallback) => fallback } : (deps.prompt ?? terminal!),
       log,
+      choices,
     );
   } finally {
     terminal?.close();

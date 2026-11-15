@@ -1,11 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  GREENFIELD_PATTERNS,
   PROTECTED_CLASSES,
   type ProtectedClass,
   classifyPath,
   liveChatOnly,
   liveChatOnlyReason,
   matchesProtectedPattern,
+  needsOpenProfile,
+  openProfileReason,
   protectedViolations,
   restoreSet,
   runnerForbiddenPaths,
@@ -36,6 +39,7 @@ describe('the protected classes', () => {
       '.mcp.json',
       '.agents/**',
       '.agflow/**',
+      '.agflow/config.json',
       '.husky/**',
       '.pre-commit-config.yaml',
       'lefthook.yml',
@@ -207,9 +211,13 @@ describe('matchesProtectedPattern', () => {
     expect(matchesProtectedPattern('server.pem.txt', '*.pem')).toBe(false);
   });
 
-  test('leaves .agflow/run/ out of .agflow/** only', () => {
+  test('leaves .agflow/run/ out of .agflow/** only, and .agflow/config.json to its own pattern', () => {
     expect(matchesProtectedPattern('.agflow/run/brief.md', '.agflow/**')).toBe(false);
-    expect(matchesProtectedPattern('.agflow/config.json', '.agflow/**')).toBe(true);
+    expect(matchesProtectedPattern('.agflow/config.json', '.agflow/**')).toBe(false);
+    expect(matchesProtectedPattern('.AGFLOW/Config.json', '.agflow/config.json')).toBe(true);
+    expect(matchesProtectedPattern('.agflow/config.json.bak', '.agflow/**')).toBe(true);
+    expect(matchesProtectedPattern('.agflow/run', '.agflow/**')).toBe(true);
+    expect(matchesProtectedPattern('.agflow', '.agflow/**')).toBe(true);
     expect(matchesProtectedPattern('.agflow/run/.env', '.env*')).toBe(true);
   });
 
@@ -312,7 +320,9 @@ describe('runnerForbiddenPaths and liveChatOnly', () => {
   test('curator paths are forbidden unless the task is a curation task', () => {
     const owned = ['docs/AGENTS.md', 'packages/*/CLAUDE.md'];
     expect(runnerForbiddenPaths(task(owned))).toEqual(owned.map((path) => ({ path, class: 'curators_only' })));
-    expect(liveChatOnly(task(owned, { createdBy: 'user:alice' }))).toBe(true);
+    // Curator files are greenfield files: an open runner's agents may change them.
+    expect(liveChatOnly(task(owned, { createdBy: 'user:alice' }))).toBe(false);
+    expect(needsOpenProfile(task(owned, { createdBy: 'user:alice' }))).toBe(true);
     expect(runnerForbiddenPaths(task(owned, { kind: 'curation' }))).toEqual([]);
     expect(liveChatOnly(task(owned, { kind: 'curation' }))).toBe(false);
   });
@@ -332,14 +342,26 @@ describe('runnerForbiddenPaths and liveChatOnly', () => {
   });
 
   test("the lead is told which owned path keeps a task from runners, and the rule that does", () => {
-    const owned = ['src/**', 'AGENTS.md', '.github/workflows/ci.yml', '.claude/settings.json'];
+    const owned = ['src/**', 'AGENTS.md', '.github/workflows/ci.yml', '.claude/settings.json', 'certs/*.pem'];
+    // Greenfield files keep a task only from runners without the open profile, so they are not named.
     expect(liveChatOnlyReason(task(owned))).toBe(
-      'AGENTS.md (only a task of kind curation may change it), ' +
-        '.github/workflows/ci.yml (only a task a person created may change it), ' +
-        '.claude/settings.json (agent configuration, which no runner agent may change)',
+      '.claude/settings.json (agent configuration, which no runner agent may change), ' +
+        'certs/*.pem (only a task a person created may change it)',
     );
+    expect(openProfileReason(task(owned))).toBeNull();
     expect(liveChatOnlyReason(task(['src/**', 'AGENTS.md'], { kind: 'curation' }))).toBeNull();
     expect(liveChatOnlyReason(task(['src/**']))).toBeNull();
+  });
+
+  test('the lead is told which task needs a runner with the open profile, and the greenfield files it owns', () => {
+    const owned = ['src/**', 'AGENTS.md', '.github/workflows/ci.yml'];
+    expect(liveChatOnlyReason(task(owned))).toBeNull();
+    expect(openProfileReason(task(owned))).toBe(
+      'needs a runner with the open profile (owns AGENTS.md, .github/workflows/ci.yml)',
+    );
+    // A curation task that a person created may change both on any runner.
+    expect(openProfileReason(task(owned, { kind: 'curation', createdBy: 'user:alice' }))).toBeNull();
+    expect(openProfileReason(task(['src/**']))).toBeNull();
   });
 });
 
@@ -391,5 +413,72 @@ describe('protectedViolations', () => {
         expect([path, protectedViolations([path], subject).length > 0]).toEqual([path, restored]);
       }
     }
+  });
+});
+
+describe('the open profile', () => {
+  const greenfield = [
+    '.env.example',
+    'apps/web/.env.local',
+    '.gitattributes',
+    '.github/workflows/ci.yml',
+    'bunfig.toml',
+    'packages/app/.npmrc',
+    '.tool-versions',
+    '.agflow/config.json',
+    'AGENTS.md',
+    'docs/CLAUDE.md',
+  ];
+  const stillProtected = [
+    '.claude/settings.json',
+    '.codex/config.toml',
+    '.mcp.json',
+    '.envrc',
+    '.agflow',
+    '.agflow/run',
+    '.agflow/prep.json',
+    '.husky/pre-commit',
+    '.gitlab-ci.yml',
+    'certs/server.pem',
+    '.gitmodules',
+  ];
+
+  test('names patterns of the protected classes', () => {
+    for (const pattern of GREENFIELD_PATTERNS) expect(ALL_PATTERNS).toContain(pattern);
+  });
+
+  test('leaves the greenfield patterns out of every restore set, a lead attempt included', () => {
+    const subjects = [task(['src/**']), task(['docs/**'], { kind: 'curation', createdBy: 'user:alice' }), null];
+    for (const subject of subjects) {
+      expect(restoreSet(subject, 'open')).toEqual(
+        restoreSet(subject).filter((pattern) => !GREENFIELD_PATTERNS.includes(pattern)),
+      );
+      expect(restoreSet(subject, 'auto')).toEqual(restoreSet(subject));
+    }
+  });
+
+  test('lets agents change the greenfield files and nothing else that is protected', () => {
+    for (const subject of [task(['src/**']), null]) {
+      expect(protectedViolations(greenfield, subject, 'open')).toEqual([]);
+      expect(protectedViolations(greenfield, subject).map((found) => found.path)).toEqual(greenfield);
+      expect(protectedViolations(stillProtected, subject, 'open').map((found) => found.path)).toEqual(stillProtected);
+    }
+    // .agflow/run/ is the runner's, under every profile.
+    expect(protectedViolations(['.agflow/run/task.md'], null, 'open')).toEqual([]);
+  });
+
+  test('a task that owns greenfield files goes to an open runner instead of a live chat', () => {
+    const owners = [['.github/workflows/ci.yml'], ['.env.example', 'src/**'], ['.agflow/config.json'], ['CLAUDE.md']];
+    for (const owned of owners) {
+      const owner = task(owned);
+      expect([owned, liveChatOnly(owner), needsOpenProfile(owner)]).toEqual([owned, false, true]);
+      expect(runnerForbiddenPaths(owner, 'open')).toEqual([]);
+    }
+    for (const owned of [['.claude/settings.json'], ['.envrc'], ['.agflow/**'], ['.agflow/*.json'], ['**']]) {
+      expect([owned, liveChatOnly(task(owned))]).toEqual([owned, true]);
+    }
+    expect(needsOpenProfile(task(['src/**']))).toBe(false);
+    // A person's task already owns its people-only paths, so any runner may take it.
+    expect(needsOpenProfile(task(['.github/workflows/ci.yml'], { createdBy: 'user:alice' }))).toBe(false);
   });
 });

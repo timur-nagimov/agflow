@@ -714,26 +714,31 @@ describe('never idle: the guides, the goal and the situation report', () => {
     expect(buildBrief(ctx, lead.agent)).toContain('Deadline: 2026-10-26 14:05 UTC, passed 55 min ago.');
   });
 
-  test('the situation report names the ready tasks left to live chats, with the owned path that keeps each there', () => {
+  test('the situation report names the ready tasks left to live chats, and those only an open runner will run', () => {
     const { ctx } = createTestContext();
     const lead = addRunnerLead(ctx);
-    const [skeleton, curated, plain] = createTasks(
+    const [skeleton, curated, plain, settings] = createTasks(
       ctx,
       [
         newTask({ title: 'Skeleton', ownedPaths: ['package.json', 'AGENTS.md'] }),
         newTask({ title: 'Conventions', kind: 'curation', ownedPaths: ['AGENTS.md'] }),
         newTask({ title: 'Parser', ownedPaths: ['src/parser/**'] }),
+        newTask({ title: 'Settings', ownedPaths: ['.claude/settings.json'] }),
       ],
       `agent:${lead.agent.id}`,
     );
     const report = situationReport(ctx);
     expect(report).toContain(
       'Ready tasks left to live chats (no runner agent may change these owned paths):\n' +
-        `- ${skeleton?.id}: AGENTS.md (only a task of kind curation may change it)\n`,
+        `- ${settings?.id}: .claude/settings.json (agent configuration, which no runner agent may change)\n` +
+        `${skeleton?.id} needs a runner with the open profile (owns AGENTS.md).\n`,
     );
-    expect(report).not.toContain(`- ${curated?.id}:`);
-    expect(report).not.toContain(`- ${plain?.id}:`);
-    expect(report).toContain('Ready tasks: 3, 2 of them dispatchable now.');
+    for (const task of [curated, plain]) {
+      expect(report).not.toContain(`- ${task?.id}:`);
+      expect(report).not.toContain(`${task?.id} needs`);
+    }
+    // A task for an open runner may start, unlike one left to live chats.
+    expect(report).toContain('Ready tasks: 4, 3 of them dispatchable now.');
   });
 
   test('the situation report stays within its 2500 characters by showing fewer events, each whole', () => {

@@ -1,11 +1,12 @@
 // The SDK options of one Claude session (design 8.2, 7.6, 8.4, X-5, X-13, X-29, X-32). Pure, so a test pins every
-// security-relevant option: the tools, the permission mode, the sandbox, the deny rules, the only MCP server, the
-// brief hook, the guard and the CLI's shell.
+// security-relevant option: the tools, the permission mode and who answers its prompts, the sandbox, the deny rules,
+// the only MCP server, the brief hook, the guard and the CLI's shell.
 import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { Vendor } from '@agflow/core';
 import type {
+  CanUseTool,
   HookCallback,
   Options,
   PermissionMode,
@@ -53,7 +54,7 @@ export interface ClaudeOptionDeps {
   /** How the runner runs agflow, from the adapter factory's input; the brief hook runs it (X-5). */
   agflow: AgflowCommand;
   /** The runner's layout; the pinned binaries lie under paths.runner. */
-  paths: Pick<RunnerPaths, 'runner' | 'vaults' | 'work'>;
+  paths: Pick<RunnerPaths, 'runner' | 'vaults' | 'work' | 'caches'>;
   /** vendorHomes(config, paths); the Claude home is the CLAUDE_CONFIG_DIR every launch must carry. */
   vendorHomes: Record<Vendor, string>;
   /** Whether the account offered auto mode in the adapter's last preflight. */
@@ -133,6 +134,27 @@ export function claudeBinary(paths: Pick<RunnerPaths, 'runner'>, version: string
 /** acceptEdits, or auto for the auto profile on an account that offers it (7.6, X-29). */
 export function effectivePermissionMode(profile: PermissionProfile, autoOffered: boolean): PermissionMode {
   return profile.name === 'auto' && autoOffered ? 'auto' : 'acceptEdits';
+}
+
+/** The tool 2.1.285 asks permission for when a sandboxed command reaches a host its allowlist leaves out. */
+export const CLAUDE_NETWORK_ASK = 'SandboxNetworkAccess';
+
+/**
+ * The open profile's answer to the CLI's permission prompts: a sandboxed command may reach any host, so a network ask
+ * is allowed; anything else is denied at once, as permissionPrompts 'none' denies it under the other profiles.
+ */
+export const openProfilePrompts: CanUseTool = async (toolName, input) =>
+  toolName === CLAUDE_NETWORK_ASK
+    ? { behavior: 'allow', updatedInput: input }
+    : { behavior: 'deny', message: 'This runner session has no approval surface, so the request was denied.' };
+
+/**
+ * Who answers the CLI's permission prompts. Nobody under the standard and auto profiles: with no canUseTool a call the
+ * rules do not allow is denied at once instead of waiting for an answer. Under the open profile, openProfilePrompts.
+ */
+function promptAnswers(profile: PermissionProfile): Pick<Options, 'permissionPrompts' | 'canUseTool'> {
+  if (profile.name !== 'open') return { permissionPrompts: 'none' };
+  return { permissionPrompts: 'host', canUseTool: openProfilePrompts };
 }
 
 // A full id names a model family and a version; the CLI resolves aliases (opus, sonnet, default, opusplan, ...)
@@ -218,8 +240,7 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
     },
     tools: claudeTools(launch.profile),
     permissionMode: effectivePermissionMode(launch.profile, deps.autoOffered),
-    // No canUseTool: a call the rules do not allow is denied at once instead of waiting for an answer.
-    permissionPrompts: 'none',
+    ...promptAnswers(launch.profile),
     // Top-level only, so the SDK passes failIfUnavailable and Bash never runs unsandboxed.
     sandbox: claudeSandboxSettings(scope),
     settings: {

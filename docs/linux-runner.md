@@ -57,6 +57,9 @@ agflow login --hub https://YOUR-HUB
 agflow runner setup
 ```
 
+For a hackathon, run `agflow runner setup --preset hackathon --capacity 8` instead: the open profile and 8 worker
+slots, which suit the VM's 16 vCPU and 32 GB. Leave out `--yes`, or setup cannot ask for the Claude token.
+
 `agflow login` shows a link and a code: open the link in a browser on your Mac. Setup asks for the runner's name and
 capacity, downloads the pinned Claude Code and Codex for Linux, and does the two vendor logins. The VM has no browser,
 so:

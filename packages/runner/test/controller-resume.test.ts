@@ -289,6 +289,30 @@ describe('AttemptController: resume', () => {
     expect(events.every((event) => fenceOf(event)?.counter === 3)).toBe(true);
   });
 
+  test('under the open profile a failed preparation on a resume is reported and the session resumes anyway', async () => {
+    let calls = 0;
+    const preparer: DependencyPreparer = {
+      available: true,
+      prepare: async () => {
+        calls += 1;
+        return calls === 1
+          ? { ran: true, ok: true, error: null, logTail: null }
+          : { ran: true, ok: false, error: 'bun install failed', logTail: 'ERR' };
+      },
+    };
+    const f = await createRunnerFixture({ files: FILES, config: { profile: 'open' }, script: { turns: [[], []] } });
+    const first = f.controller('T-4-a1', { preparer });
+    await first.start(f.spec());
+    await waitFor(() => f.events('attempt.activity').length > 0);
+    await first.stop({ fence: OLD, reason: 'paused', handoff: false, interruptFirst: false, keepClone: true });
+    const before = f.events().length;
+    expect(await f.controller('T-4-a1', { preparer }).resume(resumeCommand(f))).toEqual({ resumed: true });
+    const after = f.events().slice(before);
+    expect(after[0]).toMatchObject({ type: 'attempt.prepared', data: { ok: false, error: 'bun install failed' } });
+    expect(after.some((event) => event.type === 'attempt.failed_to_start')).toBe(false);
+    expect(f.fakes.claude?.launches).toHaveLength(2);
+  });
+
   test('after a resume, commands with the old fence are refused and WIP goes out under the new one', async () => {
     const f = await createRunnerFixture({
       files: FILES,

@@ -79,8 +79,9 @@ export function getPreparation(ctx: HubContext, id: string, agentId: string): Pr
 
 /**
  * attempt.prepared (design 6.3, 7.7). A preparation the runner ran before a start or resume (requestId null) is only
- * logged; a failed one is followed by attempt.failed_to_start. An agent's request gets the outcome, its error and log
- * tail, kept with its command whatever the command's own result said, and the attempt.prepared event.
+ * logged; a failed one is followed by attempt.failed_to_start, but on a runner with the open profile the agent starts
+ * anyway. An agent's request gets the outcome, its error and log tail, kept with its command whatever the command's own
+ * result said, and the attempt.prepared event.
  */
 export function onPrepared(
   ctx: HubContext,
