@@ -234,7 +234,7 @@ restore its archive as a backup ([Backups and restore](#backups-and-restore)).
 ## Unattended operation
 
 By default a person merges accepted work, brings outside data into the repository and answers every approval request,
-and the lead reviews every submission. Seven opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
+and the lead reviews every submission. Eight opt-in settings in `/etc/agflow/hub.env` take these out of people's hands. All are off unless set; restart the hub
 after a change. The details are in the
 [M2 design, Unattended options](superpowers/specs/2026-10-28-m2-runners-design.md#unattended-options).
 
@@ -312,6 +312,18 @@ after a change. The details are in the
   minutes it gives a whole submission, push included, so keep `AGFLOW_SUBMIT_TIMEOUT_MINUTES` (15) at least that long.
   Risk: the check is the only review, so whatever it does not test is accepted unseen, and so is a check an agent
   weakened in those ways.
+- **`AGFLOW_REVIEW=1`**, with `AGFLOW_AUTO_ACCEPT=1`. Removes: work whose check passed reaching `main` unread. The
+  first submission of each task whose check passed is not accepted at once: the hub creates a review task, "Review of
+  T-12 (S-34): title", created by `system`, at priority 1, preferably for the vendor other than the author's while a
+  runner offers it. Its agent starts at the submitted head, reads the change against `SPEC.md` and the task's
+  contract, runs commands of its own and changes nothing. The first line of its submit summary is its verdict, which
+  the hub applies as `hub:review`, with no push: accept, accept with follow-ups, which go to the lead, or reject,
+  which sends the findings back to the author's session. The task's later submissions are accepted as before, and so
+  are agflow's own tasks and live chats' submissions. The lead's report names the tasks under review apart from those
+  awaiting its own. Risks:
+  - The review runs at the strong tier, on the lead's model, so each one draws on the quota the lead uses.
+  - A review that does not start within 5 minutes, or gives no verdict within 20, lets the hub accept the task as
+    before, unread; while the project is paused it waits.
 
 Two more settings are on by default:
 
@@ -350,6 +362,7 @@ AGFLOW_MAX_PLAN_CHANGES_PER_HOUR=600
 AGFLOW_MAX_TASKS_PER_HOUR=300
 AGFLOW_LEAD_REVIEW_MINUTES=10
 AGFLOW_AUTO_ACCEPT=1
+AGFLOW_REVIEW=1
 AGFLOW_AUTO_MERGE=1
 AGFLOW_IDLE_NUDGE_MINUTES=5
 AGFLOW_DEMO_CHECK_EVERY=5
@@ -367,9 +380,11 @@ AGFLOW_AUTO_APPROVALS=1
 - `AGFLOW_MAX_PLAN_CHANGES_PER_HOUR=600`: the lead's task creations, edits and cancellations for twenty workers would
   pass 60 an hour, and the churn guard would hold dispatch.
 - `AGFLOW_MAX_TASKS_PER_HOUR=300`: the lead plans small tasks for twenty workers, twice the free slots ahead, which can
-  pass 60 new tasks an hour.
+  pass 60 new tasks an hour. agflow's own tasks, the reviews among them, do not count.
 - `AGFLOW_LEAD_REVIEW_MINUTES=10`: the lead looks over held and submitted work every 10 minutes, not every 45.
 - `AGFLOW_AUTO_ACCEPT=1`: a submission whose check passed does not wait for the lead.
+- `AGFLOW_REVIEW=1`: an agent of the other vendor reads each task's first green submission before it merges, and
+  sends defects back to the author; a review that does not finish within 20 minutes lets the hub accept as before.
 - `AGFLOW_AUTO_MERGE=1`: accepted work reaches `main` without a person, and dependent tasks wait for the merge, as
   `AGFLOW_DEPENDENCIES_NEED_MERGE=1` would make them; leave that one out. A runner checks `main` after each merge, and
   a failure gets a fix task at once.
