@@ -5,6 +5,7 @@ import {
   type RawRunnerEvent,
   type RunnerEventData,
   type SubmissionCheck,
+  quoteLines,
 } from '@agflow/core';
 import { getAttempt } from '../src/attempt-store';
 import { mintAgentToken } from '../src/auth';
@@ -14,7 +15,7 @@ import { demoCheckContract } from '../src/demo-check';
 import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
 import { listMessages } from '../src/messages';
-import { findSubmission } from '../src/submission-store';
+import { findSubmission, gapLines } from '../src/submission-store';
 import { requestSubmission } from '../src/submissions';
 import { getTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
@@ -46,9 +47,9 @@ function report(hub: Hub, held: RunnerAttempt, outcome: Outcome): void {
 }
 
 /** A runner agent's submission, pushed with the check; gives the attempt and its submission's id. */
-function submit(hub: Hub, check: SubmissionCheck | null, held = addRunnerAttempt(hub.ctx)) {
+function submit(hub: Hub, check: SubmissionCheck | null, held = addRunnerAttempt(hub.ctx), input = work) {
   hub.ctx.db.query('UPDATE runners SET protocol = $p WHERE id = $id').run({ p: PROTOCOL_VERSION, id: held.runner.id });
-  const submission = requestSubmission(hub.ctx, held.task.id, held.agent, work);
+  const submission = requestSubmission(hub.ctx, held.task.id, held.agent, input);
   report(hub, held, {
     submissionId: submission.id,
     ok: true,
@@ -160,6 +161,90 @@ describe('AGFLOW_AUTO_ACCEPT', () => {
     const report = situationReport(hub.ctx);
     expect(report).toContain(`their check passed: ${second.held.task.id} "Do the thing".`);
     expect(report).not.toContain(`${first.held.task.id} "`);
+  });
+});
+
+describe('what the authors of submissions disclose, and what demo checks find', () => {
+  /** A summary that names what someone else must still do or check, on gap: lines, as the workers' guide asks. */
+  const disclosed = {
+    summary: 'Interface: GET /api/items.\n- gap: the nav link in base.html is not mine\nGAP: nobody checked Safari',
+    evidence: ['A1: bun test items: 3 pass', '2. gap: the docs still say v1', 'A2: not verified, no browser here'],
+  };
+
+  test('the gap lines come from the summary and the evidence, in any case, after a list marker', () => {
+    expect(gapLines(disclosed)).toEqual([
+      'gap: the nav link in base.html is not mine',
+      'GAP: nobody checked Safari',
+      'gap: the docs still say v1',
+    ]);
+    expect(gapLines({ summary: 'Gaps: none.\nNo gap: here', evidence: [] })).toEqual([]);
+  });
+
+  test("the lead's situation report quotes the gap lines of the work the hub accepted since its last wake-up", () => {
+    const hub = createTestHub({ autoAccept: true });
+    addRunnerLead(hub.ctx);
+    const first = submit(hub, passed, undefined, disclosed);
+    submit(hub, passed);
+    expect(situationReport(hub.ctx)).toContain(
+      [
+        'Gaps the authors named in work the hub accepted since your last wake-up; make a task of each that needs one:',
+        `- ${first.held.task.id}:`,
+        '> gap: the nav link in base.html is not mine',
+        '> GAP: nobody checked Safari',
+        '> gap: the docs still say v1',
+      ].join('\n'),
+    );
+  });
+
+  test('the gap lines take at most 200 characters a task and 800 in all; the tasks past that are named', () => {
+    const hub = createTestHub({ autoAccept: true });
+    addRunnerLead(hub.ctx);
+    const long = { summary: `Interface: none.\ngap: ${'g'.repeat(400)}`, evidence: [] };
+    const ids = Array.from({ length: 5 }, () => submit(hub, passed, undefined, long).held.task.id);
+    const report = situationReport(hub.ctx);
+    const block = report.slice(report.indexOf('Gaps the authors named'), report.indexOf('\nRecent events:'));
+    const quotes = block.split('\n').filter((line) => line.startsWith('>'));
+    expect(quotes).toEqual(Array(3).fill(`> gap: ${'g'.repeat(192)}…`));
+    expect(block.length).toBeLessThan(800 + 200);
+    expect(block).toEndWith(`\nand 2 more: ${ids[3]}, ${ids[4]}; \`get_task\` shows their summaries.`);
+  });
+
+  test("the lead's review message quotes the gap lines and the evidence after the summary, which it cuts", () => {
+    const hub = createTestHub();
+    const summary = `${'s'.repeat(1600)}\ngap: the nav link in base.html is not mine`;
+    submit(hub, passed, undefined, { summary, evidence: disclosed.evidence });
+    const [told] = toLead(hub);
+    expect(told?.body).toContain(
+      [
+        `> ${'s'.repeat(1499)}…`,
+        'Its gap lines:',
+        '> gap: the nav link in base.html is not mine',
+        '> gap: the docs still say v1',
+        'Its evidence:',
+        '> A1: bun test items: 3 pass',
+        '> 2. gap: the docs still say v1',
+        '> A2: not verified, no browser here',
+        "The runner's check `bun test` passed in 4 s.",
+      ].join('\n'),
+    );
+  });
+
+  test("a demo check's message quotes its whole summary, counts its DEFECT lines and says what to do with them", () => {
+    const hub = createTestHub({ autoAccept: true });
+    const [demo] = createTasks(hub.ctx, [demoCheckContract(5, hub.ctx.now(), null)], 'system');
+    const summary = [
+      `Walked every flow. ${'n'.repeat(1600)}`,
+      'DEFECT: an empty search answers 500. Steps: open /search?q=',
+      '- DEFECT: the price filter ignores 0. Steps: set the price to 0',
+      'DEFECTS: none of the others is open.',
+    ].join('\n');
+    submit(hub, passed, addRunnerAttempt(hub.ctx, { taskId: demo?.id }), { summary, evidence: [] });
+    const [told] = toLead(hub).filter((message) => message.body.includes('was submitted by'));
+    expect(told?.body).toContain(`wrote:\n${quoteLines(summary)}\n`);
+    expect(told?.body).toEndWith(
+      '\nIts summary has 2 DEFECT line(s). Turn each DEFECT line into a fix task with create_tasks, then accept the ' +
+        'demo check.',
+    );
   });
 });
 

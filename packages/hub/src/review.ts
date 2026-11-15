@@ -326,7 +326,7 @@ export function reviewPack(ctx: HubContext, task: Task): string {
     `## ${reviewed.id}'s own task pack`,
     `What ${reviewed.id}'s author had as .agflow/run/task.md:`,
     '',
-    composeTaskPack(reviewed),
+    composeTaskPack(ctx, reviewed),
   ];
   return lines.join('\n');
 }

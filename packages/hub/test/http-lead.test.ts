@@ -96,14 +96,14 @@ describe('GET /api/lead/notes', () => {
     expect((await hub.call('GET', '/api/lead/notes')).status).toBe(401);
   });
 
-  test('answers the 20 newest only', async () => {
+  test('answers the 4 newest only: the newest lead handoff whole, and what came just before it', async () => {
     const { hub } = setup();
-    for (let n = 1; n <= 21; n++) {
+    for (let n = 1; n <= 5; n++) {
       addLeadNote(hub.ctx, { attemptId: null, body: `Note ${n}.`, author: 'system' });
       hub.clock.advance(1);
     }
     const { notes } = LeadNotesResponseSchema.parse((await hub.call('GET', '/api/lead/notes', asPerson)).json);
-    expect(notes.map((note) => note.body)).toEqual(Array.from({ length: 20 }, (_, n) => `Note ${21 - n}.`));
+    expect(notes.map((note) => note.body)).toEqual(['Note 5.', 'Note 4.', 'Note 3.', 'Note 2.']);
   });
 });
 

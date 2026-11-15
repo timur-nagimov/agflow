@@ -125,11 +125,11 @@ describe('resuming an attempt', () => {
       fence: getAttempt(ctx, held.attempt.id).fence,
       prompt: 'fix it',
       messages: [],
-      taskPack: composeTaskPack(task),
+      taskPack: composeTaskPack(ctx, task),
       restore: { paths: restoreSet(task), base: 'refs/heads/main' },
       acceptanceIds: ['A1'],
     });
-    expect(composeTaskPack(task)).toContain('> Handle empty lists.');
+    expect(composeTaskPack(ctx, task)).toContain('> Handle empty lists.');
   });
 
   test('a recorded stop is sent again at the new fence; a take-over or an ended attempt cannot be resumed', () => {

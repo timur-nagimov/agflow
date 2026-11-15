@@ -40,6 +40,7 @@ import {
   branchHeadOf,
   failSubmission,
   findSubmission,
+  gapLines,
   insertSubmission,
   pendingSubmissionOf,
   rowToSubmission,
@@ -47,7 +48,7 @@ import {
 } from './submission-store';
 import { findTask, getTask, move, setAgentTask, writeTask } from './task-store';
 import { acceptTask, requireHolder } from './tasks';
-import { clip } from './text';
+import { clip, linesStarting } from './text';
 
 // The reads live in submission-store.ts, below the modules that end attempts; callers import them from here.
 export { adoptableShas, listSubmissions, pendingSubmissionOf } from './submission-store';
@@ -230,6 +231,45 @@ function recordable(task: Task, attempt: Attempt | null, submission: SubmissionR
   return plannedTaskMove('submission', 'at_once', task, attempt.id) !== null;
 }
 
+/** The most of a summary, of its gap lines and of its evidence that the lead's review message quotes. */
+const QUOTED_LIMIT = 1500;
+
+/**
+ * The lead's message about a submission up for its review: the summary, cut unless a demo check wrote it; the gap
+ * lines and the evidence lines, which the cut may have dropped; the runner's check; and how to review it. A demo
+ * check's message counts its DEFECT lines and says what to do with them, as the notice at its creation did: a lead
+ * that rotated since never read that one.
+ */
+function reviewMessage(
+  ctx: HubContext,
+  task: Task,
+  attempt: Attempt,
+  submission: SubmissionRecord,
+  outcome: Outcome,
+): string {
+  const demoCheck = isDemoCheck(ctx, task.id);
+  const summary = demoCheck ? submission.summary : clip(submission.summary, QUOTED_LIMIT);
+  const lines = [
+    `${named(task)} was submitted by ${attempt.agentId} for review on branch ${task.branch ?? '(none)'} at ` +
+      `${outcome.headSha ?? 'an unknown head'}.`,
+    `${attempt.agentId} wrote:\n${quoteLines(summary)}`,
+  ];
+  const gaps = gapLines(submission);
+  if (gaps.length > 0) lines.push(`Its gap lines:\n${quoteLines(clip(gaps.join('\n'), QUOTED_LIMIT))}`);
+  if (submission.evidence.length > 0) {
+    lines.push(`Its evidence:\n${quoteLines(clip(submission.evidence.join('\n'), QUOTED_LIMIT))}`);
+  }
+  const review = `${checkLine(outcome.check)}${submissionReviewInstruction(task.id, task.branch)}`;
+  if (!demoCheck) return [...lines, review].join('\n');
+  const defects = linesStarting([submission.summary], 'DEFECT:').length;
+  return [
+    ...lines,
+    review,
+    `Its summary has ${defects} DEFECT line(s). Turn each DEFECT line into a fix task with create_tasks, then accept ` +
+      'the demo check.',
+  ].join('\n');
+}
+
 /**
  * A success, in the outcome's transaction (design 6.13, Recording): the submission is recorded, the task submitted
  * with its branch head and its work position, and the attempt holds (hold_attempt). A recorded stop is dropped, with
@@ -300,11 +340,7 @@ function recordSuccess(
       from: 'system',
       to: 'lead',
       taskId: task.id,
-      body:
-        `${named(task)} was submitted by ${attempt.agentId} for review on branch ${branch ?? '(none)'} at ` +
-        `${head ?? 'an unknown head'}.\n${attempt.agentId} wrote:\n${quoteLines(clip(submission.summary, 1500))}\n` +
-        checkLine(outcome.check) +
-        submissionReviewInstruction(task.id, branch),
+      body: reviewMessage(ctx, task, attempt, submission, outcome),
     });
   }
   const recorded = findSubmission(ctx, submission.id) as SubmissionRecord;

@@ -84,7 +84,20 @@ describe('goal', () => {
     updateGoal(ctx, { text: 'b', baseVersion: 1 }, 'user:alice');
     addGoalNote(ctx, 'Reading "b" as the CLI only.', 'agent:A-1');
     expect(listGoalVersions(ctx).map((v) => v.version)).toEqual([2, 1]);
-    expect(listGoalNotes(ctx, 2).map((n) => n.text)).toEqual(['Reading "b" as the CLI only.']);
-    expect(listGoalNotes(ctx, 1)).toEqual([]);
+    expect(listGoalNotes(ctx, 2).map((n) => [n.goalVersion, n.text])).toEqual([[2, 'Reading "b" as the CLI only.']]);
+  });
+
+  test("an edit of the goal keeps the older notes, such as the lead's checklist, marked with their version", () => {
+    const { ctx } = createTestContext();
+    updateGoal(ctx, { text: 'R1 a CLI. R2 a web page.', baseVersion: 0 }, 'user:alice');
+    addGoalNote(ctx, 'Checklist: R1, R2.', 'agent:A-1');
+    addGoalNote(ctx, 'R1 covered: T-3', 'agent:A-1');
+    updateGoal(ctx, { text: 'R1 a CLI. R2 a web page. R3 an API.', baseVersion: 1 }, 'user:alice');
+    addGoalNote(ctx, 'R3 added to the checklist.', 'agent:A-1');
+    expect(listGoalNotes(ctx, 2).map((note) => [note.goalVersion, note.text])).toEqual([
+      [1, '(goal v1) Checklist: R1, R2.'],
+      [1, '(goal v1) R1 covered: T-3'],
+      [2, 'R3 added to the checklist.'],
+    ]);
   });
 });

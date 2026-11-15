@@ -702,16 +702,20 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
   return lines;
 }
 
-/** What an idle nudge asks of the lead. */
+/** What an idle nudge asks of the lead; its order of improvements is the lead guide's (brief.ts). */
 const NUDGE_PLAN =
-  'Plan the next batch now, so that ready, independent tasks are at least twice the free worker slots. Tasks blocked ' +
-  'on dependencies count as planned: while they wait for work in progress, such as the skeleton, add only tasks that ' +
-  'need none of it. Work through SPEC.md (or the goal) until every requirement is covered. Once it is, plan in this ' +
-  'order: defects found by the latest demo check or reported by agents, missing tests, demo polish, then new features ' +
-  'a jury would notice. In the last hour before the deadline, plan only fixes.';
+  'Plan the next batch now, so that ready, independent tasks are at least as many as the worker slots, running plus ' +
+  'free. Tasks blocked on dependencies count as planned: while they wait for work in progress, such as the skeleton, ' +
+  'add only tasks that need none of it. Work through SPEC.md (or the goal) until every requirement is covered. Once ' +
+  'it is, plan in this order: requirements docs/STATUS.md does not show working, defects from the latest demo check ' +
+  'and gaps agents named, missing tests, demo polish, then new features a jury would notice. In the last hour before ' +
+  'the deadline, plan only fixes.';
+
+/** The worker slots the lead plans for: those workers take now, and the free ones (WorkerLoad). */
+const workerSlots = (load: WorkerLoad): number => load.running + load.freeSlots;
 
 /**
- * When free worker slots began to outnumber the dispatchable ready tasks, per hub context. Kept in memory: a restarted
+ * When the dispatchable ready tasks became fewer than the worker slots, per hub context. Kept in memory: a restarted
  * hub only waits idleNudgeMs again before it nudges.
  */
 const idleSince = new WeakMap<HubContext, number>();
@@ -725,11 +729,12 @@ function lastNudgeAt(ctx: HubContext): number | null {
 }
 
 /**
- * The idle nudge: while a runner lead holds the seat and free worker slots outnumber the dispatchable ready tasks for
- * idleNudgeMs without a break, the lead gets one system message with the load, each account's quota, the deadline and
- * what to plan; then none before idleNudgeIntervalMs has passed since the last (lead.idle_nudged), and none at all
- * while it is 0. While worker dispatch is held (dispatchHold: a paused project, the churn guard) no worker starts, so
- * none goes out. Without a goal there is nothing to plan, and the work is planned until the deadline, so none goes out
+ * The idle nudge: while a runner lead holds the seat and the dispatchable ready tasks are fewer than the worker slots,
+ * running plus free (workerSlots), for idleNudgeMs without a break, the lead gets one system message with the load,
+ * each account's quota, the deadline and what to plan; then none before idleNudgeIntervalMs has passed since the last
+ * (lead.idle_nudged), and none at all while it is 0. So a lead whose every slot is busy hears too, before the slots
+ * run dry. While worker dispatch is held (dispatchHold: a paused project, the churn guard) no worker starts, so none
+ * goes out. Without a goal there is nothing to plan, and the work is planned until the deadline, so none goes out
  * before the goal is set or once the deadline has passed. Part of the tick's reconcile step. Returns the message, or
  * null.
  */
@@ -739,7 +744,7 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
   const due =
     dispatchHold(ctx) === null && currentGoalVersion(ctx) > 0 && (deadlineAt === null || ctx.now() < deadlineAt);
   const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
-  if (load === null || load.freeSlots <= load.dispatchable) {
+  if (load === null || load.dispatchable >= workerSlots(load)) {
     idleSince.delete(ctx);
     return null;
   }
@@ -756,8 +761,8 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
       from: 'system',
       to: 'lead',
       body:
-        `${load.freeSlots} worker slot(s) are free, more than the ${load.dispatchable} ready task(s) that can start ` +
-        `now.\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
+        `Only ${load.dispatchable} ready task(s) are dispatchable, fewer than the ${workerSlots(load)} worker ` +
+        `slot(s) (${load.running} running, ${load.freeSlots} free).\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
     });
   });
 }
@@ -827,6 +832,15 @@ function held(ctx: HubContext, result: TickResult): TickResult {
   if (why !== null) for (const task of ready) waiting.set(task.id, why);
   memoryOf(ctx).waiting = waiting;
   return result;
+}
+
+/**
+ * Why each ready task did not start in the last tick, in the order the tick found them: those the rules hold back,
+ * then the rest in dispatch order. Some may no longer be ready. Empty before the first tick. The lead's situation
+ * report names them.
+ */
+export function waitReasons(ctx: HubContext): ReadonlyMap<string, string> {
+  return memories.get(ctx)?.waiting ?? new Map();
 }
 
 /**

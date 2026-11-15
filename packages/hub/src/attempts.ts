@@ -196,6 +196,7 @@ export function buildAttemptSpec(
   const task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
   const successor = isSuccessor(ctx, attempt);
   const review = task === null ? null : reviewTarget(ctx, task.id);
+  const feedback = Boolean(task?.feedback);
   return {
     attemptId: attempt.id,
     taskId: attempt.taskId,
@@ -214,11 +215,11 @@ export function buildAttemptSpec(
     acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     toolCaps: computeToolCaps(ctx.config, task?.checks ?? []),
     // A lead holds no task, so its task.md is empty; its brief carries what it needs. A review's adds what it reviews.
-    taskPack: task ? composeTaskPack(task) + reviewPack(ctx, task) : '',
+    taskPack: task ? composeTaskPack(ctx, task) + reviewPack(ctx, task) : '',
     brief: buildBrief(ctx, getAgent(ctx, attempt.agentId)),
     firstPrompt: review
       ? reviewFirstPrompt(review)
-      : firstPrompt({ role: attempt.role, taskId: attempt.taskId, successor }),
+      : firstPrompt({ role: attempt.role, taskId: attempt.taskId, successor, feedback }),
     successor,
   };
 }
@@ -581,7 +582,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
       fence,
       prompt,
       messages,
-      taskPack: task ? composeTaskPack(task) + reviewPack(ctx, task) : null,
+      taskPack: task ? composeTaskPack(ctx, task) + reviewPack(ctx, task) : null,
       restore: restoreFor(ctx, task, attempt.runnerId),
       acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     });

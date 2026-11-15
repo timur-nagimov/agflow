@@ -184,8 +184,8 @@ describe('AGFLOW_REVIEW: creating the review', () => {
     expect(spec.start).toEqual({ ref: `refs/heads/${held.task.branch}`, sha: sha('a') });
     expect(spec.tier).toBe('strong');
     const pack = spec.taskPack;
-    expect(pack).toStartWith(composeTaskPack(getTask(hub.ctx, review.id)));
-    expect(pack).toEndWith(composeTaskPack(getTask(hub.ctx, held.task.id)));
+    expect(pack).toStartWith(composeTaskPack(hub.ctx, getTask(hub.ctx, review.id)));
+    expect(pack).toEndWith(composeTaskPack(hub.ctx, getTask(hub.ctx, held.task.id)));
     expect(pack).toContain("## The author's summary\n> Parser done.\n> It reads JSON.");
     expect(pack).toContain("## The author's evidence\n> bun test: 12 pass\n> bun run parse x.json: ok");
     expect(pack).toContain("The runner's check `bun test` passed in 4 s, with main merged in. Do not run it again.");

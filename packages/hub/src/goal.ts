@@ -83,11 +83,16 @@ export function updateGoal(ctx: HubContext, input: { text: string; baseVersion: 
   });
 }
 
-export function listGoalNotes(ctx: HubContext, version: number): GoalNote[] {
-  const rows = ctx.db
-    .query('SELECT * FROM goal_notes WHERE goal_version = $version ORDER BY id')
-    .all({ version }) as NoteRow[];
-  return rows.map(toNote);
+/**
+ * The goal notes of every version, oldest first, so an edit of the goal does not hide the lead's checklist of its
+ * requirements. A note written for a version older than current starts with "(goal vN) ", for the readers that show no
+ * versions: get_goal and the Goal page.
+ */
+export function listGoalNotes(ctx: HubContext, current: number): GoalNote[] {
+  const rows = ctx.db.query('SELECT * FROM goal_notes ORDER BY id').all() as NoteRow[];
+  return rows
+    .map(toNote)
+    .map((note) => (note.goalVersion < current ? { ...note, text: `(goal v${note.goalVersion}) ${note.text}` } : note));
 }
 
 export function addGoalNote(ctx: HubContext, text: string, actor: string): GoalNote {

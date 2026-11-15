@@ -19,12 +19,18 @@ describe('goal routes', () => {
     const hub = createTestHub();
     const lead = addAgent(hub.ctx, 'alice', 'lead');
     await hub.call('PUT', '/api/goal', { user: 'alice', via: 'web', body: { text: 'one\ntwo', baseVersion: 0 } });
+    const checklist = await hub.call('POST', '/api/goal/notes', { user: 'alice', agent: lead.id, body: { text: 'Checklist: one, two.' } });
+    expect(checklist.status).toBe(201);
     await hub.call('PUT', '/api/goal', { user: 'alice', via: 'web', body: { text: 'one\nthree', baseVersion: 1 } });
     const note = await hub.call('POST', '/api/goal/notes', { user: 'alice', agent: lead.id, body: { text: 'Reading "three" as v3 of the API.' } });
     expect(note.status).toBe(201);
     const goal = await hub.call('GET', '/api/goal', { user: 'bob', via: 'web' });
     expect(goal.json.current.version).toBe(2);
-    expect(goal.json.notes.map((n: { text: string }) => n.text)).toEqual(['Reading "three" as v3 of the API.']);
+    // An edit of the goal hides no note: an older one says which version it was written for.
+    expect(goal.json.notes.map((n: { text: string }) => n.text)).toEqual([
+      '(goal v1) Checklist: one, two.',
+      'Reading "three" as v3 of the API.',
+    ]);
     expect((await hub.call('GET', '/api/goal/history', { user: 'bob', via: 'web' })).json.versions).toHaveLength(2);
     const diff = await hub.call('GET', '/api/goal/diff?from=1&to=2', { user: 'bob', via: 'web' });
     expect(diff.json.lines).toEqual([

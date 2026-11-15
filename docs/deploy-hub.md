@@ -299,7 +299,8 @@ after a change. The details are in the
   runners refuses them.
 - **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
   accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
-  woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
+  woken for it; its next situation report lists the tasks accepted this way, with the `gap:` lines their authors wrote
+  for what someone else must still do or check. The check is the `check` command of
   `.agflow/config.json` on `main`, such as `"check": "bun test"`; a submission without one goes to the lead as before.
   So does a submission whose branch changes the check's own files, `.agflow/config.json` or a file the check command
   names such as `scripts/check.sh`, and a demo check, whose defects the lead turns into tasks. So does one whose check
@@ -329,11 +330,14 @@ after a change. The details are in the
 Two more settings are on by default:
 
 - **The idle nudge, `AGFLOW_IDLE_NUDGE_SECONDS` (60) and `AGFLOW_IDLE_NUDGE_MINUTES` (5).** Removes: a person noticing
-  that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the free worker
-  slots outnumber the ready tasks that can start, for `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub sends the
-  lead one message: the free slots, the ready, blocked, submitted and accepted tasks, each account's quota, the time
-  left to the deadline, and what to plan next (the spec until it is covered, then defects, missing tests, demo polish
-  and new features, and only fixes in the last hour). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
+  that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the dispatchable
+  ready tasks (those the scheduler may start once a worker slot is free) are fewer than the worker slots, busy or
+  free, for `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub sends the lead one message: the worker slots, the
+  ready, blocked, submitted and accepted tasks, each account's quota, the time left to the deadline, and what to plan
+  next (the spec until it is covered, then the requirements `docs/STATUS.md` does not show working, the demo check's
+  defects and the gaps agents named, missing tests, demo polish and new features, and only fixes in the last hour). So
+  a lead whose every slot is busy hears too, before the work runs out; its situation report says why ready tasks wait
+  (a path overlap, quota, a full runner, no free slot). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
   `lead.idle_nudged` records each one. None goes out before the goal is set, while worker dispatch is held (a paused
   project, the churn guard), or once the deadline has passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk:
   the lead keeps adding work until the deadline, so the subscriptions stay in use; pause the project, or set a lower
@@ -342,12 +346,15 @@ Two more settings are on by default:
   After every N tasks merged, the hub creates one demo-check task, created by `system`, unless one is still open.
   Without `AGFLOW_AUTO_MERGE=1`, accepted tasks count until something marks a task merged. Its agent starts the
   product from a clean checkout of `main` the way `AGENTS.md` says (`scripts/demo.sh` when present), walks every flow
-  in `SPEC.md`, saves a screenshot of every screen under `docs/qa/<time>/`, records each requirement in
-  `docs/STATUS.md` as working, broken or missing, and lists every defect with steps to reproduce in its submission. It
-  may change only those files and `scripts/demo.sh`, which no runner profile protects. It runs at priority 1,
-  preferably on the vendor that implemented fewer of the last N tasks. The lead reviews it, even with
-  `AGFLOW_AUTO_ACCEPT=1`, and turns its defects into fix tasks. `0` turns it off. Risk: none beyond an agent's usual
-  work; it costs one task's quota every N tasks.
+  in `SPEC.md` with inputs of its own too (other values, empty and wrong input), reads what merged since the last demo
+  check for features that break or duplicate each other, saves a screenshot of every screen under `docs/qa/<time>/`,
+  and records each requirement in `docs/STATUS.md` as working, broken or missing. Its submission lists each defect no
+  open task covers on a line of its own that starts `DEFECT:`, most severe first, with steps to reproduce, or the single
+  line `DEFECTS: none`. It may change only those files and `scripts/demo.sh`, which no runner profile protects. It
+  runs at priority 1 and tier strong, preferably on the vendor that implemented fewer of the last N tasks. The lead
+  reviews it, even with `AGFLOW_AUTO_ACCEPT=1`: its message quotes the whole summary, counts the `DEFECT:` lines, and
+  says to turn each into a fix task, then accept the check. `0` turns it off. Risk: it runs on the stronger model,
+  the lead's, so it draws on the lead's quota once every N tasks.
 
 ### Hackathon settings
 
@@ -380,9 +387,10 @@ AGFLOW_AUTO_APPROVALS=1
   from a handoff. It still rotates once 70% of its context is used.
 - `AGFLOW_MAX_PLAN_CHANGES_PER_HOUR=600`: the lead's task creations, edits and cancellations for twenty workers would
   pass 60 an hour, and the churn guard would hold dispatch.
-- `AGFLOW_MAX_TASKS_PER_HOUR=300`: the lead plans small tasks for twenty workers, twice the free slots ahead, which can
-  pass 60 new tasks an hour. agflow's own tasks, the reviews among them, do not count.
-- `AGFLOW_LEAD_REVIEW_MINUTES=10`: the lead looks over held and submitted work every 10 minutes, not every 45.
+- `AGFLOW_MAX_TASKS_PER_HOUR=300`: the lead plans small tasks for twenty workers, a ready task ahead for every worker
+  slot, which can pass 60 new tasks an hour. agflow's own tasks, the reviews among them, do not count.
+- `AGFLOW_LEAD_REVIEW_MINUTES=10`: the lead hears of work submitted to it for more than 10 minutes, not 45, and of work
+  in an attempt for more than 30 minutes, at most every 10 minutes.
 - `AGFLOW_AUTO_ACCEPT=1`: a submission whose check passed does not wait for the lead.
 - `AGFLOW_REVIEW=1`: an agent of the other vendor reads each task's first green submission before it merges, and
   sends defects back to the author; a review that does not finish within 20 minutes lets the hub accept as before.
