@@ -489,6 +489,27 @@ describe('placementWords', () => {
     expect(placementWords(view, required, [])).toBe(`${head}: none offers codex`);
   });
 
+  test('a task its vendorHint holds says how long it waits for that vendor, with only that vendor\'s refusals', () => {
+    const hinted = candidate({ vendorHint: 'codex', readySince: NOW - 15_000 });
+    // R-1 offers only Claude, which takes the task once the wait is over.
+    expect(placementWords(view, hinted, [])).toBe('it waits up to 45 s for its preferred vendor codex');
+    const refused = [
+      { runnerId: 'R-1', vendor: 'codex', refusal: 'exhausted' },
+      { runnerId: 'R-1', vendor: 'claude', refusal: 'ceiling' },
+      { runnerId: 'R-2', vendor: null, refusal: 'full' },
+    ] as const;
+    expect(placementWords(view, hinted, refused)).toBe(
+      'it waits up to 45 s for its preferred vendor codex: R-1 codex quota used up; R-2 full',
+    );
+    // Once the wait is over, or when the ladder asks for a vendor, the hint holds nothing.
+    const waited = candidate({ vendorHint: 'codex', readySince: NOW - HINT_WAIT_MS });
+    expect(placementWords(view, waited, [])).toBe('no runner can take it: none offers a vendor');
+    const required = candidate({ vendorHint: 'codex', readySince: NOW, requirement: { step: 2, vendor: 'claude' } });
+    expect(placementWords(view, required, [])).toBe(
+      'no runner can take it (the retry ladder asks for claude): none offers claude',
+    );
+  });
+
   test('a task that owns greenfield files says it needs a runner with the open profile', () => {
     // An agent's task that owns AGENTS.md: only a runner with the open profile may take it.
     const greenfield = candidate({ ownedPaths: ['AGENTS.md'], createdBy: 'agent:A-1' });

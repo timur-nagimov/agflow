@@ -604,26 +604,33 @@ export function place(
  * Why place found no runner for a task, in one line for the board: each runner passed over, with its own refusal or
  * its vendors'. A usable vendor has no refusal, so when the retry ladder asks for one vendor, the line names it. A task
  * that owns greenfield files looks only at runners with the open profile (runnersFor), and says so; with none in the
- * snapshot, it names the files that need one.
+ * snapshot, it names the files that need one. A task its vendorHint still holds (preferredVendors) says how long it
+ * waits for that vendor, and names only that vendor's refusals.
  */
 export function placementWords(
   snapshot: PlacementSnapshot,
-  task: Pick<TaskCandidate, 'requirement' | 'ownedPaths' | 'kind' | 'createdBy'>,
+  task: Pick<TaskCandidate, 'requirement' | 'ownedPaths' | 'kind' | 'createdBy' | 'vendorHint' | 'readySince'>,
   refused: readonly RefusedPlacement[],
 ): string {
   const open = openProfileReason(task);
   if (open !== null && runnersFor(snapshot, task).length === 0) return `it ${open}, and no runner has that profile`;
   const needed = task.requirement?.vendor ?? null;
+  const hint = needed === null ? task.vendorHint : null;
+  const hintLeft = hint === null ? 0 : HINT_WAIT_MS - (snapshot.now - task.readySince);
   const runners = open === null ? 'no runner' : 'no runner with the open profile';
   const ladder = needed === null ? '' : ` (the retry ladder asks for ${needed})`;
-  const head = `${runners} can take it${ladder}`;
+  const head =
+    hintLeft > 0
+      ? `it waits up to ${Math.ceil(hintLeft / 1000)} s for its preferred vendor ${hint}`
+      : `${runners} can take it${ladder}`;
   const byRunner = new Map<string, string[]>();
   for (const one of refused) {
+    if (hintLeft > 0 && one.vendor !== null && one.vendor !== hint) continue;
     const words = PLACEMENT_REFUSAL_WORDS[one.refusal];
     const said = byRunner.get(one.runnerId) ?? [];
     byRunner.set(one.runnerId, [...said, one.vendor === null ? words : `${one.vendor} ${words}`]);
   }
-  if (byRunner.size === 0) return `${head}: none offers ${needed ?? 'a vendor'}`;
+  if (byRunner.size === 0) return hintLeft > 0 ? head : `${head}: none offers ${needed ?? 'a vendor'}`;
   return `${head}: ${[...byRunner].map(([runnerId, words]) => `${runnerId} ${words.join(', ')}`).join('; ')}`;
 }
 
