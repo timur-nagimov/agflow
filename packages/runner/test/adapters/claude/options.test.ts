@@ -43,7 +43,7 @@ import type { AgentLaunch } from '../../../src/adapters/types';
 import { runnerPaths } from '../../../src/paths';
 import { type PermissionProfile, standardProfile } from '../../../src/profile';
 
-// Paths that exist nowhere: the options are pure, and the guard resolves missing paths through their parents.
+// Paths that exist nowhere, so the real paths the options and the guard resolve through their parents are the same.
 const HOME = '/Users/owner';
 const paths = runnerPaths('/Users/owner/.agflow');
 const CLAUDE_HOME = paths.homes.claude;
@@ -520,6 +520,18 @@ describe('claudeMdExcludes', () => {
       `${HOME}/notes/CLAUDE.md`,
     ];
     for (const path of project) expect([path, excluded(path)]).toEqual([path, false]);
+  });
+
+  test("the options exclude the files above the clone's real path, which the CLI walks: a symlinked home leaks nothing", () => {
+    const root = scratchDir();
+    mkdirSync(join(root, 'real', 'work'), { recursive: true });
+    symlinkSync(join(root, 'real'), join(root, 'home'));
+    const clone = join(root, 'home', 'work', 'T-1-a1');
+    const { claudeMdExcludes: patterns } = buildQueryOptions(launch({ clone }), deps()).settings as {
+      claudeMdExcludes: string[];
+    };
+    expect(patterns).toEqual(claudeMdExcludes(join(root, 'real', 'work', 'T-1-a1')));
+    expect(excludedBy(patterns)(join(root, 'real', '.claude', 'rules', 'x.md'))).toBe(true);
   });
 
   test('a glob character in a directory name matches only itself', () => {

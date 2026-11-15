@@ -1,6 +1,6 @@
-// The SDK options of one Claude session (design 8.2, 7.6, 8.4, X-5, X-13, X-29, X-32). Pure, so a test pins every
-// security-relevant option: the tools, the permission mode and who answers its prompts, the sandbox, the deny rules,
-// the only MCP server, the brief hook, the guard and the CLI's shell.
+// The SDK options of one Claude session (design 8.2, 7.6, 8.4, X-5, X-13, X-29, X-32). Pure but for the clone's real
+// path, so a test pins every security-relevant option: the tools, the permission mode and who answers its prompts, the
+// sandbox, the deny rules, the only MCP server, the brief hook, the guard and the CLI's shell.
 import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -18,6 +18,7 @@ import type { PermissionProfile } from '../../profile';
 import { vendorBinary } from '../../vendor/pins';
 import type { AgentLaunch, AgflowCommand } from '../types';
 import { createGuardHook } from './guard';
+import { realPathOf } from './paths';
 import { claudePermissionRules, claudeSandboxSettings } from './rules';
 
 /**
@@ -299,7 +300,8 @@ export function buildQueryOptions(launch: AgentLaunch, deps: ClaudeOptionDeps): 
         ],
       },
       autoMemoryEnabled: false,
-      claudeMdExcludes: claudeMdExcludes(launch.clone),
+      // The CLI walks up from the real path of its working directory, as it names its project directory.
+      claudeMdExcludes: claudeMdExcludes(realPathOf(launch.clone)),
       crossSessionInbound: 'refuse',
       cleanupPeriodDays: 30,
       syncClaudeAiSkills: false,
