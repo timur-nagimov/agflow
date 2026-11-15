@@ -449,7 +449,7 @@ describe('fetch_submission', () => {
 });
 
 describe('lead tools', () => {
-  test("request_agents reports the running count and the target; stop_agent (with hold) and replace_agent act on runner workers, and the hub's refusal for a lead comes back as an error result", async () => {
+  test("request_agents reports the running count and the target; stop_agent and replace_agent act on runner workers, and the hub's refusal for a lead comes back as an error result", async () => {
     const hub = hubFixture();
     const lead = runnerAgent(hub, 'lead');
     const first = runnerAgent(hub);
@@ -463,8 +463,9 @@ describe('lead tools', () => {
       text: 'The target is 2 runner worker(s); 3 running now. New workers prefer codex for the next hour.',
       isError: false,
     });
-    const stopped = await bridge.call('stop_agent', { agent_id: first.agent.id, reason: 'wrong approach', hold: true });
-    expect(stopped).toEqual({ text: `Asked agflow to stop ${first.agent.id} (attempt ${first.attempt.id}), and its task is held for people.`, isError: false });
+    // Only people hold a task: the hub refuses a lead's hold.
+    const stopped = await bridge.call('stop_agent', { agent_id: first.agent.id, reason: 'wrong approach' });
+    expect(stopped).toEqual({ text: `Asked agflow to stop ${first.agent.id} (attempt ${first.attempt.id}).`, isError: false });
     const replaced = await bridge.call('replace_agent', { agent_id: second.agent.id, reason: 'stuck for an hour' });
     expect(replaced).toEqual({ text: `Asked agflow to replace ${second.agent.id} (attempt ${second.attempt.id}).`, isError: false });
     const stopRows = hub.ctx.db.query('SELECT id, json_extract(stop_requested, \'$.cause\') AS cause FROM attempts WHERE id IN ($a, $b) ORDER BY id').all({
@@ -473,7 +474,7 @@ describe('lead tools', () => {
     });
     expect(stopRows).toEqual(
       expect.arrayContaining([
-        { id: first.attempt.id, cause: 'stop_hold' },
+        { id: first.attempt.id, cause: 'stop' },
         { id: second.attempt.id, cause: 'replace' },
       ]),
     );

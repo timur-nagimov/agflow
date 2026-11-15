@@ -11,6 +11,7 @@ import { helloAgent, listAgents, startLiveSession } from '../agents';
 import { interruptAgent, replaceAgent, stopAgent } from '../attempts';
 import { buildBrief } from '../brief';
 import type { HubContext } from '../context';
+import { badRequest } from '../errors';
 import { liveInbox, peekInbox, stopCheck } from '../live';
 import type { App } from './app';
 import { type Ctx, actor, human, leadBody, principal, readBody, readQuery } from './util';
@@ -53,6 +54,13 @@ export function mountAgentRoutes(app: App, ctx: HubContext): void {
   // The agent actions of design 6.16, on runner agents only: people act on any of them, the seat holder on workers.
   app.post('/api/agents/:id/stop', async (c) => {
     const { lead, body } = await leadBody(c, ctx, AgentStopInputSchema);
+    // A held task waits for a person to unblock it, so only people hold one.
+    if (body.hold && lead.agent) {
+      throw badRequest(
+        'only a person can hold a task: stop the worker without hold, or change its task with update_task or cancel ' +
+          'it with cancel_task',
+      );
+    }
     const input = { agentId: c.req.param('id'), reason: body.reason, hold: body.hold, by: actor(lead) };
     return stopAnswer(c, stopAgent(ctx, input).attempt);
   });
