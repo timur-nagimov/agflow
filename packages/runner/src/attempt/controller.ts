@@ -602,6 +602,7 @@ export class AttemptController {
       }
       const outcome = await this.submission(spec, command, record?.clone ?? null, stops);
       this.report(fence, { type: 'attempt.submitted', data: outcome });
+      if (!outcome.ok) this.live?.policy.submissionFailed();
       return { ok: true, outcome };
     });
   }
