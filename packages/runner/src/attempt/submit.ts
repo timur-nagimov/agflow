@@ -157,12 +157,15 @@ export function checkOf(command: string, run: CheckRun): SubmissionCheck {
 /**
  * The check's own files among those a branch changes: .agflow/config.json, which names the check, and any file the
  * command names as a word, such as scripts/check.sh in `bash scripts/check.sh`, also when the word spells it
- * ./scripts//check.sh, a/../scripts/check.sh or $PWD/scripts/check.sh (${PWD}/ and $(pwd)/ too). Files the check
- * reaches only another way, such as a script that check.sh calls or a test, are not among them.
+ * ./scripts//check.sh, a/../scripts/check.sh or $PWD/scripts/check.sh (${PWD}/, $(pwd)/ and `pwd`/ too), quotes part
+ * of it, as in "$PWD"/scripts/check.sh, or follows an =, as in --config=scripts/check.json. Files the check reaches
+ * only another way, such as a script that check.sh calls or a test, are not among them.
  */
 export function checkOwnFiles(command: string, changed: readonly string[]): string[] {
-  // $(pwd) becomes $PWD first, which the split keeps whole.
-  const words = command.replaceAll('$(pwd)', '$PWD').split(/[\s;&|()<>'"`]+/);
+  // $(pwd) and `pwd` become $PWD, which the split keeps whole. A quote ends a path in code the command runs, as in
+  // python3 -c "run(['scripts/check.sh'])", but not in "$PWD"/scripts/check.sh, so the words are split both ways.
+  const text = command.replace(/\$\(pwd\)|`pwd`/g, '$PWD');
+  const words = [text, text.replace(/["']/g, '')].flatMap((each) => each.split(/[\s;&|()<>'"`=]+/));
   const paths = new Set(words.map((word) => posix.normalize(word.replace(/^\$(?:PWD|\{PWD\})\/+/, ''))));
   return changed.filter((path) => path === PREP_CONFIG_PATH || paths.has(path));
 }

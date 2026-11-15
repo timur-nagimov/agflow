@@ -130,6 +130,11 @@ describe('the check at submission', () => {
       'sh $PWD/scripts/check.sh',
       'sh "${PWD}/./scripts/check.sh"',
       'bash $(pwd)//scripts/check.sh && bun test',
+      'sh "$PWD"/scripts/check.sh',
+      'sh "$(pwd)"/scripts/check.sh',
+      'sh `pwd`/scripts/check.sh',
+      'make check SCRIPT=scripts/check.sh',
+      `python3 -c "import subprocess; subprocess.run(['sh', 'scripts/check.sh'])"`,
     ];
     for (const command of commands) {
       expect([command, checkOwnFiles(command, changed)]).toEqual([command, ['scripts/check.sh']]);
