@@ -594,6 +594,7 @@ const M2_SENTENCES: Record<HubEventType, Sentence> = {
     `The hub was down for ${duration(typeof d.gapMs === 'number' ? d.gapMs : 0)}; it recovers before it starts new work`,
   'system.recovery_ended': () => 'The hub finished recovering',
   'system.restored': (d) => `The hub was restored from a backup (epoch ${String(d.epoch)})`,
+  'project.deadline_reached': () => 'The deadline passed, so agflow paused the project',
 };
 
 const isM2Type = (type: string): type is HubEventType => Object.hasOwn(M2_SENTENCES, type);
@@ -732,6 +733,7 @@ export function eventTone(type: string, data: Record<string, unknown> = {}): Ton
     case 'task.stale':
     case 'guard.tripped':
     case 'project.paused':
+    case 'project.deadline_reached':
     case 'runner.event_rejected':
     case 'account.owner_away':
     case 'attempt.violation':

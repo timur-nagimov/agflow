@@ -278,6 +278,42 @@ export function parkedTasks(ctx: HubContext): Map<string, string> {
   );
 }
 
+/** The sha of the newest check of main that passed, or null. */
+function lastPassed(ctx: HubContext): string | null {
+  const row = ctx.db
+    .query(
+      `SELECT json_extract(data, '$.sha') AS sha FROM events
+       WHERE type = 'main.checked' AND json_extract(data, '$.status') = 'passed' ORDER BY id DESC LIMIT 1`,
+    )
+    .get() as { sha: string } | null;
+  return row?.sha ?? null;
+}
+
+/** Where main stands, for the deadline's message (deadline.ts). */
+export interface MainStanding {
+  /** main as agflow last merged it; null before its first merge. */
+  sha: string | null;
+  /** What the newest check of that sha gave; null while none gave a result. */
+  check: SubmissionCheck['status'] | null;
+  /** The newest sha whose check passed; null before any passed. */
+  passed: string | null;
+}
+
+/** main as agflow last merged it, what its check gave, and the newest sha whose check passed. */
+export function mainStanding(ctx: HubContext): MainStanding {
+  const sha = mergedMain(ctx)?.sha ?? null;
+  const newest =
+    sha === null
+      ? null
+      : (ctx.db
+          .query(
+            `SELECT json_extract(data, '$.status') AS status FROM events
+             WHERE type = 'main.checked' AND json_extract(data, '$.sha') = $sha ORDER BY id DESC LIMIT 1`,
+          )
+          .get({ sha }) as { status: SubmissionCheck['status'] } | null);
+  return { sha, check: newest?.status ?? null, passed: lastPassed(ctx) };
+}
+
 /** The tasks merged since main's check last passed, up to the merge that made sha, in the order they were merged. */
 function mergedSincePass(ctx: HubContext, sha: string): string[] {
   const mergeOf = (of: string | null) =>
@@ -288,18 +324,12 @@ function mergedSincePass(ctx: HubContext, sha: string): string[] {
             .query("SELECT MAX(id) AS id FROM events WHERE type = 'task.merged' AND json_extract(data, '$.sha') = $sha")
             .get({ sha: of }) as { id: number | null }
         ).id ?? 0);
-  const passed = ctx.db
-    .query(
-      `SELECT json_extract(data, '$.sha') AS sha FROM events
-       WHERE type = 'main.checked' AND json_extract(data, '$.status') = 'passed' ORDER BY id DESC LIMIT 1`,
-    )
-    .get() as { sha: string } | null;
   const rows = ctx.db
     .query(
       `SELECT subject FROM events WHERE type = 'task.merged' AND id > $from AND id <= $to AND subject IS NOT NULL
        ORDER BY id`,
     )
-    .all({ from: mergeOf(passed?.sha ?? null), to: mergeOf(sha) }) as { subject: string }[];
+    .all({ from: mergeOf(lastPassed(ctx)), to: mergeOf(sha) }) as { subject: string }[];
   return [...new Set(rows.map((row) => row.subject))];
 }
 
