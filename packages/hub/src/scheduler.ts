@@ -51,7 +51,7 @@ import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
 import { listAccounts, markOwnerAwayTold, probeUnknownResets } from './quota';
 import { type ClockCheck, checkClock } from './recovery';
-import { expireReviews } from './review';
+import { expireReviews, tasksUnderReview } from './review';
 import { TAKES_SLOT_SQL } from './runners';
 import { expireSubmissions } from './submissions';
 import { type StallDecisions, judgeStalls } from './supervisor';
@@ -681,16 +681,19 @@ function quotaLine(account: AccountQuota, now: number): string {
 }
 
 /**
- * The worker load, the tasks parked while main's check fails, why worker dispatch is held when it is, one quota line
- * per account and the deadline with the time left, as lines for the lead.
+ * The worker load, with how many submitted tasks agents review, the tasks parked while main's check fails, why worker
+ * dispatch is held when it is, one quota line per account and the deadline with the time left, as lines for the lead.
  */
 export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
+  const reviewing = tasksUnderReview(ctx).size;
+  const underReview = reviewing > 0 ? `, ${reviewing} of them under review by agents` : '';
   // Without a target of its own, the project's target is the cap.
   const lines = [
     `Workers: ${load.running} running (target ${load.target ?? load.cap}, cap ${load.cap}); ${load.freeSlots} free ` +
       'worker slot(s).',
     `Ready tasks: ${load.ready}, ${load.dispatchable} of them dispatchable now. Blocked on dependencies: ` +
-      `${load.blockedOnDependencies}. Submitted: ${load.submitted}. Accepted, not merged: ${load.acceptedNotMerged}.`,
+      `${load.blockedOnDependencies}. Submitted: ${load.submitted}${underReview}. Accepted, not merged: ` +
+      `${load.acceptedNotMerged}.`,
   ];
   const parked = parkedLine(ctx);
   if (parked !== null) lines.push(parked);

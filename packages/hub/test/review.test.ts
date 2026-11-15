@@ -560,8 +560,10 @@ describe('AGFLOW_REVIEW: what else sees a review', () => {
     expect(report).toContain(`Awaiting your review:\n- ${waiting.task.id} "Lint"`);
     expect(report).not.toContain(`- ${held.task.id} "`);
     expect(report).toContain(`Under review by agents: ${held.task.id} (by ${review.id}).`);
+    expect(report).toContain('Submitted: 2, 1 of them under review by agents. Accepted, not merged: 0.');
     verdict(hub, startReview(hub, review.id), 'VERDICT: accept');
     report = situationReport(hub.ctx);
+    expect(report).toContain('Submitted: 1. Accepted, not merged: 1.');
     expect(report).toContain(`Accepted by the hub since your last wake-up, their check passed: ${held.task.id} "Do the`);
     expect(report).not.toContain('Under review by agents');
     expect(report).not.toContain(`${review.id} "`);
