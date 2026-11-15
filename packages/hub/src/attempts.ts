@@ -971,8 +971,22 @@ export function ladderRequirement(ctx: HubContext, taskId: string): LadderRequir
 // ---------------------------------------------------------------------------
 
 /**
+ * The model an attempt runs (modelClass): its role's, or the lead's when its start named the strong tier. A resume
+ * keeps the model of the start, so a tier the task got since (update_task) does not count.
+ */
+function attemptModel(ctx: HubContext, attempt: Attempt): AgentRole {
+  const row = ctx.db
+    .query(
+      `SELECT json_extract(payload, '$.attempt.tier') AS tier FROM runner_commands
+       WHERE attempt_id = $attemptId AND kind = 'start_attempt' ORDER BY rowid DESC LIMIT 1`,
+    )
+    .get({ attemptId: attempt.id }) as { tier: string | null } | null;
+  return modelClass(attempt.role, row?.tier === 'strong' ? 'strong' : undefined);
+}
+
+/**
  * Whether a rejection can go back to its author (design 6.9, step 1): the author's attempt is holding and resumable, on
- * an online runner where its vendor is usable for the attempt's model (modelClass), by core's usableVendors over the
+ * an online runner where its vendor is usable for the attempt's model (attemptModel), by core's usableVendors over the
  * placement snapshot (X-46), and no other task holds paths that overlap the task's. It needs no free slot: a resume is
  * no start, and its runner takes it even when full, for as long as the review round lasts. Review rounds are the
  * ladder's.
@@ -982,7 +996,7 @@ export function authorCanResume(ctx: HubContext, task: Task, attempt: Attempt): 
   const snapshot = placementSnapshot(ctx);
   const runner = snapshot.runners.find((slot) => slot.id === attempt.runnerId);
   if (!runner || runner.state !== 'online') return false;
-  const usable = usableVendors(snapshot, runner, modelClass(attempt.role, task.tier)).usable;
+  const usable = usableVendors(snapshot, runner, attemptModel(ctx, attempt)).usable;
   if (!usable.some(({ slot }) => slot.vendor === attempt.vendor)) return false;
   return overlappingPathHolder(ctx, task) === null;
 }
@@ -1775,7 +1789,8 @@ function endOnExit(
  * attempt.quota (design 6.10, quota_wait; X-14). The account's quota is stored when the event names the account; a
  * null account id updates no account (X-21), and its exhaustion, a limit of one model or paid usage the runner refuses,
  * keeps the attempt's model off the account until the reset (setLimited), so its successor does not meet the same
- * limit. The model is the role's, or the lead's for a strong task's worker (modelClass).
+ * limit. The model is the one the attempt started on (attemptModel): the role's, or the lead's for a strong task's
+ * worker.
  * An exhaustion moves a running attempt to quota_wait until its reset, and state ok, which the runner reports when it
  * resumes the waiting turn, moves it back to running. A waiting attempt keeps its runner lease, renewed by heartbeats
  * like any other.
@@ -1790,8 +1805,7 @@ export function onAttemptQuota(
   const { vendor, accountId, quota } = data;
   if (accountId !== null) recordQuotaReports(ctx, emit, runnerId, [{ vendor, accountId, quota }]);
   else if (quota.state === 'exhausted') {
-    const tier = attempt.taskId === null ? undefined : findTask(ctx, attempt.taskId)?.tier;
-    setLimited(ctx, runnerId, { vendor, role: modelClass(attempt.role, tier), resetsAt: quota.resetsAt });
+    setLimited(ctx, runnerId, { vendor, role: attemptModel(ctx, attempt), resetsAt: quota.resetsAt });
   }
   if (quota.state === 'ok') {
     leaveQuotaWait(ctx, emit, attempt);

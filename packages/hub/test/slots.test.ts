@@ -17,7 +17,7 @@ import { accountFor, upsertAccountQuota } from '../src/quota';
 import { getRunner } from '../src/runners';
 import { replaceQuotaWaits, runTick, runningWorkers } from '../src/scheduler';
 import { getTask } from '../src/task-store';
-import { createTasks } from '../src/tasks';
+import { createTasks, updateTask } from '../src/tasks';
 import { addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
 
 const MINUTE = 60_000;
@@ -178,8 +178,10 @@ describe('quota replacements', () => {
     const { ctx } = workersOnly();
     const runnerId = addRunner(ctx);
     const [design] = tasks(ctx, { title: 'Design', tier: 'strong' });
-    const held = addRunnerAttempt(ctx, { runnerId, taskId: design });
-    limitHit(ctx, held.attempt, ctx.now() + 24 * HOUR);
+    // Started as the scheduler starts it: its start_attempt names the tier, which chose the model.
+    const start = { runnerId, taskId: design as string, role: 'worker', vendor: 'claude' } as const;
+    const { attempt } = startRunnerAttempt(ctx, start);
+    limitHit(ctx, attempt, ctx.now() + 24 * HOUR);
     // A strong task runs on the vendor's lead model, so the limit is kept under lead.
     const [slot] = placementSnapshot(ctx).runners.flatMap((runner) => runner.vendors);
     expect(slot?.limitedUntil).toEqual({ lead: ctx.now() + 24 * HOUR });
@@ -188,6 +190,19 @@ describe('quota replacements', () => {
     const started = runTick(ctx).started.map((attempt) => attempt.taskId);
     expect(started).toEqual([standard]);
     expect(getTask(ctx, strong as string).status).toBe('ready');
+  });
+
+  test("a limit is kept under the model the attempt started on, not a tier the task got since", () => {
+    const { ctx } = workersOnly();
+    const runnerId = addRunner(ctx);
+    const [parser] = tasks(ctx, { title: 'Parser' });
+    const start = { runnerId, taskId: parser as string, role: 'worker', vendor: 'claude' } as const;
+    const { attempt } = startRunnerAttempt(ctx, start);
+    // The lead makes the task strong while its standard attempt runs: only the next attempt gets the lead's model.
+    updateTask(ctx, parser as string, { tier: 'strong' }, 'user:alice');
+    limitHit(ctx, attempt, ctx.now() + 24 * HOUR);
+    const [slot] = placementSnapshot(ctx).runners.flatMap((runner) => runner.vendors);
+    expect(slot?.limitedUntil).toEqual({ worker: ctx.now() + 24 * HOUR });
   });
 
   test('a hinted task replaced for its quota starts on the other vendor at once: it waited for its vendor', () => {
