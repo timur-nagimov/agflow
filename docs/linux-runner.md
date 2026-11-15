@@ -124,7 +124,12 @@ agflow runner install
   `~/.bashrc` in each of them; Ubuntu's stock `~/.bashrc` returns at once there, so keep it that way.
 - **Sandbox.** Both sandboxes use bubblewrap instead of macOS's seatbelt. Claude's needs `bwrap`, `socat` and `rg` on
   the PATH, and Ubuntu's restriction on user namespaces off. Claude's preflight checks both and names the fix:
-  `sudo apt-get install bubblewrap socat ripgrep`, or the sysctl above.
+  `sudo apt-get install bubblewrap socat ripgrep`, or the sysctl above. Claude's commands, dependency preparation and
+  the submission check run under the sandbox's seccomp filter, which refuses them unix sockets, and the user's runtime
+  directory, `/run/user/<uid>`, is hidden from them. The agflow binary carries the filter's helper and writes it to
+  `~/.agflow/seccomp`. Without the filter, preparation and the check refuse to run, and setup's dependency
+  preparation check fails; `agflow runner check-sandbox` tells why. Local ports work within one command only: a server
+  that one command starts is out of the next one's reach.
 - **Logins.** Nothing reads a Keychain. Codex keeps its login in the runner's Codex home, Claude's is the token in
   `runner.env`. The token names no plan, so the hub shows the Claude plan as unknown. Neither does it name the account,
   so the runner reports a hash of the token as the account: the hub counts this runner's Claude quota apart from the
@@ -136,10 +141,11 @@ agflow runner install
   another machine is refused, as on a Mac.
 - **Uninstall.** `agflow runner uninstall` removes the unit. The Claude token stays in `runner.env` until
   `agflow runner uninstall --purge` removes the runner's data.
-- **Open profile.** Claude's commands keep unix sockets shut, as under the standard profile. On a Mac the open profile
-  opens them, but here the user's systemd manager listens on one, under `/run/user`, and would start any command
-  outside the sandbox. Codex's commands get the network under the open profile, and Codex's sandbox may not keep them
-  from that socket. Treat a Codex command on an open-profile VM as able to start a process outside its sandbox with
+- **Open profile.** Claude's commands and dependency preparation keep unix sockets shut, as under the standard
+  profile. On a Mac the open profile opens Claude's, but here the user's systemd manager listens on one, under
+  `/run/user`, and would start any command outside the sandbox. Local ports still work within one command only.
+  Codex's commands get the network under the open profile, and Codex's sandbox may not keep them from that socket.
+  Treat a Codex command on an open-profile VM as able to start a process outside its sandbox with
   `systemd-run --user`. That process can read the Claude token in `runner.env` and your git credentials, and become
   root through sudo.
 
