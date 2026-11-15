@@ -239,6 +239,18 @@ export function requestReview(
   }
 }
 
+/**
+ * Where every attempt of a review starts (startPositionFor): the reviewed task's branch at the submitted head. Never an
+ * earlier reviewer's WIP or unpushed commit, which would show the next reviewer a file the earlier one left behind as
+ * part of the change. Null for any other task.
+ */
+export function reviewStart(ctx: HubContext, taskId: string): { ref: string; sha: string } | null {
+  const target = reviewTarget(ctx, taskId);
+  const branch = target && findTask(ctx, target.taskId)?.branch;
+  const head = target && findSubmission(ctx, target.submissionId)?.headSha;
+  return branch && head ? { ref: `refs/heads/${branch}`, sha: head } : null;
+}
+
 // ---------------------------------------------------------------------------
 // What the reviewer gets (buildAttemptSpec)
 // ---------------------------------------------------------------------------

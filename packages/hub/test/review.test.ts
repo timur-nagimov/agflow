@@ -4,11 +4,13 @@ import {
   type MergeTaskResult,
   type RawRunnerEvent,
   type RunnerEventData,
+  type RunnerEventType,
   type SubmissionCheck,
   type Vendor,
+  lateWorkRef,
 } from '@agflow/core';
 import { getAttempt } from '../src/attempt-store';
-import { startRunnerAttempt } from '../src/attempts';
+import { startPositionFor, startRunnerAttempt } from '../src/attempts';
 import { mintAgentToken } from '../src/auth';
 import { buildBrief, composeTaskPack, reviewFirstPrompt, situationReport } from '../src/brief';
 import { pendingCommands, recordResult } from '../src/commands';
@@ -31,7 +33,7 @@ import {
 import { runTick, workerLoad } from '../src/scheduler';
 import { findSubmission, listSubmissions } from '../src/submission-store';
 import { requestSubmission } from '../src/submissions';
-import { getTask, listTasks, move } from '../src/task-store';
+import { getTask, listTaskNotes, listTasks, move } from '../src/task-store';
 import { acceptTask, blockTask, cancelTask, claimTask, createTasks, creationGuard } from '../src/tasks';
 import { type RunnerAttempt, addAgent, addRunner, addRunnerAttempt, markHubAlive, newTask } from './helpers';
 import { createTestHub } from './http-helpers';
@@ -47,19 +49,23 @@ const findings = 'The parser drops the last line: `printf "a\\nb" | bun run pars
 
 let seq = 0;
 
-/** The runner reports the outcome of the attempt's submission, as attempt.submitted, and the hub takes it whole. */
-function report(hub: Hub, held: RunnerAttempt, outcome: Outcome): void {
-  const raw: RawRunnerEvent = {
-    seq: ++seq,
-    at: hub.ctx.now(),
-    type: 'attempt.submitted',
-    attemptId: held.attempt.id,
-    fence: getAttempt(hub.ctx, held.attempt.id).fence,
-    data: outcome,
-  };
-  applyRunnerEvents(hub.ctx, held.runner.id, { outboxEpoch: 'outbox-1', events: [raw] }, { restoreReplay: false });
+/** The runner reports an event about the attempt, at its fence as the hub has it, and the hub takes it whole. */
+function runnerEvent<K extends RunnerEventType>(
+  hub: Hub,
+  runnerId: string,
+  attemptId: string,
+  type: K,
+  data: RunnerEventData[K],
+): void {
+  const fence = getAttempt(hub.ctx, attemptId).fence;
+  const raw: RawRunnerEvent = { seq: ++seq, at: hub.ctx.now(), type, attemptId, fence, data };
+  applyRunnerEvents(hub.ctx, runnerId, { outboxEpoch: 'outbox-1', events: [raw] }, { restoreReplay: false });
   expect(hub.ctx.db.query('SELECT error FROM runner_event_rejects').all()).toEqual([]);
 }
+
+/** The runner reports the outcome of the attempt's submission, as attempt.submitted. */
+const report = (hub: Hub, held: RunnerAttempt, outcome: Outcome) =>
+  runnerEvent(hub, held.runner.id, held.attempt.id, 'attempt.submitted', outcome);
 
 /** The author's submission, pushed at head with the check; gives its id. */
 function submit(hub: Hub, held: RunnerAttempt, check: SubmissionCheck = passed, head = sha('a')): string {
@@ -187,6 +193,51 @@ describe('AGFLOW_REVIEW: creating the review', () => {
     expect(pack).toContain(`- ${waiting} [submitted] "A submitted neighbour"`);
     expect(pack).not.toContain(`- ${before} `);
     expect(pack).not.toContain(`- ${held.task.id} `);
+  });
+
+  test("every attempt of a review starts at the submitted head, never at a reviewer's leftovers", () => {
+    const hub = createTestHub({ autoAccept: true, review: true });
+    const { held, review } = reviewed(hub);
+    const head = { ref: `refs/heads/${held.task.branch}`, sha: sha('a') };
+    const first = startReview(hub, review.id);
+    // The reviewer left a file: the runner pushed it as a WIP, then the agent crashed and its final push failed.
+    const wip = { ref: first.attempt.wipRef as string, sha: sha('b'), stripped: [], skipped: [], embedded: [] };
+    runnerEvent(hub, first.runnerId, first.attempt.id, 'attempt.wip', { ...wip, logStat: '' });
+    runnerEvent(hub, first.runnerId, first.attempt.id, 'attempt.exited', {
+      code: 1,
+      signal: null,
+      stoppedBy: 'none',
+      handoffWritten: false,
+      cause: null,
+      finalSha: sha('c'),
+      finalWip: null,
+      pushError: 'remote: rejected',
+    });
+    expect(getTask(hub.ctx, review.id)).toMatchObject({ status: 'ready', currentAttempt: first.attempt.id });
+    // Nothing waits for that commit, and no note names it.
+    const hold = hub.ctx.db.query('SELECT dispatch_hold_until AS until FROM tasks WHERE id = $id');
+    expect(hold.get({ id: review.id })).toEqual({ until: null });
+    expect(listTaskNotes(hub.ctx, review.id).filter((note) => note.kind === 'late_work')).toEqual([]);
+    // The runner that holds the commit and any other start at the submitted head.
+    expect(startPositionFor(hub.ctx, getTask(hub.ctx, review.id), first.runnerId)).toEqual(head);
+    expect(startPositionFor(hub.ctx, getTask(hub.ctx, review.id), addRunner(hub.ctx))).toEqual(head);
+    const second = startRunnerAttempt(hub.ctx, {
+      runnerId: first.runnerId,
+      taskId: review.id,
+      role: 'worker',
+      vendor: 'codex',
+    });
+    if (second.command.command.kind !== 'start_attempt') throw new Error('not a start');
+    expect(second.command.command.attempt.start).toEqual(head);
+    expect(second.command.command.attempt.brief).not.toContain('is only on runner');
+    // The first one's commit, pushed late, is kept for its cleanup only: nobody is told to merge it.
+    const ref = lateWorkRef('refs/agflow/', first.attempt.id, 1);
+    runnerEvent(hub, first.runnerId, first.attempt.id, 'attempt.late_work', { taskId: review.id, ref, sha: sha('c') });
+    const late = listEvents(hub.ctx.db, {}).filter((event) => event.type === 'attempt.late_work');
+    expect(late.map((event) => event.data.ref)).toEqual([ref]);
+    expect(listMessages(hub.ctx, { target: `agent:${second.agent.id}` })).toEqual([]);
+    expect(listTaskNotes(hub.ctx, review.id).filter((note) => note.kind === 'late_work')).toEqual([]);
+    expect(kinds(hub, first.runnerId)).not.toContain('refresh_vault');
   });
 
   test("the vendor hint is the author's other vendor, only while an online runner that is not draining offers it", () => {
