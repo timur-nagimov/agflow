@@ -114,6 +114,12 @@ describe('AGFLOW_AUTO_APPROVALS on', () => {
     const notices = toldLead(hub, lead.agent.id);
     expect(notices).toHaveLength(1);
     expect(notices[0]?.body).toContain('You may only decline it');
+    // Nobody may be at the machine on such a run: the lead declines it now, not at its expiry.
+    expect(notices[0]?.body).toContain(
+      "This run approves without people, so nobody may be at bob's machine: decline it now rather than let the " +
+        'agent wait for it to expire.',
+    );
+    expect(notices[0]?.body).not.toContain('Or leave it to');
   });
 });
 

@@ -4,6 +4,7 @@ import { listAttempts } from '../src/attempt-store';
 import { type HubContext, tx } from '../src/context';
 import { DEMO_CHECK_PATHS, demoCheckContract, ensureDemoCheck } from '../src/demo-check';
 import { listMessages } from '../src/messages';
+import { setDeadline } from '../src/project';
 import { runTick } from '../src/scheduler';
 import { getTask, listTasks, move } from '../src/task-store';
 import { cancelTask, updateTask } from '../src/tasks';
@@ -182,6 +183,30 @@ describe('the demo check', () => {
     finish(even, 'claude');
     finish(even, 'codex');
     expect(ensureDemoCheck(even)?.vendorHint).toBeUndefined();
+  });
+
+  test('in the last hour before the deadline one task done is enough; before that hour and after the deadline, N', () => {
+    const { ctx, clock } = createTestContext({ demoCheckEvery: 5 });
+    const hour = 60 * 60_000;
+    setDeadline(ctx, ctx.now() + 2 * hour, 'user:alice');
+    finish(ctx, 'claude');
+    expect(ensureDemoCheck(ctx)).toBeNull();
+    clock.advance(hour);
+    const first = ensureDemoCheck(ctx);
+    expect(first?.title).toBe('Demo check after 1 task');
+    cancelTask(ctx, first?.id as string, 'next one', 'user:alice');
+    finish(ctx, 'codex');
+    const second = ensureDemoCheck(ctx);
+    expect(second?.title).toBe('Demo check after 2 tasks');
+    cancelTask(ctx, second?.id as string, 'next one', 'user:alice');
+    clock.advance(hour);
+    finish(ctx, 'claude');
+    expect(ensureDemoCheck(ctx)).toBeNull();
+    // Off stays off.
+    const off = createTestContext({ demoCheckEvery: 0 });
+    setDeadline(off.ctx, off.ctx.now() + hour, 'user:alice');
+    finish(off.ctx, 'claude');
+    expect(ensureDemoCheck(off.ctx)).toBeNull();
   });
 
   test('the tick creates it before dispatch', () => {

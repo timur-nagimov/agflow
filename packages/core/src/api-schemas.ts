@@ -621,8 +621,8 @@ const OF_APPROVAL = ['approvalId', ...OF_ATTEMPT, 'summary'] as const;
 const OF_SUBMISSION = ['submissionId', ...OF_ATTEMPT] as const;
 
 /**
- * Every event type M2 adds: its group, what its subject names and the keys of its data. The hub fills every key it
- * lists, and pages describe the events from these keys only.
+ * Every event type M2 adds, and project.deadline_reached after it: its group, what its subject names and the keys of
+ * its data. The hub fills every key it lists, and pages describe the events from these keys only.
  */
 export const HUB_EVENT_TYPES = {
   'runner.online': { category: 'runners', subject: 'runner', data: ['runnerId', 'name'] },
@@ -699,6 +699,8 @@ export const HUB_EVENT_TYPES = {
   'system.recovery_ended': { category: 'hub', subject: null, data: [] },
   // epoch: the hub epoch after the restore.
   'system.restored': { category: 'hub', subject: null, data: ['epoch'] },
+  // deadlineAt: the project's deadline that passed, at which the hub paused the project.
+  'project.deadline_reached': { category: 'hub', subject: null, data: ['deadlineAt'] },
 } as const satisfies Record<string, HubEventSpec>;
 
 export type HubEventType = keyof typeof HUB_EVENT_TYPES;

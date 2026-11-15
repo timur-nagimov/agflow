@@ -39,11 +39,12 @@ import { expireApprovals } from './approvals';
 import { listAttempts, unpushedHead } from './attempt-store';
 import { expireRunnerLeases, expireStops, ladderRequirement, requestStop, startRunnerAttempt } from './attempts';
 import { type HubContext, tx } from './context';
+import { reachDeadline } from './deadline';
 import { ensureDemoCheck } from './demo-check';
 import { currentGoalVersion } from './goal';
 import { churnPaused, getHubState, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
-import { queueMainCheck, retryFixTask } from './main-check';
+import { parkedLine, parkedTasks, queueMainCheck, retryFixTask } from './main-check';
 import { failedMerges, queueMerges } from './merges';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
@@ -136,21 +137,22 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
 }
 
 /**
- * The ready set in dispatch order (design 6.6, step 3): by priority, then age. Each ready task left out goes into
- * waiting, when given, with why.
+ * The ready set in dispatch order (design 6.6, step 3): by priority, then age. A task parked while main's check fails
+ * waits too (parkedTasks). Each ready task left out goes into waiting, when given, with why.
  */
 export function readySet(ctx: HubContext, waiting?: Map<string, string>): TaskCandidate[] {
   const tasks = listTasks(ctx);
   const columns = dispatchColumns(ctx);
   const pathHolders = tasks.filter((task) => isPathHolder(task, ctx.config.autoMerge === true));
   const context = { now: ctx.now(), maxAttempts: ctx.config.maxAttempts, pathHolders };
+  const parked = parkedTasks(ctx);
   const ready = tasks.flatMap((task) => {
     const stored = columns.get(task.id);
     return task.status === 'ready' && stored ? [candidateOf(ctx, task, stored)] : [];
   });
   return orderReady(
     ready.filter((candidate) => {
-      const why = whyNotDispatchable(candidate, context);
+      const why = whyNotDispatchable(candidate, context) ?? parked.get(candidate.id) ?? null;
       if (why !== null) waiting?.set(candidate.id, why);
       return why === null;
     }),
@@ -447,16 +449,19 @@ export interface TickResult {
  * before dispatch, so that dispatch sees the account it draws on; it takes no slot. A paused project skips the lead
  * seat and dispatch (steps 2 to 6); the agents already running go on under every stall, budget and lease rule. While
  * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts. These three holds
- * are dispatchHold's, and a tick that one of them stops gives every ready task its reason (held). Accepted work goes
- * on merging into main whatever the project's state: the merge queue sends a merge that waits, and one that failed
- * again, main's check follows the merges (queueMainCheck), and a fix of main that the task limits refused is created
- * once they allow it (retryFixTask). Just before dispatch, the demo check may add its task (ensureDemoCheck). A
- * review that will not finish lets the hub accept its task as before (expireReviews), while the project is not paused.
+ * are dispatchHold's, and a tick that one of them stops gives every ready task its reason (held). Once the deadline
+ * has passed, the tick pauses the project, once per deadline (reachDeadline). Accepted work goes on merging into main
+ * whatever the project's state, unless it is paused past its deadline: the merge queue sends a merge that waits, and
+ * one that failed again, main's check follows the merges (queueMainCheck), and a fix of main that the task limits
+ * refused is created once they allow it (retryFixTask). Just before dispatch, the demo check may add its task
+ * (ensureDemoCheck). A review that will not finish lets the hub accept its task as before (expireReviews), while the
+ * project is not paused.
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
   if (inRecovery(ctx)) return held(ctx, { clock, recovering: true, reconciled: null, lead: null, started: [] });
   const reconciled = reconcile(ctx);
+  duty('the deadline', () => reachDeadline(ctx), false);
   duty('the merge queue', () => queueMerges(ctx), null);
   duty("main's check", () => queueMainCheck(ctx), null);
   duty("main's fix task", () => retryFixTask(ctx), null);
@@ -676,8 +681,8 @@ function quotaLine(account: AccountQuota, now: number): string {
 }
 
 /**
- * The worker load, why worker dispatch is held when it is, one quota line per account and the deadline with the time
- * left, as lines for the lead.
+ * The worker load, the tasks parked while main's check fails, why worker dispatch is held when it is, one quota line
+ * per account and the deadline with the time left, as lines for the lead.
  */
 export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
   // Without a target of its own, the project's target is the cap.
@@ -687,6 +692,8 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
     `Ready tasks: ${load.ready}, ${load.dispatchable} of them dispatchable now. Blocked on dependencies: ` +
       `${load.blockedOnDependencies}. Submitted: ${load.submitted}. Accepted, not merged: ${load.acceptedNotMerged}.`,
   ];
+  const parked = parkedLine(ctx);
+  if (parked !== null) lines.push(parked);
   const hold = dispatchHold(ctx);
   if (hold !== null) lines.push(`No worker starts now: ${hold}.`);
   const now = ctx.now();
@@ -715,8 +722,8 @@ const NUDGE_PLAN =
 const workerSlots = (load: WorkerLoad): number => load.running + load.freeSlots;
 
 /**
- * When the dispatchable ready tasks became fewer than the worker slots, per hub context. Kept in memory: a restarted
- * hub only waits idleNudgeMs again before it nudges.
+ * When the dispatchable ready tasks, parked ones counted, became fewer than the worker slots, per hub context. Kept in
+ * memory: a restarted hub only waits idleNudgeMs again before it nudges.
  */
 const idleSince = new WeakMap<HubContext, number>();
 
@@ -729,14 +736,14 @@ function lastNudgeAt(ctx: HubContext): number | null {
 }
 
 /**
- * The idle nudge: while a runner lead holds the seat and the dispatchable ready tasks are fewer than the worker slots,
- * running plus free (workerSlots), for idleNudgeMs without a break, the lead gets one system message with the load,
- * each account's quota, the deadline and what to plan; then none before idleNudgeIntervalMs has passed since the last
- * (lead.idle_nudged), and none at all while it is 0. So a lead whose every slot is busy hears too, before the slots
- * run dry. While worker dispatch is held (dispatchHold: a paused project, the churn guard) no worker starts, so none
- * goes out. Without a goal there is nothing to plan, and the work is planned until the deadline, so none goes out
- * before the goal is set or once the deadline has passed. Part of the tick's reconcile step. Returns the message, or
- * null.
+ * The idle nudge: while a runner lead holds the seat and the dispatchable ready tasks, with those parked while main's
+ * check fails (parkedTasks), are fewer than the worker slots, running plus free (workerSlots), for idleNudgeMs without
+ * a break, the lead gets one system message with the load, each account's quota, the deadline and what to plan; then
+ * none before idleNudgeIntervalMs has passed since the last (lead.idle_nudged), and none at all while it is 0. So a
+ * lead whose every slot is busy hears too, before the slots run dry, and parking alone sets off none. While worker
+ * dispatch is held (dispatchHold: a paused project, the churn guard) no worker starts, so none goes out. Without a
+ * goal there is nothing to plan, and the work is planned until the deadline, so none goes out before the goal is set
+ * or once the deadline has passed. Part of the tick's reconcile step. Returns the message, or null.
  */
 export function nudgeIdleLead(ctx: HubContext): Message | null {
   if (ctx.config.idleNudgeIntervalMs === 0) return null;
@@ -744,7 +751,9 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
   const due =
     dispatchHold(ctx) === null && currentGoalVersion(ctx) > 0 && (deadlineAt === null || ctx.now() < deadlineAt);
   const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
-  if (load === null || load.dispatchable >= workerSlots(load)) {
+  // A task parked while main's check fails counts as dispatchable: it takes a slot by itself once main passes.
+  const parked = load === null ? 0 : parkedTasks(ctx).size;
+  if (load === null || load.dispatchable + parked >= workerSlots(load)) {
     idleSince.delete(ctx);
     return null;
   }
@@ -761,8 +770,9 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
       from: 'system',
       to: 'lead',
       body:
-        `Only ${load.dispatchable} ready task(s) are dispatchable, fewer than the ${workerSlots(load)} worker ` +
-        `slot(s) (${load.running} running, ${load.freeSlots} free).\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
+        `Only ${load.dispatchable} ready task(s) are dispatchable${parked > 0 ? ` and ${parked} parked` : ''}, fewer ` +
+        `than the ${workerSlots(load)} worker slot(s) (${load.running} running, ${load.freeSlots} free).\n` +
+        `${lines.join('\n')}\n\n${NUDGE_PLAN}`,
     });
   });
 }

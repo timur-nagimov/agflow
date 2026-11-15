@@ -15,6 +15,7 @@ import {
 import type { HubContext } from './context';
 import type { Emit } from './events';
 import { notFound } from './errors';
+import { clip } from './text';
 
 export interface TaskRow {
   id: string;
@@ -285,13 +286,38 @@ export function unmetDependencies(ctx: HubContext, dependsOn: string[]): string[
 export const waitingReason = (ids: string[]) => `waiting on ${ids.join(', ')}`;
 
 /**
- * Why a task is blocked on its dependencies. A cancelled dependency will never be done, so instead of
+ * Why a task is blocked on its dependencies. A cancelled or failed dependency will never be done, so instead of
  * naming it among the tasks it waits on, the reason asks for a decision.
  */
 export function dependencyReason(ctx: HubContext, waiting: string[]): string {
-  const cancelled = waiting.filter((id) => findTask(ctx, id)?.status === 'cancelled');
-  if (cancelled.length === 0) return waitingReason(waiting);
-  return `${cancelled.join(', ')} ${cancelled.length === 1 ? 'was' : 'were'} cancelled; amend or cancel this task`;
+  const ended = (status: TaskStatus) => waiting.filter((id) => findTask(ctx, id)?.status === status);
+  const cancelled = ended('cancelled');
+  const failed = ended('failed');
+  if (cancelled.length === 0 && failed.length === 0) return waitingReason(waiting);
+  const why = [
+    ...(cancelled.length > 0 ? [`${cancelled.join(', ')} ${cancelled.length === 1 ? 'was' : 'were'} cancelled`] : []),
+    ...(failed.length > 0 ? [`${failed.join(', ')} failed`] : []),
+  ];
+  return `${why.join(' and ')}; amend or cancel this task`;
+}
+
+/**
+ * The open tasks that depend on a task that will never be done, cancelled or failed: each one blocked on its
+ * dependencies gets its reason again (dependencyReason), and the lines that ask the lead to decide on them are
+ * returned, none when nothing depends on it.
+ */
+export function strandedDependents(ctx: HubContext, id: string): string[] {
+  const dependents = listTasks(ctx).filter((other) => !isClosed(other.status) && other.dependsOn.includes(id));
+  for (const dependent of dependents) {
+    if (dependent.status !== 'blocked' || dependent.blockedKind !== 'deps') continue;
+    writeTask(ctx, dependent.id, { blockedReason: dependencyReason(ctx, unmetDependencies(ctx, dependent.dependsOn)) });
+  }
+  if (dependents.length === 0) return [];
+  return [
+    `${dependents.length === 1 ? 'This open task depends' : 'These open tasks depend'} on it:`,
+    ...dependents.map((dependent) => `- ${dependent.id} ("${clip(dependent.title, 80)}") [${dependent.status}]`),
+    'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
+  ];
 }
 
 // ---------------------------------------------------------------------------

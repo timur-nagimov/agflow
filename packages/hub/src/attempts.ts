@@ -114,6 +114,7 @@ import {
   move,
   overlappingPathHolder,
   setAgentTask,
+  strandedDependents,
   writeTask,
 } from './task-store';
 import { refreshLeadSubmission } from './lead-review';
@@ -890,9 +891,9 @@ function blockForReplan(ctx: HubContext, emit: Emit, task: Task, attempt: Attemp
  * The retry ladder after an ending (design 6.9), in the ending's transaction. Call it once the ending moved the task
  * to ready, or once a rejection without a resume marked it rejected. A counted failure takes its step: 2 and 3 leave
  * the task ready (ladderRequirement then steers the vendor), 4 blocks it for a re-plan and tells the lead, 5 fails it
- * and tells people. An infra ending delays the task's next dispatch by the infra backoff, and the third with one
- * failure signature since the last re-plan blocks it for a re-plan and tells the lead and people. A rejected task
- * that stays on the ladder goes back to ready.
+ * and tells people and the lead, with the open tasks that depend on it. An infra ending delays the task's next
+ * dispatch by the infra backoff, and the third with one failure signature since the last re-plan blocks it for a
+ * re-plan and tells the lead and people. A rejected task that stays on the ladder goes back to ready.
  */
 export function applyLadder(ctx: HubContext, emit: Emit, input: LadderInput): LadderOutcome {
   const { attempt, trigger } = input;
@@ -928,14 +929,13 @@ export function applyLadder(ctx: HubContext, emit: Emit, input: LadderInput): La
       });
     } else if (step === 5) {
       task = move(ctx, emit, task, 'failed', 'system', { data: { attemptId: attempt.id, ladderStep: 5 } });
-      insertMessage(ctx, emit, {
-        from: 'system',
-        to: 'humans',
-        taskId: task.id,
-        body:
-          `${named(task)} failed: ${counted} more of its attempts failed after its re-plan, so agflow will not try it ` +
-          'again. Look at its attempts and decide what to do with the work.',
-      });
+      const body =
+        `${named(task)} failed: ${counted} more of its attempts failed after its re-plan, so agflow will not try it ` +
+        'again. Look at its attempts and decide what to do with the work.';
+      insertMessage(ctx, emit, { from: 'system', to: 'humans', taskId: task.id, body });
+      // A failed task is never done, so the lead hears of it too, with the open tasks that depend on it.
+      const stranded = strandedDependents(ctx, task.id);
+      insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: task.id, body: [body, ...stranded].join('\n') });
     }
   } else if (attempt.failureSignature !== null) {
     const signature = attempt.failureSignature;
@@ -1009,16 +1009,19 @@ export function authorCanResume(ctx: HubContext, task: Task, attempt: Attempt): 
 }
 
 export interface RejectionInput {
-  /** Who rejected it: the lead or a person. */
+  /** Who rejected it: the lead or a person, or the hub when its merge conflicts. */
   actor: string;
   feedback: string;
+  /** A merge conflict (AGFLOW_AUTO_MERGE), which is no review: it neither needs nor uses a review round. */
+  conflict?: boolean | undefined;
 }
 
 /**
  * A rejection of a runner attempt's submission, in the transaction that moved the task to rejected with its feedback
  * (design 6.9). At ladder step 1 the task goes back to claimed for its author (current_attempt unchanged), the attempt
- * gets one more review round and resumes at a new fence with the quoted feedback as its prompt. Otherwise the attempt
- * ends rejected (review) and the ladder moves the task on. Returns the task afterwards.
+ * gets one more review round, unless a merge conflict sent it back, and resumes at a new fence with the quoted
+ * feedback as its prompt. Otherwise the attempt ends rejected (review) and the ladder moves the task on. Returns the
+ * task afterwards.
  */
 export function rejectRunnerAttempt(
   ctx: HubContext,
@@ -1027,11 +1030,12 @@ export function rejectRunnerAttempt(
   attempt: Attempt,
   input: RejectionInput,
 ): Task {
+  const reviewRounds = input.conflict ? 0 : attempt.reviewRounds;
   const step = ladderStep({
     counted: 0,
     ladderFloor: ladderFloor(ctx, task.id),
     maxAttempts: ctx.config.maxAttempts,
-    rejection: { authorCanResume: authorCanResume(ctx, task, attempt), reviewRounds: attempt.reviewRounds },
+    rejection: { authorCanResume: authorCanResume(ctx, task, attempt), reviewRounds },
   });
   if (step !== 1) {
     const ending = endAttempt(ctx, { attemptId: attempt.id, trigger: 'rejected', actor: input.actor });
@@ -1044,7 +1048,7 @@ export function rejectRunnerAttempt(
     data: { to: attempt.agentId, attemptId: attempt.id, ladderStep: 1 },
   });
   setAgentTask(ctx, attempt.agentId, task.id);
-  updateAttempt(ctx, attempt.id, { reviewRounds: attempt.reviewRounds + 1 });
+  if (!input.conflict) updateAttempt(ctx, attempt.id, { reviewRounds: attempt.reviewRounds + 1 });
   resumeAttempt(ctx, {
     attemptId: attempt.id,
     cause: 'review',

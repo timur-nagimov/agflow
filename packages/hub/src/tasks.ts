@@ -38,7 +38,7 @@ import { type Emit, listEvents } from './events';
 import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { getHubState, updateHubState } from './hub-state';
-import { queueMainCheck } from './main-check';
+import { parkReason, queueMainCheck, waitsForMain } from './main-check';
 import { MERGE_RETRY_MAX_MS, MERGE_RETRY_MS, failedMerges, mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
@@ -53,11 +53,11 @@ import {
   findTask,
   getTask,
   listTaskNotes,
-  listTasks,
   move,
   overlappingPathHolder,
   rowToTask,
   setAgentTask,
+  strandedDependents,
   unmetDependencies,
   waitingReason,
   writeTask,
@@ -376,24 +376,14 @@ export function cancelTask(ctx: HubContext, id: string, reason: string, actor: s
       });
     }
     // A cancelled task is never done, so the open tasks that depend on it need the lead's decision.
-    const dependents = listTasks(ctx).filter((other) => !isClosed(other.status) && other.dependsOn.includes(id));
-    for (const dependent of dependents) {
-      if (dependent.status === 'blocked' && dependent.blockedKind === 'deps') {
-        writeTask(ctx, dependent.id, { blockedReason: dependencyReason(ctx, unmetDependencies(ctx, dependent.dependsOn)) });
-      }
-    }
-    if (dependents.length > 0) {
+    const stranded = strandedDependents(ctx, id);
+    if (stranded.length > 0) {
+      const cancelled = `${id} ("${clip(task.title, 120)}") was cancelled by ${actor}.`;
       insertMessage(ctx, emit, {
         from: 'system',
         to: 'lead',
         taskId: id,
-        body: [
-          `${id} ("${clip(task.title, 120)}") was cancelled by ${actor}.`,
-          wrote(actor, clip(reason, 500)),
-          `${dependents.length === 1 ? 'This open task depends' : 'These open tasks depend'} on it:`,
-          ...dependents.map((dependent) => `- ${dependent.id} ("${clip(dependent.title, 80)}") [${dependent.status}]`),
-          'Decide for each: amend its dependencies with update_task, or cancel it with cancel_task.',
-        ].join('\n'),
+        body: [cancelled, wrote(actor, clip(reason, 500)), ...stranded].join('\n'),
       });
     }
     return getTask(ctx, id);
@@ -765,7 +755,7 @@ export function rejectTask(ctx: HubContext, id: string, actor: string, feedback:
       data: { feedback: clip(feedback, 500) },
     });
     const attempt = openRunnerAttempt(ctx, task);
-    if (attempt) return rejectRunnerAttempt(ctx, emit, rejected, attempt, { actor, feedback });
+    if (attempt) return rejectRunnerAttempt(ctx, emit, rejected, attempt, { actor, feedback, conflict: conflicted });
     const author = task.assignee
       ? (ctx.db.query('SELECT id, origin, last_seen_at FROM agents WHERE id = $id').get({ id: task.assignee }) as {
           id: string;
@@ -816,6 +806,11 @@ export function blockTask(
     const task = getTask(ctx, id);
     const attempt = requireHolder(ctx, task, agent, 'claim', token);
     if (attempt && attempt.runnerId !== null) {
+      // An attempt blocked by a failing main is parked: replaced, with a handoff note, telling nobody (waitsForMain).
+      if (kind === 'agent' && waitsForMain(ctx, attempt)) {
+        requestStop(ctx, { attemptId: attempt.id, cause: 'replace', reason: parkReason(ctx, id), by: 'system' });
+        return getTask(ctx, id);
+      }
       // The blocked and impossible rows: blocked at once, and the agent stopped without a handoff turn (design 6.4).
       const cause = kind === 'impossible' ? 'impossible' : 'blocked';
       requestStop(ctx, { attemptId: attempt.id, cause, reason, by: `agent:${agent.id}` });

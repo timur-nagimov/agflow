@@ -7,6 +7,7 @@ import { type NewTask, NewTaskSchema, type Task, type Vendor, isClosed } from '@
 import { findAttempt } from './attempt-store';
 import { type HubContext, tx } from './context';
 import { insertMessage } from './messages';
+import { getProject } from './project';
 import { findTask } from './task-store';
 import { createTasks, creationGuard } from './tasks';
 
@@ -123,15 +124,21 @@ export function demoCheckContract(count: number, now: number, vendorHint: Vendor
   });
 }
 
+/** The time before the deadline in which one task done is enough for the next demo check. */
+const LAST_HOUR_MS = 60 * 60_000;
+
 /**
  * Creates the next demo check when it is due (AGFLOW_DEMO_CHECK_EVERY): at least that many tasks done since the last
- * check was created, none still open, and room under the task limits. Its vendor hint is the vendor that implemented
- * fewer of the last tasks done, so the other model checks the work. The lead is told what to do with it. Returns the
- * new task, or null.
+ * check was created, or one in the last hour before the deadline, none still open, and room under the task limits. Its
+ * vendor hint is the vendor that implemented fewer of the last tasks done, so the other model checks the work. The
+ * lead is told what to do with it. Returns the new task, or null.
  */
 export function ensureDemoCheck(ctx: HubContext): Task | null {
-  const every = ctx.config.demoCheckEvery ?? 0;
-  if (every <= 0) return null;
+  const configured = ctx.config.demoCheckEvery ?? 0;
+  if (configured <= 0) return null;
+  const { deadlineAt } = getProject(ctx);
+  const left = deadlineAt === null ? null : deadlineAt - ctx.now();
+  const every = left !== null && left > 0 && left <= LAST_HOUR_MS ? 1 : configured;
   const checks = demoChecks(ctx);
   if (checks.some((check) => !isClosed(check.task.status))) return null;
   const done = doneTasks(ctx, new Set(checks.map((check) => check.task.id)));

@@ -675,7 +675,7 @@ describe('the event catalogue', () => {
   const types = Object.keys(HUB_EVENT_TYPES) as HubEventType[];
   const prefixOf = (type: string) => type.slice(0, type.indexOf('.'));
 
-  test('HUB_EVENT_TYPES lists every type of design 6.17 once, in its order', () => {
+  test('HUB_EVENT_TYPES lists every type of design 6.17 once, in its order, then the deadline', () => {
     expect(types).toEqual([
       'runner.online',
       'runner.offline',
@@ -716,13 +716,14 @@ describe('the event catalogue', () => {
       'system.recovery_started',
       'system.recovery_ended',
       'system.restored',
+      'project.deadline_reached',
     ]);
     expectTypeOf<'task.refs_deleted' | 'guard.plan_change' | 'guard.dispatch_paused'>().toMatchTypeOf<HubEventType>();
     // M1's types keep their own sentences; the catalogue holds only what M2 adds.
     expectTypeOf<'task.created'>().not.toMatchTypeOf<HubEventType>();
   });
 
-  test('subjects: attempt, submission, agent, approval and task events take the task id (a lead attempt its id), runner events the runner id, account events the owner, and lead, guard and system events none', () => {
+  test('subjects: attempt, submission, agent, approval and task events take the task id (a lead attempt its id), runner events the runner id, account events the owner, and lead, guard, system and project events none', () => {
     const subjects: Record<string, HubEventSubject | null> = {
       attempt: 'task',
       submission: 'task',
@@ -734,6 +735,7 @@ describe('the event catalogue', () => {
       lead: null,
       guard: null,
       system: null,
+      project: null,
     };
     for (const type of types) {
       expect([type, HUB_EVENT_TYPES[type].subject]).toEqual([type, subjects[prefixOf(type)]]);
@@ -752,6 +754,7 @@ describe('the event catalogue', () => {
       task: 'tasks',
       guard: 'guards',
       system: 'hub',
+      project: 'hub',
     };
     for (const type of types) {
       expect([type, HUB_EVENT_TYPES[type].category]).toEqual([type, categories[prefixOf(type)]]);
@@ -771,6 +774,7 @@ describe('the event catalogue', () => {
       task: ['taskId'],
       guard: [],
       system: [],
+      project: [],
     };
     for (const type of types) {
       const keys: readonly string[] = HUB_EVENT_TYPES[type].data;

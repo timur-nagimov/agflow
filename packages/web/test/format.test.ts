@@ -614,6 +614,7 @@ const M2_EVENTS: Record<HubEventType, { data: Record<string, unknown>; subject: 
     'system.recovery_started': none({ gapMs: 3 * 3_600_000, until: 60_000 }),
     'system.recovery_ended': none({}),
     'system.restored': none({ epoch: 2 }),
+    'project.deadline_reached': none({ deadlineAt: 1_800_000 }),
   };
 })();
 
@@ -754,6 +755,7 @@ describe('M2 events', () => {
     expect(describeEvent(m2Event('system.recovery_started'))).toBe('The hub was down for 3 h; it recovers before it starts new work');
     expect(describeEvent(m2Event('system.recovery_ended'))).toBe('The hub finished recovering');
     expect(describeEvent(m2Event('system.restored'))).toBe('The hub was restored from a backup (epoch 2)');
+    expect(describeEvent(m2Event('project.deadline_reached'))).toBe('The deadline passed, so agflow paused the project');
   });
 
   test("a hand-back that falls back says the task is ready without the clone's work, and why", () => {
@@ -845,6 +847,7 @@ describe('M2 events', () => {
       'system.recovery_started': 'wait',
       'system.recovery_ended': 'done',
       'system.restored': 'wait',
+      'project.deadline_reached': 'trouble',
     };
     for (const type of Object.keys(HUB_EVENT_TYPES) as HubEventType[]) {
       expect([type, eventTone(type, m2Event(type).data)]).toEqual([type, TONES[type]]);

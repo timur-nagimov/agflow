@@ -592,6 +592,8 @@ describe('the notice to the lead', () => {
     expect(body).toContain('only decline');
     expect(body).toContain(`decide_approval("${id}", "decline", reason)`);
     expect(body).not.toContain('"approve"');
+    // Without AGFLOW_AUTO_APPROVALS the owner may be there to answer.
+    expect(body).toContain('Or leave it to bob, who answers in the browser.');
   });
 
   test('on a runner whose vendor is not ready it says the lead may only decline: the policy was not read', () => {
