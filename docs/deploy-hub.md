@@ -439,6 +439,9 @@ Work that stops on its own reaches people as a message from agflow on the Messag
   runner's git credentials that cannot push `.github/workflows` changes ([Hackathon settings](#hackathon-settings)
   lists both checks). Until it is merged, the board shows the task under Needs attention with the number of failed
   merges and the last error; a person who merges it by hand marks it merged.
+- **A failing `main`** (`AGFLOW_AUTO_MERGE=1`). When the check of `main` fails after a merge and no task is open to
+  fix it, people and the lead hear which task agflow created at the top priority to fix it, or why it could not create
+  one; people hear again once `main` passes ([Unattended operation](#unattended-operation)).
 
 ## Joining from a Mac
 
