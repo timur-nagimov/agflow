@@ -513,6 +513,26 @@ describe('AGFLOW_REVIEW: a review that does not finish', () => {
     expect(expireReviews(hub.ctx)).toBe(0);
   });
 
+  test('a verdict that could not be applied leaves no task waiting for good: the hub accepts it as before', () => {
+    const hub = createTestHub({ autoAccept: true, review: true });
+    const { held, submissionId, review } = reviewed(hub);
+    const reviewer = startReview(hub, review.id);
+    hub.ctx.db.run(
+      `CREATE TRIGGER no_accept BEFORE UPDATE OF status ON tasks WHEN NEW.status = 'accepted'
+       BEGIN SELECT RAISE(ABORT, 'no accepts'); END`,
+    );
+    verdict(hub, reviewer, 'VERDICT: accept');
+    expect(quiet).toHaveBeenCalled();
+    expect(getTask(hub.ctx, review.id).status).toBe('cancelled');
+    const waiting = getTask(hub.ctx, held.task.id);
+    expect(waiting.status).toBe('submitted');
+    expect(waiting.submission?.submissionId).toBe(submissionId);
+    hub.ctx.db.run('DROP TRIGGER no_accept');
+    expect(expireReviews(hub.ctx)).toBe(1);
+    expect(accepted(hub, held.task.id).map((event) => event.actor)).toEqual(['hub:auto-accept']);
+    expect(expireReviews(hub.ctx)).toBe(0);
+  });
+
   test("a review its reviewer blocks or its vendor refuses is not the lead's to unblock: agflow accepts the task", () => {
     const hub = createTestHub({ autoAccept: true, review: true });
     const accepts = (taskId: string) =>

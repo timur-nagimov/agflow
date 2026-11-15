@@ -471,7 +471,11 @@ function lastResumed(ctx: HubContext): number {
  * or from when the project last ran again if that came later, so that a pause or downtime uses none of them up.
  */
 function unfinished(ctx: HubContext, review: Review, now: number, resumed: number): string | null {
-  if (isClosed(review.status)) return hasVerdict(ctx, review.id) ? null : 'it was closed without a verdict';
+  // A verdict applied moves the task off the submission it reviewed; one closed while the task still waits on it
+  // gave none, or gave one that could not be applied (recordVerdict drops it), and must not hold the task for good.
+  if (isClosed(review.status)) {
+    return hasVerdict(ctx, review.id) ? 'its verdict could not be applied' : 'it was closed without a verdict';
+  }
   if (review.status === 'blocked') return 'it is blocked';
   const age = now - Math.max(review.createdAt, resumed);
   if (!review.started && age >= REVIEW_START_MS) return `it did not start within ${REVIEW_START_MS / 60_000} minutes`;
@@ -482,7 +486,8 @@ function unfinished(ctx: HubContext, review: Review, now: number, resumed: numbe
 /**
  * The tick's duty for reviews (AGFLOW_REVIEW), while the project is not paused. An open review whose task no longer
  * waits on the submission it reviews (the lead or a person decided, the task was submitted again or cancelled) is
- * cancelled. While the task waits, a review closed without a verdict, a blocked one, one with no attempt
+ * cancelled. While the task waits, a review closed (with no verdict, or one that could not be applied), a blocked one,
+ * one with no attempt
  * REVIEW_START_MS after it was created and one REVIEW_FINISH_MS old let the hub accept the task as before, and an
  * open one is cancelled; both times count from when the project last ran again instead, if that came later
  * (lastResumed). Each review in its own transaction. Returns how many it settled.
