@@ -1,7 +1,7 @@
-// The lead on runners (design 6.11): the tick starts a runner lead when the seat is empty, a holding lead is woken by
-// its next delivery or ended lost when it cannot be, and a lead that fails over starts on another runner. The tick
-// also sends the periodic review and rotates a lead that is due. The seat itself is hub-state.ts's; the lead handoff a
-// successor starts from is assembled at the ending (handoff.ts).
+// The lead on runners (design 6.11): the tick starts a runner lead when the seat is empty, or tells people why none can
+// start, a holding lead is woken by its next delivery or ended lost when it cannot be, and a lead that fails over
+// starts on another runner. The tick also sends the periodic review and rotates a lead that is due. The seat itself is
+// hub-state.ts's; the lead handoff a successor starts from is assembled at the ending (handoff.ts).
 import {
   type Agent,
   type Attempt,
@@ -12,6 +12,7 @@ import {
   type RunnerState,
   type TaskStatus,
   placeLead,
+  refusalWords,
 } from '@agflow/core';
 import { getAttempt, listAttempts } from './attempt-store';
 import { endAttempt, requestStop, resumeAttempt, startRunnerAttempt } from './attempts';
@@ -52,21 +53,67 @@ function lastLeadEnding(ctx: HubContext): { endReason: AttemptEndReason; runnerI
  * demoting any other lead row, in startRunnerAttempt's transaction. A lead takes no slot, so a full runner may take it,
  * but not an account a lead's limit keeps leads off (setLimited). After a lead ended lost or crashed, another runner
  * is preferred, and the same one is used only when no other can take it; after a rotation, the same runner is
- * preferred. Its brief quotes the newest lead handoff. The tick skips this step while the project is paused. Returns
- * the attempt, or null when none started.
+ * preferred. Its brief quotes the newest lead handoff. While no lead can start, people hear why once the seat has been
+ * empty for a while (tellNoLead). The tick skips this step while the project is paused. Returns the attempt, or null
+ * when none started.
  */
 export function ensureLead(ctx: HubContext): Attempt | null {
-  if (!getProject(ctx).runnerLeads || seatHolderId(ctx) !== null) return null;
+  if (seatHolderId(ctx) !== null) return null;
+  if (!getProject(ctx).runnerLeads) {
+    tellNoLead(ctx, 'runner leads are off and no live chat holds the seat', LEAD_FROM_A_CHAT_OR_TURN_ON);
+    return null;
+  }
   const snapshot = placementSnapshot(ctx);
   const last = lastLeadEnding(ctx);
   const avoid = last && FAILOVER_ENDINGS.includes(last.endReason) ? last.runnerId : null;
   const rotatingFrom = last?.endReason === 'rotated' ? last.runnerId : null;
   const others = { ...snapshot, runners: snapshot.runners.filter((runner) => runner.id !== avoid) };
   const elsewhere = avoid === null ? null : placeLead(others, { rotatingFrom: null }).placement;
-  const placement = elsewhere ?? placeLead(snapshot, { rotatingFrom }).placement;
-  if (!placement) return null;
+  const found = placeLead(snapshot, { rotatingFrom });
+  const placement = elsewhere ?? found.placement;
+  if (!placement) {
+    const words = refusalWords(found.refused) || 'this hub has no runner';
+    tellNoLead(ctx, `no runner can take the lead seat (${words})`, WAIT_FOR_A_RUNNER_OR_LEAD_FROM_A_CHAT);
+    return null;
+  }
   return startRunnerAttempt(ctx, { runnerId: placement.runnerId, taskId: null, role: 'lead', vendor: placement.vendor })
     .attempt;
+}
+
+/** How long the seat stays empty, while the project runs, before people hear that no lead is running. */
+const NO_LEAD_TELL_MS = 2 * 60_000;
+
+/** What people do when runner leads are off. */
+const LEAD_FROM_A_CHAT_OR_TURN_ON =
+  "Run `agflow join --role lead` in the project's repository and start a chat there, or turn Runner leads on, on " +
+  'the Goal page.';
+
+/** What people do when no runner can take the lead seat. */
+const WAIT_FOR_A_RUNNER_OR_LEAD_FROM_A_CHAT =
+  'agflow starts a runner lead by itself once a runner can take it: online, with a vendor that is ready and has ' +
+  "quota left. Until then a person can lead from a live chat: run `agflow join --role lead` in the project's " +
+  'repository.';
+
+/**
+ * Tells people once that no lead is running, why and what to do, when the seat has been empty for NO_LEAD_TELL_MS. The
+ * empty spell starts at the newest change of the seat or reset of the project, or else when the database was made: all
+ * of them survive a restart. lead.seat_empty records the message, and none follows until a lead has taken the seat
+ * again. ensureLead calls it, so it says nothing while the project is paused. Returns the message, or null.
+ */
+function tellNoLead(ctx: HubContext, why: string, todo: string): Message | null {
+  return tx(ctx, (emit) => {
+    const { since, told } = ctx.db
+      .query(
+        `SELECT COALESCE((SELECT MAX(ts) FROM events WHERE type IN ('lead.seat_changed', 'project.reset')),
+             (SELECT MIN(applied_at) FROM schema_migrations)) AS since,
+           EXISTS (SELECT 1 FROM events WHERE type = 'lead.seat_empty' AND id > (SELECT COALESCE(MAX(id), 0) FROM events
+             WHERE type = 'lead.seat_changed' AND json_extract(data, '$.kind') != 'none')) AS told`,
+      )
+      .get() as { since: number; told: number };
+    if (told === 1 || ctx.now() - since < NO_LEAD_TELL_MS) return null;
+    emit({ type: 'lead.seat_empty', actor: 'system', data: { since, why } });
+    return insertMessage(ctx, emit, { from: 'system', to: 'humans', body: `No lead is running: ${why}. ${todo}` });
+  });
 }
 
 /**
