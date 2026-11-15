@@ -1,7 +1,8 @@
 // Submissions from runner agents (design 6.13). Runner agents cannot push, so a submit has two phases: the request
 // here creates a pending submission and sends push_submission, and the runner's attempt.submitted records the outcome,
 // with the runner's check of it. With AGFLOW_AUTO_ACCEPT, a submission whose check passed is accepted as it is
-// recorded, by hub:auto-accept, and the lead is not woken for it.
+// recorded, by hub:auto-accept, and the lead is not woken for it; with AGFLOW_REVIEW too, a task's first such submission
+// is reviewed by an agent first (review.ts).
 import {
   type Agent,
   type Attempt,
@@ -31,6 +32,7 @@ import type { Emit } from './events';
 import { refreshLeadSubmission, submissionReviewInstruction } from './lead-review';
 import { mainFailingHint } from './main-check';
 import { insertMessage } from './messages';
+import { recordVerdict, requestReview, reviewTarget } from './review';
 import {
   AUTO_ACCEPT,
   type SubmissionRow,
@@ -60,7 +62,8 @@ export interface RunnerSubmitInput {
  * the pending one, whatever it says. Otherwise the holder test applies, with no stop or take-over recorded, and the
  * hub creates a pending S-<n> and sends push_submission at the attempt's fence: the task branch, the head the hub
  * recorded for it as the expected one, and the shas it may adopt as the remote head. The task does not move until the
- * outcome arrives. token is the agent token the request came with (requireHolder).
+ * outcome arrives. token is the agent token the request came with (requireHolder). A reviewer's submit is its verdict,
+ * which the hub records and applies at once, with no push (review.ts, recordVerdict).
  */
 export function requestSubmission(
   ctx: HubContext,
@@ -77,6 +80,9 @@ export function requestSubmission(
     const pending = pendingSubmissionOf(ctx, attempt.id);
     if (pending) return pending;
     requireHolder(ctx, task, agent, 'claim', token);
+    // A reviewer's submit carries a verdict, which the hub applies itself: nothing is pushed (review.ts).
+    const review = reviewTarget(ctx, task.id);
+    if (review) return recordVerdict(ctx, emit, task, attempt, review, input);
     if (task.branch === null) throw conflict(`${task.id} has no branch to push`);
     const submission = insertSubmission(ctx, {
       taskId: task.id,
@@ -230,7 +236,8 @@ function recordable(task: Task, attempt: Attempt | null, submission: SubmissionR
  * its stop_attempt if the runner has not taken it; the requester of one held back for the submission is told. The lead
  * is told, as in M1, with the runner's check; with AGFLOW_AUTO_ACCEPT a submission whose check passed is accepted
  * instead, as a lead's accept would, and the lead hears of it in its next situation report. A branch that changes the
- * check's own files, a check that ran no tests, and a demo check go to the lead all the same.
+ * check's own files, a check that ran no tests, and a demo check go to the lead all the same. With AGFLOW_REVIEW, the
+ * hub creates a review of a task's first such submission instead of accepting it (review.ts, requestReview).
  */
 function recordSuccess(
   ctx: HubContext,
@@ -313,7 +320,9 @@ function recordSuccess(
     subject: attemptSubject(attempt),
     data: { ...attemptData(getAttempt(ctx, attempt.id)), submissionId: submission.id },
   });
-  if (autoAccepted) acceptTask(ctx, task.id, AUTO_ACCEPT, `its check \`${outcome.check?.command}\` passed`);
+  if (autoAccepted && !requestReview(ctx, task, attempt, submission, head)) {
+    acceptTask(ctx, task.id, AUTO_ACCEPT, `its check \`${outcome.check?.command}\` passed`);
+  }
 }
 
 /**

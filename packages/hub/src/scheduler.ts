@@ -50,6 +50,7 @@ import { placementSnapshot } from './placement';
 import { getProject, getStaffing, setVendorPreference, setWorkerTarget } from './project';
 import { listAccounts, markOwnerAwayTold, probeUnknownResets } from './quota';
 import { type ClockCheck, checkClock } from './recovery';
+import { expireReviews } from './review';
 import { TAKES_SLOT_SQL } from './runners';
 import { expireSubmissions } from './submissions';
 import { type StallDecisions, judgeStalls } from './supervisor';
@@ -449,7 +450,8 @@ export interface TickResult {
  * are dispatchHold's, and a tick that one of them stops gives every ready task its reason (held). Accepted work goes
  * on merging into main whatever the project's state: the merge queue sends a merge that waits, and one that failed
  * again, main's check follows the merges (queueMainCheck), and a fix of main that the task limits refused is created
- * once they allow it (retryFixTask). Just before dispatch, the demo check may add its task (ensureDemoCheck).
+ * once they allow it (retryFixTask). Just before dispatch, the demo check may add its task (ensureDemoCheck). A
+ * review that will not finish lets the hub accept its task as before (expireReviews), while the project is not paused.
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
@@ -459,6 +461,7 @@ export function runTick(ctx: HubContext): TickResult {
   duty("main's check", () => queueMainCheck(ctx), null);
   duty("main's fix task", () => retryFixTask(ctx), null);
   if (getProject(ctx).paused) return held(ctx, { clock, recovering: false, reconciled, lead: null, started: [] });
+  duty('the review timeouts', () => expireReviews(ctx), 0);
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
   // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).
   if (churnPaused(ctx)) return held(ctx, { clock, recovering: false, reconciled, lead, started: [] });

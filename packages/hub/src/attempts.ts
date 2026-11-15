@@ -66,7 +66,7 @@ import {
   updateAttempt,
 } from './attempt-store';
 import { revokeAgentTokens } from './auth';
-import { buildBrief, composeTaskPack, firstPrompt, isSuccessor } from './brief';
+import { buildBrief, composeTaskPack, firstPrompt, isSuccessor, reviewFirstPrompt } from './brief';
 import {
   type CommandRow,
   type StoredCommand,
@@ -93,6 +93,7 @@ import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject } from './project';
 import { recordQuotaReports } from './quota';
+import { reviewPack, reviewStart, reviewTarget } from './review';
 import {
   findRunnerRow,
   markGitNotReady,
@@ -144,14 +145,16 @@ const restoreBase = (ctx: HubContext): string => `refs/heads/${ctx.config.mainBr
  * Where an attempt starts (design 6.4, Work position): the task's work position, or main when it has none, as for
  * every lead attempt. When the previous attempt's final push failed and its harvested head is still the newest work, a
  * successor on that attempt's runner starts from the head its vault pins (design 6.8, Replacement step 4); the task's
- * work position stays the last pushed ref, which a successor elsewhere starts from. The runner fetches the ref and
- * reports the commit it actually used.
+ * work position stays the last pushed ref, which a successor elsewhere starts from. Every attempt of a review starts
+ * at the head it reviews instead (reviewStart). The runner fetches the ref and reports the commit it actually used.
  */
 export function startPositionFor(
   ctx: HubContext,
   task: Task | null,
   runnerId: string | null = null,
 ): AttemptSpec['start'] {
+  const review = task ? reviewStart(ctx, task.id) : null;
+  if (review) return review;
   const unpushed = task && runnerId !== null ? unpushedWork(ctx, task) : null;
   if (unpushed && unpushed.runnerId === runnerId) {
     return { ref: localPinRefs(unpushed.attemptId).head, sha: unpushed.sha };
@@ -192,6 +195,7 @@ export function buildAttemptSpec(
 ): Omit<AttemptSpec, 'agentToken'> {
   const task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
   const successor = isSuccessor(ctx, attempt);
+  const review = task === null ? null : reviewTarget(ctx, task.id);
   return {
     attemptId: attempt.id,
     taskId: attempt.taskId,
@@ -209,10 +213,12 @@ export function buildAttemptSpec(
     restore: restoreFor(ctx, task, attempt.runnerId),
     acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     toolCaps: computeToolCaps(ctx.config, task?.checks ?? []),
-    // A lead holds no task, so its task.md is empty; its brief carries what it needs.
-    taskPack: task ? composeTaskPack(task) : '',
+    // A lead holds no task, so its task.md is empty; its brief carries what it needs. A review's adds what it reviews.
+    taskPack: task ? composeTaskPack(task) + reviewPack(ctx, task) : '',
     brief: buildBrief(ctx, getAgent(ctx, attempt.agentId)),
-    firstPrompt: firstPrompt({ role: attempt.role, taskId: attempt.taskId, successor }),
+    firstPrompt: review
+      ? reviewFirstPrompt(review)
+      : firstPrompt({ role: attempt.role, taskId: attempt.taskId, successor }),
     successor,
   };
 }
@@ -575,7 +581,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
       fence,
       prompt,
       messages,
-      taskPack: task ? composeTaskPack(task) : null,
+      taskPack: task ? composeTaskPack(task) + reviewPack(ctx, task) : null,
       restore: restoreFor(ctx, task, attempt.runnerId),
       acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     });
@@ -1586,7 +1592,8 @@ function recordSubmittedHeadPush(ctx: HubContext, emit: Emit, attempt: Attempt, 
  * Otherwise a late_work note with the attempt's id names the ref for the next attempt to merge, and a holder, the
  * task's open attempt, is told how to merge it, after refresh_vault brings the ref to its runner's vault (design
  * 7.3). Late work for a task the hub does not have goes to people. attempt.late_work keeps the ref for its cleanup.
- * The attempt's recorded submission head is no late work (recordSubmittedHeadPush).
+ * The attempt's recorded submission head is no late work (recordSubmittedHeadPush). A reviewer's is only kept for the
+ * cleanup: nobody merges it, as the review's next attempt starts at the head it reviews (reviewStart).
  */
 export function recordLateWork(ctx: HubContext, emit: Emit, attempt: Attempt | null, work: LateWork): void {
   if (attempt !== null && work.sha === attempt.submittedSha) {
@@ -1607,6 +1614,7 @@ export function recordLateWork(ctx: HubContext, emit: Emit, attempt: Attempt | n
     });
     return;
   }
+  if (reviewTarget(ctx, task.id)) return;
   const holder = openAttemptOf(ctx, task.id);
   if (attempt && holder === null && positionIsOwn(task, attempt)) {
     writeTask(ctx, task.id, { workRef: work.ref, workSha: work.sha, dispatchHoldUntil: null });
@@ -1697,10 +1705,11 @@ export function exitedInTurn(ctx: HubContext, attempt: Attempt): boolean {
 }
 
 /**
- * attempt.exited: the agent's process is gone, and the trigger table decides what follows (design 6.4). The harvested
- * head is recorded and the attempt's pending approvals voided in every case. An attempt that ended already keeps its
- * ending (design 6.3). Otherwise its final WIP becomes its WIP and the work position, and a failed final push of an
- * attempt the exit ends holds the task's dispatch for the runner's late work (design 6.8, Replacement step 4). A
+ * attempt.exited: the agent's process is gone, and the trigger table decides what follows (design 6.4). The attempt's
+ * pending approvals are voided in every case, and its harvested head is recorded unless it is a reviewer's. An attempt
+ * that ended already keeps its ending (design 6.3). Otherwise its final WIP becomes its WIP and the work position, and
+ * a failed final push of an attempt the exit ends holds the task's dispatch for the runner's late work (design 6.8,
+ * Replacement step 4), except a reviewer's: no attempt of a review starts from another's commits (reviewStart). A
  * holding attempt stays holding, and one being taken over waits for attempt.taken_over (invariant c). Otherwise:
  * - a stop the hub asked for ends it with that cause, whatever the runner says caused the exit;
  * - the runner's own stop ends it stopped (infra, with no backoff or signature);
@@ -1717,7 +1726,8 @@ export function onExited(
   attempt: Attempt,
   data: RunnerEventData['attempt.exited'],
 ): Ending | null {
-  if (data.finalSha !== null) updateAttempt(ctx, attempt.id, { finalSha: data.finalSha });
+  const review = attempt.taskId !== null && reviewTarget(ctx, attempt.taskId) !== null;
+  if (data.finalSha !== null && !review) updateAttempt(ctx, attempt.id, { finalSha: data.finalSha });
   // Nothing takes the answers of a process that exited.
   voidApprovals(ctx, emit, attempt.id, byRunner(attempt));
   const how = `${exitError(data)}, stopped by ${data.stoppedBy}${data.cause ? ` (${data.cause})` : ''}`;
@@ -1736,7 +1746,7 @@ export function onExited(
   // The final WIP is the attempt's own, wherever the exit leads (invariant a), and its successor starts from it.
   if (data.finalWip !== null) recordWip(ctx, attempt, data.finalWip.ref, data.finalWip.sha);
   const ending = endOnExit(ctx, emit, getAttempt(ctx, attempt.id), data);
-  if (ending && data.pushError !== null) holdForUnpushed(ctx, ending.attempt, data);
+  if (ending && data.pushError !== null && !review) holdForUnpushed(ctx, ending.attempt, data);
   return ending;
 }
 
