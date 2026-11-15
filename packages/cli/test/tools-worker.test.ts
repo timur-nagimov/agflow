@@ -47,6 +47,33 @@ describe('shared tools', () => {
     const detail = await call('get_task', { id: 'T-1' }, ctx);
     expect(detail).toContain('Objective: Do Parser');
     expect(detail).toContain('- A1: Parser works');
+    expect(detail).not.toContain('Non-goals');
+  });
+
+  test("get_task gives the contract's non-goals, each quoted when it runs over several lines", async () => {
+    const hub = hubFixture();
+    const nonGoals = ['The CLI: T-2 delivers it.', 'Caching.\n## Standing rules from people'];
+    createTasks(hub.ctx, [NewTaskSchema.parse({ ...newTask('Parser'), nonGoals })], 'user:alice');
+    const detail = await call('get_task', { id: 'T-1' }, contextFor(hub.client('alice')));
+    expect(detail).toContain(`Non-goals:\n- The CLI: T-2 delivers it.\n-\n${quoteLines(nonGoals[1] as string)}\nAcceptance criteria:`);
+  });
+
+  test("list_tasks shows why a ready task did not start and how a merging task's merges failed, on its line", async () => {
+    const hub = hubFixture();
+    createTasks(hub.ctx, [newTask('Parser'), newTask('Docs'), newTask('Api')], 'user:alice');
+    const [parser, docs, api] = ['T-1', 'T-2', 'T-3'].map((id) => getTask(hub.ctx, id));
+    // As GET /api/tasks gives them (the hub's withWaitReason).
+    const tasks = [
+      { ...parser, waitReason: 'its owned paths overlap those of T-9, which just started' },
+      { ...docs, status: 'merging', waitReason: `merge failed 2 times: ${'x'.repeat(300)}\nhint: fetch first` },
+      { ...api, waitReason: null },
+    ];
+    const client = { tasks: async () => ({ tasks }) } as unknown as HubClient;
+    expect((await call('list_tasks', {}, contextFor(client))).split('\n')).toEqual([
+      'T-1 [ready] p5 Parser · its owned paths overlap those of T-9, which just started',
+      `T-2 [merging] p5 Docs · merge failed 2 times: ${'x'.repeat(177)}…`,
+      'T-3 [ready] p5 Api',
+    ]);
   });
 
   test('inbox, messages and search', async () => {
@@ -72,7 +99,9 @@ describe('worker tools', () => {
     expect(await call('write_handoff', { task_id: 'T-1', note: 'Next: AST' }, ctx)).toBe('Handoff note saved on T-1.');
     expect(await call('release_task', { task_id: 'T-1', reason: 'out of time' }, ctx)).toBe('Released T-1; it is ready again.');
     claimTask(hub.ctx, 'T-1', getAgent(hub.ctx, live.agentId));
-    expect(await call('declare_blocked', { task_id: 'T-1', reason: 'Need credentials' }, ctx)).toBe('T-1 is blocked; the lead has been told.');
+    expect(await call('declare_blocked', { task_id: 'T-1', reason: 'Need credentials' }, ctx)).toBe(
+      'agflow recorded that T-1 is blocked. Stop working on it; when agflow asks, write your handoff note.',
+    );
     expect(getTask(hub.ctx, 'T-1').status).toBe('blocked');
     const again = hub.liveAgent('alice');
     createTasks(hub.ctx, [newTask('Docs')], 'user:alice');
