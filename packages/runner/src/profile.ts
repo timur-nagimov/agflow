@@ -1,6 +1,6 @@
 // The permission profile and the denied paths of design 7.6, as data. The vendor adapters render them: Claude's
 // permission rules and sandbox settings (M2d), Codex's sandbox (M2e), and dependency preparation's sandbox (M2c).
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Vendor } from '@agflow/core';
 import type { RunnerConfig } from './config';
 import type { RunnerPaths } from './paths';
@@ -61,7 +61,7 @@ export interface DeniedPathsInput {
   paths: Pick<RunnerPaths, 'runner' | 'vaults' | 'work'>;
   /** vendorHomes(config, paths): runner.json may put them outside the runner tree, shared by several runners. */
   vendorHomes: Record<Vendor, string>;
-  /** The machine's OS, process.platform by default: on Linux the user's runtime directory is denied too. */
+  /** The machine's OS, process.platform by default: on Linux the user's runtime directories are denied too. */
   platform?: NodeJS.Platform;
 }
 
@@ -69,15 +69,17 @@ const tree = (path: string): DeniedPath => ({ path, tree: true });
 const file = (path: string): DeniedPath => ({ path, tree: false });
 
 /**
- * The user's runtime directory on Linux, $XDG_RUNTIME_DIR or /run/user/<uid>. The systemd user manager and the session
- * bus listen there, and either starts a process outside every sandbox.
+ * The user's runtime directories on Linux. The systemd user manager and the session bus listen in /run/user/<uid>
+ * whatever the runner's environment says, and either starts a process outside every sandbox. $XDG_RUNTIME_DIR comes
+ * too when it names another: one inherited from another user's session through su or sudo -E, or WSLg's.
  */
-export function userRuntimeDir(
+export function userRuntimeDirs(
   env: Record<string, string | undefined> = process.env,
   uid: number = process.getuid?.() ?? 0,
-): string {
-  const dir = env.XDG_RUNTIME_DIR;
-  return dir && isAbsolute(dir) ? dir : `/run/user/${uid}`;
+): string[] {
+  const own = `/run/user/${uid}`;
+  const dir = env.XDG_RUNTIME_DIR && isAbsolute(env.XDG_RUNTIME_DIR) ? resolve(env.XDG_RUNTIME_DIR) : own;
+  return dir === own ? [own] : [own, dir];
 }
 
 /** The vendor homes the runner tree does not already cover: their logins, transcripts and .claude.json. */
@@ -103,7 +105,7 @@ function checked(input: DeniedPathsInput, denied: DeniedPath[]): DeniedPath[] {
 
 /**
  * Paths agents may not read: credentials, vendor and CLI state, the whole runner tree and vendor homes outside it, and
- * on Linux the user's runtime directory. The Claude adapter names only the runner tree's sensitive parts in its Read
+ * on Linux the user's runtime directories. The Claude adapter names only the runner tree's sensitive parts in its Read
  * rules, keeps its allowRead for the attempt's own project directory, and adds the work root to its sandbox's denyRead
  * with the clone allowed; neither is listed here. A path that does not exist hides nothing, and the sandboxes skip it.
  */
@@ -126,7 +128,7 @@ export function deniedReadPaths(input: DeniedPathsInput): DeniedPath[] {
     tree(home('.config', 'gcloud')),
     tree(home('.kube')),
     file(home('.docker', 'config.json')),
-    ...((input.platform ?? process.platform) === 'linux' ? [tree(userRuntimeDir())] : []),
+    ...((input.platform ?? process.platform) === 'linux' ? userRuntimeDirs().map(tree) : []),
   ]);
 }
 

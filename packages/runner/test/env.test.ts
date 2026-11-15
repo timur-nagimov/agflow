@@ -11,7 +11,7 @@ import {
   type PermissionProfile,
   profileOf,
   standardProfile,
-  userRuntimeDir,
+  userRuntimeDirs,
 } from '../src/profile';
 
 const CLONE = '/h/work/demo-0123456789/T-4-a1';
@@ -389,16 +389,22 @@ describe('denied paths', () => {
     ]);
   });
 
-  test("reads on Linux: the user's runtime directory too, where the systemd manager listens", () => {
+  test("reads on Linux: the user's runtime directories too, where the systemd manager listens", () => {
     const mac = deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'darwin' });
     expect(deniedReadPaths({ home: owner, paths, vendorHomes, platform: 'linux' })).toEqual([
       ...mac,
-      tree(userRuntimeDir()),
+      ...userRuntimeDirs().map(tree),
     ]);
-    expect(userRuntimeDir({ XDG_RUNTIME_DIR: '/run/user/1000' }, 1000)).toBe('/run/user/1000');
-    expect(userRuntimeDir({}, 1001)).toBe('/run/user/1001');
+    expect(userRuntimeDirs({}, 1001)).toEqual(['/run/user/1001']);
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: '/run/user/1001/' }, 1001)).toEqual(['/run/user/1001']);
+    // The manager listens in /run/user/<uid> whatever the environment says: another user's session, or WSLg's.
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: '/run/user/1000' }, 1001)).toEqual(['/run/user/1001', '/run/user/1000']);
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: '/mnt/wslg/runtime-dir' }, 1000)).toEqual([
+      '/run/user/1000',
+      '/mnt/wslg/runtime-dir',
+    ]);
     // A relative value is no runtime directory.
-    expect(userRuntimeDir({ XDG_RUNTIME_DIR: 'run/user/1001' }, 1001)).toBe('/run/user/1001');
+    expect(userRuntimeDirs({ XDG_RUNTIME_DIR: 'run/user/1000' }, 1001)).toEqual(['/run/user/1001']);
     // Writes are the same on both.
     expect(deniedWritePaths({ home: owner, paths, vendorHomes, platform: 'linux' })).toEqual(
       deniedWritePaths({ home: owner, paths, vendorHomes, platform: 'darwin' }),
