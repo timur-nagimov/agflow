@@ -176,6 +176,11 @@ export interface HubConfig extends HubRunnerSettings {
    */
   autoAccept?: boolean | undefined;
   /**
+   * AGFLOW_REVIEW, with autoAccept: a task's first submission whose check passed is reviewed by an agent before the hub
+   * accepts it (review.ts). Off by default: autoAccept accepts it at once.
+   */
+  review?: boolean | undefined;
+  /**
    * AGFLOW_DEMO_CHECK_EVERY: after every this many tasks merged (or accepted, without autoMerge and while nothing marks
    * tasks merged), the hub creates a demo-check task (demo-check.ts). loadConfig makes it 5; 0, or a config built
    * without it, turns it off.

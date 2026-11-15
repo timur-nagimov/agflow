@@ -208,6 +208,7 @@ export function loadConfig(env: Env): LoadedConfig {
   const autoApprovals = switchOf(env, 'AGFLOW_AUTO_APPROVALS');
   const autoMerge = switchOf(env, 'AGFLOW_AUTO_MERGE');
   const autoAccept = switchOf(env, 'AGFLOW_AUTO_ACCEPT');
+  const review = switchOf(env, 'AGFLOW_REVIEW');
   const backupDir = env.AGFLOW_BACKUP_DIR ?? 'data/backups';
   const testMode = env.AGFLOW_TEST === '1';
   if (env.AGFLOW_TEST_CONFIG && !testMode) throw new Error('AGFLOW_TEST_CONFIG is honoured only with AGFLOW_TEST=1');
@@ -234,6 +235,7 @@ export function loadConfig(env: Env): LoadedConfig {
     autoApprovals,
     autoMerge,
     autoAccept,
+    review,
     backupDir,
     demoCheckEvery: countOf(env, 'AGFLOW_DEMO_CHECK_EVERY', 5),
   };

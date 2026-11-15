@@ -42,6 +42,7 @@ import { queueMainCheck } from './main-check';
 import { MERGE_RETRY_MAX_MS, MERGE_RETRY_MS, failedMerges, mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
+import { reviewTarget } from './review';
 import { listSubmissions } from './submission-store';
 import {
   RUNNER_HELD_SQL,
@@ -119,7 +120,11 @@ function reaches(ctx: HubContext, from: string, target: string, seen = new Set<s
 
 const HOUR = 60 * 60_000;
 
-/** Why creating count more tasks would pass a safety limit, or null; the demo check asks before it creates its task. */
+/**
+ * Why creating count more tasks would pass a safety limit, or null; the demo check asks before it creates its task. The
+ * hourly limit counts the tasks agents and people created: the system's own (reviews, demo checks, fixes of main) do
+ * not use up the lead's budget.
+ */
 export function creationGuard(ctx: HubContext, count: number): string | null {
   const open = (
     ctx.db
@@ -130,7 +135,9 @@ export function creationGuard(ctx: HubContext, count: number): string | null {
     return `creating ${count} more task(s) would exceed the limit of ${ctx.config.maxOpenTasks} open tasks`;
   }
   const recent = (
-    ctx.db.query('SELECT COUNT(*) AS n FROM tasks WHERE created_at > $since').get({ since: ctx.now() - HOUR }) as { n: number }
+    ctx.db
+      .query("SELECT COUNT(*) AS n FROM tasks WHERE created_at > $since AND created_by != 'system'")
+      .get({ since: ctx.now() - HOUR }) as { n: number }
   ).n;
   if (recent + count > ctx.config.maxTasksPerHour) {
     return `creating ${count} more task(s) would exceed the limit of ${ctx.config.maxTasksPerHour} new tasks per hour`;
@@ -480,6 +487,8 @@ export function claimTask(
     if (held) throw conflict(`you already hold ${held.id}; submit, release or hand it off first`);
     const task = getTask(ctx, id);
     if (task.status !== 'ready') throw conflict(`${id} is ${task.status}, not ready`);
+    // A review's verdict is taken from a runner agent's submit only (review.ts).
+    if (reviewTarget(ctx, id)) throw conflict(`${id} is a review, which only runner agents take`);
     // An unblocked task is ready while its last attempt still stops; its successor starts from that one's final WIP.
     if (openAttemptOf(ctx, id)) throw conflict('the previous attempt is still stopping');
     if (needsNewBridge(task) && (bridge === null || bridge < BRIDGE_VERSION)) {

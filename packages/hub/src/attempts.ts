@@ -66,7 +66,7 @@ import {
   updateAttempt,
 } from './attempt-store';
 import { revokeAgentTokens } from './auth';
-import { buildBrief, composeTaskPack, firstPrompt, isSuccessor } from './brief';
+import { buildBrief, composeTaskPack, firstPrompt, isSuccessor, reviewFirstPrompt } from './brief';
 import {
   type CommandRow,
   type StoredCommand,
@@ -93,6 +93,7 @@ import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
 import { getProject } from './project';
 import { recordQuotaReports } from './quota';
+import { reviewPack, reviewTarget } from './review';
 import {
   findRunnerRow,
   markGitNotReady,
@@ -192,6 +193,7 @@ export function buildAttemptSpec(
 ): Omit<AttemptSpec, 'agentToken'> {
   const task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
   const successor = isSuccessor(ctx, attempt);
+  const review = task === null ? null : reviewTarget(ctx, task.id);
   return {
     attemptId: attempt.id,
     taskId: attempt.taskId,
@@ -209,10 +211,12 @@ export function buildAttemptSpec(
     restore: restoreFor(ctx, task, attempt.runnerId),
     acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     toolCaps: computeToolCaps(ctx.config, task?.checks ?? []),
-    // A lead holds no task, so its task.md is empty; its brief carries what it needs.
-    taskPack: task ? composeTaskPack(task) : '',
+    // A lead holds no task, so its task.md is empty; its brief carries what it needs. A review's adds what it reviews.
+    taskPack: task ? composeTaskPack(task) + reviewPack(ctx, task) : '',
     brief: buildBrief(ctx, getAgent(ctx, attempt.agentId)),
-    firstPrompt: firstPrompt({ role: attempt.role, taskId: attempt.taskId, successor }),
+    firstPrompt: review
+      ? reviewFirstPrompt(review)
+      : firstPrompt({ role: attempt.role, taskId: attempt.taskId, successor }),
     successor,
   };
 }
@@ -575,7 +579,7 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
       fence,
       prompt,
       messages,
-      taskPack: task ? composeTaskPack(task) : null,
+      taskPack: task ? composeTaskPack(task) + reviewPack(ctx, task) : null,
       restore: restoreFor(ctx, task, attempt.runnerId),
       acceptanceIds: task?.acceptance.map((criterion) => criterion.id) ?? [],
     });
