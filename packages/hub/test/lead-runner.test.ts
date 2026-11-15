@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { Attempt, AttemptFacts, Message, RawRunnerEvent, RunnerEventData } from '@agflow/core';
+import { touchAgent } from '../src/agents';
 import { getAttempt, updateAttempt } from '../src/attempt-store';
 import { endAttempt, renewLeases, requestStop } from '../src/attempts';
 import { type CommandRow, pendingCommands } from '../src/commands';
@@ -245,6 +246,30 @@ describe('an empty lead seat', () => {
     tx(ctx, (emit) => emptySeat(ctx, emit, 'user:alice', live.id));
     tickAfter(ctx, clock, 2 * MINUTE);
     expect(toPeople(ctx)).toEqual([told, told]);
+  });
+
+  test("a live lead's seat lapses and is held again with no event: each lapse is told two minutes after it", () => {
+    const { ctx, clock } = createTestContext();
+    ctx.db.run('UPDATE project SET runner_leads = 0 WHERE id = 1');
+    const live = addAgent(ctx, 'alice', 'lead');
+    const told =
+      'No lead is running: runner leads are off and no live chat holds the seat. Run `agflow join --role lead` in the ' +
+      "project's repository and start a chat there, or turn Runner leads on, on the Goal page.";
+    // Unseen for liveLeadGraceMs, it no longer holds the seat; the spell starts then, not when it took the seat.
+    tickAfter(ctx, clock, ctx.config.liveLeadGraceMs);
+    expect(seatHolderId(ctx)).toBeNull();
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([]);
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    // The same chat is seen again and holds the seat; its next lapse is a new spell, told in its turn.
+    touchAgent(ctx, live.id);
+    expect(seatHolderId(ctx)).toBe(live.id);
+    tickAfter(ctx, clock, ctx.config.liveLeadGraceMs + MINUTE);
+    expect(toPeople(ctx)).toEqual([told]);
+    tickAfter(ctx, clock, MINUTE);
+    expect(toPeople(ctx)).toEqual([told, told]);
+    expect(listEvents(ctx.db).filter((event) => event.type === 'lead.seat_changed')).toHaveLength(1);
   });
 });
 

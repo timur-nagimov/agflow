@@ -414,7 +414,8 @@ Work that stops on its own reaches people as a message from agflow on the Messag
   (`R-1 offline; R-2 claude quota used up, codex not ready`), or that runner leads are off and no live chat holds
   the seat. It also says what to do: get a runner able to take the seat, and agflow starts a lead there by itself,
   or lead from a chat with `agflow join --role lead`. The next such message comes only after a lead has held the
-  seat again.
+  seat again. A live chat's seat counts as empty once the chat has gone unseen for
+  `AGFLOW_LIVE_LEAD_GRACE_MINUTES` (120).
 - **A merge that keeps failing** (`AGFLOW_AUTO_MERGE=1`). Its next try waits 15 seconds, then twice as long after
   each failure, up to 10 minutes, and the other merges go on meanwhile. People hear of the first failure and again
   of the fifth, with the likely cause when the error names one: a `main` that is protected or requires checks, or a

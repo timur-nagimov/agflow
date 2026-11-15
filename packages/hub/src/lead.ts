@@ -14,6 +14,7 @@ import {
   placeLead,
   refusalWords,
 } from '@agflow/core';
+import { findAgent } from './agents';
 import { getAttempt, listAttempts } from './attempt-store';
 import { endAttempt, requestStop, resumeAttempt, startRunnerAttempt } from './attempts';
 import type { CommandRow } from './commands';
@@ -97,19 +98,26 @@ const WAIT_FOR_A_RUNNER_OR_LEAD_FROM_A_CHAT =
 /**
  * Tells people once that no lead is running, why and what to do, when the seat has been empty for NO_LEAD_TELL_MS. The
  * empty spell starts at the newest change of the seat or reset of the project, or else when the database was made: all
- * of them survive a restart. lead.seat_empty records the message, and none follows until a lead has taken the seat
- * again. ensureLead calls it, so it says nothing while the project is paused. Returns the message, or null.
+ * of them survive a restart. A live lead's seat lapses once it has gone unseen for liveLeadGraceMs, and it holds the
+ * seat again when next seen, with no change recorded either way: while the seat still names one, the spell starts at
+ * the lapse, and only a message sent since it was last seen counts. lead.seat_empty records the message, and none
+ * follows until a lead has held the seat again. ensureLead calls it, so it says nothing while the project is paused.
+ * Returns the message, or null.
  */
 function tellNoLead(ctx: HubContext, why: string, todo: string): Message | null {
   return tx(ctx, (emit) => {
-    const { since, told } = ctx.db
+    const { leadAgentId, leadKind } = getHubState(ctx);
+    const seen = leadKind === 'live' && leadAgentId !== null ? (findAgent(ctx, leadAgentId)?.lastSeenAt ?? null) : null;
+    const { changed, told } = ctx.db
       .query(
         `SELECT COALESCE((SELECT MAX(ts) FROM events WHERE type IN ('lead.seat_changed', 'project.reset')),
-             (SELECT MIN(applied_at) FROM schema_migrations)) AS since,
-           EXISTS (SELECT 1 FROM events WHERE type = 'lead.seat_empty' AND id > (SELECT COALESCE(MAX(id), 0) FROM events
-             WHERE type = 'lead.seat_changed' AND json_extract(data, '$.kind') != 'none')) AS told`,
+             (SELECT MIN(applied_at) FROM schema_migrations)) AS changed,
+           EXISTS (SELECT 1 FROM events WHERE type = 'lead.seat_empty' AND ts > $seen
+             AND id > (SELECT COALESCE(MAX(id), 0) FROM events
+               WHERE type = 'lead.seat_changed' AND json_extract(data, '$.kind') != 'none')) AS told`,
       )
-      .get() as { since: number; told: number };
+      .get({ seen: seen ?? 0 }) as { changed: number; told: number };
+    const since = seen === null ? changed : Math.max(changed, seen + ctx.config.liveLeadGraceMs);
     if (told === 1 || ctx.now() - since < NO_LEAD_TELL_MS) return null;
     emit({ type: 'lead.seat_empty', actor: 'system', data: { since, why } });
     return insertMessage(ctx, emit, { from: 'system', to: 'humans', body: `No lead is running: ${why}. ${todo}` });
