@@ -10,6 +10,7 @@ import { loadRunnerConfig, RunnerConfigSchema, saveRunnerConfig } from '@agflow/
 import { openRunnerDb } from '@agflow/runner/src/db';
 import { Outbox } from '@agflow/runner/src/outbox';
 import { runnerPaths } from '@agflow/runner/src/paths';
+import { standardProfile } from '@agflow/runner/src/profile';
 import type { RunnerServiceOptions } from '@agflow/runner/src/service/host';
 import {
   installRefusal,
@@ -74,6 +75,7 @@ describe('agflow runner', () => {
     expect(RUNNER_HELP).toContain('agflow runner undrain');
     expect(RUNNER_HELP).toContain('agflow runner install');
     expect(RUNNER_HELP).toContain('agflow runner status [--json]');
+    expect(RUNNER_HELP).toContain('agflow runner check-sandbox');
     expect(out.join('')).toContain(RUNNER_HELP);
     expect(err).toEqual([]);
   });
@@ -633,4 +635,33 @@ test('on Linux stop disables an installed systemd unit and restart restarts it',
   const none = capture();
   expect(await runnerCommand(parseArgs(['runner', 'stop']), none.io, { ...deps, home: tempDir('agf-home-') })).toBe(0);
   expect(none.out.join('')).toContain('no runner was running; no systemd unit was installed');
+});
+
+test("check-sandbox runs the preparation sandbox's self-check for the runner's profile, with no sign-in", async () => {
+  const results = [
+    { works: true, reason: null },
+    { works: false, reason: 'unix sockets are reachable inside the preparation sandbox' },
+  ];
+  const checkPrepSandbox = mock(async (_options?: object) => results.shift()!);
+  const deps = { checkPrepSandbox, platform: 'linux' as const };
+  // A machine with no runner yet gets the standard profile.
+  const fresh = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'check-sandbox']), fresh.io, deps)).toBe(0);
+  expect(fresh.out).toEqual(['ok preparation sandbox (standard profile): works\n']);
+  saveRunnerConfig(
+    runnerPaths().config,
+    RunnerConfigSchema.parse({ runnerKey: 'rk_check', machineId: 'MACHINE-1', name: 'vm', profile: 'open' }),
+  );
+  const open = capture();
+  expect(await runnerCommand(parseArgs(['runner', 'check-sandbox']), open.io, deps)).toBe(1);
+  expect(open.out).toEqual([
+    'FAIL preparation sandbox (open profile): unix sockets are reachable inside the preparation sandbox\n',
+  ]);
+  expect(checkPrepSandbox.mock.calls.map(([options]) => options)).toEqual([
+    { allowedDomains: [...standardProfile.network.allowedDomains], open: false, platform: 'linux' },
+    { allowedDomains: [...standardProfile.network.allowedDomains], open: true, platform: 'linux' },
+  ]);
+  const extra = capture();
+  expect(await main(['runner', 'check-sandbox', 'extra'], extra.io)).toBe(2);
+  expect(extra.err.join('')).toContain('usage: agflow runner check-sandbox');
 });

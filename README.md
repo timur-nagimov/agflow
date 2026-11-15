@@ -120,6 +120,7 @@ Checks run **inside the service**: hub identity, repository access (`git ls-remo
 | `agflow runner start` | Run in the foreground, with terminal and file logs; Ctrl-C suspends attempts and saves WIP. Only one instance runs. |
 | `agflow runner install` | Install/enable/start `~/Library/LaunchAgents/dev.agflow.runner.plist` in the logged-in macOS desktop session, or on Linux `~/.config/systemd/user/agflow-runner.service` with lingering; also installs missing pins. |
 | `agflow runner status` | Query the running runner; without its socket, report best-effort service state, last exit and log tail. `--json` includes attempts and process identities. |
+| `agflow runner check-sandbox` | Run the dependency preparation sandbox's self-check for the profile in `runner.json` (standard without one), with no hub or vendor sign-in: a write, and on Linux a unix socket the sandbox must keep commands from. Exits 1 with the reason when the sandbox does not work. |
 | `agflow runner drain` | Take no new attempts; current work continues. Offline changes are sent at reconnect. |
 | `agflow runner undrain` | Accept work again and clear the crash-loop guard. |
 | `agflow runner restart` | Suspend attempts, save WIP and restart the service (launchd, or systemd on Linux). |

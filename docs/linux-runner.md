@@ -32,10 +32,12 @@ The script prints the VM's address and the steps below.
 
 ## Sign in and set up
 
-Sign in as the runner's user (`ssh agflow@VM_IP`) and wait for cloud-init:
+Sign in as the runner's user (`ssh agflow@VM_IP`), wait for cloud-init, and check the sandbox that dependency
+preparation and the submission check run in. The check needs no sign-in, and prints the reason when it fails:
 
 ```bash
 cloud-init status --wait
+agflow runner check-sandbox
 ```
 
 Agents commit as the git identity setup finds, and the runner fetches and pushes with your own git login, as on a Mac.
