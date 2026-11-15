@@ -32,6 +32,7 @@ import {
   tasksUnderReview,
 } from '../src/review';
 import { runTick, workerLoad } from '../src/scheduler';
+import { onVendorOutcome } from '../src/supervisor';
 import { findSubmission, listSubmissions } from '../src/submission-store';
 import { requestSubmission } from '../src/submissions';
 import { getTask, listTaskNotes, listTasks, move } from '../src/task-store';
@@ -280,8 +281,18 @@ describe('AGFLOW_REVIEW: creating the review', () => {
     expect(reviewOf(hub, unchecked.task.id)).toBeNull();
   });
 
-  test('a review the task limits refuse, or whose creation throws, leaves the accept as before; the event stands', () => {
+  test('the hourly limit, which the lead may reach, never holds a review back; nothing trips', () => {
     const hub = createTestHub({ autoAccept: true, review: true, maxTasksPerHour: 1 });
+    const { held, review } = reviewed(hub);
+    expect(creationGuard(hub.ctx, 1)).toContain('new tasks per hour');
+    expect(getTask(hub.ctx, held.task.id).status).toBe('submitted');
+    expect(getTask(hub.ctx, review.id).status).toBe('ready');
+    expect(listEvents(hub.ctx.db, {}).filter((event) => event.type === 'guard.tripped')).toEqual([]);
+    expect(listMessages(hub.ctx, {})).toEqual([]);
+  });
+
+  test('a review the open-task limit refuses, or whose creation throws, leaves the accept as before; the event stands', () => {
+    const hub = createTestHub({ autoAccept: true, review: true, maxOpenTasks: 1 });
     const held = addRunnerAttempt(hub.ctx);
     const submissionId = submit(hub, held);
     expect(getTask(hub.ctx, held.task.id).status).toBe('accepted');
@@ -500,6 +511,34 @@ describe('AGFLOW_REVIEW: a review that does not finish', () => {
     expect(accepted(hub, decided.held.task.id).map((event) => event.actor)).toEqual(['user:alice']);
     for (const { review } of [cancelled, blocked, decided]) expect(getTask(hub.ctx, review.id).status).toBe('cancelled');
     expect(expireReviews(hub.ctx)).toBe(0);
+  });
+
+  test("a review its reviewer blocks or its vendor refuses is not the lead's to unblock: agflow accepts the task", () => {
+    const hub = createTestHub({ autoAccept: true, review: true });
+    const accepts = (taskId: string) =>
+      `The review of ${taskId} cannot finish, so agflow accepts ${taskId} as its check passed.`;
+    const about = (taskId: string, to: string) =>
+      listMessages(hub.ctx, {}).flatMap((message) => (message.taskId === taskId && message.to === to ? [message.body] : []));
+    const blocked = reviewed(hub);
+    const blocker = startReview(hub, blocked.review.id).agent;
+    blockTask(hub.ctx, blocked.review.id, blocker, 'the clone has no SPEC.md');
+    expect(about(blocked.review.id, 'lead')).toEqual([
+      `${blocked.review.id} ("${blocked.review.title}") is blocked, reported by ${blocker.id}.\n${blocker.id} wrote:\n` +
+        `> the clone has no SPEC.md\n${accepts(blocked.held.task.id)}`,
+    ]);
+    const refused = reviewed(hub);
+    const reviewer = startReview(hub, refused.review.id);
+    tx(hub.ctx, (emit) =>
+      onVendorOutcome(hub.ctx, emit, getAttempt(hub.ctx, reviewer.attempt.id), { kind: 'policy', detail: null }),
+    );
+    const policy =
+      `${refused.review.id} is blocked: the vendor refused the work under its usage policy. ` +
+      accepts(refused.held.task.id);
+    expect([about(refused.review.id, 'humans'), about(refused.review.id, 'lead')]).toEqual([[policy], [policy]]);
+    expect(expireReviews(hub.ctx)).toBe(2);
+    for (const { held } of [blocked, refused]) {
+      expect(accepted(hub, held.task.id).map((event) => event.actor)).toEqual(['hub:auto-accept']);
+    }
   });
 
   test('a pause stops its clock: the tick leaves it alone, and its times count from the resume', () => {

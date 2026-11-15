@@ -74,6 +74,16 @@ export function reviewTarget(ctx: HubContext, taskId: string): ReviewTarget | nu
   return targetOf(row?.title);
 }
 
+/**
+ * What agflow says of a review its reviewer blocked or its vendor refused, in place of how to unblock it: the tick
+ * accepts the task it reviews as before and cancels it (expireReviews), so there is nothing to unblock. Null for any
+ * other task.
+ */
+export function reviewCannotFinish(ctx: HubContext, taskId: string): string | null {
+  const target = reviewTarget(ctx, taskId);
+  return target && `The review of ${target.taskId} cannot finish, so agflow accepts ${target.taskId} as its check passed.`;
+}
+
 interface Review extends ReviewTarget {
   id: string;
   status: TaskStatus;
@@ -209,10 +219,11 @@ export function reviewContract(
 
 /**
  * Creates the review of a submission whose check passed, in place of the hub's accept (recordSuccess, AGFLOW_REVIEW):
- * for a task an agent or a person created, the first time one of its submissions passes, while the task limits allow
- * one more task. The review starts at the submitted head, and prefers the vendor other than the author's while a
- * runner offers it. It runs inside a runner event's transaction, where a throw would reject the event for good, so
- * any failure is caught and leaves no review, and the caller accepts as before. Returns whether it created one.
+ * for a task an agent or a person created, the first time one of its submissions passes, while the open-task limit
+ * allows one more task (the hourly limit, which the lead may reach, does not hold reviews). The review starts at the
+ * submitted head, and prefers the vendor other than the author's while a runner offers it. It runs inside a runner
+ * event's transaction, where a throw would reject the event for good, so any failure is caught and leaves no review,
+ * and the caller accepts as before. Returns whether it created one.
  */
 export function requestReview(
   ctx: HubContext,
@@ -224,7 +235,7 @@ export function requestReview(
   const branch = task.branch;
   if (!ctx.config.review || task.createdBy === 'system' || branch === null || headSha === null) return false;
   try {
-    if (everReviewed(ctx, task.id) || creationGuard(ctx, 1) !== null) return false;
+    if (everReviewed(ctx, task.id) || creationGuard(ctx, 1, false) !== null) return false;
     const other = OTHER[attempt.vendor];
     const contract = reviewContract(task, submission.id, offered(ctx, other) ? other : null);
     return tx(ctx, () => {

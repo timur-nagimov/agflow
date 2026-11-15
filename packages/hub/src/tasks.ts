@@ -42,7 +42,7 @@ import { parkReason, queueMainCheck, waitsForMain } from './main-check';
 import { MERGE_RETRY_MAX_MS, MERGE_RETRY_MS, failedMerges, mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
-import { reviewTarget } from './review';
+import { reviewCannotFinish, reviewTarget } from './review';
 import { listSubmissions } from './submission-store';
 import {
   RUNNER_HELD_SQL,
@@ -121,11 +121,12 @@ function reaches(ctx: HubContext, from: string, target: string, seen = new Set<s
 const HOUR = 60 * 60_000;
 
 /**
- * Why creating count more tasks would pass a safety limit, or null; the demo check asks before it creates its task. The
- * hourly limit counts the tasks agents and people created: the system's own (reviews, demo checks, fixes of main) do
- * not use up the lead's budget.
+ * Why creating count more tasks would pass a safety limit, or null; the system asks before it creates a task of its
+ * own. The hourly limit counts the tasks agents and people created: the system's own (reviews, demo checks, fixes of
+ * main) do not use up the lead's budget. With hourly false only the open-task limit holds: a review asks so, since one
+ * the hourly limit refused would be skipped for good, while a demo check or a fix of main waits for the next tick.
  */
-export function creationGuard(ctx: HubContext, count: number): string | null {
+export function creationGuard(ctx: HubContext, count: number, hourly = true): string | null {
   const open = (
     ctx.db
       .query("SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN ('accepted', 'merging', 'merged', 'cancelled', 'failed')")
@@ -134,6 +135,7 @@ export function creationGuard(ctx: HubContext, count: number): string | null {
   if (open + count > ctx.config.maxOpenTasks) {
     return `creating ${count} more task(s) would exceed the limit of ${ctx.config.maxOpenTasks} open tasks`;
   }
+  if (!hourly) return null;
   const recent = (
     ctx.db
       .query("SELECT COUNT(*) AS n FROM tasks WHERE created_at > $since AND created_by != 'system'")
@@ -213,7 +215,8 @@ export function countPlanChange(
 // ---------------------------------------------------------------------------
 
 export function createTasks(ctx: HubContext, inputs: NewTask[], actor: string): Task[] {
-  const refusal = creationGuard(ctx, inputs.length);
+  // The system asked creationGuard already, with the limits it keeps.
+  const refusal = creationGuard(ctx, inputs.length, actor !== 'system');
   if (refusal) tripGuard(ctx, refusal, actor);
   return tx(ctx, (emit) => {
     const goalVersion = currentGoalVersion(ctx);
@@ -823,10 +826,15 @@ export function blockTask(
       setAgentTask(ctx, agent.id, null);
       endLiveAttempt(ctx, task, kind === 'impossible' ? 'impossible' : 'blocked', `agent:${agent.id}`);
     }
+    const next =
+      reviewCannotFinish(ctx, id) ??
+      (kind === 'impossible'
+        ? 'Decide: amend it with update_task and then unblock_task, split it, or cancel it.'
+        : 'Unblock it with unblock_task once this is resolved.');
     const body =
       kind === 'impossible'
-        ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified.\n${wrote(agent.id, reason)}\nDecide: amend it with update_task and then unblock_task, split it, or cancel it.`
-        : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}.\n${wrote(agent.id, reason)}\nUnblock it with unblock_task once this is resolved.`;
+        ? `${agent.id} says ${id} ("${clip(task.title, 120)}") cannot be done as specified.\n${wrote(agent.id, reason)}\n${next}`
+        : `${id} ("${clip(task.title, 120)}") is blocked, reported by ${agent.id}.\n${wrote(agent.id, reason)}\n${next}`;
     insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: id, body });
     return getTask(ctx, id);
   });

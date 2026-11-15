@@ -17,6 +17,7 @@ import { type HubContext, tx } from './context';
 import type { Emit } from './events';
 import { parkReason, waitsForMain } from './main-check';
 import { insertMessage } from './messages';
+import { reviewCannotFinish } from './review';
 import { markVendorNotReady, setDegraded } from './runners';
 import { pendingSubmissionOf } from './submission-store';
 import { getTask } from './task-store';
@@ -215,12 +216,16 @@ const policySteps = (vendor: Vendor): string =>
   `${vendor === 'claude' ? 'codex' : 'claude'} there, then unblock it with unblock_task; or cancel it with ` +
   'cancel_task.';
 
-/** What people are told of a policy refusal, from what the stop actually did to the attempt and its task. */
+/**
+ * What people are told of a policy refusal, from what the stop actually did to the attempt and its task; of a blocked
+ * review, that the hub accepts the task it reviews (reviewCannotFinish).
+ */
 function policyNotice(ctx: HubContext, attempt: Attempt, reason: string): string {
   if (attempt.taskId === null) return `The lead attempt ${attempt.id} is stopping: ${reason}.`;
   const task = getTask(ctx, attempt.taskId);
   if (task.status === 'blocked' && task.blockedKind === 'policy') {
-    return `${task.id} is blocked: ${reason}. Change the task or decide how to go on, then unblock it.`;
+    const next = reviewCannotFinish(ctx, task.id) ?? 'Change the task or decide how to go on, then unblock it.';
+    return `${task.id} is blocked: ${reason}. ${next}`;
   }
   const now = getAttempt(ctx, attempt.id);
   const state =
@@ -234,13 +239,13 @@ function policyNotice(ctx: HubContext, attempt: Attempt, reason: string): string
 
 /**
  * attempt.vendor_outcome (design 6.4): auth stops the attempt crashed (infra, no handoff) and marks the vendor not
- * ready on the runner until a preflight passes; context replaces it with a handoff; policy blocks the task as policy
- * at once and tells people, and for a worker the lead too, with the vendor and what it may do (a lead's own refusal
- * ends that lead); denials and session_budget stop it as stall_budget. A stop already recorded follows the
- * second-request rules (requestStop). While a submission is pending its outcome decides (design 6.13): the stop is
- * recorded deferred, so it neither interrupts the push's retries nor replaces a stop already held back for it. An
- * attempt with no process is left alone: a holding worker's session and clone are its author's for a review return,
- * and a holding lead meets the outcome again when it resumes.
+ * ready on the runner until a preflight passes; context replaces it with a handoff; policy blocks the task as policy at
+ * once and tells people, and for a worker the lead too, with the vendor and what it may do, or for a review that the
+ * hub accepts the task it reviews (a lead's own refusal ends that lead); denials and session_budget stop it as
+ * stall_budget. A stop already recorded follows the second-request rules (requestStop). While a submission is pending
+ * its outcome decides (design 6.13): the stop is recorded deferred, so it neither interrupts the push's retries nor
+ * replaces a stop already held back for it. An attempt with no process is left alone: a holding worker's session and
+ * clone are its author's for a review return, and a holding lead meets the outcome again when it resumes.
  */
 export function onVendorOutcome(
   ctx: HubContext,
@@ -263,8 +268,9 @@ export function onVendorOutcome(
     const body = policyNotice(ctx, attempt, reason);
     insertMessage(ctx, emit, { from: 'system', to: 'humans', taskId: attempt.taskId, body });
     if (attempt.taskId !== null) {
-      const lead = `${body}\n${policySteps(attempt.vendor)}`;
-      insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: attempt.taskId, body: lead });
+      // A review is never unblocked: the tick accepts the task it reviews instead.
+      const steps = reviewCannotFinish(ctx, attempt.taskId) === null ? `\n${policySteps(attempt.vendor)}` : '';
+      insertMessage(ctx, emit, { from: 'system', to: 'lead', taskId: attempt.taskId, body: `${body}${steps}` });
     }
   }
 }
