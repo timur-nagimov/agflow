@@ -270,7 +270,8 @@ after a change. The details are in the
 - **`AGFLOW_AUTO_APPROVALS=1`.** Removes: anyone, person or agent, reading each request before it is answered. The hub
   approves every approval request the moment it arrives, recorded as `hub:auto-approvals` in the attempt's log and the
   event. Only a request from a runner whose device policy reserves approvals to its owner waits for the owner, and a
-  runner notifies its owner only of a request still unanswered 10 seconds after relaying it. Risk:
+  runner notifies its owner only of a request still unanswered 10 seconds after relaying it. The lead, told of such a
+  request, is asked to decline it at once with what to do instead, since nobody may be at that machine. Risk:
   every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
   owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
   removing the line and restarting the hub.
@@ -291,12 +292,15 @@ after a change. The details are in the
   prepared and the project's check run there, as at a submission, apart from the merges, which never wait for it.
   Two changes that each pass alone can still break `main`, and then every later submission fails its check. So a
   failure creates one task at the top priority, "Fix main: the check fails after T-42", created by `system`, and tells
-  people and the lead (when the task limits refuse it, agflow creates it once they allow); while `main` fails, an
-  agent whose check fails hears which task fixes `main`, and keeps its own change focused. A pass afterwards tells
-  people and cancels that task if nobody has started it. The Load page shows where the check of `main` passed, or
-  since when it fails. Only runners of this release (runner protocol 4) that can prepare dependencies, as
-  `agflow runner status` shows, check `main`, so deploy the hub first, then update the runners: a hub older than its
-  runners refuses them.
+  people and the lead (when the task limits refuse it, agflow creates it once they allow). While `main` fails, an
+  agent whose check fails hears which task fixes `main`, and when the failure is not from its change it calls
+  `declare_blocked`: agflow then parks the task instead of blocking it. The attempt is replaced, which counts no
+  failure, asks for a handoff note and tells nobody, and the task waits, ready, with the board saying why, until
+  `main`'s check passes, or 45 minutes at most. An agent that stalls while its last submission failed this way is
+  parked the same way. A pass afterwards tells people and the lead, and cancels the fix task if nobody has started
+  it. The Load page shows where the check of `main` passed, or since when it fails. Only runners of this release
+  (runner protocol 4) that can prepare dependencies, as `agflow runner status` shows, check `main`, so deploy the hub
+  first, then update the runners: a hub older than its runners refuses them.
 - **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
   accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of
@@ -332,9 +336,24 @@ Two more settings are on by default:
   in `SPEC.md`, saves a screenshot of every screen under `docs/qa/<time>/`, records each requirement in
   `docs/STATUS.md` as working, broken or missing, and lists every defect with steps to reproduce in its submission. It
   may change only those files and `scripts/demo.sh`, which no runner profile protects. It runs at priority 1,
-  preferably on the vendor that implemented fewer of the last N tasks. The lead reviews it, even with
-  `AGFLOW_AUTO_ACCEPT=1`, and turns its defects into fix tasks. `0` turns it off. Risk: none beyond an agent's usual
-  work; it costs one task's quota every N tasks.
+  preferably on the vendor that implemented fewer of the last N tasks. In the last hour before the deadline one task
+  merged is enough, so the `main` of the end gets checked. The lead reviews it, even with `AGFLOW_AUTO_ACCEPT=1`, and
+  turns its defects into fix tasks. `0` turns it off. Risk: none beyond an agent's usual work; it costs one task's
+  quota every N tasks, and more in the last hour.
+
+### At the deadline
+
+When the project's deadline passes (`agflow start --deadline`, or the operator's deadline route), the hub presses
+Pause, once for that deadline, and records `project.deadline_reached`. It is the usual pause: no worker or lead
+starts, the idle nudge stops, and the agents already running finish or hand off what they hold. On top of it, while
+the project stays paused past its deadline, no merge goes into `main`: accepted work waits in `merging`, a merge
+already sent to a runner still lands, and the check of `main` still runs. People and the lead get one message: the
+deadline passed and merges are held; `main` as agflow last merged it, with what its check gave (passed, failed or not
+run yet); and the last `main` whose check passed, the one to show if the newest fails. **Resume** in the web UI goes
+on: workers start again and accepted work merges. A deadline moved later lifts the merge hold at once, and pauses
+the project again when it passes; with no deadline nothing changes. Risk: a mistyped deadline (`+36m` for `+36h`)
+pauses an unattended run at that time; `agflow start` prints the deadline it set, and the Load page shows the time
+left.
 
 ### Hackathon settings
 
@@ -356,6 +375,7 @@ AGFLOW_DEMO_CHECK_EVERY=5
 AGFLOW_AGENT_FETCH=1
 AGFLOW_LEAD_APPROVALS=1
 AGFLOW_AUTO_APPROVALS=1
+AGFLOW_APPROVAL_MINUTES=5
 ```
 
 - `AGFLOW_MAX_WORKERS=20`: room for every runner slot, 6 on each Mac with `--preset hackathon` and 8 on the VM
@@ -377,6 +397,9 @@ AGFLOW_AUTO_APPROVALS=1
   the demo check, the backstop of auto accept, stay on.
 - `AGFLOW_AGENT_FETCH=1`, `AGFLOW_LEAD_APPROVALS=1` and `AGFLOW_AUTO_APPROVALS=1`: nobody has to fetch outside data or
   answer approval requests during the run. Read their risks above first.
+- `AGFLOW_APPROVAL_MINUTES=5`: a request that a runner's device policy reserves to its owner, which nobody answers
+  during an unattended run, holds its agent 5 minutes before it is declined, not 15. `hub.env.example` sets the key
+  already: change that line.
 
 Before the run, check four things:
 
@@ -441,7 +464,16 @@ Work that stops on its own reaches people as a message from agflow on the Messag
   merges and the last error; a person who merges it by hand marks it merged.
 - **A failing `main`** (`AGFLOW_AUTO_MERGE=1`). When the check of `main` fails after a merge and no task is open to
   fix it, people and the lead hear which task agflow created at the top priority to fix it, or why it could not create
-  one; people hear again once `main` passes ([Unattended operation](#unattended-operation)).
+  one; both hear again once `main` passes. Parking a task meanwhile tells nobody
+  ([Unattended operation](#unattended-operation)).
+- **A failed task.** When a task's attempts fail again after its re-plan, agflow will not try it again: people and
+  the lead hear of it, and the lead's message lists the open tasks that depend on it, whose blocked reason now asks
+  to amend or cancel them, as after a cancel.
+- **A refusal under a vendor's usage policy.** The task is blocked at once, and people hear of it. For a worker's
+  task the lead does too, with the vendor and what to do: reword the task or set its `vendorHint` to the other vendor
+  with `update_task`, then unblock it, or cancel it.
+- **The deadline.** People and the lead hear that the project is paused and merges are held, with where `main`
+  stands ([At the deadline](#at-the-deadline)).
 
 ## Joining from a Mac
 
