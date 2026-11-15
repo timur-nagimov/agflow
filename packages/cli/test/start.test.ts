@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { NewTaskSchema } from '@agflow/core';
 import { getCurrentGoal } from '@agflow/hub/src/goal';
 import { listStandingRules } from '@agflow/hub/src/messages';
@@ -14,7 +15,7 @@ import { KEYCHAIN_SERVICE, findOperatorToken, operatorTokenCommand } from '../sr
 import { type RunCommand, runCommand } from '../src/run';
 import { describeStack, seedFiles } from '../src/seed';
 import type { SpecFile } from '../src/spec';
-import { type StartDeps, parseDeadline, repoOf, startCommand } from '../src/start';
+import { type StartDeps, askTerminal, parseDeadline, repoOf, startCommand } from '../src/start';
 import { HUB_URL, hubFixture } from './fixture';
 
 const TOKEN = 'op-0123456789abcdef0123456789abcdef';
@@ -396,5 +397,21 @@ describe('agflow start', () => {
     const { io } = capture();
     expect(await startCommand(parseArgs(['start', '--spec', s.spec, '--repo', s.origin, '--yes']), io, s.deps)).toBe(0);
     expect(getProject(s.hub.ctx).name).toBe('afisha');
+  });
+});
+
+describe('the question at the terminal', () => {
+  /** askTerminal's answer after these keys, at a terminal: its output is a TTY, so the reader takes keys as one does. */
+  function answerTo(keys: string): Promise<string> {
+    const input = new PassThrough();
+    const answer = askTerminal('Continue? [y/N] ', input, Object.assign(new PassThrough(), { isTTY: true }));
+    input.write(keys);
+    return answer;
+  }
+
+  test('Ctrl-C or Ctrl-D answers it with nothing, a no; a typed line is the answer', async () => {
+    expect(await answerTo('\x03')).toBe('');
+    expect(await answerTo('\x04')).toBe('');
+    expect(await answerTo('y\r')).toBe('y');
   });
 });

@@ -5,7 +5,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { createInterface } from 'node:readline/promises';
+import { createInterface } from 'node:readline';
 import { DeadlineInputSchema, type OperatorProject, type ProjectResetResult } from '@agflow/core';
 import { type ParsedArgs, UsageError, listFlag, stringFlag } from './args';
 import { loadCredentials } from './credentials';
@@ -35,14 +35,23 @@ export interface StartDeps extends OperatorTokenDeps {
   ask: ((question: string) => Promise<string>) | null;
 }
 
-/** One question on standard error, and the line typed after it on standard input. */
-async function askTerminal(question: string): Promise<string> {
-  const reader = createInterface({ input: process.stdin, output: process.stderr });
-  try {
-    return await reader.question(question);
-  } finally {
-    reader.close();
-  }
+/**
+ * One question on output (standard error), and the line typed after it on input (standard input). Ctrl-C or Ctrl-D at
+ * the question closes the reader before a line comes, which answers '', a no.
+ */
+export function askTerminal(
+  question: string,
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stderr,
+): Promise<string> {
+  return new Promise((resolve) => {
+    const reader = createInterface({ input, output });
+    reader.once('close', () => resolve(''));
+    reader.question(question, (answer) => {
+      resolve(answer);
+      reader.close();
+    });
+  });
 }
 
 export const defaultStartDeps = (): StartDeps => ({
