@@ -269,7 +269,8 @@ after a change. The details are in the
   browser restricts those and says nothing about approvals. The Runners card shows both facts.
 - **`AGFLOW_AUTO_APPROVALS=1`.** Removes: anyone, person or agent, reading each request before it is answered. The hub
   approves every approval request the moment it arrives, recorded as `hub:auto-approvals` in the attempt's log and the
-  event. Only a request from a runner whose device policy reserves approvals to its owner waits for the owner. Risk:
+  event. Only a request from a runner whose device policy reserves approvals to its owner waits for the owner, and a
+  runner notifies its owner only of a request still unanswered 10 seconds after relaying it. Risk:
   every command an agent asks to run outside the sandbox runs there, with network access and write access to all the
   owner's files, and nobody reads it first. Turn it on for projects you would run unattended anyway; turn it off by
   removing the line and restarting the hub.
@@ -402,6 +403,23 @@ What still needs a person:
 - **Runner sign-in.** A person runs `agflow login` on each Mac and completes the Claude and Codex logins that
   `agflow runner setup` opens ([Joining from a Mac](#joining-from-a-mac)).
 - **Secrets.** API keys and other secrets are never handed out by the hub or by the lead. A person provides them.
+
+### When the hub writes to people
+
+Work that stops on its own reaches people as a message from agflow on the Messages page:
+
+- **No lead.** While the project runs and the lead seat has been empty for 2 minutes, one message says that no lead
+  is running and why: each runner and vendor that cannot take the seat, in the board's words
+  (`R-1 offline; R-2 claude quota used up, codex not ready`), or that runner leads are off and no live chat holds
+  the seat. It also says what to do: get a runner able to take the seat, and agflow starts a lead there by itself,
+  or lead from a chat with `agflow join --role lead`. The next such message comes only after a lead has held the
+  seat again.
+- **A merge that keeps failing** (`AGFLOW_AUTO_MERGE=1`). Its next try waits 15 seconds, then twice as long after
+  each failure, up to 10 minutes, and the other merges go on meanwhile. People hear of the first failure and again
+  of the fifth, with the likely cause when the error names one: a `main` that is protected or requires checks, or a
+  runner's git credentials that cannot push `.github/workflows` changes ([Hackathon settings](#hackathon-settings)
+  lists both checks). Until it is merged, the board shows the task under Needs attention with the number of failed
+  merges and the last error; a person who merges it by hand marks it merged.
 
 ## Joining from a Mac
 
