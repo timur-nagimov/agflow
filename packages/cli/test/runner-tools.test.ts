@@ -277,7 +277,7 @@ describe('submit', () => {
     const bridge = await bridgeFor(worker, { decide: { prefix: '/api/submissions/', at: 3, run: () => submitted(hub, worker, { error: null }) } });
     const answer = await bridge.call('submit', { task_id: taskId, summary: 'Parser added', evidence: ['bun test: 3 pass'] });
     expect(answer).toEqual({ text: expect.stringContaining(`${taskId} submitted at ${HEAD}`), isError: false });
-    expect(answer.text).toContain('The lead will review it; your work on it is done, so end your turn.');
+    expect(answer.text).toContain('It is up for review; your work on it is done, so end your turn.');
     expect(bridge.gets('/api/submissions/')).toBe(3);
     expect(getTask(hub.ctx, taskId)).toMatchObject({ status: 'submitted', submission: expect.objectContaining({ summary: 'Parser added' }) });
   });

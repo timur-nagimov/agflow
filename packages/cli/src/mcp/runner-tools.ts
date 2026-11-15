@@ -157,7 +157,7 @@ const runnerHello = defineTool(
 
 const submit = defineTool(
   'submit',
-  'Submit your task for review once every change is committed in your working directory. The runner pushes the task branch for you; wait for the answer, and do not submit again while it is pending.',
+  'Submit your task once every change is committed in your working directory; a review submits only its verdict. The runner pushes the task branch for you; wait for the answer, and do not submit again while it is pending.',
   {
     task_id: TaskIdSchema,
     summary: z.string().min(1).max(8000),
@@ -185,7 +185,7 @@ const submit = defineTool(
     if (accepted) {
       return `${done} agflow accepted it because the project's check passed, and ${accepted}. Your work on it is done, so end your turn.`;
     }
-    return `${done} The lead will review it; your work on it is done, so end your turn.`;
+    return `${done} It is up for review; your work on it is done, so end your turn.`;
   },
 );
 
