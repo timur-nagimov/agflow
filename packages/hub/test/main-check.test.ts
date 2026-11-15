@@ -27,6 +27,7 @@ import {
 } from '../src/main-check';
 import { listMessages } from '../src/messages';
 import { setPaused, setWorkerTarget } from '../src/project';
+import { expireReviews, tasksUnderReview } from '../src/review';
 import { nudgeIdleLead, readySet, runTick, workerLoad } from '../src/scheduler';
 import { requestSubmission } from '../src/submissions';
 import { judgeStalls } from '../src/supervisor';
@@ -49,7 +50,7 @@ const failed: SubmissionCheck = { status: 'failed', command, durationMs: 61_000,
 const passed: SubmissionCheck = { status: 'passed', command, durationMs: 58_000, tail: '12 pass' };
 
 /** A hub with auto merge, and a runner of this release, which speaks the protocol that knows check_main. */
-function setup(config: { autoAccept?: boolean; maxTasksPerHour?: number } = {}) {
+function setup(config: { autoAccept?: boolean; review?: boolean; maxTasksPerHour?: number } = {}) {
   const { ctx, clock } = createTestContext({ autoMerge: true, ...config });
   return { ctx, clock, runner: current(ctx) };
 }
@@ -588,6 +589,41 @@ describe('parking a task while main fails', () => {
       'Only 1 ready task(s) are dispatchable and 1 parked, fewer than the 3 worker slot(s) (1 running, 2 free).',
     );
     expect(nudge).toContain(`\n${line}\n`);
+  });
+
+  test("a review is never parked, and a parked task's first green submission is still reviewed", () => {
+    const { ctx, runner } = setup({ autoAccept: true, review: true });
+    const green = { ok: true, headSha: sha('8'), remoteHead: sha('8'), error: null, detail: null, check: passed };
+    merge(ctx, sha('a'));
+    answer(ctx, runner, passed);
+    // A green submission goes to a review, then main's check fails.
+    const author = addRunnerAttempt(ctx);
+    submit(ctx, author, green);
+    const review = tasksUnderReview(ctx).get(author.task.id) as string;
+    merge(ctx, sha('b'), 'Print the config');
+    answer(ctx, runner, failed);
+    const fix = openFixTask(ctx) as Task;
+    // Its reviewer, which submitted nothing, is blocked as any agent is: the hub then accepts the task as before.
+    const reviewer = addRunnerAttempt(ctx, { taskId: review });
+    expect(waitsForMain(ctx, reviewer.attempt)).toBe(false);
+    blockTask(ctx, review, reviewer.agent, `waiting for ${fix.id}`);
+    expect(getAttempt(ctx, reviewer.attempt.id).stopRequested).toMatchObject({ cause: 'blocked' });
+    exited(ctx, reviewer.attempt.id);
+    expect(getTask(ctx, review).status).toBe('blocked');
+    expect(expireReviews(ctx)).toBe(1);
+    expect(getTask(ctx, author.task.id).status).toBe('merging');
+    // A task whose check failed only because of main is parked; once main passes, its green submission is reviewed.
+    const worker = addRunnerAttempt(ctx);
+    submit(ctx, worker, refusedCheck);
+    blockTask(ctx, worker.task.id, worker.agent, `waiting for ${fix.id}`);
+    exited(ctx, worker.attempt.id);
+    expect(dispatchable(ctx, worker.task.id).now).toBe(false);
+    merge(ctx, sha('c'), 'Lint the config');
+    answer(ctx, runner, passed);
+    const again = addRunnerAttempt(ctx, { taskId: worker.task.id, runnerId: worker.runner.id });
+    submit(ctx, again, green);
+    expect(getTask(ctx, worker.task.id).status).toBe('submitted');
+    expect(tasksUnderReview(ctx).has(worker.task.id)).toBe(true);
   });
 
   test("while main passes, a failed check is the agent's own: declare_blocked blocks the task and tells the lead", () => {

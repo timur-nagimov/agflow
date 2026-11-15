@@ -386,7 +386,7 @@ describe('lead brief', () => {
   test("a successor runner lead's brief on a busy board keeps the newest standing rules, with room to spare", () => {
     // The deployed settings, a short goal as agflow start sets it, a deadline, four rules of about 500 characters, and
     // the longest lead handoff of the real run.
-    const { ctx } = createTestContext({ autoAccept: true, autoMerge: true });
+    const { ctx } = createTestContext({ autoAccept: true, autoMerge: true, review: true });
     const goal = (version: number) => `Build what SPEC.md describes. ${'g'.repeat(270 + version)}`;
     updateGoal(ctx, { text: goal(0), baseVersion: 0 }, 'user:alice');
     setDeadline(ctx, ctx.now() + 6 * 60 * 60_000, 'user:alice');
@@ -411,6 +411,8 @@ describe('lead brief', () => {
     expect(report.length).toBeGreaterThan(2400);
     const brief = buildBrief(ctx, next.agent);
     expect(brief).toContain(`\n\n${report}\n\n## Messages`);
+    // The guide carries the AUTO_ACCEPT, REVIEW and AUTO_MERGE lines.
+    expect(brief).toContain("- An agent of the other vendor reviews each task's first green submission");
     expect(section(brief, '## Lead handoff from the previous lead')).toEndWith(`…\n${LEAD_HANDOFF_CUT}`);
     const rules = section(brief, '## Standing rules from people');
     expect(rules.match(/Rule \d/g)).toEqual(['Rule 4', 'Rule 3']);

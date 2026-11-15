@@ -8,6 +8,7 @@ import { requestSubmission } from '@agflow/hub/src/submissions';
 import { tx } from '@agflow/hub/src/context';
 import { updateGoal } from '@agflow/hub/src/goal';
 import { onPrepared } from '@agflow/hub/src/prepare';
+import { tasksUnderReview } from '@agflow/hub/src/review';
 import { runningWorkers } from '@agflow/hub/src/scheduler';
 import { onSubmitted } from '@agflow/hub/src/submissions';
 import { getTask } from '@agflow/hub/src/task-store';
@@ -318,6 +319,29 @@ describe('submit', () => {
     expect(await submit.run({ task_id: 'T-9', summary: 'VERDICT: accept' }, ctx)).toBe(
       'agflow recorded your submission S-4 and closed T-9. Your work on it is done, so end your turn.',
     );
+  });
+
+  test("a reviewer's verdict on this hub (AGFLOW_REVIEW) is answered as recorded and closed; a malformed one gets the format", async () => {
+    const hub = hubFixture({ autoAccept: true, review: true });
+    const author = runnerAgent(hub);
+    const taskId = author.task?.id as string;
+    const check: SubmissionCheck = { status: 'passed', command: 'bun test', durationMs: 1_200, tail: '3 pass' };
+    requestSubmission(hub.ctx, taskId, author.agent, { summary: 'Parser added', evidence: [] });
+    submitted(hub, author, { error: null, check });
+    const reviewId = tasksUnderReview(hub.ctx).get(taskId) as string;
+    const reviewer = hub.runnerAgent({ taskId: reviewId, vendor: 'codex' });
+    agentHub.set(reviewer, hub);
+    const bridge = await bridgeFor(reviewer);
+    const malformed = await bridge.call('submit', { task_id: reviewId, summary: 'Looks fine to me.' });
+    expect(malformed).toEqual({ text: expect.stringContaining('exactly `VERDICT: accept`'), isError: true });
+    expect(getTask(hub.ctx, taskId).status).toBe('submitted');
+    const answer = await bridge.call('submit', { task_id: reviewId, summary: 'VERDICT: accept', evidence: ['bun test: 3 pass'] });
+    const verdict = hub.ctx.db.query('SELECT id FROM submissions WHERE task_id = $reviewId').get({ reviewId }) as { id: string };
+    expect(answer).toEqual({
+      text: `agflow recorded your submission ${verdict.id} and closed ${reviewId}. Your work on it is done, so end your turn.`,
+      isError: false,
+    });
+    expect([getTask(hub.ctx, taskId).status, getTask(hub.ctx, reviewId).status]).toEqual(['accepted', 'cancelled']);
   });
 
   test('dirty, protected_paths and needs_merge are error results that say what to fix, the detail passed on unchanged', async () => {

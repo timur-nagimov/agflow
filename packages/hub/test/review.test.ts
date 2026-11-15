@@ -21,7 +21,7 @@ import { listEvents } from '../src/events';
 import { applyRunnerEvents } from '../src/events-in';
 import { periodicLeadReview } from '../src/lead';
 import { listMessages } from '../src/messages';
-import { setPaused } from '../src/project';
+import { getProject, setDeadline, setPaused } from '../src/project';
 import { checkClock } from '../src/recovery';
 import {
   REVIEW_FINISH_MS,
@@ -525,6 +525,29 @@ describe('AGFLOW_REVIEW: a review that does not finish', () => {
     hub.clock.advance(1);
     expect(expireReviews(hub.ctx)).toBe(1);
     expect(accepted(hub, held.task.id).map((event) => event.actor)).toEqual(['hub:auto-accept']);
+  });
+
+  test('past the deadline no review lets the hub accept, and an accepting verdict merges nothing', () => {
+    const hub = createTestHub({ autoAccept: true, review: true, autoMerge: true });
+    setDeadline(hub.ctx, hub.ctx.now() + 60_000, 'user:alice');
+    const { held, review } = reviewed(hub);
+    hub.clock.advance(60_000);
+    markHubAlive(hub.ctx);
+    runTick(hub.ctx);
+    expect(getProject(hub.ctx).paused).toBe(true);
+    // Past both of the review's times, the paused tick neither accepts the task nor starts the review.
+    hub.clock.advance(REVIEW_FINISH_MS);
+    markHubAlive(hub.ctx);
+    runTick(hub.ctx);
+    expect(getTask(hub.ctx, held.task.id).status).toBe('submitted');
+    expect(getTask(hub.ctx, review.id).status).toBe('ready');
+    // A reviewer at work still gives its verdict: the task is accepted, and waits in merging.
+    verdict(hub, startReview(hub, review.id), 'VERDICT: accept');
+    expect(getTask(hub.ctx, held.task.id).status).toBe('merging');
+    markHubAlive(hub.ctx);
+    runTick(hub.ctx);
+    const merges = "SELECT COUNT(*) AS n FROM runner_commands WHERE kind = 'merge_task'";
+    expect(hub.ctx.db.query(merges).get()).toEqual({ n: 0 });
   });
 
   test("the hub's downtime stops its clock too: its times count from the end of the recovery window", () => {
