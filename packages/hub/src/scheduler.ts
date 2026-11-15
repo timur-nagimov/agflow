@@ -758,8 +758,8 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
       from: 'system',
       to: 'lead',
       body:
-        `Only ${load.dispatchable} ready task(s) can start now, fewer than the ${workerSlots(load)} worker slot(s) ` +
-        `(${load.running} running, ${load.freeSlots} free).\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
+        `Only ${load.dispatchable} ready task(s) are dispatchable, fewer than the ${workerSlots(load)} worker ` +
+        `slot(s) (${load.running} running, ${load.freeSlots} free).\n${lines.join('\n')}\n\n${NUDGE_PLAN}`,
     });
   });
 }

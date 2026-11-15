@@ -40,7 +40,7 @@ function idleProject(overrides: Partial<HubConfig> = {}) {
 
 /** The idle nudges among the messages to the lead. */
 const nudgeMessages = (ctx: HubContext) =>
-  listMessages(ctx, { target: 'lead' }).filter((message) => message.body.includes('ready task(s) can start now'));
+  listMessages(ctx, { target: 'lead' }).filter((message) => message.body.includes('ready task(s) are dispatchable'));
 
 /** Ready tasks the scheduler may start, by the lead. */
 function ready(ctx: HubContext, count: number): void {
@@ -85,7 +85,7 @@ describe('the idle nudge', () => {
     expect(message).toMatchObject({ from: 'system', to: 'lead' });
     expect(message?.body).toStartWith(
       [
-        'Only 0 ready task(s) can start now, fewer than the 3 worker slot(s) (1 running, 2 free).',
+        'Only 0 ready task(s) are dispatchable, fewer than the 3 worker slot(s) (1 running, 2 free).',
         'Workers: 1 running (target 4, cap 4); 2 free worker slot(s).',
         'Ready tasks: 0, 0 of them dispatchable now. Blocked on dependencies: 0. Submitted: 0. Accepted, not merged: 0.',
         'Quota:',
@@ -156,7 +156,7 @@ describe('the idle nudge', () => {
     expect(nudgeIdleLead(ctx)).toBeNull();
     clock.advance(ctx.config.idleNudgeMs);
     expect(nudgeIdleLead(ctx)?.body).toStartWith(
-      'Only 2 ready task(s) can start now, fewer than the 3 worker slot(s) (1 running, 2 free).',
+      'Only 2 ready task(s) are dispatchable, fewer than the 3 worker slot(s) (1 running, 2 free).',
     );
   });
 
@@ -169,7 +169,7 @@ describe('the idle nudge', () => {
     expect(nudgeIdleLead(ctx)).toBeNull();
     clock.advance(ctx.config.idleNudgeMs);
     expect(nudgeIdleLead(ctx)?.body).toStartWith(
-      'Only 0 ready task(s) can start now, fewer than the 3 worker slot(s) (3 running, 0 free).\n' +
+      'Only 0 ready task(s) are dispatchable, fewer than the 3 worker slot(s) (3 running, 0 free).\n' +
         'Workers: 3 running (target 4, cap 4); 0 free worker slot(s).',
     );
     // A ready task for every busy slot is enough: the clock stops, and nothing more goes out.

@@ -317,17 +317,18 @@ after a change. The details are in the
 Two more settings are on by default:
 
 - **The idle nudge, `AGFLOW_IDLE_NUDGE_SECONDS` (60) and `AGFLOW_IDLE_NUDGE_MINUTES` (5).** Removes: a person noticing
-  that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the ready tasks that
-  can start are fewer than the worker slots, busy or free, for `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub
-  sends the lead one message: the worker slots, the ready, blocked, submitted and accepted tasks, each account's
-  quota, the time left to the deadline, and what to plan next (the spec until it is covered, then the requirements
-  `docs/STATUS.md` does not show working, the demo check's defects and the gaps agents named, missing tests, demo
-  polish and new features, and only fixes in the last hour). So a lead whose every slot is busy hears too, before the
-  work runs out; its situation report says why ready tasks wait (a path overlap, quota, a full runner, no free slot).
-  No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event `lead.idle_nudged` records each one. None goes out
-  before the goal is set, while worker dispatch is held (a paused project, the churn guard), or once the deadline has
-  passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk: the lead keeps adding work until the deadline, so the
-  subscriptions stay in use; pause the project, or set a lower worker target, to stop it.
+  that workers sit idle and telling the lead to plan more. While a runner lead holds the seat and the dispatchable
+  ready tasks (those the scheduler may start once a worker slot is free) are fewer than the worker slots, busy or
+  free, for `AGFLOW_IDLE_NUDGE_SECONDS` without a break, the hub sends the lead one message: the worker slots, the
+  ready, blocked, submitted and accepted tasks, each account's quota, the time left to the deadline, and what to plan
+  next (the spec until it is covered, then the requirements `docs/STATUS.md` does not show working, the demo check's
+  defects and the gaps agents named, missing tests, demo polish and new features, and only fixes in the last hour). So
+  a lead whose every slot is busy hears too, before the work runs out; its situation report says why ready tasks wait
+  (a path overlap, quota, a full runner, no free slot). No other follows for `AGFLOW_IDLE_NUDGE_MINUTES`; the event
+  `lead.idle_nudged` records each one. None goes out before the goal is set, while worker dispatch is held (a paused
+  project, the churn guard), or once the deadline has passed, and `AGFLOW_IDLE_NUDGE_MINUTES=0` turns it off. Risk:
+  the lead keeps adding work until the deadline, so the subscriptions stay in use; pause the project, or set a lower
+  worker target, to stop it.
 - **The demo check, `AGFLOW_DEMO_CHECK_EVERY` (5).** Removes: a person trying the product by hand from time to time.
   After every N tasks merged, the hub creates one demo-check task, created by `system`, unless one is still open.
   Without `AGFLOW_AUTO_MERGE=1`, accepted tasks count until something marks a task merged. Its agent starts the

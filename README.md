@@ -268,7 +268,7 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_RECOVERY_SECONDS` | `120` | Reconnect/replay window after hub downtime |
 | `AGFLOW_APPROVAL_MINUTES` | `15` | Time to answer an approval |
 | `AGFLOW_LEAD_REVIEW_MINUTES` | `45` | Least time between two periodic review messages to the lead. One names the work submitted to the lead for longer than this and the work in an attempt for more than 30 minutes, with the minutes and attempts of each; none goes out while no task waits that long |
-| `AGFLOW_IDLE_NUDGE_SECONDS` | `60` | How long the ready tasks that can start must be fewer than the worker slots, busy or free, before the runner lead is told to plan more; see [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
+| `AGFLOW_IDLE_NUDGE_SECONDS` | `60` | How long the dispatchable ready tasks must be fewer than the worker slots, busy or free, before the runner lead is told to plan more; see [docs/deploy-hub.md](docs/deploy-hub.md#unattended-operation) |
 | `AGFLOW_IDLE_NUDGE_MINUTES` | `5` | Least time between two of those messages to the lead; `0` turns them off |
 | `AGFLOW_LIVE_LEAD_GRACE_MINUTES` | `120` | Live lead absence grace |
 | `AGFLOW_QUOTA_WAIT_MINUTES` | `45` | Maximum quota wait before a worker is replaced on another account; a lead is replaced at once |
