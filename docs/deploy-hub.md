@@ -318,12 +318,13 @@ after a change. The details are in the
   runner offers it. Its agent starts at the submitted head, reads the change against `SPEC.md` and the task's
   contract, runs commands of its own and changes nothing. The first line of its submit summary is its verdict, which
   the hub applies as `hub:review`, with no push: accept, accept with follow-ups, which go to the lead, or reject,
-  which sends the findings back to the author's session. The task's later submissions are accepted as before, and so
-  are agflow's own tasks and live chats' submissions. The lead's report names the tasks under review apart from those
-  awaiting its own. Risks:
+  which sends the findings back to the author's session. The task's later submissions, agflow's own tasks and live
+  chats go on as before (live chats' submissions and demo checks go to the lead). The lead's report names the tasks
+  under review apart from those awaiting its own. Risks:
   - The review runs at the strong tier, on the lead's model, so each one draws on the quota the lead uses.
   - A review that does not start within 5 minutes, or gives no verdict within 20, lets the hub accept the task as
-    before, unread; while the project is paused it waits.
+    before, unread. It waits while the project is paused or the hub is down, and both times start again after the
+    resume or the hub's recovery window.
 
 Two more settings are on by default:
 
