@@ -154,6 +154,23 @@ describe('accepting with AGFLOW_AUTO_MERGE', () => {
     expect(findCommand(ctx, sent?.id as string)?.status).toBe('cancelled');
   });
 
+  test('after a failed merge the next try goes to another able runner, and back once it failed there too', () => {
+    const { ctx, held, taskId } = setup();
+    const other = addRunner(ctx, { owner: 'bob' });
+    current(ctx, other);
+    acceptTask(ctx, taskId, 'user:alice');
+    const fail = (runnerId: string): void => {
+      const [merge] = merges(ctx, runnerId);
+      recordResult(ctx, runnerId, { commandId: merge?.id as string, ok: false, error: 'remote: denied' });
+    };
+    // The first merge goes to the author's runner. It fails there, so the tick sends the next try to the other runner.
+    fail(held.runner.id);
+    expect(queueMerges(ctx)).toMatchObject({ runnerId: other, command: { kind: 'merge_task', taskId } });
+    // Once it failed on both, it goes where it failed longest ago.
+    fail(other);
+    expect(queueMerges(ctx)).toMatchObject({ runnerId: held.runner.id, command: { kind: 'merge_task', taskId } });
+  });
+
   test("passes over a runner whose git is not ready, the author's included", () => {
     const { ctx, held, taskId } = setup();
     markGitNotReady(ctx, held.runner.id, 'the last 3 WIP pushes failed: denied');

@@ -278,9 +278,10 @@ after a change. The details are in the
   owner's git credentials, the same ones that push the task branches, so **`main` must accept direct pushes from both
   owners**: no branch protection, required reviews or required status checks on `main`. A conflict sends the task
   back to its author through `rejected`, with the conflicting files as feedback. A merge that fails otherwise leaves
-  the task in `merging`, tells people once, and is tried again every tick; a person who merges it by hand marks it
-  merged. A dependency then counts as done only once merged, and accepted and merging tasks keep their owned paths.
-  Risk: work reaches `main` with no person looking at the merge, and the repository's own CI runs after it landed.
+  the task in `merging`, tells people once, and is tried again every tick, on another runner when one can take it; a
+  person who merges it by hand marks it merged. A dependency then counts as done only once merged, and accepted and
+  merging tasks keep their owned paths. Risk: work reaches `main` with no person looking at the merge, and the
+  repository's own CI runs after it landed.
 - **`AGFLOW_AUTO_ACCEPT=1`.** Removes: the lead reviewing each submission. A runner submission whose check passed is
   accepted the moment it is recorded, as `hub:auto-accept`, with the same events as a lead's accept. The lead is not
   woken for it; its next situation report lists the tasks accepted this way. The check is the `check` command of

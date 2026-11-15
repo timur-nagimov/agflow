@@ -1,8 +1,9 @@
 // Merging inside agflow (AGFLOW_AUTO_MERGE). An accepted task waits in merging, and one merge at a time goes to a
 // runner as merge_task: the runner merges the accepted head into main in its vault and pushes main with its owner's
 // git credentials, the ones that push task branches. The author's runner merges when it can, else any online runner
-// whose git is ready and whose protocol knows merge_task. A merge_task left with a runner that went offline, or for a
-// task no longer merging, is cancelled, and the next one goes out. tasks.ts records what a merge gave.
+// whose git is ready and whose protocol knows merge_task; after a merge failed on a runner, the next try goes to
+// another one when it can. A merge_task left with a runner that went offline, or for a task no longer merging, is
+// cancelled, and the next one goes out. tasks.ts records what a merge gave.
 import { COMMAND_MIN_PROTOCOL, CommitShaSchema, type Task, isTaskBranch } from '@agflow/core';
 import { type CommandRow, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
@@ -46,7 +47,24 @@ function mergingTasks(ctx: HubContext): Task[] {
   return rows.map((row) => rowToTask(ctx, row));
 }
 
-/** Where a task's merge goes: the runner of its last attempt, when it can take merge_task now, else the first that can. */
+/** The runners a merge of the task failed on since it last began merging, each with its newest task.merge_failed. */
+function mergeFailures(ctx: HubContext, taskId: string): Map<string, number> {
+  const rows = ctx.db
+    .query(
+      `SELECT json_extract(data, '$.runnerId') AS runner_id, MAX(id) AS last FROM events
+       WHERE subject = $taskId AND type = 'task.merge_failed'
+         AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE subject = $taskId AND type = 'task.merging')
+       GROUP BY runner_id`,
+    )
+    .all({ taskId }) as { runner_id: string; last: number }[];
+  return new Map(rows.map((row) => [row.runner_id, row.last]));
+}
+
+/**
+ * Where a task's merge goes, among the runners that can take merge_task now: one where no merge of the task failed
+ * since it began merging, the runner of its last attempt first; else the one where it failed longest ago. So a merge
+ * that keeps failing on one runner moves on to the next.
+ */
 function mergeRunner(ctx: HubContext, taskId: string): string | null {
   const able = findRunnerRows(ctx).filter(
     (row) => row.state === 'online' && row.protocol >= COMMAND_MIN_PROTOCOL.merge_task && runnerInfo(row).git.ready,
@@ -56,7 +74,10 @@ function mergeRunner(ctx: HubContext, taskId: string): string | null {
       'SELECT runner_id FROM attempts WHERE task_id = $taskId AND runner_id IS NOT NULL ORDER BY number DESC LIMIT 1',
     )
     .get({ taskId }) as { runner_id: string } | null;
-  return (able.find((row) => row.id === last?.runner_id) ?? able[0])?.id ?? null;
+  const failures = mergeFailures(ctx, taskId);
+  // Event ids start at 1, so a runner with no failure comes before every one with a failure.
+  const rank = (runnerId: string): number => failures.get(runnerId) ?? (runnerId === last?.runner_id ? -1 : 0);
+  return able.sort((a, b) => rank(a.id) - rank(b.id))[0]?.id ?? null;
 }
 
 /**
