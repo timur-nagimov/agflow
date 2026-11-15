@@ -123,10 +123,20 @@ export function recordQuotaReports(
 const accountKey = (owner: string, vendor: Vendor, accountId: string): string =>
   JSON.stringify([owner, vendor, accountId]);
 
+/** The reading of an account no runner has reported yet: older than any report, so the first one replaces it. */
+const UNREPORTED: VendorQuota = {
+  state: 'unknown',
+  resetsAt: null,
+  windows: { fiveHour: null, weekly: null },
+  paidUsage: 'unknown',
+  updatedAt: 0,
+};
+
 /**
  * The accounts as placement reads them (core's AccountView): each with its vendor's starting, running and quota_wait
  * attempts on the owner's runners that report being logged in to it, which core's probing start for an unknown
- * reset waits on.
+ * reset waits on, and which core's placement spreads over. Every account a runner names is there: one with no report
+ * yet has the unknown reading (UNREPORTED), so its attempts count too, and the scheduler counts its starts in a tick.
  */
 export function accountViews(ctx: HubContext): AccountView[] {
   const open = ctx.db
@@ -144,24 +154,23 @@ export function accountViews(ctx: HubContext): AccountView[] {
     const key = accountKey(row.owner, row.vendor, accountId);
     counts.set(key, (counts.get(key) ?? 0) + row.n);
   }
-  return listAccounts(ctx).map((account) => ({
-    ...account,
-    openAttempts: counts.get(accountKey(account.owner, account.vendor, account.accountId)) ?? 0,
-  }));
+  const views = new Map(
+    listAccounts(ctx).map((account) => [accountKey(account.owner, account.vendor, account.accountId), account]),
+  );
+  for (const row of findRunnerRows(ctx)) {
+    for (const { vendor, accountId } of runnerInfo(row).vendors) {
+      if (accountId === null) continue;
+      const key = accountKey(row.owner, vendor, accountId);
+      if (views.has(key)) continue;
+      views.set(key, { owner: row.owner, vendor, accountId, quota: UNREPORTED, ownerAway: false });
+    }
+  }
+  return [...views].map(([key, account]) => ({ ...account, openAttempts: counts.get(key) ?? 0 }));
 }
 
 // ---------------------------------------------------------------------------
 // Owner away (design 6.10)
 // ---------------------------------------------------------------------------
-
-/** The reading of an account no runner has reported yet: older than any report, so the first one replaces it. */
-const UNREPORTED: VendorQuota = {
-  state: 'unknown',
-  resetsAt: null,
-  windows: { fiveHour: null, weekly: null },
-  paidUsage: 'unknown',
-  updatedAt: 0,
-};
 
 export interface OwnerAwayInput {
   owner: string;

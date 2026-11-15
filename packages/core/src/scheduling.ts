@@ -138,7 +138,7 @@ export interface RefusedPlacement {
   refusal: PlacementRefusal;
 }
 
-/** A vendor usable on a runner, with its account when the hub has a quota report for it. */
+/** A vendor usable on a runner, with its account when the snapshot has it (the hub's has all that runners name). */
 export interface UsableVendor {
   slot: VendorSlot;
   account: AccountView | null;
@@ -182,7 +182,7 @@ export function candidateRunners(
   return { candidates, refused };
 }
 
-/** The owner's account a vendor on the runner draws on, when the runner names one and the hub has a report for it. */
+/** The owner's account a vendor on the runner draws on, when the runner names one and the snapshot has it. */
 function accountOf(snapshot: PlacementSnapshot, runner: RunnerSlot, slot: VendorSlot): AccountView | null {
   if (slot.accountId === null) return null;
   const matches = (account: AccountView) =>
@@ -525,7 +525,7 @@ function accountUse(snapshot: PlacementSnapshot, account: AccountView | null): n
 /**
  * Options in placement order (design 6.6, step 5): not on the runner to avoid; then on the account (owner and vendor)
  * with the fewest open attempts, then on the least used one (accountUse); then in runner order (orderRunners), and
- * Claude before Codex on one runner. An option with no account report has no open attempts. A new array.
+ * Claude before Codex on one runner. An option without an account in the snapshot has no open attempts. A new array.
  */
 function orderOptions(snapshot: PlacementSnapshot, found: readonly Option[], avoid: string | null): Option[] {
   const runners = orderRunners([...new Set(found.map((option) => option.runner))], avoid);

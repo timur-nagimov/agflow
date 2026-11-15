@@ -254,6 +254,19 @@ describe('placement over accounts', () => {
     expect(placed.sort()).toEqual(['alice claude', 'alice codex', 'bob claude', 'bob codex']);
   });
 
+  test('a tick spreads its workers over all four accounts when only the Codex ones have reported', () => {
+    const { ctx } = workersOnly();
+    const alices = addRunner(ctx, { vendors: ['claude', 'codex'] });
+    const bobs = addRunner(ctx, { owner: 'bob', vendors: ['claude', 'codex'] });
+    // Claude's usage call gave nothing, so the Claude accounts have no report: each start on them still counts.
+    report(ctx, 'alice', alices, 'codex');
+    report(ctx, 'bob', bobs, 'codex');
+    tasks(ctx, { title: 'One' }, { title: 'Two' }, { title: 'Three' }, { title: 'Four' });
+    const owners: Record<string, string> = { [alices]: 'alice', [bobs]: 'bob' };
+    const placed = runTick(ctx).started.map((attempt) => `${owners[attempt.runnerId as string]} ${attempt.vendor}`);
+    expect(placed.sort()).toEqual(['alice claude', 'alice codex', 'bob claude', 'bob codex']);
+  });
+
   test('a hinted task waits a minute for its vendor, then starts on the other', () => {
     const { ctx, clock } = workersOnly();
     const runnerId = addRunner(ctx, { vendors: ['claude', 'codex'] });
