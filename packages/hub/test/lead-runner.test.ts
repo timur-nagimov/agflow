@@ -15,7 +15,7 @@ import { setPaused } from '../src/project';
 import { markVendorNotReady, setLimited } from '../src/runners';
 import { runTick } from '../src/scheduler';
 import { startHub } from '../src/server';
-import { getTask } from '../src/task-store';
+import { getTask, writeTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
 import { type TestClock, addAgent, addRunner, addRunnerAttempt, createTestContext, markHubAlive, newTask } from './helpers';
 
@@ -38,8 +38,8 @@ function tickLead(ctx: HubContext): Attempt {
 }
 
 /** A runner lead on R-1 (one Claude runner), running. */
-function runningLead() {
-  const { ctx, clock } = createTestContext();
+function runningLead(overrides: Partial<HubContext['config']> = {}) {
+  const { ctx, clock } = createTestContext(overrides);
   const runnerId = addRunner(ctx);
   const lead = tickLead(ctx);
   updateAttempt(ctx, lead.id, { status: 'running', phase: 'idle' });
@@ -607,35 +607,55 @@ describe('the periodic review', () => {
   const reviews = (ctx: HubContext) =>
     listMessages(ctx, { target: 'lead' }).filter((message) => message.from === 'system');
 
-  test('a review message goes to the lead every leadReviewMs while a task is held or submitted', () => {
-    const { ctx, clock } = runningLead();
+  test('names only the work that waits long: submitted past leadReviewMs, or in work past 30 minutes', () => {
+    const { ctx, clock } = runningLead({ leadReviewMs: 10 * MINUTE });
     // Nothing held: no review, and no clock runs.
     expect(periodicLeadReview(ctx)).toBeNull();
     expect(getHubState(ctx).lastLeadReviewAt).toBeNull();
     const held = addRunnerAttempt(ctx);
+    // The clock starts when work is held.
+    expect(periodicLeadReview(ctx)).toBeNull();
+    expect(getHubState(ctx).lastLeadReviewAt).toBe(ctx.now());
+    clock.advance(5 * MINUTE);
     const working = addRunnerAttempt(ctx);
     ctx.db.query("UPDATE tasks SET status = 'working' WHERE id = $id").run({ id: working.task.id });
     const submitted = addRunnerAttempt(ctx);
-    ctx.db.query("UPDATE tasks SET status = 'submitted' WHERE id = $id").run({ id: submitted.task.id });
-    // The clock starts when work is held; the first review comes leadReviewMs later.
+    const submission = {
+      summary: 'Done.',
+      evidence: [],
+      branch: submitted.task.branch,
+      headSha: null,
+      submittedAt: ctx.now(),
+      by: submitted.agent.id,
+      attemptId: submitted.attempt.id,
+      submissionId: null,
+    };
+    writeTask(ctx, submitted.task.id, { status: 'submitted', submission });
+    // Due at 10 minutes, but nothing has waited long: no message, and the review goes out once something has.
+    clock.advance(5 * MINUTE);
     expect(periodicLeadReview(ctx)).toBeNull();
+    clock.advance(6 * MINUTE);
+    const first = periodicLeadReview(ctx);
+    expect(first).toMatchObject({ from: 'system', to: 'lead' });
+    expect(first?.body).toBe(
+      `Periodic review (at most every 10 min) of work that waits long: ${submitted.task.id} [submitted] for 11 min, ` +
+        '1 attempt(s). Review what is submitted, and check that work held this long is moving.',
+    );
     expect(getHubState(ctx).lastLeadReviewAt).toBe(ctx.now());
-    clock.advance(ctx.config.leadReviewMs - 1);
-    expect(periodicLeadReview(ctx)).toBeNull();
-    clock.advance(1);
-    const review = periodicLeadReview(ctx);
-    expect(review).toMatchObject({ from: 'system', to: 'lead' });
-    expect(review?.body).toContain(`${held.task.id} [claimed]`);
-    expect(review?.body).toContain(`${working.task.id} [working]`);
-    expect(review?.body).toContain(`${submitted.task.id} [submitted]`);
-    expect(getHubState(ctx).lastLeadReviewAt).toBe(ctx.now());
+    clock.advance(5 * MINUTE);
     expect(periodicLeadReview(ctx)).toBeNull();
     // The tick runs it; the runners stay connected meanwhile.
-    const later = ctx.now() + 2 * ctx.config.leadReviewMs;
+    const later = ctx.now() + 60 * MINUTE;
     ctx.db.query("UPDATE attempts SET lease_expires_at = $later WHERE status != 'ended'").run({ later });
-    clock.advance(ctx.config.leadReviewMs);
+    clock.advance(10 * MINUTE);
     markHubAlive(ctx);
     expect(runTick(ctx).reconciled?.leadReview).toBe(true);
+    const second = reviews(ctx).find((message) => message.id !== first?.id)?.body;
+    expect(second).toContain(
+      `: ${held.task.id} [claimed] for 31 min, 1 attempt(s); ${submitted.task.id} [submitted] for 26 min, ` +
+        '1 attempt(s).',
+    );
+    expect(second).not.toContain(working.task.id);
     expect(reviews(ctx)).toHaveLength(2);
     // Once nothing is held or submitted, the clock stops.
     ctx.db.run("UPDATE tasks SET status = 'done'");
@@ -686,6 +706,10 @@ describe('rotation', () => {
     expect(stop?.reason).toContain('write_handoff');
     // One clause, which the runner's handoff prompt quotes.
     expect(stop?.reason).toStartWith('the lead rotates after 3 wake-ups;');
+    // The next lead's brief quotes only the start of the handoff.
+    expect(stop?.reason).toContain(
+      "the next steps and what is still open first, since a fresh lead's brief shows only its start",
+    );
     expect(stop?.reason.endsWith('.')).toBe(false);
     const [rotated] = listEvents(ctx.db).filter((event) => event.type === 'lead.rotated');
     expect(rotated?.data).toMatchObject({ attemptId: lead.id, agentId: lead.agentId, runnerId });
