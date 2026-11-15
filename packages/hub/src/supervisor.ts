@@ -14,6 +14,7 @@ import { appendAttemptLog, getAttempt } from './attempt-store';
 import { factsAreFresh, hasLiveProcess, requestStop } from './attempts';
 import { type HubContext, tx } from './context';
 import type { Emit } from './events';
+import { parkReason, waitsForMain } from './main-check';
 import { insertMessage } from './messages';
 import { markVendorNotReady, setDegraded } from './runners';
 import { pendingSubmissionOf } from './submission-store';
@@ -150,7 +151,12 @@ function judgeOne(ctx: HubContext, id: string): Judgement {
   }
   // The facts it fired on were judged already: confirming needs a heartbeat after them.
   if (factsAt <= suspicion.factsAt) return null;
-  requestStop(ctx, { attemptId: id, cause: verdict.cause, reason: verdict.reason, by: 'system' });
+  // An attempt that waits for main is parked instead: replaced, which counts nothing (main-check.ts, waitsForMain).
+  const stop =
+    attempt.taskId !== null && waitsForMain(ctx, attempt)
+      ? { cause: 'replace' as const, reason: parkReason(ctx, attempt.taskId) }
+      : verdict;
+  requestStop(ctx, { attemptId: id, cause: stop.cause, reason: stop.reason, by: 'system' });
   pending.delete(id);
   return 'stopped';
 }
@@ -158,9 +164,10 @@ function judgeOne(ctx: HubContext, id: string): Judgement {
 /**
  * Judges every running runner attempt by design 6.8's rules, each in its own transaction, from fresh facts only:
  * ages are as of their heartbeat and never extrapolated. A rule that fires is suspected; when a later fresh heartbeat
- * still fires one, the attempt is stopped with that rule's cause and its flags (agent.stalled). No decision is made
- * while a stop is recorded or a submission is pending, nor for a lead outside a turn (judgeStall). Vendor errors
- * past vendorErrorReplaceMs replace the attempt at once. The tick runs it.
+ * still fires one, the attempt is stopped with that rule's cause and its flags (agent.stalled), or, while it waits for
+ * a failing main (waitsForMain), parked: replaced, with nothing counted. No decision is made while a stop is recorded
+ * or a submission is pending, nor for a lead outside a turn (judgeStall). Vendor errors past vendorErrorReplaceMs
+ * replace the attempt at once. The tick runs it.
  */
 export function judgeStalls(ctx: HubContext): StallDecisions {
   const decisions: StallDecisions = { suspected: [], stopped: [] };

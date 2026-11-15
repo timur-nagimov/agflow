@@ -43,7 +43,7 @@ import { ensureDemoCheck } from './demo-check';
 import { currentGoalVersion } from './goal';
 import { churnPaused, getHubState, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
-import { queueMainCheck, retryFixTask } from './main-check';
+import { parkedTasks, queueMainCheck, retryFixTask } from './main-check';
 import { failedMerges, queueMerges } from './merges';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
@@ -135,21 +135,22 @@ function candidateOf(ctx: HubContext, task: Task, columns: { holdUntil: number |
 }
 
 /**
- * The ready set in dispatch order (design 6.6, step 3): by priority, then age. Each ready task left out goes into
- * waiting, when given, with why.
+ * The ready set in dispatch order (design 6.6, step 3): by priority, then age. A task parked while main's check fails
+ * waits too (parkedTasks). Each ready task left out goes into waiting, when given, with why.
  */
 export function readySet(ctx: HubContext, waiting?: Map<string, string>): TaskCandidate[] {
   const tasks = listTasks(ctx);
   const columns = dispatchColumns(ctx);
   const pathHolders = tasks.filter((task) => isPathHolder(task, ctx.config.autoMerge === true));
   const context = { now: ctx.now(), maxAttempts: ctx.config.maxAttempts, pathHolders };
+  const parked = parkedTasks(ctx);
   const ready = tasks.flatMap((task) => {
     const stored = columns.get(task.id);
     return task.status === 'ready' && stored ? [candidateOf(ctx, task, stored)] : [];
   });
   return orderReady(
     ready.filter((candidate) => {
-      const why = whyNotDispatchable(candidate, context);
+      const why = whyNotDispatchable(candidate, context) ?? parked.get(candidate.id) ?? null;
       if (why !== null) waiting?.set(candidate.id, why);
       return why === null;
     }),

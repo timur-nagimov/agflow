@@ -38,7 +38,7 @@ import { type Emit, listEvents } from './events';
 import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { getHubState, updateHubState } from './hub-state';
-import { queueMainCheck } from './main-check';
+import { parkReason, queueMainCheck, waitsForMain } from './main-check';
 import { MERGE_RETRY_MAX_MS, MERGE_RETRY_MS, failedMerges, mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
@@ -807,6 +807,11 @@ export function blockTask(
     const task = getTask(ctx, id);
     const attempt = requireHolder(ctx, task, agent, 'claim', token);
     if (attempt && attempt.runnerId !== null) {
+      // An attempt blocked by a failing main is parked: replaced, with a handoff note, telling nobody (waitsForMain).
+      if (kind === 'agent' && waitsForMain(ctx, attempt)) {
+        requestStop(ctx, { attemptId: attempt.id, cause: 'replace', reason: parkReason(ctx, id), by: 'system' });
+        return getTask(ctx, id);
+      }
       // The blocked and impossible rows: blocked at once, and the agent stopped without a handoff turn (design 6.4).
       const cause = kind === 'impossible' ? 'impossible' : 'blocked';
       requestStop(ctx, { attemptId: attempt.id, cause, reason, by: `agent:${agent.id}` });

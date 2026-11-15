@@ -5,6 +5,7 @@
 // merge queue's path, and a failure gets a fix task at the top priority at once. What the checks gave is read from
 // their main.checked events; no table holds it.
 import {
+  type Attempt,
   COMMAND_MIN_PROTOCOL,
   FullShaSchema,
   MainCheckResultSchema,
@@ -13,6 +14,7 @@ import {
   NewTaskSchema,
   type SubmissionCheck,
   type Task,
+  minutesUntil,
   quoteLines,
 } from '@agflow/core';
 import { type CommandResult, type CommandRow, RESULT_HANDLERS, enqueueCommand } from './commands';
@@ -203,8 +205,8 @@ export function mainHealth(ctx: HubContext): MainHealth | null {
 
 /**
  * What an agent whose submission failed its check hears while main's own check fails and a fix task is open: that task
- * fixes main, so the agent keeps its change focused and submits again once it is merged. Empty otherwise, and for the
- * fix task itself.
+ * fixes main, and when the failure is not from its change, it calls declare_blocked, which parks its task until main
+ * passes (waitsForMain). Empty otherwise, and for the fix task itself.
  */
 export function mainFailingHint(ctx: HubContext, taskId: string): string {
   const health = mainHealth(ctx);
@@ -213,8 +215,66 @@ export function mainFailingHint(ctx: HubContext, taskId: string): string {
   const fix = health.fixTask;
   return (
     `\n${main}'s own check has failed since ${short(health.since)}; ${fix} fixes it. If the failure is not from your ` +
-    `change, do not fix it in your branch: keep your change focused, and submit again after ${fix} is merged (the ` +
-    `runner merges the newest ${main} before each check).`
+    `change, do not fix it in your branch: call declare_blocked with the reason "waiting for ${fix}". agflow then ` +
+    `parks your task and starts it again once ${main}'s check passes.`
+  );
+}
+
+/** How long a task parked while main's check fails stays out of dispatch at most, from the end of its attempt. */
+export const PARK_MAX_MS = 45 * 60_000;
+
+/**
+ * Whether the attempt waits for main (AGFLOW_AUTO_MERGE): main's check fails, the attempt's task is not the fix task,
+ * and the attempt's newest submission failed its check, which runs with main merged in. Such an attempt is parked
+ * rather than blocked or stopped as stalled (tasks.ts blockTask, supervisor.ts): the hub replaces it, which counts
+ * nothing and asks for a handoff note, tells nobody, and its task waits out of dispatch until main passes
+ * (parkedTasks).
+ */
+export function waitsForMain(ctx: HubContext, attempt: Pick<Attempt, 'id' | 'taskId'>): boolean {
+  const health = mainHealth(ctx);
+  if (health?.status !== 'failed' || attempt.taskId === null || health.fixTask === attempt.taskId) return false;
+  const newest = ctx.db
+    .query(
+      `SELECT status, error FROM submissions WHERE attempt_id = $attemptId
+       ORDER BY requested_at DESC, rowid DESC LIMIT 1`,
+    )
+    .get({ attemptId: attempt.id }) as { status: string; error: string | null } | null;
+  // A refusal's error is its code, then the runner's detail after a colon (submissions.ts).
+  return newest?.status === 'failed' && /^check_failed(:|$)/.test(newest.error ?? '');
+}
+
+/** The reason of the stop that parks a task waiting for main, which its agent reads in the handoff prompt. */
+export function parkReason(ctx: HubContext, taskId: string): string {
+  const main = ctx.config.mainBranch;
+  const health = mainHealth(ctx);
+  const fix = health?.status === 'failed' && health.fixTask !== null ? ` and ${health.fixTask} fixes it` : '';
+  return `${main}'s own check fails${fix}, so agflow parks ${taskId} until it passes, then starts ${taskId} again`;
+}
+
+/**
+ * Why each parked task waits, while main's check fails: a ready task whose newest attempt the hub replaced because it
+ * waited for main, within PARK_MAX_MS of that attempt's end. People and the lead replace an agent as themselves, so a
+ * replace by system is a park. Dispatch leaves these tasks alone (scheduler.ts readySet); once main passes, or after
+ * PARK_MAX_MS, they start as any ready task does.
+ */
+export function parkedTasks(ctx: HubContext): Map<string, string> {
+  const health = mainHealth(ctx);
+  if (health?.status !== 'failed') return new Map();
+  const rows = ctx.db
+    .query(
+      `SELECT attempts.task_id AS taskId, attempts.ended_at AS endedAt FROM attempts
+       JOIN tasks ON tasks.id = attempts.task_id
+       WHERE tasks.status = 'ready' AND attempts.end_reason = 'replaced' AND attempts.ended_at > $since
+         AND json_extract(attempts.stop_requested, '$.cause') = 'replace'
+         AND json_extract(attempts.stop_requested, '$.by') = 'system'
+         AND attempts.number = (SELECT MAX(number) FROM attempts AS newer WHERE newer.task_id = attempts.task_id)`,
+    )
+    .all({ since: ctx.now() - PARK_MAX_MS }) as { taskId: string; endedAt: number }[];
+  const main = ctx.config.mainBranch;
+  const fix = health.fixTask === null ? '' : ` (${health.fixTask} fixes it)`;
+  const left = (endedAt: number) => minutesUntil(endedAt + PARK_MAX_MS, ctx.now());
+  return new Map(
+    rows.map((row) => [row.taskId, `it waits for ${main}'s check to pass${fix}, up to ${left(row.endedAt)} more min`]),
   );
 }
 
@@ -327,8 +387,9 @@ export function retryFixTask(ctx: HubContext): Task | null {
 }
 
 /**
- * main's check passes again: people hear of it, and the failure's fix task, found before the pass was recorded (after
- * it, openFixTask finds none), is cancelled while it was never claimed: ready or blocked, with no attempt.
+ * main's check passes again: people and the lead hear of it, and the failure's fix task, found before the pass was
+ * recorded (after it, openFixTask finds none), is cancelled while it was never claimed: ready or blocked, with no
+ * attempt. The tasks parked while it failed start again (parkedTasks).
  */
 function mainPassesAgain(ctx: HubContext, emit: Emit, sha: string, since: string, fixTask: string | null): void {
   const main = ctx.config.mainBranch;
@@ -336,14 +397,12 @@ function mainPassesAgain(ctx: HubContext, emit: Emit, sha: string, since: string
   const unclaimed =
     fix !== null && fix.currentAttempt === null && (fix.status === 'ready' || fix.status === 'blocked');
   if (unclaimed) cancelTask(ctx, fix.id, `${main}'s check passes again at ${short(sha)}: no fix is needed.`, 'system');
-  insertMessage(ctx, emit, {
-    from: 'system',
-    to: 'humans',
-    taskId: unclaimed ? fix.id : undefined,
-    body:
-      `${main}'s check passes again at ${short(sha)}; it had failed since ${short(since)}.` +
-      (unclaimed ? ` agflow cancelled ${fix.id}, which nobody had started.` : ''),
-  });
+  const body =
+    `${main}'s check passes again at ${short(sha)}; it had failed since ${short(since)}.` +
+    (unclaimed ? ` agflow cancelled ${fix.id}, which nobody had started.` : '');
+  for (const to of ['humans', 'lead']) {
+    insertMessage(ctx, emit, { from: 'system', to, taskId: unclaimed ? fix.id : undefined, body });
+  }
 }
 
 /**
