@@ -10,7 +10,15 @@ import { upsertAccountQuota } from '../src/quota';
 import { resetProject } from '../src/reset';
 import { nudgeIdleLead, runTick, workerLoad } from '../src/scheduler';
 import { createTasks } from '../src/tasks';
-import { addAgent, addRunner, addRunnerLead, createTestContext, markHubAlive, newTask } from './helpers';
+import {
+  addAgent,
+  addRunner,
+  addRunnerAttempt,
+  addRunnerLead,
+  createTestContext,
+  markHubAlive,
+  newTask,
+} from './helpers';
 
 const MINUTE = 60_000;
 
@@ -19,7 +27,7 @@ const setGoal = (ctx: HubContext) => updateGoal(ctx, { text: 'Ship the parser.',
 
 /**
  * A runner lead holding the seat on R-1, whose one slot its runner worker fills (a lead takes no slot), and R-2 with
- * two free slots: two free worker slots and no ready task, with a goal set.
+ * two free slots: three worker slots, one running and two free, and no ready task, with a goal set.
  */
 function idleProject(overrides: Partial<HubConfig> = {}) {
   const { ctx, clock } = createTestContext(overrides);
@@ -32,7 +40,7 @@ function idleProject(overrides: Partial<HubConfig> = {}) {
 
 /** The idle nudges among the messages to the lead. */
 const nudgeMessages = (ctx: HubContext) =>
-  listMessages(ctx, { target: 'lead' }).filter((message) => message.body.includes('worker slot(s) are free'));
+  listMessages(ctx, { target: 'lead' }).filter((message) => message.body.includes('ready task(s) can start now'));
 
 /** Ready tasks the scheduler may start, by the lead. */
 function ready(ctx: HubContext, count: number): void {
@@ -46,7 +54,7 @@ function ready(ctx: HubContext, count: number): void {
 const nudges = (ctx: HubContext) => listEvents(ctx.db).filter((event) => event.type === 'lead.idle_nudged');
 
 describe('the idle nudge', () => {
-  test('fires once free slots have outnumbered the dispatchable tasks for idleNudgeMs, with the numbers in it', () => {
+  test('fires once the startable tasks have been fewer than the worker slots for idleNudgeMs, with the numbers', () => {
     const { ctx, clock } = idleProject();
     tx(ctx, (emit) =>
       upsertAccountQuota(ctx, emit, {
@@ -77,14 +85,15 @@ describe('the idle nudge', () => {
     expect(message).toMatchObject({ from: 'system', to: 'lead' });
     expect(message?.body).toStartWith(
       [
-        '2 worker slot(s) are free, more than the 0 ready task(s) that can start now.',
+        'Only 0 ready task(s) can start now, fewer than the 3 worker slot(s) (1 running, 2 free).',
         'Workers: 1 running (target 4, cap 4); 2 free worker slot(s).',
         'Ready tasks: 0, 0 of them dispatchable now. Blocked on dependencies: 0. Submitted: 0. Accepted, not merged: 0.',
         'Quota:',
         '- alice claude: ok, 5-hour 40%, weekly 12%, resets in 2 h 59 min',
         'Deadline: 2026-10-26 17:20 UTC, 5 h 19 min left.',
         '',
-        'Plan the next batch now, so that ready, independent tasks are at least twice the free worker slots.',
+        'Plan the next batch now, so that ready, independent tasks are at least as many as the worker slots, running ' +
+          'plus free.',
       ].join('\n'),
     );
     for (const part of [
@@ -92,7 +101,9 @@ describe('the idle nudge', () => {
       'Tasks blocked on dependencies count as planned: while they wait for work in progress, such as the skeleton, add ' +
         'only tasks that need none of it.',
       'Work through SPEC.md (or the goal) until every requirement is covered.',
-      'defects found by the latest demo check or reported by agents, missing tests, demo polish, then new features a jury would notice',
+      // The lead guide's order (brief.ts).
+      'Once it is, plan in this order: requirements docs/STATUS.md does not show working, defects from the latest ' +
+        'demo check and gaps agents named, missing tests, demo polish, then new features a jury would notice.',
       'In the last hour before the deadline, plan only fixes.',
     ]) {
       expect(message?.body).toContain(part);
@@ -128,23 +139,47 @@ describe('the idle nudge', () => {
     expect(nudges(ctx)).toHaveLength(2);
   });
 
-  test('none while the dispatchable ready tasks cover the free slots; the clock starts once they do not', () => {
+  test('none while the startable tasks cover the worker slots, busy or free; the clock starts once they do not', () => {
     const { ctx, clock } = idleProject();
-    ready(ctx, 2);
-    expect(workerLoad(ctx)).toMatchObject({ freeSlots: 2, ready: 2, dispatchable: 2 });
+    ready(ctx, 3);
+    expect(workerLoad(ctx)).toMatchObject({ running: 1, freeSlots: 2, ready: 3, dispatchable: 3 });
     expect(nudgeIdleLead(ctx)).toBeNull();
     clock.advance(ctx.config.idleNudgeIntervalMs);
     expect(nudgeIdleLead(ctx)).toBeNull();
-    // A third worker would fit no runner: the free slots of the runners bound the cap.
+    // A fourth worker would fit no runner: the free slots of the runners bound the cap.
     ready(ctx, 1);
-    expect(workerLoad(ctx)).toMatchObject({ freeSlots: 2, dispatchable: 3 });
+    expect(workerLoad(ctx)).toMatchObject({ freeSlots: 2, dispatchable: 4 });
     expect(nudgeIdleLead(ctx)).toBeNull();
-    // With one of them cancelled the slots outnumber the tasks again, and the clock starts from there.
+    // With two of them cancelled the slots outnumber the tasks again, and the clock starts from there.
     ctx.db.run("UPDATE tasks SET status = 'cancelled' WHERE id IN ('T-2', 'T-3')");
-    expect(workerLoad(ctx)).toMatchObject({ freeSlots: 2, dispatchable: 1 });
+    expect(workerLoad(ctx)).toMatchObject({ freeSlots: 2, dispatchable: 2 });
     expect(nudgeIdleLead(ctx)).toBeNull();
     clock.advance(ctx.config.idleNudgeMs);
-    expect(nudgeIdleLead(ctx)?.body).toStartWith('2 worker slot(s) are free, more than the 1 ready task(s)');
+    expect(nudgeIdleLead(ctx)?.body).toStartWith(
+      'Only 2 ready task(s) can start now, fewer than the 3 worker slot(s) (1 running, 2 free).',
+    );
+  });
+
+  test('fires at full load too, while the ready tasks are fewer than the busy slots, and not once they suffice', () => {
+    const { ctx, clock } = idleProject();
+    // Two more runner workers fill R-2: every slot is busy, and nothing is ready to follow them.
+    addRunnerAttempt(ctx, { runnerId: 'R-2' });
+    addRunnerAttempt(ctx, { runnerId: 'R-2' });
+    expect(workerLoad(ctx)).toMatchObject({ running: 3, freeSlots: 0, dispatchable: 0 });
+    expect(nudgeIdleLead(ctx)).toBeNull();
+    clock.advance(ctx.config.idleNudgeMs);
+    expect(nudgeIdleLead(ctx)?.body).toStartWith(
+      'Only 0 ready task(s) can start now, fewer than the 3 worker slot(s) (3 running, 0 free).\n' +
+        'Workers: 3 running (target 4, cap 4); 0 free worker slot(s).',
+    );
+    // A ready task for every busy slot is enough: the clock stops, and nothing more goes out.
+    ready(ctx, 3);
+    expect(workerLoad(ctx)).toMatchObject({ running: 3, freeSlots: 0, dispatchable: 3 });
+    for (let tick = 0; tick < 3; tick++) {
+      clock.advance(ctx.config.idleNudgeIntervalMs);
+      expect(nudgeIdleLead(ctx)).toBeNull();
+    }
+    expect(nudges(ctx)).toHaveLength(1);
   });
 
   test('none with the duty off, AGFLOW_IDLE_NUDGE_MINUTES 0', () => {
