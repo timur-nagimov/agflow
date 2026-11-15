@@ -496,11 +496,13 @@ export interface ProjectResetResult {
   goalVersion: number;
 }
 
-/** What GET /api/operator/project answers: the project, and the branch its attempts start from. */
+/** What GET /api/operator/project answers: the project, the branch its attempts start from and its task count. */
 export interface OperatorProject {
   project: Project;
   /** AGFLOW_MAIN_BRANCH, the branch agflow start puts the seed on. */
   mainBranch: string;
+  /** The project's tasks, in any status: agflow start asks before it replaces a project that has any. */
+  tasks: number;
 }
 
 /** POST /api/tasks/:id/fetch-grant: why the task needs data from outside; its event and the assignee's message quote it. */

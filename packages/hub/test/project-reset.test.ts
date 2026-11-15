@@ -258,11 +258,14 @@ describe('the project reset', () => {
     expect(reset.json).toMatchObject({ archive: null, epoch: 2, goalVersion: 1 });
     expect(hub.ctx.db.query('SELECT deadline_at FROM project').get()).toEqual({ deadline_at: null });
     expect(hub.ctx.db.query("SELECT type FROM events WHERE type = 'project.deadline_set'").all()).toEqual([]);
-    // What agflow start reads first: the branch the seed goes on.
+    // What agflow start reads first: the branch the seed goes on, and whether the project has tasks to lose.
     expect((await hub.call('GET', '/api/operator/project', op())).json).toMatchObject({
       project: { name: 'afisha', repo: 'https://github.com/acme/afisha', paused: false },
       mainBranch: 'main',
+      tasks: 0,
     });
+    createTasks(hub.ctx, [newTask(), newTask()], 'user:alice');
+    expect((await hub.call('GET', '/api/operator/project', op())).json.tasks).toBe(2);
   });
 
   test('refuses a wrong token, a deadline without its offset and a multi-line name, changing nothing', async () => {

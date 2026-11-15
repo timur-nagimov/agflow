@@ -184,7 +184,7 @@ for example `openssl rand -hex 32`) and `AGFLOW_OPERATOR_USER` (an allowed login
 | `POST /api/operator/tasks/:id/merged` `{ "sha"?: string }` | marks an accepted task merged |
 | `POST /api/operator/tasks/:id/unblock` `{ "note"?: string }` | unblocks a task |
 | `POST /api/operator/messages` (same body as `POST /api/messages`) | sends a message as the operator's person |
-| `GET /api/operator/project` | answers the project and the hub's main branch (`AGFLOW_MAIN_BRANCH`), where `agflow start` puts the seed |
+| `GET /api/operator/project` | answers the project, its number of tasks, and the hub's main branch (`AGFLOW_MAIN_BRANCH`), where `agflow start` puts the seed |
 | `POST /api/operator/project/reset` `{ "name", "repo", "deadline": ISO 8601 or null, "goal", "rules": string[] }` | replaces the project with a new one ([Start a new project](#start-a-new-project)) |
 
 Call them on the server (`curl http://127.0.0.1:8787/...`), so the token never leaves it; `agflow start` is the one
@@ -202,7 +202,8 @@ it is marked merged, so the hub releases dependent tasks after their dependencie
 project needs no ssh; the README's [Start a project](../README.md#start-a-project) shows the command. Store the operator
 token on that Mac once, with `agflow operator-token set < token-file` (the Keychain item `agflow-operator`). The token
 then lives on a laptop where agents run: whoever reads it can replace the project. Prefer the Keychain to
-`~/.agflow/operator-token`, which any process of the owner's can read.
+`~/.agflow/operator-token`, which any process of the owner's can read. When the hub's project has tasks,
+`agflow start` asks before it seeds or resets anything, and without a terminal it refuses unless given `--yes`.
 
 The reset, in one go:
 

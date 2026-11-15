@@ -166,6 +166,10 @@ agflow start --spec brief.pdf --spec https://example.com/rules.html --repo acme/
   deadline. A standing rule names the stack. `--deadline` is an ISO 8601 date and time with a zone, such as
   `2026-11-16T18:00:00+03:00`, or a span such as `+36h`. The hub is the one `agflow login` signed in to, or
   `--hub <url>`.
+- **A project with tasks.** Before it changes anything, `agflow start` asks
+  `This replaces the hub's project <name> (<n> tasks); its database is archived. Continue? [y/N]`. Without a
+  terminal it refuses, unless `--yes` is given, which also skips the question. A project with no task is replaced
+  without asking.
 
 The operator token is read from `AGFLOW_OPERATOR_TOKEN`, then from the Keychain item `agflow-operator`, then from
 `~/.agflow/operator-token` (mode 600). Whoever holds it can replace the hub's project, so prefer the Keychain. A
