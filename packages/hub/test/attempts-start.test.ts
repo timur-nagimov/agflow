@@ -221,7 +221,7 @@ describe('the attempt spec', () => {
       restore: { paths: restoreSet(held), base: 'refs/heads/main' },
       acceptanceIds: ['A1', 'A2'],
       toolCaps: computeToolCaps(ctx.config, held.checks),
-      taskPack: composeTaskPack(held),
+      taskPack: composeTaskPack(ctx, held),
       brief: buildBrief(ctx, getAgent(ctx, agent.id)),
       firstPrompt: firstPrompt({ role: 'worker', taskId: task.id, successor: false }),
       successor: false,

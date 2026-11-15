@@ -5,9 +5,18 @@ import { attemptSubject, findAttempt, listAttempts } from './attempt-store';
 import type { HubContext } from './context';
 import { nextId } from './db';
 import type { Emit } from './events';
+import { linesStarting } from './text';
 
 /** Who accepts a submission whose check passed, with AGFLOW_AUTO_ACCEPT (submissions.ts). */
 export const AUTO_ACCEPT = 'hub:auto-accept';
+
+/**
+ * The gap lines of a submission, from its summary and its evidence: each thing its author says someone else must still
+ * do or check, on a line that starts with "gap:", as the workers' guide asks. The lead hears them; nobody else would.
+ */
+export function gapLines(submission: { summary: string; evidence: readonly string[] }): string[] {
+  return linesStarting([submission.summary, ...submission.evidence], 'gap:');
+}
 
 export interface SubmissionRow {
   id: string;

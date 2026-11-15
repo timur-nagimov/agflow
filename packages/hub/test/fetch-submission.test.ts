@@ -40,8 +40,11 @@ describe('fetch_submission', () => {
     expect((await poll(id)).json.request.status).toBe('pending');
     recordResult(hub.ctx, lead.attempt!.runnerId!, { commandId: id, ok: true, data: { refs: { [ref]: HEAD } } });
     expect((await poll(id)).json.request).toMatchObject({ status: 'ok', branch, head_sha: HEAD, error: null });
-    expect(buildBrief(hub.ctx, lead.agent)).toContain('fetch_submission');
-    expect(buildBrief(hub.ctx, lead.agent)).toContain('FETCH_HEAD');
+    // The review message says how to review, when the lead needs it; the lead's guide no longer repeats it.
+    const [review] = unreadFor(hub.ctx, lead.agent).filter((message) => message.taskId === task.id);
+    expect(review?.body).toContain(`Call \`fetch_submission\` with task_id "${task.id}"`);
+    expect(review?.body).toContain('FETCH_HEAD');
+    expect(buildBrief(hub.ctx, lead.agent)).not.toContain('fetch_submission');
   });
 
   test.each([7, 39])('fetches a submission accepted by the API with a %i-character head SHA', async (length) => {
