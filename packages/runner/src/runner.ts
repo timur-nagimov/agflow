@@ -492,6 +492,8 @@ class Runtime {
       local: this.local,
       remote: () => this.remote(),
       wipRefPrefix: () => this.wipRefPrefix(),
+      paths: options.paths,
+      preparer: this.preparer,
       adapters: this.adapters,
       preflighted: (result) => this.preflights.set(result.facts.vendor, { result, at: Date.now() }),
       // The executor sends it as runner.vendors: the hub hears this report.

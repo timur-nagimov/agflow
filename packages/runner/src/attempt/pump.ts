@@ -7,7 +7,8 @@
 //   about deliver.more are never reported (X-4).
 // - Approvals (X-9): each vendor request gets a runner-minted UUID, held in memory with the vendor's id, and becomes
 //   approval.requested with the fence and the adapter's enriched detail, its texts clipped to fit the outbox; the
-//   owner gets one notification keyed by that UUID. A withdrawn request is approval.voided; decide_approval answers at once whether it applied.
+//   owner gets one notification keyed by that UUID when it is still unanswered after APPROVAL_NOTIFY_GRACE_MS. A
+//   withdrawn request is approval.voided; decide_approval answers at once whether it applied.
 //   A request the outbox refuses all the same is declined to the agent with the reason, so it never waits in vain.
 // - Descendants: every tool start, and every 5 s while a tool runs, snapshots the agent's descendants and records
 //   their groups, so a tool's group can be stopped even after its parent is gone.
@@ -28,6 +29,11 @@ export const LONG_TEXT_MAX = 4_000;
 export const DESCENDANT_SNAPSHOT_MS = 5_000;
 /** The longest approval summary: 4,000 characters. */
 export const APPROVAL_SUMMARY_MAX = 4_000;
+/**
+ * How long a relayed approval request waits for an answer before its owner is notified: 10 s. With
+ * AGFLOW_AUTO_APPROVALS the hub answers at once, and then nobody needs to hear of it.
+ */
+export const APPROVAL_NOTIFY_GRACE_MS = 10_000;
 /**
  * The most bytes one approval detail field takes in the event's JSON: 64 KB, so the six fields stay far below the
  * outbox's 1 MB however the agent's text escapes. A manifest diff after an install easily passes 1 MB.
@@ -93,6 +99,8 @@ export interface EventPumpOptions {
   root(): Promise<ProcessIdentity | null>;
   /** DESCENDANT_SNAPSHOT_MS by default. */
   snapshotEveryMs?: number;
+  /** APPROVAL_NOTIFY_GRACE_MS by default. */
+  notifyGraceMs?: number | undefined;
   /** A resumed session: the attempt's first output came from an earlier process, so none is reported again. */
   firstOutputReported?: boolean;
 }
@@ -108,6 +116,8 @@ export class EventPump {
   private readonly backgroundTools = new Set<string>();
   private readonly descendants = new DescendantTracker();
   private snapshotTimer: ReturnType<typeof setInterval> | null = null;
+  /** The owner notifications waiting out their grace. */
+  private readonly notifyTimers = new Set<ReturnType<typeof setTimeout>>();
   private snapshotting: Promise<void> = Promise.resolve();
   private firstOutputSent = false;
   private handoffCount = 0;
@@ -245,10 +255,12 @@ export class EventPump {
     }
   }
 
-  /** Stops the descendant snapshots; the agent's events have ended. */
+  /** Stops the descendant snapshots and the notifications still waiting; the agent's events have ended. */
   close(): void {
     this.tools.clear();
     this.stopSnapshots();
+    for (const timer of this.notifyTimers) clearTimeout(timer);
+    this.notifyTimers.clear();
   }
 
   /** Waits for a snapshot under way. */
@@ -317,6 +329,18 @@ export class EventPump {
       this.activity('note', APPROVAL_NOT_FORWARDED);
       return;
     }
+    // The hub may answer it at once (AGFLOW_AUTO_APPROVALS): the owner hears only of a request still unanswered.
+    const timer = setTimeout(() => {
+      this.notifyTimers.delete(timer);
+      if (this.approvals.has(approvalId)) void this.notifyOwner(approvalId, summary);
+    }, this.options.notifyGraceMs ?? APPROVAL_NOTIFY_GRACE_MS);
+    timer.unref?.();
+    this.notifyTimers.add(timer);
+  }
+
+  /** The owner's one notification of a request, keyed by its UUID, with the hub's approvals page. */
+  private async notifyOwner(approvalId: string, summary: string): Promise<void> {
+    const { spec, logger } = this.options;
     const hub = spec.hubUrl.replace(/\/+$/, '');
     try {
       await this.options.notifier.notify({

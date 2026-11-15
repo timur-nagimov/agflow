@@ -49,6 +49,8 @@ import { type CommandResult, Journal } from '../src/journal';
 import type { CommandMessage } from '../src/link';
 import { memoryLogger } from '../src/log';
 import { Outbox, type SettingsEvent, type StoredEvent } from '../src/outbox';
+import type { RunnerPaths } from '../src/paths';
+import { skipDependencyPreparer } from '../src/seams';
 
 // Each run's directory goes when it ends; a run that throws leaves its own to the afterAll.
 const dirs = new Set<string>();
@@ -473,6 +475,8 @@ class Model {
       local: {} as GitEnvironment,
       remote: unused as unknown as () => Promise<GitEnvironment>,
       wipRefPrefix: () => 'refs/agflow/',
+      paths: {} as RunnerPaths,
+      preparer: skipDependencyPreparer,
       // A preflight holds the runner's queue while a step's long one runs; one run again after a restart does not.
       adapters: new Map([
         [

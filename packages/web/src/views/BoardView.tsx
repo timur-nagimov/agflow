@@ -11,6 +11,7 @@ import {
   draftReady,
   draftToTask,
   groupTasks,
+  mergeFailing,
   toneOf,
 } from '../format';
 import { useAction } from '../hooks';
@@ -73,11 +74,12 @@ export function BoardView() {
 }
 
 function TaskCard({ task }: { task: Task }) {
+  const failing = mergeFailing(task);
   return (
-    <a className={`task-card tone-${toneOf(task.status, task.blockedKind)}`} href={routeHref({ view: 'task', id: task.id })}>
+    <a className={`task-card tone-${toneOf(task.status, task.blockedKind, failing)}`} href={routeHref({ view: 'task', id: task.id })}>
       <div className="task-card-top">
         <span className="task-id">{task.id}</span>
-        <StatusChip status={task.status} blockedKind={task.blockedKind} />
+        <StatusChip status={task.status} blockedKind={task.blockedKind} mergeFailed={failing} />
       </div>
       <p className="task-title">{task.title}</p>
       <div className="task-meta">
@@ -99,8 +101,8 @@ function TaskCard({ task }: { task: Task }) {
         ) : null}
       </div>
       {task.status === 'blocked' && task.blockedReason ? <p className="task-note">{task.blockedReason}</p> : null}
-      {/* Why the scheduler's last tick did not start this ready task (design 6.6), in one line. */}
-      {task.status === 'ready' && task.waitReason ? (
+      {/* Why the scheduler's last tick did not start this ready task (design 6.6), or why agflow could not merge it. */}
+      {(task.status === 'ready' || failing) && task.waitReason ? (
         <p className="task-note task-wait" title={task.waitReason}>
           {task.waitReason}
         </p>

@@ -24,10 +24,10 @@ import type {
 } from './types';
 
 /**
- * Protocol 2 added settings answers. Protocol 3 adds the welcome's project, merge_task, the check that
- * attempt.submitted reports with its new codes, and the attempt spec's tier.
+ * Protocol 2 added settings answers. Protocol 3 added the welcome's project, merge_task, the check that
+ * attempt.submitted reports with its new codes, and the attempt spec's tier. Protocol 4 adds check_main.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** The WebSocket close codes the hub ends a runner's link with. */
 export const CLOSE_CODES = {
@@ -286,10 +286,24 @@ export type RunnerCommand =
       branch: string;
       /** The accepted head, which may be abbreviated as M1's records hold it. */
       headSha: string;
+    }
+  | {
+      /**
+       * Checks main at a sha agflow merged (protocol 4): the project's check runs in a fresh clone at the sha, after
+       * its dependencies are prepared, as a submission's check runs. The result's data is a MainCheckResult.
+       */
+      kind: 'check_main';
+      sha: string;
     };
 
 /** merge_task's result data: merged, with main's new sha, or a conflict, with the files it is in. */
 export type MergeTaskResult = { status: 'merged'; sha: string } | { status: 'conflict'; files: string[] };
+
+/** check_main's result data: the sha checked and how its check went (passed, failed, or none, with why). */
+export interface MainCheckResult {
+  sha: string;
+  check: SubmissionCheck;
+}
 
 /** An exact answer, scoped to the runner.db that emitted the edit. */
 export interface SettingsAnswer {
@@ -691,6 +705,8 @@ export const RunnerCommandSchema = schemaFor<RunnerCommand>()(
       branch: BranchSchema,
       headSha: CommitShaSchema,
     }),
+    // The hub checks the sha a runner reported for a merge, so it is full.
+    z.strictObject({ kind: z.literal('check_main'), sha: FullShaSchema }),
   ]),
 );
 
@@ -702,7 +718,7 @@ export const MergeTaskResultSchema = schemaFor<MergeTaskResult>()(
   ]),
 );
 
-/** The 17 command kinds of protocol 1, in the order of design 6.3, then protocol 3's merge_task. */
+/** The 17 command kinds of protocol 1, in the order of design 6.3, then protocol 3's merge_task and 4's check_main. */
 export const RUNNER_COMMAND_KINDS = [
   'start_attempt',
   'resume_attempt',
@@ -722,6 +738,7 @@ export const RUNNER_COMMAND_KINDS = [
   'delete_refs',
   'update_settings',
   'merge_task',
+  'check_main',
 ] as const satisfies readonly RunnerCommandKind[];
 
 /** The oldest protocol that understands each command kind. The hub never sends a command to an older runner. */
@@ -744,6 +761,7 @@ export const COMMAND_MIN_PROTOCOL: Readonly<Record<RunnerCommandKind, number>> =
   delete_refs: 1,
   update_settings: 1,
   merge_task: 3,
+  check_main: 4,
 };
 
 const HelloSchema = z
@@ -882,6 +900,17 @@ export const SubmissionCheckSchema = schemaFor<SubmissionCheck>()(
     ownFilesChanged: z.array(Name).min(1).optional(),
   }),
 );
+
+/** How the hub reads check_main's result data: the sha it checked, in full, and its check. */
+export const MainCheckResultSchema = schemaFor<MainCheckResult>()(
+  z.strictObject({ sha: FullShaSchema, check: SubmissionCheckSchema }),
+);
+
+/**
+ * The line agflow start's scripts/check.sh prints when it ran no tests. A check that passed with this line in its tail
+ * verified nothing, so the hub never accepts such a submission by itself (AGFLOW_AUTO_ACCEPT): it goes to the lead.
+ */
+export const NO_TESTS_LINE = 'agflow-check: no tests ran';
 
 // The event table of design 6.3, in its order: one schema per type. Runners read shas from git, so every sha an
 // event reports is full.

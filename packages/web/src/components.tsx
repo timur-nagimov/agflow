@@ -28,8 +28,17 @@ import {
 import { useAction, useNow } from './hooks';
 import { routeHref } from './route';
 
-export function StatusChip({ status, blockedKind = null }: { status: TaskStatus; blockedKind?: BlockedKind | null }) {
-  return <span className={`chip tone-${toneOf(status, blockedKind)}`}>{statusLabel(status, blockedKind)}</span>;
+export function StatusChip({
+  status,
+  blockedKind = null,
+  mergeFailed = false,
+}: {
+  status: TaskStatus;
+  blockedKind?: BlockedKind | null;
+  /** A merging task whose merges keep failing (mergeFailing) shows in trouble. */
+  mergeFailed?: boolean;
+}) {
+  return <span className={`chip tone-${toneOf(status, blockedKind, mergeFailed)}`}>{statusLabel(status, blockedKind)}</span>;
 }
 
 const LAMP_TONES: Record<AgentStatus, string> = { active: 'done', idle: 'active', gone: 'closed' };

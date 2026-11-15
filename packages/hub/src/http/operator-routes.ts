@@ -19,6 +19,7 @@ import { updateGoal } from '../goal';
 import { sendMessage } from '../messages';
 import { getProject, setDeadline } from '../project';
 import { resetProject } from '../reset';
+import { countTasks } from '../task-store';
 import { markMerged, unblockTask } from '../tasks';
 import type { App, AppEnv } from './app';
 import { readBody } from './util';
@@ -77,10 +78,15 @@ export function mountOperatorRoutes(app: App, ctx: HubContext): void {
     return c.json({ message }, 201);
   });
 
-  // agflow start reads the main branch before it seeds the repository: attempts start from that branch only.
+  // agflow start reads the main branch before it seeds the repository: attempts start from that branch only. It asks
+  // before it replaces a project that has tasks.
   app.get('/api/operator/project', (c) => {
     operator(c);
-    const answer: OperatorProject = { project: getProject(ctx), mainBranch: ctx.config.mainBranch };
+    const answer: OperatorProject = {
+      project: getProject(ctx),
+      mainBranch: ctx.config.mainBranch,
+      tasks: countTasks(ctx),
+    };
     return c.json(answer);
   });
 

@@ -62,7 +62,19 @@ export function createLeadClone(target: CloneTarget & { startSha: string }): Pro
   return create(target, target.startSha, ['--detach', target.startSha]);
 }
 
-async function create(target: CloneTarget, startSha: string, checkout: string[]): Promise<CloneResult> {
+/**
+ * A clone detached at sha for the runner's own work, main's check: no attempt, so no pin. It lives only while that
+ * work runs, and the vault keeps every object while a clone exists. An existing clone is kept as it is.
+ */
+export function createDetachedClone(target: Omit<CloneTarget, 'attemptId'> & { sha: string }): Promise<CloneResult> {
+  return create({ ...target, attemptId: null }, target.sha, ['--detach', target.sha]);
+}
+
+async function create(
+  target: Omit<CloneTarget, 'attemptId'> & { attemptId: string | null },
+  startSha: string,
+  checkout: string[],
+): Promise<CloneResult> {
   const { vault, local, clone, attemptId } = target;
   if (!SHA.test(startSha)) throw new Error(`not a commit sha: ${JSON.stringify(startSha)}`);
   if (cloneExists(clone)) return { created: false };
@@ -77,7 +89,7 @@ async function create(target: CloneTarget, startSha: string, checkout: string[])
     await runGit(local, [...self, 'checkout', '--quiet', ...checkout], { cwd: building });
     await mkdir(join(building, '.git', 'info'), { recursive: true });
     await writeFile(join(building, '.git', 'info', 'exclude'), '# Written by the agflow runner.\n/.agflow/run/\n');
-    await vault.pin(attemptId, { start: startSha });
+    if (attemptId !== null) await vault.pin(attemptId, { start: startSha });
     await rename(building, clone);
   } catch (error) {
     await rm(building, { recursive: true, force: true });

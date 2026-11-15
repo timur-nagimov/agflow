@@ -32,13 +32,14 @@ import {
 } from './attempts';
 import { resolveAgentToken } from './auth';
 import { type CommandResult, type CommandRow, RESULT_HANDLERS, enqueueCommand } from './commands';
-import { type HubContext, tx } from './context';
+import { type HubContext, afterCommit, tx } from './context';
 import { nextId } from './db';
 import { type Emit, listEvents } from './events';
 import { HubError, badRequest, conflict, forbidden } from './errors';
 import { currentGoalVersion } from './goal';
 import { getHubState, updateHubState } from './hub-state';
-import { mergeableHead, queueMerges } from './merges';
+import { queueMainCheck } from './main-check';
+import { MERGE_RETRY_MAX_MS, MERGE_RETRY_MS, failedMerges, mergeableHead, queueMerges } from './merges';
 import { insertMessage, listMessages } from './messages';
 import { getProject } from './project';
 import { listSubmissions } from './submission-store';
@@ -916,13 +917,16 @@ function landMerge(ctx: HubContext, emit: Emit, task: Task, actor: string, sha: 
   else endLiveAttempt(ctx, task, 'accepted', actor);
   const merged = move(ctx, emit, task, 'merged', actor, { changes: { mergedSha: sha }, data: { sha } });
   refreshDependents(ctx, emit);
+  // main's check of the new main goes out at once, after the merge commits: a failure there cannot undo it.
+  afterCommit(ctx, () => queueMainCheck(ctx), 'main-check');
   return merged;
 }
 
 /**
  * merge_task's result (AGFLOW_AUTO_MERGE). merged marks the task merged at main's new sha; a conflict sends it back
- * to its author through rejected, with the files as feedback; either way the next merge goes out. A failure leaves the
- * task merging for the tick to try again, records task.merge_failed, and tells people the first time a merge fails.
+ * to its author through rejected, with the files as feedback. A failure leaves the task merging, records
+ * task.merge_failed, and tells people at its first and fifth failure; a later tick tries again once its wait is over
+ * (merges.ts, mergeDue). Whatever the result, the next merge goes out.
  */
 function onMergeResult(ctx: HubContext, emit: Emit, command: CommandRow, result: CommandResult): void {
   if (command.command.kind !== 'merge_task') return;
@@ -935,6 +939,7 @@ function onMergeResult(ctx: HubContext, emit: Emit, command: CommandRow, result:
   if (!parsed?.success) {
     const error = result.ok ? 'the runner gave a result agflow cannot read' : (result.error ?? 'no reason given');
     mergeFailed(ctx, emit, task, command.runnerId, error);
+    queueMerges(ctx);
     return;
   }
   const outcome = parsed.data;
@@ -952,23 +957,56 @@ function onMergeResult(ctx: HubContext, emit: Emit, command: CommandRow, result:
   queueMerges(ctx);
 }
 
-/** A merge that failed: task.merge_failed, and a message to people the first time a merge of the task fails. */
+/** The failure of a task's merge at which people hear again that it keeps failing; they hear of the first too. */
+const MERGE_FAILURES_TOLD_AGAIN = 5;
+
+/**
+ * What a merge's error suggests people fix, or null: a main that is protected or requires checks, which a runner
+ * cannot push to, or git credentials that may not push changes to .github/workflows.
+ */
+function mergeCause(error: string, main: string): string | null {
+  if (/protected branch|GH006|GH013|rule violation|status check|through a pull request/i.test(error)) {
+    return (
+      `Likely cause: ${main} is protected or requires checks, and AGFLOW_AUTO_MERGE needs a ${main} that accepts ` +
+      "direct pushes from the runners' owners."
+    );
+  }
+  if (/refusing to allow .*workflow/i.test(error)) {
+    return (
+      "Likely cause: the runner's git credentials cannot push changes to .github/workflows. A fine-grained token " +
+      'needs Workflows write; a classic token or an OAuth login needs the workflow scope.'
+    );
+  }
+  return null;
+}
+
+/**
+ * A merge that failed: task.merge_failed, and a message to people at the first failure since the task began merging,
+ * and again at the MERGE_FAILURES_TOLD_AGAIN-th, with the likely cause when the error names one (mergeCause).
+ */
 function mergeFailed(ctx: HubContext, emit: Emit, task: Task, runnerId: string, error: string): void {
-  const earlier = ctx.db
-    .query(
-      `SELECT 1 FROM events WHERE subject = $taskId AND type = 'task.merge_failed'
-         AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE subject = $taskId AND type = 'task.merging')`,
-    )
-    .get({ taskId: task.id });
   emit({ type: 'task.merge_failed', actor: `runner:${runnerId}`, subject: task.id, data: { runnerId, error: clip(error, 500) } });
-  if (earlier) return;
+  const failures = failedMerges(ctx, task.id)?.count ?? 1;
+  if (failures !== 1 && failures !== MERGE_FAILURES_TOLD_AGAIN) return;
+  const main = ctx.config.mainBranch;
+  const named = `${task.id} ("${clip(task.title, 120)}")`;
+  const head =
+    failures === 1
+      ? `agflow could not merge ${named} into ${main}`
+      : `agflow is still failing to merge ${named} into ${main} after ${failures} tries`;
+  const cause = mergeCause(error, main);
+  const max = MERGE_RETRY_MAX_MS / 60_000;
+  const retry =
+    failures === 1
+      ? `agflow tries again after ${MERGE_RETRY_MS / 1000} s, then twice as long after each failure, up to ${max} min.`
+      : `agflow keeps trying, up to ${max} min apart.`;
   insertMessage(ctx, emit, {
     from: 'system',
     to: 'humans',
     taskId: task.id,
     body:
-      `agflow could not merge ${task.id} ("${clip(task.title, 120)}") into ${ctx.config.mainBranch}: runner ` +
-      `${runnerId} said: ${clip(error, 500)}\nagflow tries again every tick. If you merge it yourself, mark it merged.`,
+      `${head}: runner ${runnerId} said: ${clip(error, 500)}\n${cause === null ? '' : `${cause}\n`}${retry} If you ` +
+      'merge it yourself, mark it merged.',
   });
 }
 

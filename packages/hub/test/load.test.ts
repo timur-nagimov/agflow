@@ -227,6 +227,8 @@ describe('GET /api/load', () => {
         mergedLastHour: 1,
       },
       deadline: { at: ctx.now() + 5 * HOUR, leftMs: 5 * HOUR },
+      // Without AGFLOW_AUTO_MERGE nothing checks main.
+      main: null,
     });
   });
 

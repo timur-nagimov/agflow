@@ -191,7 +191,7 @@ export function buildAttemptSpec(
   model: string | null = null,
 ): Omit<AttemptSpec, 'agentToken'> {
   const task = attempt.taskId === null ? null : getTask(ctx, attempt.taskId);
-  const successor = isSuccessor(attempt);
+  const successor = isSuccessor(ctx, attempt);
   return {
     attemptId: attempt.id,
     taskId: attempt.taskId,
@@ -1415,11 +1415,12 @@ export function onActivity(ctx: HubContext, attempt: Attempt, data: RunnerEventD
 /**
  * attempt.first_output: a successor's restatement of the state and its next step (design 6.8), kept with its attempt
  * id as a restatement note on the task, or for a lead in lead_notes. It is stored as the agent wrote it, under the
- * agent's name, so every reader quotes it. A first attempt has nothing to restate: its first output is only logged.
+ * agent's name, so every reader quotes it. An attempt that follows none (isSuccessor), such as the first lead of a new
+ * project, has nothing to restate: its first output is only logged.
  */
 export function onFirstOutput(ctx: HubContext, attempt: Attempt, data: RunnerEventData['attempt.first_output']): void {
   const text = clip(data.text, RESTATEMENT_LIMIT);
-  if (!isSuccessor(attempt)) {
+  if (!isSuccessor(ctx, attempt)) {
     appendAttemptLog(ctx, attempt.id, 'text', text);
     return;
   }

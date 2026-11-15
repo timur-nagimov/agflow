@@ -4,7 +4,15 @@ import { join } from 'node:path';
 import type { InjectedMessage } from '@agflow/core';
 import { FakeAdapter, type FakeAdapterOptions, type FakeScript, type TranscriptLine } from '@agflow/testkit';
 import type { AgentSession, VendorAdapter } from '../src/adapters/types';
-import { APPROVAL_DETAIL_FIELD_MAX_BYTES, APPROVAL_NOT_FORWARDED, APPROVAL_SUMMARY_MAX, EventPump, type EventPumpOptions } from '../src/attempt/pump';
+import {
+  APPROVAL_DETAIL_FIELD_MAX_BYTES,
+  APPROVAL_NOT_FORWARDED,
+  APPROVAL_SUMMARY_MAX,
+  EventPump,
+  type EventPumpOptions,
+  type PumpEvent,
+} from '../src/attempt/pump';
+import { memoryLogger } from '../src/log';
 import type { Outbox } from '../src/outbox';
 import { listProcesses } from '../src/processes';
 import type { Notification } from '../src/seams';
@@ -186,7 +194,8 @@ describe('AttemptController: the event pump', () => {
       },
       { enrichDetail: { manifestDiff: '+ "left-pad": "1.3.0"' } },
     );
-    const controller = f.controller('T-4-a1', { notifier: { notify: (note) => void notifications.push(note) } });
+    const notifier = { notify: (note: Notification) => void notifications.push(note) };
+    const controller = f.controller('T-4-a1', { notifier, approvalNotifyGraceMs: 0 });
     await controller.start(f.spec());
     const [requested] = await waitFor(
       () => f.events('approval.requested').length > 0 && f.events('approval.requested'),
@@ -201,7 +210,7 @@ describe('AttemptController: the event pump', () => {
       summary: 'npm install left-pad',
       detail: { command: 'npm install left-pad', cwd: '/work', manifestDiff: '+ "left-pad": "1.3.0"' },
     });
-    await waitFor(() => controller.phase === 'waiting_approval');
+    await waitFor(() => controller.phase === 'waiting_approval' && notifications.length > 0);
     expect(notifications).toEqual([
       {
         key: approvalId,
@@ -379,4 +388,43 @@ test('the pump keeps a background command in flight across turns until it actual
     await pump.handle({ type: 'tool_ended', toolId: 'bash', ok: true, denied: false, terminal: null, hubUnreachable: false });
     expect(pump.toolInFlight).toBe(false);
   } finally { pump.close(); }
+});
+
+test('the owner hears of an approval request only once it waited the grace unanswered, and never after the agent exits', async () => {
+  const notifications: Notification[] = [];
+  const reports: PumpEvent[] = [];
+  const pump = new EventPump({
+    spec: { attemptId: 'T-1-a1', successor: false, hubUrl: 'http://hub.test/' },
+    session: { answerApproval: async () => true },
+    adapter: {},
+    notifier: { notify: (note: Notification) => void notifications.push(note) },
+    logger: memoryLogger(),
+    report: (event: PumpEvent) => reports.push(event),
+    setPhase: () => {},
+    root: async () => null,
+    notifyGraceMs: 20,
+  } as unknown as EventPumpOptions);
+  const request = (vendorId: string) =>
+    pump.handle({ type: 'approval_request', approvalId: vendorId, kind: 'command', summary: `run ${vendorId}`, detail: {} });
+  const relayed = () =>
+    reports.flatMap((event) => (event.type === 'approval.requested' ? [event.data.approvalId] : []));
+  try {
+    await request('answered');
+    await request('waiting');
+    const [answered, waiting] = relayed();
+    // The hub answers the first at once (AGFLOW_AUTO_APPROVALS); nobody hears of either yet.
+    expect(await pump.answer(answered as string, 'approve', null)).toBe(true);
+    expect(notifications).toEqual([]);
+    await Bun.sleep(60);
+    expect(notifications).toEqual([
+      { key: waiting as string, title: 'agflow: T-1-a1 asks for your approval', body: 'run waiting\nhttp://hub.test#/approvals' },
+    ]);
+    // A request still waiting when the agent's events end is never posted.
+    await request('late');
+    pump.close();
+    await Bun.sleep(60);
+    expect(notifications).toHaveLength(1);
+  } finally {
+    pump.close();
+  }
 });

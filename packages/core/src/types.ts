@@ -112,7 +112,7 @@ export interface Task extends TaskContract {
   fetchGranted: boolean;
   /**
    * Why the scheduler's last tick did not start this ready task, in one line, as GET /api/tasks gives it; null when
-   * that tick said nothing about it.
+   * that tick said nothing about it. A merging task whose last merge failed says how many failed, and the newest error.
    */
   waitReason?: string | null;
 }
@@ -676,7 +676,18 @@ export interface ProjectLoad {
   };
   /** project.deadline_at, and the time left until it, below 0 once it has passed. */
   deadline: { at: number | null; leftMs: number | null };
+  /** main's check (AGFLOW_AUTO_MERGE); null until one passed or failed. */
+  main: MainHealth | null;
 }
+
+/**
+ * main's check as its newest result that passed or failed left it: passed at a sha, or failing since the first failure
+ * after the last pass, with the open task that fixes it, if any. A failure counts only at the sha agflow had merged
+ * last when it came.
+ */
+export type MainHealth =
+  | { status: 'passed'; sha: string; at: number }
+  | { status: 'failed'; since: string; fixTask: string | null };
 
 /** GET /api/load: how busy the accounts and the project are, for people in the web UI. */
 export interface HubLoad {

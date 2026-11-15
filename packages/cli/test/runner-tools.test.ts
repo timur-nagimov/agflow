@@ -241,8 +241,27 @@ describe('submit', () => {
     const bridge = await bridgeFor(worker, { decide: { prefix: '/api/submissions/', at: 3, run: () => submitted(hub, worker, { error: null }) } });
     const answer = await bridge.call('submit', { task_id: taskId, summary: 'Parser added', evidence: ['bun test: 3 pass'] });
     expect(answer).toEqual({ text: expect.stringContaining(`${taskId} submitted at ${HEAD}`), isError: false });
+    expect(answer.text).toContain('The lead will review it; your work on it is done, so end your turn.');
     expect(bridge.gets('/api/submissions/')).toBe(3);
     expect(getTask(hub.ctx, taskId)).toMatchObject({ status: 'submitted', submission: expect.objectContaining({ summary: 'Parser added' }) });
+  });
+
+  test('a submission the hub accepted at once (AGFLOW_AUTO_ACCEPT) is answered as accepted, not as up for review', async () => {
+    // With AGFLOW_AUTO_MERGE the author's attempt holds until the merge, so the bridge still reads the task.
+    const hub = hubFixture({ autoAccept: true, autoMerge: true });
+    const worker = runnerAgent(hub);
+    const taskId = worker.task?.id as string;
+    const check: SubmissionCheck = { status: 'passed', command: 'bun test', durationMs: 1_200, tail: '3 pass' };
+    const decide = { prefix: '/api/submissions/', at: 1, run: () => submitted(hub, worker, { error: null, check }) };
+    const answer = await (await bridgeFor(worker, { decide })).call('submit', { task_id: taskId, summary: 'Done' });
+    const { status, submission } = getTask(hub.ctx, taskId);
+    expect(status).toBe('merging');
+    expect(answer).toEqual({
+      text:
+        `${taskId} submitted at ${HEAD} (${submission?.submissionId}). agflow accepted it because the project's check ` +
+        'passed, and merges it into main. Your work on it is done, so end your turn.',
+      isError: false,
+    });
   });
 
   test('dirty, protected_paths and needs_merge are error results that say what to fix, the detail passed on unchanged', async () => {

@@ -17,7 +17,9 @@ import {
   type InjectedMessage,
   InjectedMessageSchema,
   LiveAttemptSchema,
+  MainCheckResultSchema,
   MergeTaskResultSchema,
+  NO_TESTS_LINE,
   PROTOCOL_VERSION,
   type Parsed,
   ProfileSummarySchema,
@@ -150,7 +152,7 @@ const messages: InjectedMessage[] = [
   { messageId: 17, authority: 'person', text: '> timur: please add a test for the empty password' },
 ];
 
-// One command of each kind; the mapped type makes the compiler insist on all 18.
+// One command of each kind; the mapped type makes the compiler insist on all 19.
 const commands: { [K in RunnerCommandKind]: Extract<RunnerCommand, { kind: K }> } = {
   start_attempt: { kind: 'start_attempt', attempt: spec },
   resume_attempt: {
@@ -204,6 +206,7 @@ const commands: { [K in RunnerCommandKind]: Extract<RunnerCommand, { kind: K }> 
   delete_refs: { kind: 'delete_refs', refs: [{ ref: 'refs/agflow/T-42/a3', expectedSha: sha('c') }] },
   update_settings: { kind: 'update_settings', settings: { capacity: 3, draining: false }, version: 4 },
   merge_task: { kind: 'merge_task', taskId: 'T-42', title: 'Add the login form', branch: 'agflow/T-42-add-login', headSha: sha('d') },
+  check_main: { kind: 'check_main', sha: sha('e') },
 };
 
 type Variant<M extends { t: string }, T extends M['t']> = Extract<M, { t: T }>;
@@ -305,9 +308,9 @@ describe('round trips', () => {
     for (const message of hubMessages) expect(fromHub(message)).toEqual({ ok: true, value: message });
   });
 
-  test('each of the 18 command kinds round-trips through RunnerCommandSchema', () => {
-    expect(RUNNER_COMMAND_KINDS).toHaveLength(18);
-    expect(new Set(RUNNER_COMMAND_KINDS).size).toBe(18);
+  test('each of the 19 command kinds round-trips through RunnerCommandSchema', () => {
+    expect(RUNNER_COMMAND_KINDS).toHaveLength(19);
+    expect(new Set(RUNNER_COMMAND_KINDS).size).toBe(19);
     for (const kind of RUNNER_COMMAND_KINDS) {
       expect([kind, RunnerCommandSchema.safeParse(commands[kind]).data]).toEqual([kind, commands[kind]]);
     }
@@ -561,12 +564,35 @@ describe('value schemas', () => {
 });
 
 describe('commands', () => {
-  test('COMMAND_MIN_PROTOCOL maps the 17 kinds of protocol 1 to 1, and merge_task to 3', () => {
+  test('COMMAND_MIN_PROTOCOL maps the 17 kinds of protocol 1 to 1, merge_task to 3 and check_main to 4', () => {
     expect(Object.keys(COMMAND_MIN_PROTOCOL).sort()).toEqual([...RUNNER_COMMAND_KINDS].sort());
+    const newer: Partial<Record<RunnerCommandKind, number>> = { merge_task: 3, check_main: 4 };
     for (const kind of RUNNER_COMMAND_KINDS) {
-      expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, kind === 'merge_task' ? 3 : 1]);
+      expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, newer[kind] ?? 1]);
     }
-    expect(PROTOCOL_VERSION).toBe(3);
+    expect(PROTOCOL_VERSION).toBe(4);
+  });
+
+  test('check_main names a full sha, and its result is that sha with its check', () => {
+    expect(RunnerCommandSchema.safeParse({ kind: 'check_main', sha: 'abc1234' }).success).toBe(false);
+    expect(RunnerCommandSchema.safeParse({ kind: 'check_main', sha: sha('e'), taskId: 'T-42' }).success).toBe(false);
+    const parses = (data: unknown) => MainCheckResultSchema.safeParse(data).success;
+    const check = { status: 'failed', command: 'bash scripts/check.sh', durationMs: 4_200, tail: '1 fail' };
+    expect(parses({ sha: sha('e'), check })).toBe(true);
+    expect(parses({ sha: sha('e'), check: { status: 'none', command: null, durationMs: 0, tail: 'no sandbox' } })).toBe(
+      true,
+    );
+    for (const bad of [
+      { sha: 'abc1234', check },
+      { sha: sha('e') },
+      { sha: sha('e'), check: { ...check, status: 'skipped' } },
+      { sha: sha('e'), check: { ...check, tail: 'x'.repeat(CHECK_TAIL_MAX + 1) } },
+      { sha: sha('e'), check, extra: 1 },
+      null,
+    ]) {
+      expect([bad, parses(bad)]).toEqual([bad, false]);
+    }
+    expect(NO_TESTS_LINE).toBe('agflow-check: no tests ran');
   });
 
   test("merge_task's result is merged with main's full sha, or a conflict with its files", () => {
@@ -586,7 +612,7 @@ describe('commands', () => {
   });
 
   test("protocol 3: an attempt spec may carry the task's tier, standard or strong, and nothing else", () => {
-    expect(PROTOCOL_VERSION).toBe(3);
+    expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(3);
     for (const tier of ['standard', 'strong'] as const) {
       expect(AttemptSpecSchema.parse({ ...spec, tier }).tier).toBe(tier);
       expect(RunnerCommandSchema.safeParse({ kind: 'start_attempt', attempt: { ...spec, tier } }).success).toBe(true);

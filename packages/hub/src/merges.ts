@@ -2,8 +2,9 @@
 // runner as merge_task: the runner merges the accepted head into main in its vault and pushes main with its owner's
 // git credentials, the ones that push task branches. The author's runner merges when it can, else any online runner
 // whose git is ready and whose protocol knows merge_task; after a merge failed on a runner, the next try goes to
-// another one when it can. A merge_task left with a runner that went offline, or for a task no longer merging, is
-// cancelled, and the next one goes out. tasks.ts records what a merge gave.
+// another one when it can, and each try waits longer than the one before (mergeDue). A merge_task left with a runner
+// that went offline, or for a task no longer merging, is cancelled, and the next one goes out. tasks.ts records what
+// a merge gave.
 import { COMMAND_MIN_PROTOCOL, CommitShaSchema, type Task, isTaskBranch } from '@agflow/core';
 import { type CommandRow, enqueueCommand } from './commands';
 import { type HubContext, tx } from './context';
@@ -47,6 +48,41 @@ function mergingTasks(ctx: HubContext): Task[] {
   return rows.map((row) => rowToTask(ctx, row));
 }
 
+/** A failed merge's next try waits this long, and twice as long after each further failure (mergeDue). */
+export const MERGE_RETRY_MS = 15_000;
+/** The longest wait between two tries of a merge that keeps failing. */
+export const MERGE_RETRY_MAX_MS = 10 * 60_000;
+
+/** The merges of a task that failed since it last began merging: how many, and the newest one's time and error. */
+export interface FailedMerges {
+  count: number;
+  lastAt: number;
+  lastError: string;
+}
+
+/** The task's failed merges since it last began merging (task.merge_failed); null while none failed. */
+export function failedMerges(ctx: HubContext, taskId: string): FailedMerges | null {
+  const row = ctx.db
+    .query(
+      `SELECT COUNT(*) OVER () AS count, ts, json_extract(data, '$.error') AS error FROM events
+       WHERE subject = $taskId AND type = 'task.merge_failed'
+         AND id > (SELECT COALESCE(MAX(id), 0) FROM events WHERE subject = $taskId AND type = 'task.merging')
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get({ taskId }) as { count: number; ts: number; error: string | null } | null;
+  return row && { count: row.count, lastAt: row.ts, lastError: row.error ?? 'no reason given' };
+}
+
+/**
+ * Whether the task's next merge may go out: at once while none of its merges failed; after n failures since it began
+ * merging, once min(MERGE_RETRY_MS * 2^(n-1), MERGE_RETRY_MAX_MS) has passed since the last one.
+ */
+function mergeDue(ctx: HubContext, taskId: string): boolean {
+  const failed = failedMerges(ctx, taskId);
+  if (failed === null) return true;
+  return ctx.now() - failed.lastAt >= Math.min(MERGE_RETRY_MS * 2 ** (failed.count - 1), MERGE_RETRY_MAX_MS);
+}
+
 /** The runners a merge of the task failed on since it last began merging, each with its newest task.merge_failed. */
 function mergeFailures(ctx: HubContext, taskId: string): Map<string, number> {
   const rows = ctx.db
@@ -83,8 +119,8 @@ function mergeRunner(ctx: HubContext, taskId: string): string | null {
 /**
  * Sends the next merge when none is in flight: one merge at a time, so each leases on the main the one before it left.
  * Called when a task starts merging, when a merge's result arrives, and by every tick, which also retries a merge that
- * failed. A task with nothing a runner can merge stays merging until a person marks it merged. Gives the merge_task
- * it queued, or null.
+ * failed once its wait is over (mergeDue); a task that waits holds up no other. A task with nothing a runner can merge
+ * stays merging until a person marks it merged. Gives the merge_task it queued, or null.
  */
 export function queueMerges(ctx: HubContext): CommandRow | null {
   return tx(ctx, () => {
@@ -97,7 +133,7 @@ export function queueMerges(ctx: HubContext): CommandRow | null {
     }
     for (const task of mergingTasks(ctx)) {
       const head = mergeableHead(task);
-      if (head === null) continue;
+      if (head === null || !mergeDue(ctx, task.id)) continue;
       const runnerId = mergeRunner(ctx, task.id);
       if (runnerId === null) return null;
       return enqueueCommand(ctx, runnerId, { kind: 'merge_task', taskId: task.id, title: task.title, ...head });

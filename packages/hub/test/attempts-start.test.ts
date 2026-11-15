@@ -8,16 +8,17 @@ import {
 } from '@agflow/core';
 import { getAgent } from '../src/agents';
 import { findAttempt, listAttempts, updateAttempt } from '../src/attempt-store';
-import { startPositionFor, startRunnerAttempt } from '../src/attempts';
+import { endAttempt, onFirstOutput, startPositionFor, startRunnerAttempt } from '../src/attempts';
 import { resolveAgentToken } from '../src/auth';
 import { buildBrief, composeTaskPack, firstPrompt } from '../src/brief';
 import { pendingCommands, toWireCommand } from '../src/commands';
 import { tx } from '../src/context';
 import { listEvents } from '../src/events';
 import { getHubState } from '../src/hub-state';
+import { resetProject } from '../src/reset';
 import { getTask, move, writeTask } from '../src/task-store';
 import { createTasks } from '../src/tasks';
-import { addAgent, addRunner, createTestContext, newTask } from './helpers';
+import { addAgent, addLeadNote, addRunner, createTestContext, newTask } from './helpers';
 
 type Ctx = ReturnType<typeof createTestContext>['ctx'];
 
@@ -345,5 +346,41 @@ describe('lead attempts', () => {
     expect(() => startRunnerAttempt(ctx, { runnerId, taskId: task.id, role: 'lead', vendor: 'claude' })).toThrow(
       'a lead attempt takes no task',
     );
+  });
+
+  test('a lead follows an earlier lead attempt or a lead handoff of this database, whatever its number', () => {
+    const { ctx, runnerId } = setup();
+    const startLead = () => {
+      const { attempt, command } = startRunnerAttempt(ctx, { runnerId, taskId: null, role: 'lead', vendor: 'claude' });
+      const wire = toWireCommand(ctx, command).command;
+      if (wire.kind !== 'start_attempt') throw new Error('not a start');
+      return { attempt, spec: wire.attempt };
+    };
+    const first = (successor: boolean) => ({ successor, firstPrompt: firstPrompt({ role: 'lead', taskId: null, successor }) });
+    const restatements = () => ctx.db.query("SELECT attempt_id FROM lead_notes WHERE kind = 'restatement'").all();
+    // The old project's lead rotated out. The reset empties the project and advances the lead_attempt counter, so the
+    // first lead of the new project has a high number, and no lead or lead handoff before it.
+    endAttempt(ctx, { attemptId: startLead().attempt.id, trigger: 'rotation' });
+    const reset = { name: 'afisha', repo: 'https://github.com/acme/afisha', deadlineAt: null, goal: 'Ship it.', rules: [] };
+    resetProject(ctx, reset, 'user:alice');
+    const lead = startLead();
+    expect(lead.attempt.number).toBe(1002);
+    expect(lead.spec).toMatchObject(first(false));
+    // Its first output restates nothing: it is only logged.
+    onFirstOutput(ctx, lead.attempt, { text: 'Reading the goal.' });
+    expect(restatements()).toEqual([]);
+    // The next lead restates from the lead handoff its predecessor left.
+    endAttempt(ctx, { attemptId: lead.attempt.id, trigger: 'rotation' });
+    const next = startLead();
+    expect(next.spec).toMatchObject(first(true));
+    onFirstOutput(ctx, next.attempt, { text: 'T-1 is next.' });
+    expect(restatements()).toEqual([{ attempt_id: next.attempt.id }]);
+
+    // A live lead's lead handoff is enough: the first runner lead of a database restates from it.
+    const other = setup();
+    addLeadNote(other.ctx, { author: 'agent:A-9', attemptId: null, body: 'Keep T-1 small.' });
+    const started = startRunnerAttempt(other.ctx, { runnerId: other.runnerId, taskId: null, role: 'lead', vendor: 'claude' });
+    expect(started.attempt.number).toBe(1);
+    expect(toWireCommand(other.ctx, started.command).command).toMatchObject({ attempt: first(true) });
   });
 });
