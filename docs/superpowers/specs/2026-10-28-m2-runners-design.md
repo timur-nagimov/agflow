@@ -59,7 +59,7 @@ As in M1, the lead accepts or rejects submissions and people mark tasks merged.
 | Codex: `AGENTS.md` loads only in trusted projects (§6.3) | `AGENTS.md` loads without trust. Trust enables the project's `.codex/` layer, which can add MCP servers. | Trust is given only to a clone whose `.codex/` equals the base commit's (section 9.2). |
 | Codex fallback `codex exec --json` (§6.3) | Under MDM, `exec` cannot answer approvals, so no command runs. | No `exec` fallback. |
 | Codex: re-send the brief after compaction (§6.3) | `developerInstructions` survive compaction and restarts but cannot change on resume. | Static brief in `developerInstructions`; dynamic updates as messages. |
-| A per-agent `CLAUDE_CONFIG_DIR` loses the login (earlier research) | The 2.1.285 binary names the keychain item `Claude Code-credentials-<first 8 hex of sha256(configDir)>` whenever `CLAUDE_CONFIG_DIR` is set. `.claude.json`, transcripts and memory stay inside the directory. | Each runner has its own Claude config directory and its own Codex home, each logged in once by the owner. Agents never load the owner's hooks, skills, MCP servers or global instructions, and the runner's login cannot disturb the owner's. |
+| A per-agent `CLAUDE_CONFIG_DIR` loses the login (earlier research) | The 2.1.285 binary names the keychain item `Claude Code-credentials-<first 8 hex of sha256(configDir)>` whenever `CLAUDE_CONFIG_DIR` is set. `.claude.json`, transcripts and memory stay inside the directory. | Each runner has its own Claude config directory and its own Codex home, each logged in once by the owner. Agents never load the owner's hooks, skills, MCP servers or global instructions, and the runner's login cannot disturb the owner's. A Claude session also excludes the instruction files of every directory above its clone (`claudeMdExcludes`), so the owner's `~/CLAUDE.md` and `~/.claude/rules` stay out. |
 | Codex's managed policy shows as a mismatch on `thread/start` (revision 1) | On this Mac, `thread/start` returns the policy that was requested. `configRequirements/read` and `config/read {includeLayers: true}` show the requirements and the MDM layer. | Detection uses those two calls and fails closed. The runner never answers approvals itself anyway (section 6.10). |
 | Codex agents are isolated by their own `CODEX_HOME` | The built-in `codex_apps` MCP server exposes the account's ChatGPT apps. Their read-only tools (web search) run without approval. Personal skills load from `$HOME/.agents/skills`. | `--disable apps --disable plugins`. App-server runs with a runner-owned empty `HOME`. Every start checks that the agflow bridge is the only MCP server and that no user skills load. |
 | `ZDOTDIR` keeps the owner's shell profile away from Claude agents | The implemented mitigation sets `ZDOTDIR=<claudeHome>/agflow-empty`, drops incoming `CLAUDE_CODE_SHELL`, and sets `CLAUDE_CODE_SHELL=/bin/zsh` unless `SHELL` already names zsh. Only the snapshot sources `~/.zshrc` outside the sandbox, once per Claude process; `~/.zshenv`, `~/.zprofile`, `~/.zlogin` and `~/.bashrc` do not run around agent commands. | The snapshot remains an accepted residual risk (section 5). Its file lives in the runner's Claude home, which sandboxed commands cannot read. |
@@ -1157,7 +1157,7 @@ After `vendorErrorReplaceMs` (60 minutes) of continuous vendor errors, the hub r
 
 **Continuation.** It happens on the runner, without waiting for the hub. A worker gets a continuation prompt listing the task's acceptance ids when all of these hold:
 - its turn completed normally;
-- it has not completed `submit`, `declare_blocked`, `declare_impossible` or `release_task` successfully (a refused submit does not count; a pending one does);
+- it has not completed `submit`, `declare_blocked`, `declare_impossible` or `release_task` successfully in that turn (a refused submit does not count; a pending one does until the runner reports that its submission failed);
 - no `hold_attempt` or `stop_attempt` has arrived within 5 s of the turn's end.
 
 Further rules:
@@ -1902,6 +1902,8 @@ query({
                                                               // <agflow>: the agflow command the adapter factory gets (section 13)
       autoMemoryEnabled: false, crossSessionInbound: 'refuse', cleanupPeriodDays: 30,
       syncClaudeAiSkills: false, syncClaudeAiPlugins: false,
+      claudeMdExcludes,                                       // CLAUDE.md, CLAUDE.local.md, .claude/CLAUDE.md and
+                                                              // .claude/rules/** of every directory above the clone
     },
     hooks: { PreToolUse: [guard], PreCompact: [...], PostCompact: [captureSummary] },
   },
@@ -2057,7 +2059,7 @@ query({
   - **workers:** the shared tools, `report_progress`, `write_handoff`, `declare_blocked`, `declare_impossible`, `release_task`, `submit` (section 6.13) and `prepare_dependencies` (section 7.7). Not `claim_task` or `resume_claim`: the task is assigned. Also `fetch_url(url, save_as)` (section 5, Unattended options): it asks the hub to download one public URL and saves the answer into the agent's clone (`AGFLOW_CLONE`, never the bridge's own working directory).
   - **leads:** the shared tools and the M1 lead tools, plus:
     - `request_agents(count, vendor?, reason)`;
-    - `replace_agent(agent_id, reason)` and `stop_agent(agent_id, reason, hold?)`, for runner agents only;
+    - `replace_agent(agent_id, reason)` and `stop_agent(agent_id, reason)`, for runner agents only; only a person holds a task;
     - `write_handoff` with an optional task id (none: a lead handoff);
     - `get_lead_notes()`;
     - `fetch_submission(task_id)` (section 6.13): wait for the submitted branch in the runner vault, then fetch from `origin` and review `FETCH_HEAD`.
