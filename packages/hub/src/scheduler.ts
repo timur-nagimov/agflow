@@ -43,6 +43,7 @@ import { ensureDemoCheck } from './demo-check';
 import { currentGoalVersion } from './goal';
 import { churnPaused, getHubState, inRecovery, leadSeat } from './hub-state';
 import { checkHoldingLeads, ensureLead, periodicLeadReview, rotateLeadIfDue } from './lead';
+import { queueMainCheck, retryFixTask } from './main-check';
 import { queueMerges } from './merges';
 import { insertMessage } from './messages';
 import { placementSnapshot } from './placement';
@@ -447,13 +448,16 @@ export interface TickResult {
  * the churn guard holds dispatch (churnPaused), the lead seat step still runs and no worker starts. These three holds
  * are dispatchHold's, and a tick that one of them stops gives every ready task its reason (held). Accepted work goes
  * on merging into main whatever the project's state: the merge queue sends a merge that waits, and one that failed
- * again. Just before dispatch, the demo check may add its task (ensureDemoCheck).
+ * again, main's check follows the merges (queueMainCheck), and a fix of main that the task limits refused is created
+ * once they allow it (retryFixTask). Just before dispatch, the demo check may add its task (ensureDemoCheck).
  */
 export function runTick(ctx: HubContext): TickResult {
   const clock = checkClock(ctx);
   if (inRecovery(ctx)) return held(ctx, { clock, recovering: true, reconciled: null, lead: null, started: [] });
   const reconciled = reconcile(ctx);
   duty('the merge queue', () => queueMerges(ctx), null);
+  duty("main's check", () => queueMainCheck(ctx), null);
+  duty("main's fix task", () => retryFixTask(ctx), null);
   if (getProject(ctx).paused) return held(ctx, { clock, recovering: false, reconciled, lead: null, started: [] });
   const lead = duty('starting a runner lead', () => ensureLead(ctx), null);
   // The churn guard holds worker dispatch only: the lead that changes the plan keeps its seat (design 6.15).

@@ -6,6 +6,7 @@ import {
   accountStateText,
   accountTone,
   deadlineText,
+  mainText,
   overCeiling,
   queueText,
   resetText,
@@ -88,6 +89,7 @@ function ProjectSection({ load }: { load: HubLoad }) {
         <Fact label="Accepted, not merged">{queueText(tasks.acceptedNotMerged)}</Fact>
         <Fact label="Merged in the last hour">{tasks.mergedLastHour}</Fact>
         <Fact label="Deadline">{deadlineText(project.deadline, now)}</Fact>
+        {project.main && <Fact label="Main">{mainText(project.main, now)}</Fact>}
       </dl>
       <p className="hint">
         A ready task that does not start says why on its board card. Runner slots count the runners that can take a

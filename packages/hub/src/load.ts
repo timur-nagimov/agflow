@@ -1,7 +1,8 @@
 // GET /api/load: how busy each account and the project are, for people watching a run. The accounts are read with
 // core's placement rules over the placement snapshot, so a row says what placement would do now. The project's workers,
 // slots and task counts are the scheduler's (workerLoad, runnerSlots), the same the lead's report and the idle nudge
-// read; the free slot minutes come from the scheduler's samples, which it keeps in memory.
+// read; the free slot minutes come from the scheduler's samples, which it keeps in memory. main's state is its check's
+// (main-check.ts).
 import {
   type AccountLoad,
   type HubLoad,
@@ -14,6 +15,7 @@ import {
   utilization,
 } from '@agflow/core';
 import type { HubContext } from './context';
+import { mainHealth } from './main-check';
 import { placementSnapshot } from './placement';
 import { getProject } from './project';
 import { TAKES_SLOT_SQL, findRunnerRows, runnerInfo } from './runners';
@@ -141,6 +143,7 @@ function projectLoad(ctx: HubContext): ProjectLoad {
       mergedLastHour: merged.n,
     },
     deadline: { at: deadlineAt, leftMs: deadlineAt === null ? null : deadlineAt - now },
+    main: mainHealth(ctx),
   };
 }
 

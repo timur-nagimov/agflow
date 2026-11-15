@@ -614,6 +614,8 @@ describe('never idle: the guides, the goal and the situation report', () => {
       'read the whole goal with `get_goal` and SPEC.md in the repository',
       'Post a checklist of its requirements once as a goal note (`add_goal_note`), then one short note per requirement covered, such as "R3 covered: T-12".',
       'skeleton task that the others depend on',
+      // Until a test exists, the check runs none, and the hub accepts nothing by itself.
+      'the check and demo scripts, a first test so that the check runs tests,',
       'kind curation: only such tasks may change AGENTS.md',
       'interface contracts (API shapes, data models, file layout)',
       'about twice the free worker slots',
@@ -644,10 +646,11 @@ describe('never idle: the guides, the goal and the situation report', () => {
   });
 
   test("the lead's guide says what the hub accepts and merges itself, only while those settings are on", () => {
-    // A passed check whose branch changes the check's own files, and a demo check, still come to the lead.
+    // A passed check that ran no tests or whose branch changes the check's own files, and a demo check, still come to
+    // the lead; agflow's fix of main does not.
     const accept =
-      "- The hub itself accepts a submission whose check passed, unless its branch changes the check's own files or " +
-      'it is a demo check: those come to you with the others.';
+      "- The hub itself accepts a submission whose check passed, agflow's own fixes of main included, unless the check " +
+      "ran no tests, its branch changes the check's own files, or it is a demo check: those come to you with the others.";
     const merge = '- agflow merges accepted work into main itself; a conflict sends the task back to its author.';
     const guides = (config: { autoAccept?: boolean; autoMerge?: boolean }) => {
       const { ctx: live } = createTestContext(config);

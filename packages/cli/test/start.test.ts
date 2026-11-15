@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { NO_TESTS_LINE } from '@agflow/core';
 import { getCurrentGoal } from '@agflow/hub/src/goal';
 import { listStandingRules } from '@agflow/hub/src/messages';
 import { getProject } from '@agflow/hub/src/project';
@@ -187,6 +188,35 @@ describe('the seed files', () => {
       'npm ci',
       'bun test',
     ]);
+  });
+
+  test('the check says so whenever it ran no tests, and passes all the same', () => {
+    const bin = join(tempDir(), 'bin');
+    mkdirSync(bin);
+    for (const tool of ['uv', 'bun', 'bunx']) {
+      writeFileSync(join(bin, tool), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(bin, tool), 0o755);
+    }
+    const noTests = (stack: string | null, manifest: Record<string, string>): boolean => {
+      const dir = tempDir();
+      const added = Object.entries(manifest).map(([path, content]) => ({ path, content }));
+      for (const file of [...seedFiles({ name: 'p', stack, specs }), ...added]) {
+        mkdirSync(join(dir, file.path, '..'), { recursive: true });
+        writeFileSync(join(dir, file.path), file.content);
+      }
+      const ran = runCommand(['bash', 'scripts/check.sh'], { env: { PATH: `${bin}:/usr/bin:/bin` }, cwd: dir });
+      expect([stack, ran.code]).toEqual([stack, 0]);
+      return ran.stdout.split('\n').includes(NO_TESTS_LINE);
+    };
+    const pyproject = '[project]\nname = "p"\n';
+    expect(noTests('python', {})).toBe(true);
+    expect(noTests('python', { 'pyproject.toml': pyproject })).toBe(true);
+    expect(noTests('python', { 'pyproject.toml': pyproject, 'tests/test_p.py': '' })).toBe(false);
+    expect(noTests('typescript', {})).toBe(true);
+    expect(noTests('typescript', { 'package.json': '{ "scripts": { "demo": "bun src/demo.ts" } }' })).toBe(true);
+    expect(noTests('typescript', { 'package.json': '{ "scripts": { "test": "bun test" } }' })).toBe(false);
+    expect(noTests('typescript', { 'package.json': '{}', 'src/a.test.ts': '' })).toBe(false);
+    for (const stack of ['Go with Gin', null]) expect([stack, noTests(stack, {})]).toEqual([stack, true]);
   });
 });
 

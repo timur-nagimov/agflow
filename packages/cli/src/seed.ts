@@ -1,6 +1,8 @@
 // The seed commit of agflow start: the spec, the agents' instructions, the dependency preparation and check the runner
 // reads from .agflow/config.json, and three scripts that do nothing harmful in an empty project and the right thing
-// once the stack's manifest exists.
+// once the stack's manifest exists. The check says when it ran no tests (NO_TESTS_LINE), so the hub never accepts by
+// itself a submission that nothing verified.
+import { NO_TESTS_LINE } from '@agflow/core';
 import { type SpecFile, specMarkdown } from './spec';
 
 /** A stack agflow start knows; any other text is a stack the first task sets up. */
@@ -71,6 +73,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 `;
 
+/** What the check prints whenever it ran no tests. */
+const NO_TESTS = `echo "${NO_TESTS_LINE}"`;
+
 /** The three scripts per stack; an unknown stack's say what to fill in, and pass. */
 const SCRIPTS: Record<KnownStack | 'other', Record<'install' | 'check' | 'demo', string>> = {
   python: {
@@ -84,6 +89,7 @@ uv sync
     check: `# The project's check: the linters and the tests. A task is done only when it passes.
 if [ ! -f pyproject.toml ]; then
   echo "no pyproject.toml yet: nothing to check"
+  ${NO_TESTS}
   exit 0
 fi
 if grep -q '^\\[tool\\.ruff' pyproject.toml || [ -f ruff.toml ] || [ -f .ruff.toml ]; then
@@ -91,6 +97,8 @@ if grep -q '^\\[tool\\.ruff' pyproject.toml || [ -f ruff.toml ] || [ -f .ruff.to
 fi
 if [ -d tests ]; then
   uv run pytest
+else
+  ${NO_TESTS}
 fi
 `,
     demo: `# Shows the product: the demo entry under [project.scripts] in pyproject.toml.
@@ -115,6 +123,7 @@ fi
     check: `# The project's check: the type check and the tests. A task is done only when it passes.
 if [ ! -f package.json ]; then
   echo "no package.json yet: nothing to check"
+  ${NO_TESTS}
   exit 0
 fi
 if [ -f tsconfig.json ]; then
@@ -124,6 +133,8 @@ if grep -Eq '"test"[[:space:]]*:' package.json; then
   bun run test
 elif [ -n "$(find . -name '*.test.ts' -not -path './node_modules/*' -print -quit)" ]; then
   bun test
+else
+  ${NO_TESTS}
 fi
 `,
     demo: `# Shows the product: the demo script in package.json.
@@ -139,6 +150,8 @@ echo "scripts/install.sh: fill in how to install the dependencies of the stack A
 `,
     check: `# The project's check: the linters and the tests. A task is done only when it passes.
 echo "scripts/check.sh: fill in the linters and the tests of the stack AGENTS.md names"
+# Printed whenever no test ran, so that agflow leaves the review of the work to the lead.
+${NO_TESTS}
 `,
     demo: `# Shows the product as a person would see it.
 echo "scripts/demo.sh: fill in how to show the product"

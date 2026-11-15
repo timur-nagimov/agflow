@@ -170,14 +170,19 @@ export function checkOwnFiles(command: string, changed: readonly string[]): stri
   return changed.filter((path) => path === PREP_CONFIG_PATH || paths.has(path));
 }
 
-/** check_failed's detail: how the check failed, what the agent does about it, and the end of its output. */
-export function checkFailedDetail(check: SubmissionCheck, run: CheckRun, timeoutMs: number, main: string): string {
+/** How a check that did not pass ended: it timed out after the limit, was killed by a signal, or exited with a code. */
+export function checkEnding(run: CheckRun, timeoutMs: number): string {
   const limit = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} min` : `${timeoutMs} ms`;
-  const how = run.timedOut
+  return run.timedOut
     ? `timed out after ${limit}`
     : run.signal !== null
       ? `was killed by ${run.signal}`
       : `exited with code ${run.code ?? 'unknown'}`;
+}
+
+/** check_failed's detail: how the check failed, what the agent does about it, and the end of its output. */
+export function checkFailedDetail(check: SubmissionCheck, run: CheckRun, timeoutMs: number, main: string): string {
+  const how = checkEnding(run, timeoutMs);
   const intro =
     `the project's check \`${check.command}\` ${how}, run on your branch with ${main} merged in. Run it yourself, ` +
     'make it pass, commit, and submit again.';

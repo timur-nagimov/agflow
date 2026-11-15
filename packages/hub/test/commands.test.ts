@@ -72,9 +72,12 @@ describe('the command queue', () => {
       expect(wire).toMatchObject({ t: 'command', id: row.id, seq: row.seq, command: { kind } });
     }
     expect(pendingCommands(ctx, runner.id, PROTOCOL_VERSION).map((row) => row.kind)).toEqual([...RUNNER_COMMAND_KINDS]);
-    // merge_task needs protocol 3; every other kind needs protocol 1, so a runner below it gets nothing.
-    const older = RUNNER_COMMAND_KINDS.filter((kind) => kind !== 'merge_task');
-    expect(pendingCommands(ctx, runner.id, 2).map((row) => row.kind)).toEqual(older);
+    // merge_task needs protocol 3 and check_main 4; every other kind needs protocol 1, so a runner below it gets
+    // nothing.
+    const older = RUNNER_COMMAND_KINDS.filter((kind) => kind !== 'check_main');
+    expect(pendingCommands(ctx, runner.id, 3).map((row) => row.kind)).toEqual(older);
+    const oldest = older.filter((kind) => kind !== 'merge_task');
+    expect(pendingCommands(ctx, runner.id, 2).map((row) => row.kind)).toEqual(oldest);
     expect(pendingCommands(ctx, runner.id, 0)).toEqual([]);
   });
 
