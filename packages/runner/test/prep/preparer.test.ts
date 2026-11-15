@@ -394,6 +394,8 @@ describe('DependencyPreparer seam', () => {
     const wraps: string[] = [];
     const working = new PrepSandbox({
       allowedDomains: standardProfile.network.allowedDomains,
+      // Unsandboxed commands: a Mac's check, which has no unix socket probe.
+      platform: 'darwin',
       manager: manager({
         wrapWithSandboxArgv: async (command) => {
           wraps.push(command);

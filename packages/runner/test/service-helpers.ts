@@ -136,10 +136,14 @@ export function sleepingServiceAdapter() {
   });
 }
 
-/** Each service gets a fresh manager: sandbox initialization is cached by manager identity. */
+/**
+ * Each service gets a fresh manager: sandbox initialization is cached by manager identity. Its commands run
+ * unsandboxed, which the self-check's Linux unix socket probe would find, so it is a Mac's on every test host.
+ */
 export function fakePrepSandbox(overrides: Partial<SandboxBackend> = {}): PrepSandbox {
   return new PrepSandbox({
     allowedDomains: standardProfile.network.allowedDomains,
+    platform: 'darwin',
     manager: {
       initialize: async () => {},
       isSupportedPlatform: () => true,
