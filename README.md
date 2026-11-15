@@ -264,7 +264,7 @@ Protected paths are matched case-insensitively. The runner restores them before 
 | `AGFLOW_LEASE_MINUTES` | `120` | How long a claim survives without agent activity |
 | `AGFLOW_REMINDER_MINUTES` | `30` | Minimum time between "you hold a task" reminders |
 | `AGFLOW_MAX_OPEN_TASKS` | `200` | Guard: refuse new tasks beyond this many open tasks |
-| `AGFLOW_MAX_TASKS_PER_HOUR` | `60` | Guard: refuse new tasks beyond this hourly rate; the tasks agflow creates itself (reviews, demo checks, fixes of `main`) do not count toward it |
+| `AGFLOW_MAX_TASKS_PER_HOUR` | `60` | Guard: refuse new tasks beyond this hourly rate; the tasks agflow creates itself (reviews, demo checks, fixes of `main`) do not count toward it, and it never holds a review back |
 | `AGFLOW_RUNNER_LEASE_MINUTES` | `15` | Runner silence before an attempt is lost |
 | `AGFLOW_TICK_SECONDS` | `15` | Hub scheduling/reconciliation interval |
 | `AGFLOW_STALL_MINUTES` | `10` | Stall detection window |
