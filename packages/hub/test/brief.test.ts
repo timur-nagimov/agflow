@@ -763,7 +763,7 @@ describe('never idle: the guides, the goal and the situation report', () => {
         'Workers: 1 running (target 4, cap 4); 2 free worker slot(s).',
         'Ready tasks: 1, 1 of them dispatchable now. Blocked on dependencies: 1. Submitted: 0. Accepted, not merged: 1.',
         'Quota:',
-        '- alice claude: ok, 5-hour 40%, weekly 12%, resets 2026-10-26 15:00 UTC',
+        '- alice claude: ok, 5-hour 40%, weekly 12%, resets in 3 h 0 min',
         '- alice codex: unknown, 5-hour unknown, weekly unknown, reset unknown',
         'Deadline: 2026-10-26 14:05 UTC, 2 h 5 min left.',
       ].join('\n'),
@@ -775,6 +775,31 @@ describe('never idle: the guides, the goal and the situation report', () => {
     expect(later).toContain('Workers: 1 running (target 2, cap 4); 1 free worker slot(s).');
     expect(later).toContain('Deadline: 2026-10-26 14:05 UTC, passed 55 min ago.');
     expect(buildBrief(ctx, lead.agent)).toContain('Deadline: 2026-10-26 14:05 UTC, passed 55 min ago.');
+  });
+
+  test('a quota line reads the account as placement does: stale once its reset has passed, the reset relative to now', () => {
+    const { ctx, clock } = createTestContext();
+    addRunnerLead(ctx);
+    const bobs = addRunner(ctx, { owner: 'bob' });
+    // bob's Claude account ran out until 13:00.
+    const quota = {
+      state: 'exhausted' as const,
+      resetsAt: ctx.now() + HOUR,
+      windows: { fiveHour: 1, weekly: 0.3 },
+      paidUsage: 'disabled' as const,
+      updatedAt: ctx.now(),
+    };
+    tx(ctx, (emit) =>
+      upsertAccountQuota(ctx, emit, {
+        owner: 'bob',
+        runnerId: bobs,
+        report: { vendor: 'claude', accountId: TEST_ACCOUNT_ID, quota },
+      }),
+    );
+    expect(situationReport(ctx)).toContain('\n- bob claude: exhausted, 5-hour 100%, weekly 30%, resets in 1 h 0 min\n');
+    // At 14:00 placement takes the account again: its 5-hour window has reset, and its weekly one keeps its reading.
+    clock.advance(2 * HOUR);
+    expect(situationReport(ctx)).toContain('\n- bob claude: stale, 5-hour unknown, weekly 30%, reset passed 1 h 0 min ago\n');
   });
 
   test('the situation report names the ready tasks left to live chats, and those only an open runner will run', () => {

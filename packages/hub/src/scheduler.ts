@@ -28,8 +28,10 @@ import {
   place,
   placeLead,
   placementWords,
+  reportHolds,
   runnerToAvoid,
   usableVendors,
+  utilization,
   whyNotDispatchable,
   workerSlotsFree,
 } from '@agflow/core';
@@ -644,13 +646,26 @@ function span(ms: number): string {
   return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
 }
 
-const share = (value: number | null): string => (value === null ? 'unknown' : `${Math.round(value * 100)}%`);
-
-function quotaLine(account: AccountQuota): string {
+/**
+ * An account's quota line for the lead, read as placement reads it (core's reportHolds and utilization), as the web's
+ * runner card does: once its reset has passed, the reading is stale, and its limiting window reads unknown until a
+ * newer report. The reset is told relative to now.
+ */
+function quotaLine(account: AccountQuota, now: number): string {
   const { state, windows, resetsAt } = account.quota;
-  const reset = resetsAt === null ? 'reset unknown' : `resets ${at(resetsAt)}`;
-  const use = `5-hour ${share(windows.fiveHour)}, weekly ${share(windows.weekly)}`;
-  return `- ${account.owner} ${account.vendor}: ${state}, ${use}, ${reset}`;
+  // As on the runner card, a probing start does not count: a reading with an unknown reset holds until a newer one.
+  const view = { ...account, openAttempts: 1 };
+  const holds = reportHolds({ now, quotaUnknownMs: 0, runners: [], accounts: [] }, view);
+  const placed = utilization(view, holds);
+  const use = (window: 'fiveHour' | 'weekly'): string => {
+    const value = windows[window];
+    return value === null || placed[window] !== value ? 'unknown' : `${Math.round(value * 100)}%`;
+  };
+  const head = `- ${account.owner} ${account.vendor}`;
+  const read = `5-hour ${use('fiveHour')}, weekly ${use('weekly')}`;
+  if (resetsAt === null) return `${head}: ${state}, ${read}, reset unknown`;
+  if (holds) return `${head}: ${state}, ${read}, resets in ${span(resetsAt - now)}`;
+  return `${head}: stale, ${read}, reset passed ${span(now - resetsAt)} ago`;
 }
 
 /**
@@ -667,13 +682,14 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
   ];
   const hold = dispatchHold(ctx);
   if (hold !== null) lines.push(`No worker starts now: ${hold}.`);
+  const now = ctx.now();
   const accounts = listAccounts(ctx);
   if (accounts.length === 0) lines.push('Quota: no account has reported yet.');
-  else lines.push('Quota:', ...accounts.map(quotaLine));
+  else lines.push('Quota:', ...accounts.map((account) => quotaLine(account, now)));
   const { deadlineAt } = getProject(ctx);
   if (deadlineAt === null) lines.push('Deadline: no deadline.');
   else {
-    const left = deadlineAt - ctx.now();
+    const left = deadlineAt - now;
     lines.push(`Deadline: ${at(deadlineAt)}, ${left >= 0 ? `${span(left)} left` : `passed ${span(left)} ago`}.`);
   }
   return lines;

@@ -81,7 +81,7 @@ describe('the idle nudge', () => {
         'Workers: 1 running (target 4, cap 4); 2 free worker slot(s).',
         'Ready tasks: 0, 0 of them dispatchable now. Blocked on dependencies: 0. Submitted: 0. Accepted, not merged: 0.',
         'Quota:',
-        '- alice claude: ok, 5-hour 40%, weekly 12%, resets 2026-10-26 15:00 UTC',
+        '- alice claude: ok, 5-hour 40%, weekly 12%, resets in 2 h 59 min',
         'Deadline: 2026-10-26 17:20 UTC, 5 h 19 min left.',
         '',
         'Plan the next batch now, so that ready, independent tasks are at least twice the free worker slots.',
