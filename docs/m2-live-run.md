@@ -47,7 +47,7 @@ Before anything starts, the script runs each vendor home's status command (`clau
 
 1. Use a Mac with Apple silicon, on AC power: the pinned binaries exist only for `darwin-arm64`. The script runs
    under `caffeinate -i`.
-2. Run `agflow runner setup` once, as for normal use: it installs the pinned Claude and Codex binaries and logs both
+2. Run `agflow runner setup --vendors both` once, as for normal use: it installs the pinned Claude and Codex binaries and logs both
    vendors in to the runner's own homes. `agflow runner setup --relogin` repeats the logins.
 3. If your own runner is running, `agflow runner stop` keeps it from spending the same quota during the run.
 4. Install dependencies and build the web UI: `bun install && bun run build:web`. The take-over check uses the task

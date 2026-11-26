@@ -241,7 +241,9 @@ export async function installService(
     options.log?.(line);
   };
 
-  await (options.installPins ?? ensurePinnedVendors)(paths, { env, exec: options.exec, log: options.log });
+  await (options.installPins ?? ensurePinnedVendors)(paths, {
+    env, exec: options.exec, log: options.log, vendors: config.vendors,
+  });
   for (const argument of files) {
     if (
       ['Desktop', 'Documents', 'Downloads'].some((folder) => {

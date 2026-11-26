@@ -340,6 +340,7 @@ async function preflightOf(adapter: VendorAdapter): Promise<Preflight> {
 export async function createRunner(options: RunnerOptions): Promise<RunnerHandle> {
   const logger = options.logger ?? noopLogger;
   const config = options.config ?? loadRunnerConfig(options.paths.config);
+  options = { ...options, adapters: options.adapters.filter((adapter) => config.vendors.includes(adapter.vendor)) };
   const ownDb = options.db === undefined;
   if (ownDb) mkdirSync(dirname(options.paths.db), { recursive: true, mode: 0o700 });
   const db = options.db ?? openRunnerDb(options.paths.db);
