@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { connect } from 'node:net';
+import { cleanupTestProcesses } from '../src/process-cleanup';
 import { type RefusingProxy, startRefusingProxy } from '../src/refusing-proxy';
 
 const proxies: RefusingProxy[] = [];
@@ -68,4 +69,21 @@ describe('startRefusingProxy', () => {
     });
     expect(refusedConnection).toBe(true);
   });
+});
+
+// Calls the same fallback as the preload after a failed/timed-out test, without using the fixture's close list.
+test('the test cleanup backstop closes an unreturned proxy and its open connections', async () => {
+  const refusing = await startRefusingProxy();
+  const socket = connect(refusing.port, '127.0.0.1');
+  await new Promise<void>((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+  try {
+    await cleanupTestProcesses();
+    expect(await outcome(fetch(refusing.url))).toBe('failed');
+  } finally {
+    socket.destroy();
+    await refusing.close();
+  }
 });

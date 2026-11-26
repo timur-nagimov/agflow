@@ -32,6 +32,7 @@ import { createRunnerConfig } from '@agflow/runner/src/service/runner-json';
 import type { RunnerStatusReport } from '@agflow/runner/src/service/status';
 import { VENDOR_PINS, vendorBinary } from '@agflow/runner/src/vendor/pins';
 import { linkClaudeBinary } from '../anthropic/binary';
+import { bindTestProcessScope } from '../process-cleanup';
 import { E2E_PLATFORM } from './env';
 import type { Models } from './models';
 import {
@@ -583,7 +584,7 @@ function createRunnerProcess(home: RunnerHome): RunnerProcess {
     get exitCode() {
       return proc === null || running() ? null : proc.exitCode;
     },
-    start,
+    start: bindTestProcessScope(start),
     stop,
     kill,
     freeze,

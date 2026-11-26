@@ -2,7 +2,8 @@
 // connection a vendor CLI tries to an external host is refused and recorded, and a test can assert that none
 // succeeded. Local servers are reached through NO_PROXY and never pass through it.
 import { createServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
+import { registerTestCleanup } from './process-cleanup';
 
 export interface RefusedRequest {
   /** connect: a CONNECT tunnel (https); http: a plain request with an absolute URI. */
@@ -34,11 +35,23 @@ export async function startRefusingProxy(): Promise<RefusingProxy> {
     refused.push({ kind: 'http', method: request.method ?? 'GET', target, at: Date.now() });
     response.writeHead(403, { 'content-type': 'text/plain' }).end('refused by the agflow test proxy\n');
   });
+  const sockets = new Set<Socket>();
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
   server.on('connect', (request, socket) => {
     refused.push({ kind: 'connect', method: 'CONNECT', target: request.url ?? '', at: Date.now() });
     socket.on('error', () => {});
     socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
   });
+  const close = () => new Promise<void>((resolve) => {
+    for (const socket of sockets) socket.destroy();
+    server.close(() => resolve());
+    server.closeAllConnections();
+  });
+  const unregister = registerTestCleanup(close);
+  server.once('close', unregister);
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () => resolve());
@@ -48,10 +61,6 @@ export async function startRefusingProxy(): Promise<RefusingProxy> {
     url: `http://127.0.0.1:${port}`,
     port,
     refused,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections();
-      }),
+    close,
   };
 }

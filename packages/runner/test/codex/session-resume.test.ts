@@ -1,3 +1,4 @@
+import { withoutTestProcessEnv } from '@agflow/testkit/src/process-cleanup';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { readFileSync, realpathSync } from 'node:fs';
 import { BRIDGE_TOOL_NAMES } from '../../src/adapters/bridge-tools';
@@ -48,7 +49,7 @@ describe('CodexSession resume', () => {
     const run = runs[0]!;
     expect(run.argv).toEqual(appServerArgs(f.options.testConfig));
     expect(run.cwd).toBe(realpathSync(f.options.userHome));
-    expect(run.env).toEqual(
+    expect(withoutTestProcessEnv(run.env)).toEqual(
       appServerEnv({
         base: f.launch.env,
         bridgeEnv: f.launch.bridge.env,
