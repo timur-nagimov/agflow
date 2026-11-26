@@ -3,7 +3,7 @@
 import { existsSync } from 'node:fs';
 import type { RunnerVendor } from '@agflow/core';
 import type { AttemptRecord } from '../attempt-store';
-import type { RunnerConfig } from '../config';
+import { loadRunnerConfig, type RunnerConfig } from '../config';
 import type { RunnerPaths } from '../paths';
 import type { AttemptStatus, RunnerStatus } from '../runner';
 import type { HealthReport, HealthState } from '../seams';
@@ -48,6 +48,7 @@ interface RunningStatus {
   keepAwake: { mode: RunnerConfig['keepAwake']; held: boolean };
   dependencyPrep: boolean;
   vendors: RunnerVendor[];
+  disabledVendors: RunnerConfig['vendors'];
   attempts: StatusAttempt[];
   keptClones: { attemptId: string; clone: string; error: string }[];
   warnings: string[];
@@ -56,6 +57,7 @@ interface RunningStatus {
 interface OfflineStatus {
   running: false;
   bestEffort: true;
+  disabledVendors: RunnerConfig['vendors'];
   /** What runs the runner: a LaunchAgent on macOS, a systemd user unit on Linux. */
   service: 'launchd' | 'systemd';
   /** Whether the service's file is installed: the plist, or on Linux the unit. */
@@ -72,7 +74,7 @@ export type RunnerStatusReport = RunningStatus | OfflineStatus;
 interface StatusInput {
   status: RunnerStatus | null;
   owner: RunnerLock['owner'];
-  config: Pick<RunnerConfig, 'name' | 'capacity' | 'draining' | 'keepAwake' | 'minFreeGb'>;
+  config: Pick<RunnerConfig, 'name' | 'capacity' | 'draining' | 'keepAwake' | 'minFreeGb' | 'vendors'>;
   hubUrl: string | null;
   health: HealthState;
   heartbeat: HealthReport;
@@ -163,6 +165,7 @@ export function buildStatusReport(input: StatusInput): RunningStatus {
       degraded: vendor.degraded,
       preflightAt: vendor.preflightAt,
     })),
+    disabledVendors: (['claude', 'codex'] as const).filter((vendor) => !config.vendors.includes(vendor)),
     attempts,
     // Only an exited attempt keeps its clone for a failed or pending push; a resumed one can carry a stale error.
     keptClones: input.records.flatMap((record) =>
@@ -235,16 +238,27 @@ export async function offlineStatus(
   const disabled = !consult ? null : linux ? await systemdServiceDisabled(options) : await launchdDisabled(options);
   const file = linux ? unitPath(options.home) : plistPath({ home: options.home, label: options.label });
   const owner = readLockOwner(options.paths);
+  const warnings = disabled ? [linux ? SYSTEMD_DISABLED_WARNING : LOGIN_ITEMS_WARNING] : [];
+  let disabledVendors: RunnerConfig['vendors'] = [];
+  if (existsSync(options.paths.config)) {
+    try {
+      const config = loadRunnerConfig(options.paths.config);
+      disabledVendors = (['claude', 'codex'] as const).filter((vendor) => !config.vendors.includes(vendor));
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : String(error));
+    }
+  }
   return {
     running: false,
     bestEffort: true,
+    disabledVendors,
     service: linux ? 'systemd' : 'launchd',
     plistInstalled: consult && existsSync(file),
     disabled,
     lastExit: new ServiceRuns(options.paths).lastExit({ running: owner !== null }),
     lockHolder: owner === null ? null : { pid: owner.pid, mode: owner.mode },
     logLines: tailLines(options.paths, 20),
-    warnings: disabled ? [linux ? SYSTEMD_DISABLED_WARNING : LOGIN_ITEMS_WARNING] : [],
+    warnings,
   };
 }
 
@@ -333,6 +347,7 @@ export function formatStatus(report: RunnerStatusReport): string {
       );
     lines.push('Last log lines:', ...report.logLines);
   }
+  for (const vendor of report.disabledVendors ?? []) lines.push(line(vendor, 'off (by choice)'));
   for (const warning of report.warnings) lines.push(`Warning: ${warning}`);
   return `${lines.join('\n')}\n`;
 }

@@ -485,7 +485,7 @@ What still needs a person:
 - **Internet for Codex agents.** They never fetch, with or without a grant. Give outside-data tasks to Claude agents,
   or commit the data. On a runner with the open profile (`agflow runner setup --preset hackathon`) Codex commands
   reach the network themselves ([README](../README.md#runner-permissions-and-risks)).
-- **Runner sign-in.** A person runs `agflow login` on each Mac and completes the Claude and Codex logins that
+- **Runner sign-in.** A person runs `agflow login` on each Mac and completes the chosen vendor logins that
   `agflow runner setup` opens ([Joining from a Mac](#joining-from-a-mac)).
 - **Secrets.** API keys and other secrets are never handed out by the hub or by the lead. A person provides them.
 
@@ -564,7 +564,7 @@ agflow runner status
 
 Compare the terminal verification code with the browser page before approving CLI sign-in. The credentials preserve the HTTPS hub URL; the runner opens `wss://YOUR_PUBLIC_HOST/api/runner/ws`. No port forwarding is needed.
 
-`setup` records machine identity, git identity, login-shell PATH/proxy/CA settings and capacity (default two). It installs pinned binaries in separate runner vendor homes, opens Claude subscription and Codex logins, and installs/starts the LaunchAgent. Checks run inside the service, including hub identity, repository fetch/push probe, vendor preflight and sandbox support. Setup never requires vendor credentials on the Linux host. `agflow runner setup --relogin` repeats vendor login; `agflow login --hub ...` renews an expired hub token, which the running runner will detect.
+`setup` records machine identity, git identity, login-shell PATH/proxy/CA settings and capacity (default two). It installs pinned binaries in separate runner vendor homes, opens only the chosen vendor logins (`--vendors claude|codex|both`, default both), and installs/starts the LaunchAgent. Checks run inside the service, including hub identity, repository fetch/push probe, vendor preflight and sandbox support. Setup never requires vendor credentials on the Linux host. `agflow runner setup --relogin` repeats the chosen vendor logins; a kept runner keeps its vendor choice unless `--vendors` is given, including with `--preset hackathon`. `agflow login --hub ...` renews an expired hub token, which the running runner will detect.
 
 Instead of building, you can download `agflow-darwin-arm64` from the repository's latest release into `~/.local/bin/agflow` and make it executable. For a hackathon, `agflow runner setup --preset hackathon --name <name>` asks no questions and sets capacity 6, ceilings 1, keep-awake always and the open profile, which gives agents the network and the greenfield files ([README](../README.md#runner-permissions-and-risks)).
 

@@ -898,3 +898,14 @@ describe('placeLead', () => {
     });
   });
 });
+
+// A runner's advertised list is the only source of vendor slots, including on older hubs.
+test.each(['claude', 'codex'] as const)('placement uses only advertised vendor %s', (vendor) => {
+  const other: Vendor = vendor === 'claude' ? 'codex' : 'claude';
+  const view = snapshot([runner({ vendors: [vendorSlot({ vendor })] })]);
+  const project = { projectPref: { vendor: other, until: NOW + HOUR } };
+  expect(place(view, candidate(), project).placement?.vendor).toBe(vendor);
+  expect(placeLead(view, { rotatingFrom: null }).placement?.vendor).toBe(vendor);
+  expect(place(view, candidate({ vendorHint: other, readySince: NOW }), project).placement).toBeNull();
+  expect(place(view, candidate({ requirement: { step: 2, vendor: other } }), project).placement).toBeNull();
+});

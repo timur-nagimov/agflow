@@ -127,6 +127,13 @@ export const RunnerConfigSchema = z
     /** The Mac's IOPlatformUUID; a copied home folder is refused at start. */
     machineId: Name,
     name: Name,
+    /** Vendors this runner offers; older files offer both. */
+    vendors: z
+      .array(VendorSchema)
+      .min(1)
+      .max(2)
+      .refine((vendors) => new Set(vendors).size === vendors.length, { error: 'vendors must be unique' })
+      .default(['claude', 'codex']),
     // The settings the hub shows and the owner may change (RunnerSettings, design 6.3).
     capacity: z.number().int().min(1).max(16).default(2),
     keepAwake: z.enum(['off', 'ac', 'always']).default('ac'),

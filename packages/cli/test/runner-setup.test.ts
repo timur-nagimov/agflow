@@ -642,6 +642,10 @@ test('checks retry startup route errors within the socket deadline', async () =>
 test('setup flags choose the runner settings, and the hackathon preset chooses them all', () => {
   const choices = (...flags: string[]) => setupChoices(parseArgs(['runner', 'setup', ...flags]));
   expect(choices('--yes')).toEqual({});
+  expect(choices('--vendors', 'claude')).toEqual({ vendors: ['claude'] });
+  expect(choices('--vendors=codex')).toEqual({ vendors: ['codex'] });
+  expect(choices('--vendors', 'claude', '--vendors', 'both')).toEqual({ vendors: ['claude', 'codex'] });
+  expect(choices('--preset', 'hackathon', '--vendors', 'codex')).toEqual({ ...HACKATHON_PRESET, vendors: ['codex'] });
   expect(HACKATHON_PRESET).toEqual({ capacity: 6, ceiling: 1, keepAwake: 'always', profile: 'open' });
   expect(choices('--preset', 'hackathon')).toEqual(HACKATHON_PRESET);
   expect(choices('--preset', 'hackathon', '--capacity', '8', '--profile', 'standard')).toEqual({
@@ -654,6 +658,10 @@ test('setup flags choose the runner settings, and the hackathon preset chooses t
   ).toEqual({ name: 'Hack Mac', capacity: 16, ceiling: 0.5, keepAwake: 'off', profile: 'auto' });
   for (const flags of [
     ['--preset', 'party'],
+    ['--vendors', 'gemini'],
+    ['--vendors', 'claude,codex'],
+    ['--vendors'],
+    ['--vendors='],
     ['--name', ' '],
     ['--name'],
     ['--capacity', '0'],
@@ -736,3 +744,39 @@ try {
     expect(err).toContain('three [fallback]:');
   });
 }
+
+for (const [linux, vendor] of [[false, 'claude'], [false, 'codex'], [true, 'codex']] as const) {
+  test(`setup installs, logs in and checks only ${vendor} (linux=${linux})`, async () => {
+    const f = await fixture({ linux });
+    expect(await f.run(['--yes', '--vendors', vendor], {
+      secret: async () => { throw new Error('unchosen Claude must not ask for a token'); },
+    })).toBe(0);
+    expect(loadRunnerConfig(f.paths.config).vendors).toEqual([vendor]);
+    expect(f.registry.requests).toHaveLength(1);
+    expect([...new Set(f.vendorCalls().map((call) => call.vendor))]).toEqual([vendor]);
+    expect(f.logins().map((call) => call.vendor)).toEqual([vendor]);
+    const other = vendor === 'claude' ? 'codex' : 'claude';
+    expect(existsSync(join(f.paths.runner, vendorBinary(other, f.pins[other].version)))).toBe(false);
+    expect(f.out.join('')).toContain(`ok ${vendor}:`);
+    expect(f.out.join('')).not.toContain(`ok ${other}:`);
+    await expect(f.run(['--yes', '--vendors', 'both'])).rejects.toThrow('is running');
+    process.env.AGFLOW_HOME = f.paths.home;
+    const status: string[] = [];
+    expect(await runnerCommand(parseArgs(['runner', 'status']), {
+      out: (line) => void status.push(line), err: f.io.err,
+    }, { env: { AGFLOW_TEST: '1' }, platform: linux ? 'linux' : 'darwin' })).toBe(0);
+    expect(status.join('')).toMatch(new RegExp(`${other}\\s+off \\(by choice\\)`));
+  });
+}
+
+test('setup keeps its vendors across reruns and presets until explicitly changed', async () => {
+  const f = await fixture();
+  await f.run(['--yes', '--no-service', '--vendors', 'codex']);
+  const initial = loadRunnerConfig(f.paths.config);
+  await f.run(['--yes', '--no-service', '--preset', 'hackathon']);
+  expect(loadRunnerConfig(f.paths.config)).toMatchObject({ runnerKey: initial.runnerKey, vendors: ['codex'] });
+  expect(f.logins().map((call) => call.vendor)).toEqual(['codex']);
+  await f.run(['--yes', '--no-service', '--vendors', 'both']);
+  expect(loadRunnerConfig(f.paths.config).vendors).toEqual(['claude', 'codex']);
+  expect(f.logins().map((call) => call.vendor)).toEqual(['codex', 'claude']);
+});

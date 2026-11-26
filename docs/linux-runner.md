@@ -75,11 +75,14 @@ agflow runner setup
 
 For a hackathon, run `agflow runner setup --preset hackathon --capacity 8` instead: the open profile and 8 worker
 slots, which suit the default VM's 16 vCPU and 32 GB; give a smaller VM about one slot for every 2 vCPU, as the script
-prints. Leave out `--yes`, or setup cannot ask for the Claude token. Read
+prints. If Claude is chosen, leave out `--yes`, or setup cannot ask for its token. Read
 **Open profile** below first: with it, a Codex command on the VM may get out of its sandbox.
 
 `agflow login` shows a link and a code: open the link in a browser on your Mac. Setup asks for the runner's name and
-capacity, downloads the pinned Claude Code and Codex for Linux, and does the two vendor logins. The VM has no browser,
+capacity, downloads the chosen pinned binaries for Linux, and signs in only to those vendors. Use
+`--vendors claude|codex|both` (default `both`); a kept runner keeps its choice unless the flag is given, and
+`--preset hackathon` does not change it. For Codex alone, run `agflow runner setup --vendors codex`: it skips
+the Claude token step entirely, including with `--yes`. The VM has no browser,
 so:
 
 - **Codex** signs in with a device code. Setup runs `codex login --device-auth` in the runner's own Codex home: open
@@ -147,7 +150,7 @@ agflow runner install
   so the runner reports a hash of the token as the account: the hub counts this runner's Claude quota apart from the
   Macs', though the subscription is the same. A token lasts a year. Once the API refuses it, the runner's Claude stays
   not ready, and the hub's Runners card says why, until `runner.env` holds another token: make a new one and paste it
-  into `agflow runner setup --relogin`, which signs Codex in again too and restarts the service.
+  into `agflow runner setup --relogin`, which repeats logins for the chosen vendors and restarts the service.
 - **Service.** A systemd user unit with lingering instead of a LaunchAgent; there are no Login Items to allow.
 - **Machine id.** The runner is bound to `/etc/machine-id` instead of the Mac's hardware id. A copy of `~/.agflow` on
   another machine is refused, as on a Mac.

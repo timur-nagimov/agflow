@@ -1019,3 +1019,33 @@ describe('createRunner', () => {
     expect(later.attempts.map((facts) => facts.attemptId).sort()).toEqual(['T-5-a1', 'T-6-a1']);
   }, 40_000);
 });
+
+test.each(['claude', 'codex'] as const)('the runner advertises and preflights only the chosen vendor %s', async (vendor) => {
+  const s = await setup();
+  const other = vendor === 'claude' ? 'codex' : 'claude';
+  let unchosenPreflights = 0;
+  const disabled = new FakeAdapter({ vendor: other, skipAuthChecks: true, script: { turns: [[]] } });
+  disabled.preflight = async () => { unchosenPreflights++; throw new Error('disabled'); };
+  const runner = await s.start({
+    config: { vendors: [vendor] },
+    adapters: [disabled, new FakeAdapter({ vendor, skipAuthChecks: true, script: { turns: [[]] } })],
+  });
+  const hello = await s.hub.waitFor(() => hellos(s.hub)[0]);
+  expect(RunnerMessageSchema.safeParse(hello).success).toBe(true);
+  expect(hello.vendors.map((entry) => entry.vendor)).toEqual([vendor]);
+  expect(runner.status().vendors.map((entry) => entry.vendor)).toEqual([vendor]);
+  expect(await run(s.hub, { kind: 'preflight', vendor })).toMatchObject({ ok: true });
+  const report = await s.hub.waitFor(() => s.hub.events().find((event) => event.type === 'runner.vendors'));
+  expect(report.data).toEqual(expect.objectContaining({ vendors: [expect.objectContaining({ vendor })] }));
+  expect(await run(s.hub, { kind: 'preflight', vendor: other })).toMatchObject({ ok: false });
+  expect(unchosenPreflights).toBe(0);
+});
+
+test.each(['claude', 'codex'] as const)('the runner refuses an attempt for unchosen vendor %s', async (vendor) => {
+  const s = await setup();
+  await s.start({ config: { vendors: [vendor === 'claude' ? 'codex' : 'claude'] } });
+  await s.hub.waitFor(() => hellos(s.hub)[0]);
+  expect(await run(s.hub, { kind: 'start_attempt', attempt: { ...specOf(s), vendor } })).toMatchObject({
+    ok: false, error: `${vendor} is not ready on this runner`,
+  });
+});

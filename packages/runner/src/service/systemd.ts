@@ -136,7 +136,9 @@ export async function installSystemdService(
     options.log?.(line);
   };
 
-  await (options.installPins ?? ensurePinnedVendors)(paths, { env, exec: options.exec, log: options.log });
+  await (options.installPins ?? ensurePinnedVendors)(paths, {
+    env, exec: options.exec, log: options.log, vendors: config.vendors,
+  });
   const unit = renderUnit({
     execStart: [agflow.command, ...agflow.args, 'runner', 'start', '--service'],
     environment: serviceEnvironment(config, paths, env),

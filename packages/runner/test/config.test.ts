@@ -62,6 +62,7 @@ describe('loadRunnerConfig', () => {
     const loaded = load(identity);
     expect(loaded).toMatchObject({
       ...identity,
+      vendors: ['claude', 'codex'],
       capacity: 2,
       keepAwake: 'ac',
       draining: false,
@@ -488,4 +489,15 @@ describe('settings sync', () => {
     expect(isWholeSettings({ ...patch, allowPaidUsage: { codex: true } }, codexOnly)).toBe(true);
     expect(isWholeSettings({ ...patch, ceilings: { claude: whole.ceilings.claude } }, codexOnly)).toBe(false);
   });
+});
+
+test('runner.json validates and persists a nonempty, unique choice of supported vendors', () => {
+  const path = file(identity);
+  for (const vendors of [['claude'], ['codex'], ['claude', 'codex']] as const) {
+    saveRunnerConfig(path, config({ vendors }));
+    expect(loadRunnerConfig(path).vendors).toEqual([...vendors]);
+  }
+  for (const vendors of [[], ['claude', 'claude'], ['other'], 'codex', null]) {
+    expect(() => load({ ...identity, vendors })).toThrow('runner.json: vendors');
+  }
 });

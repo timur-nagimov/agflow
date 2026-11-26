@@ -552,7 +552,8 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       if (ending) return;
       hubUrl = credentials!.hubUrl;
     }
-    adapters = options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow });
+    adapters = (options.adapters ?? (options.createAdapters ?? createAdapters)(config, paths, { agflow }))
+      .filter((adapter) => config.vendors.includes(adapter.vendor));
     const open = config.profile === 'open';
     sandbox =
       options.prepSandbox ?? new PrepSandbox({ allowedDomains: standardProfile.network.allowedDomains, open, logger });

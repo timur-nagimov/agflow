@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { createTasks } from '@agflow/hub/src/tasks';
 import { newTask } from '@agflow/hub/test/helpers';
 import { AttemptStore } from '../../src/attempt-store';
+import { saveRunnerConfig } from '../../src/config';
 import { openRunnerDb } from '../../src/db';
 import { GB } from '../../src/ops/health';
 import type { RunnerStatus } from '../../src/runner';
@@ -285,4 +286,13 @@ test('GET /status lists a retained failed-push clone only while it exists', asyn
   } finally {
     db.close();
   }
+});
+
+test('offline status shows a vendor disabled by choice', async () => {
+  const s = await setupTestService();
+  saveRunnerConfig(s.paths.config, { ...s.config, vendors: ['codex'] });
+  const report = await offlineStatus({ paths: s.paths, launchd: false });
+  expect(report.disabledVendors).toEqual(['claude']);
+  expect(formatStatus(report)).toMatch(/claude\s+off \(by choice\)/);
+  expect(report.warnings).toEqual([]);
 });

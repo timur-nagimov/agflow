@@ -2,4 +2,5 @@
 import type { AdapterFactory } from '../types';
 import { createClaudeAdapter } from './factory';
 
-export const claudeAdapterFactory: AdapterFactory = (input) => createClaudeAdapter(input);
+export const claudeAdapterFactory: AdapterFactory = (input) =>
+  input.config.vendors.includes('claude') ? createClaudeAdapter(input) : null;

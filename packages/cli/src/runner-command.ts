@@ -20,11 +20,12 @@ import type { RunnerUninstallDeps } from './runner-uninstall';
 import { selfCommand } from './self';
 
 /** The runner subcommands' lines in main.ts's HELP; each subcommand adds its own. */
-export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-service] [--preset hackathon]
+export const RUNNER_HELP = `  agflow runner setup [--yes] [--relogin] [--no-service] [--preset hackathon] [--vendors claude|codex|both]
       [--name <name>] [--capacity <1-16>] [--ceiling <0.5-1>] [--keep-awake always|ac|off]
       [--profile standard|auto|open]
                                 Set up this machine's runner: sign-in, runner.json, binaries, logins and the service;
-                                --preset hackathon is capacity 6, ceilings 1, keep-awake always and profile open
+                                --vendors defaults to both; a kept runner keeps its choice unless given
+                                --preset hackathon leaves vendors unchanged and is capacity 6, ceilings 1, keep-awake always and profile open
   agflow runner start [--service]
                                 Run this machine's runner in the foreground (--service for launchd or systemd)
   agflow runner stop             Hand off agents and stop and disable the service
@@ -77,7 +78,7 @@ export async function runnerCommand(
     setup: async (args, io) => {
       if (args.positional.length > 2) {
         throw new UsageError(
-          'usage: agflow runner setup [--yes] [--relogin] [--no-service] [--preset hackathon] [--name <name>] ' +
+          'usage: agflow runner setup [--yes] [--relogin] [--no-service] [--preset hackathon] [--vendors claude|codex|both] [--name <name>] ' +
             '[--capacity <1-16>] [--ceiling <0.5-1>] [--keep-awake always|ac|off] [--profile standard|auto|open]',
         );
       }

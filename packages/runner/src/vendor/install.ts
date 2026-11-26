@@ -41,6 +41,7 @@ export interface PinnedVendorsOptions extends VendorInstallOptions {
   platform?: string;
   /** Test packages can replace the platform's real pins without a real download. */
   pins?: PlatformPins;
+  vendors?: readonly Vendor[];
 }
 
 async function checkBinary(
@@ -234,15 +235,17 @@ export async function ensureVendorBinary(
 export async function ensurePinnedVendors(
   paths: RunnerPaths,
   options: PinnedVendorsOptions = {},
-): Promise<Record<Vendor, string>> {
+): Promise<Partial<Record<Vendor, string>>> {
   const platform = options.platform ?? vendorPlatform();
   const pins = options.pins ?? VENDOR_PINS[platform];
   if (!pins) throw new VendorInstallError(`unsupported platform ${platform}`);
-  const claude = await ensureVendorBinary('claude', pins.claude, paths, options);
-  options.log?.(claude);
-  const codex = await ensureVendorBinary('codex', pins.codex, paths, options);
-  options.log?.(codex);
-  return { claude, codex };
+  const binaries: Partial<Record<Vendor, string>> = {};
+  for (const vendor of options.vendors ?? ['claude', 'codex']) {
+    const binary = await ensureVendorBinary(vendor, pins[vendor], paths, options);
+    binaries[vendor] = binary;
+    options.log?.(binary);
+  }
+  return binaries;
 }
 
 /** Fills AGFLOW_HOME's vendor directory without setup, for the smoke suites and standalone installation. */

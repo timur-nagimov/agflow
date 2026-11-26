@@ -1,5 +1,5 @@
 // Runner setup (design 7.1): verify sign-in before writes, then reuse the runner's config, pins, logins and service.
-// Flags answer its questions and set runner.json's ceilings, keep-awake and profile; --preset hackathon sets them all.
+// Flags choose vendors and answer its questions; --preset hackathon sets capacity, ceilings, keep-awake and profile.
 import { chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface, type Interface } from 'node:readline/promises';
@@ -106,10 +106,11 @@ export interface RunnerSetupDeps {
 
 /**
  * What setup's flags choose, so it asks nothing about them (design 7.1): the name, the capacity, one ceiling for both
- * windows of both vendors, keep-awake and the profile. A flag given beside --preset wins over the preset.
+ * windows of both vendors, keep-awake and the profile, plus which vendors to use. A flag beside --preset wins.
  */
 export interface SetupChoices {
   name?: string;
+  vendors?: RunnerConfig['vendors'];
   capacity?: number;
   ceiling?: number;
   keepAwake?: RunnerConfig['keepAwake'];
@@ -151,6 +152,8 @@ export function setupChoices(args: ParsedArgs): SetupChoices {
     return usage(`--${name} must be one of: ${values.join(', ')}`);
   };
   const choices: SetupChoices = oneOf('preset', ['hackathon']) ? { ...HACKATHON_PRESET } : {};
+  const vendors = oneOf('vendors', ['claude', 'codex', 'both']);
+  if (vendors !== undefined) choices.vendors = vendors === 'both' ? ['claude', 'codex'] : [vendors];
   const name = flag('name')?.trim();
   if (name !== undefined) choices.name = name || usage('--name must not be empty');
   const capacity = flag('capacity');
@@ -171,11 +174,14 @@ export function setupChoices(args: ParsedArgs): SetupChoices {
 
 /** The config with the choices laid over it, the settings among them as local edits; null when they change nothing. */
 function withChoices(config: RunnerConfig, choices: SetupChoices): RunnerConfig | null {
-  const { name = config.name, profile = config.profile, capacity, keepAwake, ceiling } = choices;
+  const { name = config.name, profile = config.profile, vendors = config.vendors, capacity, keepAwake, ceiling } = choices;
   const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
   const edited = editLocalSettings(config, { capacity, keepAwake, ceilings });
-  if (name === config.name && profile === config.profile && Object.keys(edited.changed).length === 0) return null;
-  return { ...edited.config, name, profile };
+  if (
+    name === config.name && profile === config.profile &&
+    Bun.deepEquals(vendors, config.vendors) && Object.keys(edited.changed).length === 0
+  ) return null;
+  return { ...edited.config, name, profile, vendors };
 }
 
 async function configure(
@@ -233,7 +239,7 @@ async function configure(
       if (refreshed !== kept) log(`runner.json takes the login shell's PATH: ${path}`);
       return next;
     }
-    const { ceiling, keepAwake, profile } = choices;
+    const { ceiling, keepAwake, profile, vendors } = choices;
     const ceilings = ceiling === undefined ? undefined : { claude: both(ceiling), codex: both(ceiling) };
     const captured = await captureLoginShellEnv({ env, exec });
     const config = createRunnerConfig(
@@ -245,7 +251,7 @@ async function configure(
         commitIdentity: await readGitIdentity(exec),
         homes: { claude: canonicalHome(paths.homes.claude), codex: canonicalHome(paths.homes.codex) },
       },
-      { name, capacity, keepAwake, ceilings, profile },
+      { name, capacity, keepAwake, ceilings, profile, vendors },
     );
     saveRunnerConfig(paths.config, config);
     if (mismatch) log('assigned a new runner key because runner.json came from another Mac');
@@ -352,14 +358,14 @@ export async function runnerSetup(args: ParsedArgs, io: Io, deps: Partial<Runner
   }
   const platform = deps.platform ?? vendorPlatform();
   const pins = deps.pins ?? VENDOR_PINS[platform];
-  const pinOptions = { env, exec, platform, pins, log };
-  log('installing the pinned Claude and Codex binaries; the first setup downloads about 550 MB');
+  const pinOptions = { env, exec, platform, pins, log, vendors: config.vendors };
+  log(`installing the pinned binaries: ${config.vendors.join(', ')}`);
   await ensurePinnedVendors(paths, pinOptions);
   // The Claude token's file holds a secret: only its owner reads it.
   if (existsSync(paths.envFile)) chmodSync(paths.envFile, 0o600);
   const ask = args.flags.yes !== true;
   let claudeToken = false;
-  for (const vendor of ['claude', 'codex'] as const) {
+  for (const vendor of config.vendors) {
     const options = { version: pins?.[vendor].version, platform, exec, base: env, deviceAuth: linux };
     const status = await (vendor === 'claude' ? claudeLoginStatus : codexLoginStatus)(config, paths, options);
     // On Linux Claude signs in with a token made on a Mac, which setup asks for; --yes asks for nothing.
