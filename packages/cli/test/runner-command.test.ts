@@ -249,7 +249,7 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
   }
 
   test('start says hello to the hub and exits cleanly on SIGTERM', async () => {
-    // The real host reads this Mac's free space for its disk guard; test mode keeps its notifier silent.
+    // The real host reads this machine's resources; low RAM may hold admission but must not prevent its hello.
     const s = await setupTestService({ config: { machineId: await readMachineId(), minFreeGb: 0 } });
     const child = Bun.spawn([process.execPath, MAIN, 'runner', 'start'], {
       env: { ...process.env, AGFLOW_HOME: s.paths.home, AGFLOW_CONFIG_DIR: s.configDir, AGFLOW_TEST: '1' },
@@ -265,7 +265,8 @@ console.log(JSON.stringify(Object.keys(require.cache).filter((path) => path.incl
     const stderr = new Response(child.stderr).text();
     await waitFor(() => {
       if (child.exitCode !== null) throw new Error(`runner exited before hello (code ${child.exitCode})`);
-      return findRunnerByKey(s.hub.ctx, s.config.runnerKey)?.state === 'online';
+      const runner = findRunnerByKey(s.hub.ctx, s.config.runnerKey);
+      return runner !== null && runner.connection_id !== null;
     });
     expect(readLockOwner(s.paths)).toMatchObject({ pid: child.pid, mode: 'foreground' });
     child.kill('SIGTERM');

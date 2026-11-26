@@ -217,6 +217,7 @@ describe('state', () => {
       [{ linked: true, sessionValid: true, reported: 'ok' }, 'online'],
       [{ linked: true, sessionValid: true, reported: 'crash_loop' }, 'crash_loop'],
       [{ linked: true, sessionValid: true, reported: 'disk_low' }, 'disk_low'],
+      [{ linked: true, sessionValid: true, reported: 'memory_low' }, 'memory_low'],
     ];
     for (const [input, state] of cases) expect<unknown>([input, deriveRunnerState(input)]).toEqual([input, state]);
   });

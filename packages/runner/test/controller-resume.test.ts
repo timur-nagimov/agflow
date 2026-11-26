@@ -6,7 +6,7 @@ import { commitFiles, FakeAdapter, type TranscriptLine } from '@agflow/testkit';
 import type { VendorAdapter } from '../src/adapters/types';
 import { handoffPrompt } from '../src/attempt/stop';
 import { readCloneHead } from '../src/git/clone';
-import type { DependencyPreparer } from '../src/seams';
+import { defaultHealth, type DependencyPreparer } from '../src/seams';
 import {
   cleanupRunnerFixtures,
   createRunnerFixture,
@@ -68,6 +68,17 @@ async function startedAndStopped(f: RunnerFixture, spec = f.spec()) {
 }
 
 describe('AttemptController: resume', () => {
+  test('a suspended agent cannot bypass RAM admission on resume', async () => {
+    const f = await createRunnerFixture();
+    await startedAndStopped(f);
+    const before = f.fakes.claude!.launches.length;
+    const controller = f.controller('T-4-a1', { health: { ...defaultHealth, admit: () => 'memory_low' } });
+    expect(await controller.resume(resumeCommand(f))).toMatchObject({ resumed: false });
+    expect(f.fakes.claude!.launches).toHaveLength(before);
+    expect(f.events('attempt.failed_to_start').at(-1)).toMatchObject({ fence: NEW, data: { refused: 'memory_low' } });
+    expect(controller.holdsSlot).toBe(false);
+  });
+
   test('resume resets finalization before preparing work, even if preparation fails', async () => {
     const f = await createRunnerFixture();
     await startedAndStopped(f);

@@ -151,6 +151,10 @@ export const RunnerConfigSchema = z
       })
       .prefault({}),
     minFreeGb: z.number().min(0).default(10),
+    /** RAM admission: decimal GB, with at least 10% of effective RAM kept in reserve. */
+    memoryReserveGb: z.number().positive().default(2),
+    /** Additional growth headroom reserved for every live agent, including leads. */
+    memoryPerAgentGb: z.number().positive().default(2),
     batteryDrainPercent: z.number().min(0).max(100).default(20),
     /** How long a submission's check may run before it fails as timed out, in minutes. */
     checkMinutes: z.number().positive().default(10),

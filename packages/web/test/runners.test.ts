@@ -104,7 +104,7 @@ function account(overrides: Partial<AccountQuota> = {}, quota: Partial<AccountQu
 
 describe('runner state', () => {
   test('every runner state has a label and a tone', () => {
-    const states: RunnerState[] = ['online', 'offline', 'needs_login', 'incompatible', 'crash_loop', 'disk_low'];
+    const states: RunnerState[] = ['online', 'offline', 'needs_login', 'incompatible', 'crash_loop', 'disk_low', 'memory_low'];
     expect(Object.keys(RUNNER_STATE_LABELS).sort()).toEqual([...states].sort());
     // The typecheck makes the labels cover RunnerState; core's schema confirms each is a state the hub sends.
     for (const state of states) expect(RunnerSchema.safeParse(runner({ state })).success).toBe(true);
@@ -116,11 +116,15 @@ describe('runner state', () => {
       ['incompatible', 'Incompatible', 'trouble'],
       ['crash_loop', 'Crash loop', 'trouble'],
       ['disk_low', 'Disk low', 'trouble'],
+      ['memory_low', 'RAM low', 'trouble'],
     ]);
     expect(runnerTone(runner({ draining: true }))).toBe('wait');
   });
 
   test('every state but online has a one-line why', () => {
+    expect(runnerWhy(runner({ state: 'memory_low' }), NOW)).toBe(
+      'Not enough RAM for another agent; existing agents continue running',
+    );
     expect(runnerWhy(runner(), NOW)).toBeNull();
     expect(runnerWhy(runner({ state: 'offline', lastSeenAt: NOW - 20 * MINUTE }), NOW)).toBe('Last seen 20 min ago');
     expect(runnerWhy(runner({ state: 'needs_login' }), NOW)).toBe(

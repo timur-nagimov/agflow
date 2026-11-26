@@ -161,6 +161,7 @@ export function fakeServiceOperations(): Partial<RunnerServiceOptions> {
     prepSandbox: fakePrepSandbox(),
     power: async () => ({ source: 'ac', batteryPercent: 100, lowPowerMode: false }),
     freeBytes: () => 100_000_000_000,
+    memory: () => ({ totalBytes: 64_000_000_000, availableBytes: 60_000_000_000 }),
     usage: { current: () => 1_000_000 },
     exec: recordingExec(),
     platform: 'linux',

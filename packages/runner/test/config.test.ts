@@ -58,6 +58,13 @@ function config(overrides: Record<string, unknown> = {}): RunnerConfig {
 const MIN = 60_000;
 
 describe('loadRunnerConfig', () => {
+  test('RAM protection defaults on and requires positive finite reserve and per-agent budgets', () => {
+    expect(load(identity)).toMatchObject({ memoryReserveGb: 2, memoryPerAgentGb: 2 });
+    for (const key of ['memoryReserveGb', 'memoryPerAgentGb']) {
+      for (const value of [0, -1, '2', null]) expect(() => load({ ...identity, [key]: value })).toThrow(key);
+    }
+    expect(load({ ...identity, memoryReserveGb: 4, memoryPerAgentGb: 3 })).toMatchObject({ memoryReserveGb: 4, memoryPerAgentGb: 3 });
+  });
   test('gives a runner.json with only its identity the section 12 defaults', () => {
     const loaded = load(identity);
     expect(loaded).toMatchObject({

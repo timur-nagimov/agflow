@@ -10,7 +10,7 @@ type Hello = Extract<RunnerMessage, { t: 'hello' }>;
 export interface HealthReport {
   power: Runner['power'];
   disk: Runner['disk'];
-  /** Ms from now during which the runner takes no new attempt (wake, battery, disk); null when it takes them. */
+  /** Ms from now during which the runner takes no new attempt (wake, battery, disk, RAM); null when it takes them. */
   acceptingUntil: number | null;
 }
 
@@ -21,8 +21,10 @@ export interface HealthState {
 }
 
 export interface RunnerHealth {
-  /** Asked for each start_attempt after the core's own checks: one of core's START_REFUSALS, or null to admit. */
+  /** Start/resume admission and a final pre-launch check; repeated calls for one attempt reuse its reservation. */
   admit(spec: AttemptSpec): StartRefusal | null | Promise<StartRefusal | null>;
+  /** Release admission resources after a failed start or after the process and its cleanup end. */
+  release?(attemptId: string): void;
   heartbeat(): HealthReport;
   state(): HealthState;
 }

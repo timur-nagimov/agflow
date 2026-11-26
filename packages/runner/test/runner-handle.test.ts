@@ -529,7 +529,8 @@ describe('RunnerEvents', () => {
     connection.send(testWelcome(0));
     const started = run(s.hub, { kind: 'start_attempt', attempt: specOf(s) });
     expect(await started).toMatchObject({ ok: true });
-    expect(order).toEqual(['welcome R-1', 'admit']);
+    // Admission reserves headroom before preparation, then checks again immediately before launch.
+    expect(order).toEqual(['welcome R-1', 'admit', 'admit']);
     await online(runner);
   }, 60_000);
 

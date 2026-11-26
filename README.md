@@ -112,6 +112,24 @@ Flags answer setup's questions and set the rest of `runner.json`: `--vendors cla
 agflow runner setup --preset hackathon --name hack-mac
 ```
 
+Runner RAM protection is enabled by default and only controls admission: running agents are never stopped for low
+memory. Before starting or resuming an agent, the runner requires available RAM for a safety reserve plus a growth
+budget for every admitted agent, including the lead and agents still preparing. It checks again immediately before
+launch. The budget stays reserved until the attempt finishes or its start fails, preventing simultaneous starts
+from spending the same headroom. This is deliberately conservative: an agent's current RAM usage does not consume
+its reserved growth budget.
+
+In `~/.agflow/runner/runner.json`, `memoryReserveGb` defaults to **2 GB** (the effective reserve is at least **10%** of
+RAM), and `memoryPerAgentGb` defaults to **2 GB** per agent. Both must be positive; sizes use decimal GB. Stop the
+runner before editing these local settings, then restart it. Increase the per-agent budget for memory-heavy builds
+or tools. Linux uses `MemAvailable` and the available headroom under visible cgroup v1/v2 limits, including parent
+groups; macOS conservatively uses free RAM. Swap is not counted. If RAM cannot be measured, new launches wait.
+
+The Runners page and runner status show `memory_low` / **RAM low** while another agent would exceed the budget;
+admission resumes automatically when enough memory is available. This is an admission budget, not an OS memory
+limit: existing agents or other applications can still grow beyond it. Upgrade the hub before runners: RAM status
+and refusal reporting require runner protocol 5.
+
 Checks run **inside the service**: hub identity, repository access (`git ls-remote`), a fenced create/delete push to a probe ref, the chosen vendor preflights (including the expected MCP surface), the dependency sandbox, and sleep settings. The runner needs your git credentials for vault fetches and pushes. It captures connectivity settings because a LaunchAgent does not inherit an interactive shell. A missing pinned binary at start is a preflight failure; start never downloads one.
 
 | Command | Effect |

@@ -2,8 +2,9 @@
 // state hello and runner.state report, the heartbeat's machine facts, and the guards that stop the agents below 8%
 // battery or half of minFreeGb. Power is sampled on a timer so the battery guard also works with the link down; free
 // space is read on use. A guard warns once per crossing but, while it stays tripped, stops whatever holds a slot again
-// at each evaluation: a resume skips admit, and a stop can reach no agent (the handle not bound yet), so one call per
-// crossing could leave agents running. Each agent is still stopped once: a stopped one holds no slot.
+// at each evaluation: a stop can reach no agent (the handle not bound yet), so one call per crossing could leave
+// agents running. Each agent is still stopped once: a stopped one holds no slot. RAM admission is separate: it
+// reserves growth headroom at start/resume and never asks for a stop.
 import type { StartRefusal } from '@agflow/core';
 import { type ClockGap, type ClockSource, systemClock } from '../clock';
 import type { RunnerConfig } from '../config';
@@ -11,6 +12,7 @@ import { type Logger, noopLogger } from '../log';
 import type { RunnerPaths } from '../paths';
 import type { HealthReport, RunnerHealth } from '../seams';
 import { AgflowUsage, diskFreeBytes } from './disk';
+import { MemoryAdmission, type MemoryConfig, type MemorySample } from './memory';
 import { type PowerSample, samplePower } from './power';
 
 /** Below this battery percentage on battery power, the runner stops its agents (design 7.9). */
@@ -84,11 +86,13 @@ export interface ServiceHealth extends RunnerHealth {
 export interface ServiceHealthOptions {
   paths: RunnerPaths;
   /** runner.json's values, read on every use so an edit applies at once. */
-  config: () => Pick<RunnerConfig, 'minFreeGb' | 'batteryDrainPercent' | 'timings'>;
+  config: () => Pick<RunnerConfig, 'minFreeGb' | 'batteryDrainPercent' | 'timings'> & MemoryConfig;
   /** The interval heartbeats go at now: welcome's override, or timings.heartbeat. */
   heartbeatMs: () => number;
   /** RunnerHandle.stopAgents, bound by the host once the handle exists; it may throw until then. */
   stopAgents: (cause: 'runner_stop', options: { handoff: false }) => Promise<unknown>;
+  /** A fresh, cheap RAM measurement; failure holds new starts, never stops existing agents. */
+  memory?: () => MemorySample | null;
   samplePower?: () => Promise<PowerSample | null>;
   /** diskFreeBytes(AGFLOW_HOME) by default. */
   freeBytes?: () => number | null;
@@ -110,6 +114,7 @@ export function createServiceHealth(options: ServiceHealthOptions): ServiceHealt
   const readPower = options.samplePower ?? samplePower;
   const readFreeBytes = options.freeBytes ?? (() => diskFreeBytes(options.paths.home));
   const usage = options.usage ?? new AgflowUsage({ root: options.paths.home, now });
+  const memory = new MemoryAdmission(options.config, options.memory);
   let power: PowerSample | null = null;
   let wakingUntil: number | null = null;
   /** The wakeHold of the gap that set wakingUntil. */
@@ -218,13 +223,18 @@ export function createServiceHealth(options: ServiceHealthOptions): ServiceHealt
       if (timer !== null) clock.clearInterval(timer);
       timer = null;
     },
-    admit: () => evaluate().decision.refusal,
+    admit: (spec) => {
+      const refusal = evaluate().decision.refusal;
+      if (refusal !== null) return refusal;
+      return memory.admit(spec.attemptId) ? null : 'memory_low';
+    },
+    release: (attemptId) => memory.release(attemptId),
     heartbeat() {
       const { decision, at, freeBytes } = evaluate();
       // A hold with no end goes out as two heartbeat intervals; the next heartbeat renews it.
       const hold = Math.max(
         decision.waking && wakingUntil !== null ? wakingUntil - at : 0,
-        decision.batteryLow || decision.diskLow ? 2 * options.heartbeatMs() : 0,
+        decision.batteryLow || decision.diskLow || memory.check().detail !== null ? 2 * options.heartbeatMs() : 0,
       );
       const report: HealthReport = {
         power,
@@ -240,6 +250,8 @@ export function createServiceHealth(options: ServiceHealthOptions): ServiceHealt
       // The detail stays fixed for a threshold: a change of it goes out as a persisted runner.state event, and the
       // heartbeat's disk.freeBytes already carries the live number.
       if (decision.diskLow) return { state: 'disk_low', detail: `free space below ${minFreeGb} GB` };
+      const ram = memory.check();
+      if (ram.detail !== null) return { state: 'memory_low', detail: ram.detail };
       return { state: 'ok', detail: null };
     },
   };

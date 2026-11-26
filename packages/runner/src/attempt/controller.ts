@@ -292,7 +292,14 @@ async function startStep<T>(what: string, step: () => Promise<T>): Promise<T> {
   try {
     return await step();
   } catch (error) {
+    if (error instanceof AdmissionRefused) throw error;
     throw new Error(`${what}: ${describe(error)}`);
+  }
+}
+
+class AdmissionRefused extends Error {
+  constructor(readonly code: StartRefusal) {
+    super(`the runner refused the launch: ${code}`);
   }
 }
 
@@ -344,6 +351,7 @@ export class AttemptController {
   private set currentPhase(phase: AttemptPhase | null) {
     if (phase === this.phaseNow) return;
     this.phaseNow = phase;
+    if (phase === null) this.deps.health.release?.(this.attemptId);
     try {
       this.deps.phaseChanged?.(phase);
     } catch (error) {
@@ -564,6 +572,8 @@ export class AttemptController {
       this.cloneDir = null;
       this.deps.store.update(this.attemptId, { spec: stored, fence: spec.fence, state: 'starting', finalizedAt: null });
       try {
+        const refusal = await this.deps.health.admit(spec);
+        if (refusal !== null) throw new AdmissionRefused(refusal);
         await this.resumeAdmitted(spec, record, command);
         return { resumed: true };
       } catch (error) {
@@ -575,7 +585,9 @@ export class AttemptController {
             error: describe(pushError),
           });
         });
-        const failed = this.failedToStart(spec.fence, describe(error));
+        const failed = this.failedToStart(
+          spec.fence, describe(error), error instanceof AdmissionRefused ? error.code : null,
+        );
         return { resumed: false, error: failed.error };
       }
     });
@@ -964,7 +976,7 @@ export class AttemptController {
       } catch (error) {
         // Whatever failed, the start gives back what it took, and the hub hears once why.
         await this.releaseBaseCheckout();
-        return this.failedToStart(spec.fence, describe(error));
+        return this.failedToStart(spec.fence, describe(error), error instanceof AdmissionRefused ? error.code : null);
       }
     });
   }
@@ -1312,6 +1324,8 @@ export class AttemptController {
     workspace: PreparedWorkspace,
     options: { cliVersion: string; resume: AgentLaunch['resume']; resumed: boolean },
   ): Promise<void> {
+    const refusal = await this.deps.health.admit(spec);
+    if (refusal !== null) throw new AdmissionRefused(refusal);
     const { store, logger, config, paths, agflow, local, vault } = this.deps;
     const adapter = this.deps.adapters.get(spec.vendor);
     if (!adapter) throw new Error(`no ${spec.vendor} adapter on this runner`);
@@ -2272,12 +2286,16 @@ export class AttemptController {
     }
   }
 
-  /** attempt.failed_to_start for a start the runner tried: refused null, class infra, the error clipped. */
-  private failedToStart(fence: Fence, error: string): Extract<StartOutcome, { started: false }> {
+  /** A failed start; a late admission refusal is not an infrastructure/vendor failure. */
+  private failedToStart(
+    fence: Fence,
+    error: string,
+    refused: StartRefusal | null = null,
+  ): Extract<StartOutcome, { started: false }> {
     this.currentPhase = null;
     const clipped = clipStartError(error);
-    this.report(fence, { type: 'attempt.failed_to_start', data: { error: clipped, refused: null } });
-    return { started: false, refused: null, error: clipped };
+    this.report(fence, { type: 'attempt.failed_to_start', data: { error: clipped, refused } });
+    return { started: false, refused, error: clipped };
   }
 
   /**
