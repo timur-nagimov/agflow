@@ -8,6 +8,7 @@ import {
 } from '@agflow/core';
 import type { AttemptController } from '../src/attempt/controller';
 import { SerialQueue } from '../src/queue';
+import { MemoryAdmission, MEMORY_GB as GB } from '../src/ops/memory';
 import { defaultHealth, type RunnerHealth, silentNotifier, skipDependencyPreparer } from '../src/seams';
 import { cleanupRunnerFixtures, createRunnerFixture } from './fixture';
 
@@ -61,6 +62,70 @@ describe('SerialQueue', () => {
 });
 
 describe('AttemptController admission', () => {
+  test('a live worker keeps its RAM budget until its process and exit work finish', async () => {
+    const f = await createRunnerFixture();
+    const memory = new MemoryAdmission(() => ({}), () => ({ totalBytes: 8 * GB, availableBytes: 4 * GB }));
+    const controller = f.controller('T-4-a1', {
+      health: {
+        ...defaultHealth,
+        admit: (spec) => memory.admit(spec.attemptId) ? null : 'memory_low',
+        release: (id) => memory.release(id),
+      },
+    });
+    expect(await controller.start(f.spec())).toEqual({ started: true });
+    expect(memory.admit('next')).toBe(false);
+    expect(await controller.stopForRunner('runner_stop', { handoff: false })).toMatchObject({ ok: true });
+    expect(memory.admit('next')).toBe(true);
+  });
+
+  test('concurrent starts reserve RAM before preparing, and a failed start releases it', async () => {
+    const f = await createRunnerFixture();
+    const memory = new MemoryAdmission(() => ({}), () => ({ totalBytes: 8 * GB, availableBytes: 4 * GB }));
+    const health: RunnerHealth = {
+      ...defaultHealth,
+      admit: (spec) => memory.admit(spec.attemptId) ? null : 'memory_low',
+      release: (id) => memory.release(id),
+    };
+    const preparation = gate();
+    const first = f.controller('T-4-a1', { health, preparer: {
+      available: true,
+      prepare: async () => {
+        await preparation.opened;
+        return { ran: true, ok: false, error: 'failed install', logTail: null };
+      },
+    } });
+    const other = f.controller('T-5-a1', { health });
+    const starting = first.start(f.spec());
+    // Both queues begin concurrently; reservation happens before preparation awaits.
+    const refused = await other.start(f.spec({ attemptId: 'T-5-a1', taskId: 'T-5', branch: 'agflow/T-5-x', wipRef: 'refs/agflow/T-5/a1' }));
+    expect(refused).toMatchObject({ started: false, refused: 'memory_low' });
+    preparation.open();
+    expect(await starting).toMatchObject({ started: false });
+    expect(memory.admit('next')).toBe(true);
+  });
+
+  test('RAM falling during preparation refuses the launch without blaming the vendor', async () => {
+    const f = await createRunnerFixture();
+    let availableBytes = 4 * GB;
+    const memory = new MemoryAdmission(() => ({}), () => ({ totalBytes: 8 * GB, availableBytes }));
+    const controller = f.controller('T-4-a1', {
+      health: { ...defaultHealth,
+        admit: (spec) => memory.admit(spec.attemptId) ? null : 'memory_low',
+        release: (id) => memory.release(id),
+      },
+      preparer: { available: true, prepare: async () => {
+        availableBytes = GB;
+        return { ran: true, ok: true, error: null, logTail: null };
+      } },
+    });
+    expect(await controller.start(f.spec())).toMatchObject({ started: false, refused: 'memory_low' });
+    expect(f.events('attempt.failed_to_start').at(-1)?.data.refused).toBe('memory_low');
+    expect(f.fakes.claude?.launches).toEqual([]);
+    expect(controller.holdsSlot).toBe(false);
+    availableBytes = 4 * GB;
+    expect(memory.admit('next')).toBe(true);
+  });
+
   test('draining, a full capacity and a vendor that is not ready are refused, and nothing starts', async () => {
     const f = await createRunnerFixture();
     f.config.draining = true;

@@ -413,7 +413,7 @@ export interface AttemptFacts {
 }
 
 /** Derived by the hub; draining is a separate flag. */
-export type RunnerState = 'online' | 'offline' | 'needs_login' | 'incompatible' | 'crash_loop' | 'disk_low';
+export type RunnerState = 'online' | 'offline' | 'needs_login' | 'incompatible' | 'crash_loop' | 'disk_low' | 'memory_low';
 
 export interface Runner {
   /** 'R-<n>' */

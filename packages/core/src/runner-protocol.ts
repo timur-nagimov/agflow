@@ -26,8 +26,9 @@ import type {
 /**
  * Protocol 2 added settings answers. Protocol 3 added the welcome's project, merge_task, the check that
  * attempt.submitted reports with its new codes, and the attempt spec's tier. Protocol 4 adds check_main.
+ * Protocol 5 adds memory_low admission and runner state.
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** The WebSocket close codes the hub ends a runner's link with. */
 export const CLOSE_CODES = {
@@ -51,6 +52,7 @@ export const START_REFUSALS = [
   'at_capacity',
   'vendor_not_ready',
   'disk_low',
+  'memory_low',
   'battery_low',
   'waking',
   'needs_login',
@@ -148,7 +150,7 @@ export type RunnerMessage =
       quota: AccountQuotaReport[];
       profile: ProfileSummary;
       git: Runner['git'];
-      state: 'ok' | 'crash_loop' | 'disk_low';
+      state: 'ok' | 'crash_loop' | 'disk_low' | 'memory_low';
       stateDetail: string | null;
       /** New whenever runner.db is new. */
       outboxEpoch: string;
@@ -553,7 +555,7 @@ export const RunnerDiskSchema = schemaFor<NonNullable<Runner['disk']>>()(
 );
 
 /** The state a runner reports in hello and runner.state; the hub derives the rest. */
-const ReportedStateSchema = z.enum(['ok', 'crash_loop', 'disk_low']);
+const ReportedStateSchema = z.enum(['ok', 'crash_loop', 'disk_low', 'memory_low']);
 
 export const LiveAttemptSchema = schemaFor<LiveAttempt>()(
   z.strictObject({

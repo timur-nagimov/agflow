@@ -104,6 +104,12 @@ function judge(slot: Partial<VendorSlot> = {}, accounts: AccountView[] = [accoun
 }
 
 describe('candidate runners', () => {
+  test('a memory hold prevents placement until the runner reports recovery', () => {
+    const held = runner({ state: 'memory_low' });
+    expect(candidateRunners(snapshot([held])).candidates).toEqual([]);
+    held.state = 'online';
+    expect(candidateRunners(snapshot([held])).candidates.map((entry) => entry.id)).toEqual([held.id]);
+  });
   test('are online, not draining, git ready, past acceptingUntil, without a refused start, with a free slot', () => {
     const runners = [
       runner({ id: 'R-1' }),

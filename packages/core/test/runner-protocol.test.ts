@@ -570,7 +570,7 @@ describe('commands', () => {
     for (const kind of RUNNER_COMMAND_KINDS) {
       expect([kind, COMMAND_MIN_PROTOCOL[kind]]).toEqual([kind, newer[kind] ?? 1]);
     }
-    expect(PROTOCOL_VERSION).toBe(4);
+    expect(PROTOCOL_VERSION).toBe(5);
   });
 
   test('check_main names a full sha, and its result is that sha with its check', () => {
@@ -1048,6 +1048,7 @@ describe('runner events', () => {
       'at_capacity',
       'vendor_not_ready',
       'disk_low',
+      'memory_low',
       'battery_low',
       'waking',
       'needs_login',

@@ -92,7 +92,7 @@ export type TakeoverRefusal = (typeof TAKEOVER_REFUSALS)[number];
 // ---------------------------------------------------------------------------
 
 const RunnerStateSchema = schemaFor<RunnerState>()(
-  z.enum(['online', 'offline', 'needs_login', 'incompatible', 'crash_loop', 'disk_low']),
+  z.enum(['online', 'offline', 'needs_login', 'incompatible', 'crash_loop', 'disk_low', 'memory_low']),
 );
 
 const AttemptStatusSchema = schemaFor<AttemptStatus>()(z.enum(['starting', 'running', 'quota_wait', 'holding', 'ended']));

@@ -26,6 +26,7 @@ export const RUNNER_STATE_LABELS: Record<RunnerState, string> = {
   incompatible: 'Incompatible',
   crash_loop: 'Crash loop',
   disk_low: 'Disk low',
+  memory_low: 'RAM low',
 };
 
 /** An offline runner is simply away; the other states need someone at that laptop. Draining is chosen, so it waits. */
@@ -58,6 +59,8 @@ export function runnerWhy(
       return 'Its login to the hub expired: run agflow login on that laptop';
     case 'incompatible':
       return 'Its agflow is too old for this hub: update agflow on that laptop';
+    case 'memory_low':
+      return 'Not enough RAM for another agent; existing agents continue running';
     case 'disk_low':
       return `${
         runner.disk ? `Only ${formatBytes(runner.disk.freeBytes)} free` : 'Its disk is nearly full'

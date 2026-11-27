@@ -20,6 +20,27 @@ import { cleanupRunnerFixtures, createRunnerFixture, waitFor } from '../fixture'
 
 afterEach(cleanupRunnerFixtures);
 
+test('RAM holds new starts and reports recovery, but never stops existing agents', async () => {
+  let availableBytes = 6 * GB;
+  const f = fixture({ memory: () => ({ totalBytes: 16 * GB, availableBytes }) });
+  const attempt = (attemptId: string) => ({ attemptId }) as AttemptSpec;
+  expect(f.health.admit(attempt('worker'))).toBeNull();
+  expect(f.health.admit(attempt('lead'))).toBeNull();
+  expect(f.health.admit(attempt('another'))).toBe('memory_low');
+  expect(f.health.state().state).toBe('memory_low');
+  expect(f.health.heartbeat().acceptingUntil).toBe(30_000);
+  f.data.agents = 2;
+  availableBytes = 0;
+  await f.health.sample();
+  f.health.heartbeat();
+  expect(f.stops).toEqual([]);
+  expect(f.data.agents).toBe(2);
+  availableBytes = 6 * GB;
+  f.health.release?.('worker');
+  expect(f.health.state().state).toBe('ok');
+  expect(f.health.admit(attempt('another'))).toBeNull();
+});
+
 const power = (batteryPercent: number | null, source: PowerSample['source'] = 'battery'): PowerSample => ({
   source,
   batteryPercent,
@@ -94,6 +115,7 @@ function fixture(overrides: Partial<Parameters<typeof createServiceHealth>[0]> =
       return data.power;
     },
     freeBytes: () => data.freeBytes,
+    memory: () => ({ totalBytes: 64 * GB, availableBytes: 60 * GB }),
     usage: { current: () => 1234 },
     stopAgents,
     onSample: () => {

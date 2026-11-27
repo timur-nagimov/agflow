@@ -12,7 +12,7 @@ import { openRunnerDb, type RunnerDb } from '../db';
 import type { FetchFn } from '../hub-http';
 import { Journal } from '../journal';
 import { sameHubUrl, type WelcomeMessage } from '../link';
-import { createServiceHealth, type ServiceHealth } from '../ops/health';
+import { createServiceHealth, type ServiceHealth, type ServiceHealthOptions } from '../ops/health';
 import { KeepAwake } from '../ops/keep-awake';
 import type { PowerSample } from '../ops/power';
 import { RETENTION, sweepRetention } from '../ops/retention';
@@ -85,6 +85,7 @@ export interface RunnerServiceOptions {
   /** Machine samplers; pmset, diskFreeBytes and AgflowUsage by default. */
   power?: () => Promise<PowerSample | null>;
   freeBytes?: () => number | null;
+  memory?: ServiceHealthOptions['memory'];
   usage?: { current(): number };
   /** Keep-awake command; /usr/bin/caffeinate on macOS by default. */
   caffeinate?: string;
@@ -504,6 +505,7 @@ export async function startRunnerService(options: RunnerServiceOptions): Promise
       onSample: () => keepAwake?.evaluate(),
       samplePower: options.power,
       freeBytes: options.freeBytes,
+      memory: options.memory,
       usage: options.usage,
       clock,
       logger,

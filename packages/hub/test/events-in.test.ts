@@ -442,6 +442,15 @@ describe('runner events', () => {
   const apply = (ctx: Ctx, events: RawRunnerEvent[]) =>
     applyRunnerEvents(ctx, 'R-1', { outboxEpoch: 'outbox-1', events }, { restoreReplay: false });
 
+  test('RAM holds and recovery round-trip through runner events', async () => {
+    const { ctx, gateway, token } = setup();
+    await connectFakeRunner(ctx, gateway, { token });
+    apply(ctx, [{ seq: 1, at: 0, type: 'runner.state', data: { state: 'memory_low', detail: 'RAM budget exhausted' } }]);
+    expect(getRunner(ctx, 'R-1')).toMatchObject({ state: 'memory_low', stateDetail: 'RAM budget exhausted' });
+    apply(ctx, [{ seq: 2, at: 0, type: 'runner.state', data: { state: 'ok', detail: null } }]);
+    expect(getRunner(ctx, 'R-1')).toMatchObject({ state: 'online', stateDetail: null });
+  });
+
   test('runner.state sets crash_loop, disk_low or ok, with the detail as lastError', async () => {
     const { ctx, gateway, token } = setup();
     await connectFakeRunner(ctx, gateway, { token });
