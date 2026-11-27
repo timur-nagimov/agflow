@@ -25,7 +25,6 @@ function runnerSlot(row: RunnerRow): RunnerSlot {
   });
   return {
     id: row.id,
-    machineId: row.machine_id,
     owner: row.owner,
     state: row.state,
     draining: row.draining === 1,
@@ -44,18 +43,11 @@ function runnerSlot(row: RunnerRow): RunnerSlot {
  * What placement reads now: every runner that is not retired, in id order, and every account. The scheduler updates
  * it after each placement it makes in one tick; anything else builds a new one.
  */
-export function placementSnapshot(ctx: HubContext, ignoreAttemptId?: string): PlacementSnapshot {
+export function placementSnapshot(ctx: HubContext): PlacementSnapshot {
   return {
     now: ctx.now(),
     quotaUnknownMs: ctx.config.quotaUnknownMs,
     runners: findRunnerRows(ctx).map(runnerSlot),
     accounts: accountViews(ctx),
-    resourceHolders: (ctx.db.query(`
-      SELECT attempts.id AS attemptId, runners.machine_id AS machineId,
-        json_extract(tasks.contract, '$.placement.resourceGroup') AS "group"
-      FROM attempts JOIN runners ON runners.id = attempts.runner_id JOIN tasks ON tasks.id = attempts.task_id
-      WHERE attempts.status != 'ended'
-        AND json_extract(tasks.contract, '$.placement.resourceGroup') IS NOT NULL
-    `).all() as NonNullable<PlacementSnapshot['resourceHolders']>).filter((holder) => holder.attemptId !== ignoreAttemptId),
   };
 }

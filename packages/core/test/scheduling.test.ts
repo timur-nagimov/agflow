@@ -362,7 +362,6 @@ test('refusals are named', () => {
   expect(PLACEMENT_REFUSALS).toEqual([
     'runner_constraint',
     'vendor_constraint',
-    'resource_busy',
     'offline',
     'draining',
     'git',
@@ -920,16 +919,12 @@ describe('hard task placement', () => {
     expect(place(view, task, { projectPref: null }).placement?.vendor).toBe('claude');
   });
 
-  test('missing pinned runners and occupied resources have actionable wait reasons', () => {
-    const view = snapshot([runner({ machineId: 'host-1' })]);
+  test('missing pinned runners have an actionable wait reason', () => {
+    const view = snapshot([runner()]);
     const missing = candidate({ placement: { runnerIds: ['R-99'] } });
     const result = place(view, missing, { projectPref: null });
     expect(result.placement).toBeNull();
     expect(placementWords(view, missing, result.refused)).toContain('required runner(s): R-99');
-    view.resourceHolders = [{ attemptId: 'attempt', machineId: 'host-1', group: 'heavy-check' }];
-    const heavy = candidate({ placement: { resourceGroup: 'heavy-check' } });
-    const busy = place(view, heavy, { projectPref: null });
-    expect(busy.placement).toBeNull();
-    expect(placementWords(view, heavy, busy.refused)).toContain('resource group busy on this host');
+
   });
 });

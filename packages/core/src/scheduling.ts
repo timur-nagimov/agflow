@@ -37,7 +37,6 @@ import type {
 export const PLACEMENT_REFUSALS = [
   'runner_constraint',
   'vendor_constraint',
-  'resource_busy',
   'offline',
   'draining',
   'git',
@@ -57,7 +56,6 @@ export type PlacementRefusal = (typeof PLACEMENT_REFUSALS)[number];
 export const PLACEMENT_REFUSAL_WORDS: Readonly<Record<PlacementRefusal, string>> = {
   runner_constraint: 'outside the task runner allowlist',
   vendor_constraint: 'not the required vendor',
-  resource_busy: 'task resource group busy on this host',
   offline: 'offline',
   draining: 'draining',
   git: 'git not ready',
@@ -98,7 +96,6 @@ export interface VendorSlot {
 /** A runner, as placement sees it. */
 export interface RunnerSlot {
   id: string;
-  machineId?: string;
   owner: string;
   state: RunnerState;
   draining: boolean;
@@ -135,7 +132,6 @@ export interface PlacementSnapshot {
   quotaUnknownMs: number;
   runners: RunnerSlot[];
   accounts: AccountView[];
-  resourceHolders?: { attemptId: string; machineId: string; group: string }[];
 }
 
 /** A runner placement passed over, or one vendor on it, and why. */
@@ -583,7 +579,6 @@ function runnersFor(
 
 /** Hard constraints also checked by the transactional start/resume entry points. */
 export function taskPlacementRefusal(
-  snapshot: PlacementSnapshot,
   task: Pick<Task, 'placement'>,
   runner: RunnerSlot,
   vendor: Vendor,
@@ -591,11 +586,6 @@ export function taskPlacementRefusal(
   const constraints = task.placement;
   if (constraints?.runnerIds && !constraints.runnerIds.includes(runner.id)) return 'runner_constraint';
   if (constraints?.vendor && constraints.vendor !== vendor) return 'vendor_constraint';
-  if (constraints?.resourceGroup && snapshot.resourceHolders?.some((holder) =>
-    holder.machineId === (runner.machineId ?? runner.id) && holder.group === constraints.resourceGroup,
-  )) {
-    return 'resource_busy';
-  }
   return null;
 }
 
@@ -618,7 +608,7 @@ export function place(
   const runners = runnersFor(snapshot, task);
   const found = options(snapshot, 'worker', runners, modelClass('worker', task.tier));
   found.options = found.options.filter((option) => {
-    const refusal = taskPlacementRefusal(snapshot, task, option.runner, option.usable.slot.vendor);
+    const refusal = taskPlacementRefusal(task, option.runner, option.usable.slot.vendor);
     if (refusal === null) return true;
     found.refused.push({ runnerId: option.runner.id, vendor: option.usable.slot.vendor, refusal });
     return false;

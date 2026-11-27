@@ -108,10 +108,6 @@ export const TaskPlacementSchema = z
       .optional()
       .describe('Hard runner allowlist. The task waits if none is available; no wrong-host attempts.'),
     vendor: VendorSchema.optional().describe('Required vendor, without fallback. Use vendorHint for a preference.'),
-    resourceGroup: z.string().min(1).max(80).regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/)
-      .optional()
-      .describe('Exclusive per physical host until the attempt ends, including review/quota waits, e.g. heavy-check. ' +
-        'Independent hosts run concurrently.'),
   })
   .nullable();
 

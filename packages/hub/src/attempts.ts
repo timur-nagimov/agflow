@@ -273,7 +273,7 @@ export function startRunnerAttempt(ctx: HubContext, input: StartAttemptInput): S
     if (task?.placement) {
       const snapshot = placementSnapshot(ctx);
       const slot = snapshot.runners.find((slot) => slot.id === input.runnerId);
-      const refusal = slot && taskPlacementRefusal(snapshot, task, slot, input.vendor);
+      const refusal = slot && taskPlacementRefusal(task, slot, input.vendor);
       if (!slot || refusal) throw conflict(`task placement refused: ${refusal ?? 'runner unavailable'}`);
     }
     const now = ctx.now();
@@ -567,9 +567,9 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
     if (before.stopRequested?.cause === 'takeover') throw conflict(`a take-over is in flight for attempt ${before.id}`);
     const placementTask = before.taskId === null ? null : getTask(ctx, before.taskId);
     if (placementTask?.placement) {
-      const snapshot = placementSnapshot(ctx, before.id);
+      const snapshot = placementSnapshot(ctx);
       const slot = snapshot.runners.find((slot) => slot.id === before.runnerId);
-      const refusal = slot && taskPlacementRefusal(snapshot, placementTask, slot, before.vendor);
+      const refusal = slot && taskPlacementRefusal(placementTask, slot, before.vendor);
       if (!slot || refusal) throw conflict(`task placement refused: ${refusal ?? 'runner unavailable'}`);
     }
     const pending = pendingResumeOf(ctx, before.id);

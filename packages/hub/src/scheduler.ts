@@ -161,23 +161,9 @@ export function readySet(ctx: HubContext, waiting?: Map<string, string>): TaskCa
 }
 
 /** Counts a placement in the snapshot: an open attempt more on its account, and a worker's slot less on its runner. */
-function recordPlacement(
-  snapshot: PlacementSnapshot,
-  placement: Placement,
-  role: AgentRole,
-  task?: Pick<Task, 'placement'>,
-): void {
+function recordPlacement(snapshot: PlacementSnapshot, placement: Placement, role: AgentRole): void {
   const runner = snapshot.runners.find((slot) => slot.id === placement.runnerId);
-  if (runner && role === 'worker') {
-    runner.openAttempts += 1;
-    if (task?.placement?.resourceGroup) {
-      (snapshot.resourceHolders ??= []).push({
-        attemptId: 'planned',
-        machineId: runner.machineId ?? runner.id,
-        group: task.placement.resourceGroup,
-      });
-    }
-  }
+  if (runner && role === 'worker') runner.openAttempts += 1;
   if (placement.account) placement.account.openAttempts += 1;
 }
 
@@ -297,7 +283,7 @@ export function dispatch(ctx: HubContext): DispatchResult {
       result.started.push(attempt);
       result.waiting.delete(task.id);
       started.push(task);
-      recordPlacement(snapshot, placement, 'worker', task);
+      recordPlacement(snapshot, placement, 'worker');
       free -= 1;
     } catch (error) {
       console.error(`starting ${task.id} on ${placement.runnerId} failed`, error);
@@ -361,14 +347,8 @@ export function replaceQuotaWaits(ctx: HubContext): string[] {
       if (task ? workerRoom === 0 : !project.runnerLeads) continue;
       // The task waited in quota_wait already, so its vendorHint holds it back no longer.
       const prefs = task && { ...placementPrefs(ctx, task, listAttempts(ctx, { task: task.id })), readySince: 0 };
-      // A replacement may reuse its predecessor's resource after that attempt ends. This is only a plan:
-      // dispatch and startRunnerAttempt retain the real reservation until the predecessor has stopped.
-      const replacementSnapshot = {
-        ...snapshot,
-        resourceHolders: snapshot.resourceHolders?.filter((holder) => holder.attemptId !== attempt.id),
-      };
       const { placement } = prefs
-        ? place(replacementSnapshot, prefs, { projectPref: vendorPref })
+        ? place(snapshot, prefs, { projectPref: vendorPref })
         : placeLead(snapshot, { rotatingFrom: null });
       if (!placement || isProbe(placement)) continue;
       requestStop(ctx, {
@@ -377,7 +357,7 @@ export function replaceQuotaWaits(ctx: HubContext): string[] {
         reason: `the ${attempt.vendor} quota is exhausted and ${resetWords(ctx, attempt.quotaResetsAt)}`,
         by: 'system',
       });
-      recordPlacement(snapshot, placement, attempt.role, task ?? undefined);
+      recordPlacement(snapshot, placement, attempt.role);
       if (task) workerRoom -= 1;
       replaced.push(attempt.id);
     } catch (error) {
@@ -740,8 +720,9 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
 /** What an idle nudge asks of the lead; its order of improvements is the lead guide's (brief.ts). */
 const NUDGE_PLAN =
   'First inspect existing blocked tasks and ready-task wait reasons. Fix stale dependencies and placement constraints, ' +
-  'and unblock tasks whose prerequisites are satisfied. Keep transient host/resource waits ready with placement constraints; ' +
-  'independent hosts may work concurrently. Preserve explicit review/publication gates, scoped to the work they govern. ' +
+  'and unblock tasks whose prerequisites are satisfied. Keep host/vendor waits ready with placement constraints. ' +
+  'Use runner capacity and admission checks for parallelism; do not impose one-heavy-check-per-host limits. ' +
+  'Preserve explicit review/publication gates, scoped to the work they govern. ' +
   'Do not create duplicate audits just to fill slots. If there is still uncovered useful work, plan the next batch now, ' +
   'so that ready, independent tasks are at least as many as the worker slots, running plus ' +
   'free. Tasks blocked on dependencies count as planned: while they wait for work in progress, such as the skeleton, ' +

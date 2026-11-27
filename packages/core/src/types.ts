@@ -58,8 +58,6 @@ export interface TaskCheck {
 export interface TaskPlacement {
   runnerIds?: string[];
   vendor?: Vendor;
-  /** At most one open attempt in this group per physical machine, including holding/quota waits. */
-  resourceGroup?: string;
 }
 
 export interface TaskContract {
