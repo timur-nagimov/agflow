@@ -123,7 +123,8 @@ In `~/.agflow/runner/runner.json`, `memoryReserveGb` defaults to **2 GB** (the e
 RAM), and `memoryPerAgentGb` defaults to **2 GB** per agent. Both must be positive; sizes use decimal GB. Stop the
 runner before editing these local settings, then restart it. Increase the per-agent budget for memory-heavy builds
 or tools. Linux uses `MemAvailable` and the available headroom under visible cgroup v1/v2 limits, including parent
-groups; macOS conservatively uses free RAM. Swap is not counted. If RAM cannot be measured, new launches wait.
+groups; macOS uses free, inactive, purgeable and speculative pages from `vm_stat`, multiplied by its reported page
+size. Swap is not counted. If RAM cannot be measured, new launches wait.
 
 The Runners page and runner status show `memory_low` / **RAM low** while another agent would exceed the budget;
 admission resumes automatically when enough memory is available. This is an admission budget, not an OS memory
