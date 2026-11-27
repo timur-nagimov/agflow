@@ -54,7 +54,16 @@ export interface TaskCheck {
   timeoutS?: number;
 }
 
+/** Hard placement constraints; omitted fields impose no restriction. */
+export interface TaskPlacement {
+  runnerIds?: string[];
+  vendor?: Vendor;
+  /** At most one open attempt in this group per physical machine, including holding/quota waits. */
+  resourceGroup?: string;
+}
+
 export interface TaskContract {
+  placement?: TaskPlacement | null;
   title: string;
   kind: TaskKind;
   objective: string;

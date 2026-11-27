@@ -92,8 +92,7 @@ describe('the idle nudge', () => {
         '- alice claude: ok, 5-hour 40%, weekly 12%, resets in 2 h 59 min',
         'Deadline: 2026-10-26 17:20 UTC, 5 h 19 min left.',
         '',
-        'Plan the next batch now, so that ready, independent tasks are at least as many as the worker slots, running ' +
-          'plus free.',
+        'First inspect existing blocked tasks and ready-task wait reasons.',
       ].join('\n'),
     );
     for (const part of [
@@ -174,7 +173,7 @@ describe('the idle nudge', () => {
     );
     // A ready task for every busy slot is enough: the clock stops, and nothing more goes out.
     ready(ctx, 3);
-    expect(workerLoad(ctx)).toMatchObject({ running: 3, freeSlots: 0, dispatchable: 3 });
+    expect(workerLoad(ctx)).toMatchObject({ running: 3, freeSlots: 0, dispatchable: 0 });
     for (let tick = 0; tick < 3; tick++) {
       clock.advance(ctx.config.idleNudgeIntervalMs);
       expect(nudgeIdleLead(ctx)).toBeNull();
@@ -274,4 +273,16 @@ describe('the idle nudge', () => {
     expect(runTick(ctx).reconciled?.idleNudge).toBe(true);
     expect(nudgeMessages(ctx)).toHaveLength(1);
   });
+});
+
+test('unplaceable ready tasks do not hide idle slots; the nudge names the actual host wait', () => {
+  const { ctx, clock } = idleProject();
+  createTasks(ctx, Array.from({ length: 4 }, () => newTask({ placement: { runnerIds: ['R-99'] } })), 'user:alice');
+  expect(workerLoad(ctx)).toMatchObject({ ready: 4, dispatchable: 0, freeSlots: 2 });
+  expect(nudgeIdleLead(ctx)).toBeNull();
+  clock.advance(ctx.config.idleNudgeMs);
+  const body = nudgeIdleLead(ctx)?.body;
+  expect(body).toContain('First inspect existing blocked tasks');
+  expect(body).toContain('required runner(s): R-99');
+  expect(body).toContain('Do not create duplicate audits');
 });

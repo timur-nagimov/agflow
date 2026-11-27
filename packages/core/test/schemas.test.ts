@@ -448,3 +448,17 @@ describe('BranchSchema', () => {
     }
   });
 });
+
+describe('task placement', () => {
+  test('validates structured constraints and permits clearing them', () => {
+    const task = { title: 'check', objective: 'Run checks', acceptance: [{ id: 'A1', assertion: 'passes' }] };
+    const placement = { runnerIds: ['R-1001'], vendor: 'claude' as const, resourceGroup: 'heavy-check' };
+    expect(NewTaskSchema.parse({ ...task, placement }).placement).toEqual(placement);
+    expect(TaskPatchSchema.parse({ placement: null })).toEqual({ placement: null });
+    expect(NewTaskSchema.parse(task).placement).toBeUndefined();
+    for (const invalid of [
+      { runnerIds: [] }, { runnerIds: ['R-1', 'R-1'] }, { runnerIds: ['host'] },
+      { vendor: 'any' }, { resourceGroup: '' }, { resourceGroup: 'two\nlines' }, { unknown: true },
+    ]) expect(NewTaskSchema.safeParse({ ...task, placement: invalid }).success).toBe(false);
+  });
+});

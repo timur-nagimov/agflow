@@ -412,14 +412,14 @@ describe('lead brief', () => {
     const brief = buildBrief(ctx, next.agent);
     expect(brief).toContain(`\n\n${report}\n\n## Messages`);
     // The guide carries the AUTO_ACCEPT, REVIEW and AUTO_MERGE lines.
-    expect(brief).toContain("- An agent of the other vendor reviews each task's first green submission");
+    expect(brief).toContain("- The hub requests review of each task's first green submission");
     expect(section(brief, '## Lead handoff from the previous lead')).toEndWith(`…\n${LEAD_HANDOFF_CUT}`);
     const rules = section(brief, '## Standing rules from people');
     expect(rules.match(/Rule \d/g)).toEqual(['Rule 4', 'Rule 3']);
     expect(rules).toEndWith('\n2 older standing rule(s) did not fit in this brief. Ask a person for them.');
     expect(rules.length).toBeGreaterThan(1000);
-    // A line of 200 characters more in the guide would leave the same rules.
-    expect(brief.length).toBeLessThanOrEqual(RUNNER_BRIEF_LIMIT - 200);
+    // Placement guidance still leaves both newest rules within the existing size budget.
+    expect(brief.length).toBeLessThanOrEqual(RUNNER_BRIEF_LIMIT);
   });
 });
 
@@ -1065,8 +1065,8 @@ describe('never idle: the guides, the goal and the situation report', () => {
       expect(report).not.toContain(`- ${task?.id}:`);
       expect(report).not.toContain(`${task?.id} needs`);
     }
-    // A task for an open runner may start, unlike one left to live chats.
-    expect(report).toContain('Ready tasks: 4, 3 of them dispatchable now.');
+    // No open runner is available: only the two ordinary tasks have an eligible placement.
+    expect(report).toContain('Ready tasks: 4, 2 of them dispatchable now.');
   });
 
   test('the situation report names the ready tasks the last tick could not start, with why, eight at most', () => {

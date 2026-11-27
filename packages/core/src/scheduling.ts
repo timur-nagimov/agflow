@@ -35,6 +35,9 @@ import type {
  * - ceiling: the account's utilization reached the runner's ceiling for the vendor.
  */
 export const PLACEMENT_REFUSALS = [
+  'runner_constraint',
+  'vendor_constraint',
+  'resource_busy',
   'offline',
   'draining',
   'git',
@@ -52,6 +55,9 @@ export type PlacementRefusal = (typeof PLACEMENT_REFUSALS)[number];
 
 /** Each refusal in a few words, for the board's wait reasons and the Load page. */
 export const PLACEMENT_REFUSAL_WORDS: Readonly<Record<PlacementRefusal, string>> = {
+  runner_constraint: 'outside the task runner allowlist',
+  vendor_constraint: 'not the required vendor',
+  resource_busy: 'task resource group busy on this host',
   offline: 'offline',
   draining: 'draining',
   git: 'git not ready',
@@ -92,6 +98,7 @@ export interface VendorSlot {
 /** A runner, as placement sees it. */
 export interface RunnerSlot {
   id: string;
+  machineId?: string;
   owner: string;
   state: RunnerState;
   draining: boolean;
@@ -128,6 +135,7 @@ export interface PlacementSnapshot {
   quotaUnknownMs: number;
   runners: RunnerSlot[];
   accounts: AccountView[];
+  resourceHolders?: { attemptId: string; machineId: string; group: string }[];
 }
 
 /** A runner placement passed over, or one vendor on it, and why. */
@@ -293,7 +301,7 @@ export function usableVendors(
 // ---------------------------------------------------------------------------
 
 /** The task's own fields the ready set, its order and its placement read. */
-type CandidateFields = 'id' | 'status' | 'priority' | 'createdAt' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier';
+type CandidateFields = 'id' | 'status' | 'priority' | 'createdAt' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier' | 'placement';
 
 /** A ready task as the scheduler reads it: its own fields and what the hub knows about its attempts. */
 export interface TaskCandidate extends Pick<Task, CandidateFields | 'nextDispatchAt'> {
@@ -573,6 +581,24 @@ function runnersFor(
   return snapshot.runners.filter((runner) => runner.profile === 'open');
 }
 
+/** Hard constraints also checked by the transactional start/resume entry points. */
+export function taskPlacementRefusal(
+  snapshot: PlacementSnapshot,
+  task: Pick<Task, 'placement'>,
+  runner: RunnerSlot,
+  vendor: Vendor,
+): PlacementRefusal | null {
+  const constraints = task.placement;
+  if (constraints?.runnerIds && !constraints.runnerIds.includes(runner.id)) return 'runner_constraint';
+  if (constraints?.vendor && constraints.vendor !== vendor) return 'vendor_constraint';
+  if (constraints?.resourceGroup && snapshot.resourceHolders?.some((holder) =>
+    holder.machineId === (runner.machineId ?? runner.id) && holder.group === constraints.resourceGroup,
+  )) {
+    return 'resource_busy';
+  }
+  return null;
+}
+
 /**
  * Places a ready task (design 6.6, step 5): the first tier of vendors (preferredVendors) usable on some candidate
  * runner, on its best option (orderOptions, avoiding task.avoidRunner); a task that owns greenfield files only on a
@@ -585,20 +611,29 @@ export function place(
   snapshot: PlacementSnapshot,
   task: Pick<
     TaskCandidate,
-    'vendorHint' | 'requirement' | 'avoidRunner' | 'readySince' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier'
+    'vendorHint' | 'requirement' | 'avoidRunner' | 'readySince' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier' | 'placement'
   >,
   project: { projectPref: VendorPreferenceInput['projectPref'] },
 ): PlaceResult {
   const runners = runnersFor(snapshot, task);
   const found = options(snapshot, 'worker', runners, modelClass('worker', task.tier));
-  const tiers = preferredVendors({
-    requirement: task.requirement,
-    vendorHint: task.vendorHint,
-    projectPref: project.projectPref,
-    now: snapshot.now,
-    offered: offeredVendors(runners),
-    readySince: task.readySince,
+  found.options = found.options.filter((option) => {
+    const refusal = taskPlacementRefusal(snapshot, task, option.runner, option.usable.slot.vendor);
+    if (refusal === null) return true;
+    found.refused.push({ runnerId: option.runner.id, vendor: option.usable.slot.vendor, refusal });
+    return false;
   });
+  // Explicit contract requirements override soft hints and automatic vendor rotation.
+  const tiers = task.placement?.vendor
+    ? [[task.placement.vendor]]
+    : preferredVendors({
+        requirement: task.requirement,
+        vendorHint: task.vendorHint,
+        projectPref: project.projectPref,
+        now: snapshot.now,
+        offered: offeredVendors(runners),
+        readySince: task.readySince,
+      });
   for (const vendors of tiers) {
     const onTier = found.options.filter((option) => vendors.includes(option.usable.slot.vendor));
     const [best] = orderOptions(snapshot, onTier, task.avoidRunner);
@@ -617,9 +652,16 @@ export function place(
  */
 export function placementWords(
   snapshot: PlacementSnapshot,
-  task: Pick<TaskCandidate, 'requirement' | 'ownedPaths' | 'kind' | 'createdBy' | 'vendorHint' | 'readySince'>,
+  task: Pick<TaskCandidate, 'requirement' | 'ownedPaths' | 'kind' | 'createdBy' | 'vendorHint' | 'readySince' | 'placement'>,
   refused: readonly RefusedPlacement[],
 ): string {
+  const constraints = task.placement;
+  if (constraints?.runnerIds && !snapshot.runners.some((runner) => constraints.runnerIds!.includes(runner.id))) {
+    return `it waits for required runner(s): ${constraints.runnerIds.join(', ')}`;
+  }
+  if (constraints?.vendor) {
+    return `it requires ${constraints.vendor}: ${refusalWords(refused) || 'no eligible runner offers it'}`;
+  }
   const open = openProfileReason(task);
   const candidates = runnersFor(snapshot, task);
   if (open !== null && candidates.length === 0) return `it ${open}, and no runner has that profile`;

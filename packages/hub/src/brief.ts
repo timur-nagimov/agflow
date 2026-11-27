@@ -84,6 +84,7 @@ const LEAD_GUIDE = `## Your duties as lead
 - An acceptance criterion is a result a stranger can check: an input and what must come out, never "tests exist" or "the check passes". Ask for cases beyond SPEC.md's examples.
 - First plan one skeleton task that the others depend on: layout, build, the check and demo scripts, a first test so that the check runs tests, AGENTS.md conventions (kind curation: only such tasks may change AGENTS.md). Put the interface contracts (API shapes, data models, file layout) into the objectives.
 - Keep as many ready, independent tasks as there are worker slots, busy or free. Keep tasks small, well under an hour of agent work, with narrow, disjoint owned paths that include their tests. Spread \`vendorHint\` over claude and codex so both subscriptions work.
+- Use \`placement.runnerIds\`/\`.vendor\` for hard requirements, \`.resourceGroup\` for per-host exclusivity. Keep waits ready; run independent hosts concurrently. Fix stale blockers before creating audits.
 - Give every shared file (router, settings, navigation, manifest) one owner; have the skeleton pick features up from their own files, and name in the objective any line a task must add to one.
 - Mark a task that needs deep reasoning (architecture, hard algorithms, cross-cutting changes) \`tier: "strong"\`: it runs on the stronger model, with more reasoning.
 - Decide yourself and never wait for people: tell "humans" what you decided, and ask them only for a secret or an account. Post conventions for every agent as a standing rule: \`send_message\` to "all" with \`standing_rule\`; make a defect that could recur elsewhere a one-line rule.
@@ -126,8 +127,8 @@ const AUTO_ACCEPT_LINE =
   "- The hub itself accepts a submission whose check passed, agflow's own fixes of main included, unless the check " +
   "ran no tests, its branch changes the check's own files, or it is a demo check: those come to you with the others.";
 const REVIEW_LINE =
-  "- An agent of the other vendor reviews each task's first green submission before the hub accepts it; its " +
-  'rejections go back to the author, and its follow-ups and questions come to you.';
+  "- The hub requests review of each task's first green submission, preferring the other vendor with fallback/timeouts. " +
+  "Rejections return to the author; follow-ups come to you. People's mandatory vendor/review requirements still apply.";
 const AUTO_MERGE_LINE = '- agflow merges accepted work into main itself; a conflict sends the task back to its author.';
 
 /** The lead's guide, with the line of each of AGFLOW_AUTO_ACCEPT, AGFLOW_REVIEW and AGFLOW_AUTO_MERGE that is on. */
@@ -453,6 +454,9 @@ export function composeTaskPack(ctx: HubContext, task: Task): string {
     `Priority: ${task.priority} (${PRIORITY_HELP})`,
   ];
   if (task.vendorHint) lines.push(`Preferred vendor: ${task.vendorHint}`);
+  if (task.placement?.runnerIds) lines.push(`Required runners: ${task.placement.runnerIds.join(', ')}`);
+  if (task.placement?.vendor) lines.push(`Required vendor: ${task.placement.vendor} (no fallback)`);
+  if (task.placement?.resourceGroup) lines.push(`Exclusive host resource group: ${task.placement.resourceGroup}`);
   if (task.branch) lines.push(`Branch: ${task.branch}`);
   if (task.dependsOn.length > 0) lines.push(`Depends on: ${task.dependsOn.join(', ')}`);
   if (task.fetchGranted) {

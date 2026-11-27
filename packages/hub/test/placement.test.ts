@@ -82,6 +82,7 @@ describe('placementSnapshot', () => {
     const [first, second, third] = snapshot.runners;
     expect(first).toEqual({
       id: r1,
+      machineId: 'machine-1',
       owner: 'alice',
       state: 'online',
       draining: false,
