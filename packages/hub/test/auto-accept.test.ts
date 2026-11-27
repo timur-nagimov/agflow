@@ -212,8 +212,8 @@ describe('what the authors of submissions disclose, and what demo checks find', 
     const ids = Array.from({ length: 5 }, () => submit(hub, passed, undefined, long).held.task.id);
     const report = situationReport(hub.ctx);
     expect(report.length).toBeLessThanOrEqual(2500);
-    expect(report).toContain('\nBlocked:\n');
-    const block = report.slice(report.indexOf('\nGaps the authors named'));
+    expect(report).toContain('\nNeeds attention (10):');
+    const block = report.slice(report.indexOf('\nGaps the authors named')).split('\nRecent events:')[0];
     expect(block.split('\n').filter((line) => line.startsWith('>'))).toEqual(Array(3).fill(`> gap: ${'g'.repeat(192)}…`));
     expect(block).toEndWith(`\nand 2 more: ${ids[3]}, ${ids[4]}; \`get_task\` shows their summaries.`);
   });

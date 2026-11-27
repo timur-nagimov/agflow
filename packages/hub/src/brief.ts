@@ -13,6 +13,7 @@ import {
   quoteLines,
 } from '@agflow/core';
 import { findAttempt, listAttempts, unpushedHead } from './attempt-store';
+import { attentionLines, attentionTasks } from './attention';
 import type { HubContext } from './context';
 import { listEvents } from './events';
 import { clipGoal, currentGoalVersion, getCurrentGoal } from './goal';
@@ -766,7 +767,11 @@ export function situationReport(ctx: HubContext): string {
   for (const task of tasks) counts.set(task.status, (counts.get(task.status) ?? 0) + 1);
   const goalVersion = currentGoalVersion(ctx);
   const summary = counts.size > 0 ? [...counts].map(([status, n]) => `${status} ${n}`).join(' · ') : 'none yet';
-  const lines = ['## Situation report', `Tasks: ${summary}`, ...loadLines(ctx, workerLoad(ctx))];
+  const lines = [
+    '## Situation report', `Tasks: ${summary}`,
+    ...attentionLines(attentionTasks(ctx, tasks), 5),
+    ...loadLines(ctx, workerLoad(ctx)),
+  ];
   const liveOnly = tasks.flatMap((task) => {
     const why = task.status === 'ready' ? liveChatOnlyReason(task) : null;
     return why === null ? [] : [`- ${task.id}: ${why}`];
@@ -795,10 +800,6 @@ export function situationReport(ctx: HubContext): string {
   }
   const autoAccepted = autoAcceptedLine(ctx, tasks);
   if (autoAccepted !== null) lines.push(autoAccepted);
-  const blocked = tasks.filter((task) => task.status === 'blocked' && task.blockedKind !== 'deps');
-  if (blocked.length > 0) {
-    lines.push('Blocked:', ...blocked.slice(0, 10).map((task) => `- ${task.id}:\n${quoted(task.blockedReason ?? '', 150)}`));
-  }
   const outdated = tasks.filter((task) => task.goalVersion < goalVersion && OPEN_STATUSES.has(task.status));
   if (outdated.length > 0) {
     lines.push(

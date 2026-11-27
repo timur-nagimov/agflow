@@ -676,6 +676,7 @@ export const HUB_EVENT_TYPES = {
   'approval.voided': { category: 'approvals', subject: 'task', data: [...OF_APPROVAL] },
   // The seat after the change; kind none leaves the ids null.
   'lead.seat_changed': { category: 'lead', subject: null, data: ['kind', 'agentId', 'attemptId', 'runnerId'] },
+  'lead.attention_reminded': { category: 'lead', subject: null, data: ['agentId', 'attemptId', 'runnerId', 'taskIds', 'total'] },
   // reason: wake-ups, context or runner leads turned off.
   'lead.rotated': { category: 'lead', subject: null, data: ['attemptId', 'agentId', 'runnerId', 'reason'] },
   'submission.pending': { category: 'submissions', subject: 'task', data: [...OF_SUBMISSION] },

@@ -16,6 +16,7 @@ import {
   refusalWords,
 } from '@agflow/core';
 import { findAgent } from './agents';
+import { ATTENTION_BATCH_SIZE, ATTENTION_REVIEW_MS, attentionLines, attentionTasks } from './attention';
 import { findAttempt, getAttempt, listAttempts } from './attempt-store';
 import { endAttempt, requestStop, resumeAttempt, startRunnerAttempt } from './attempts';
 import type { CommandRow } from './commands';
@@ -231,18 +232,22 @@ function overdueWork(ctx: HubContext, tasks: readonly Task[], now: number): stri
 }
 
 /**
- * The periodic review (design 6.11, Wake-ups are deliveries): while any task is held or submitted, the lead hears of
+ * The periodic review (design 6.11, Wake-ups are deliveries): while work is held, submitted or in Needs attention, the lead hears of
  * the work that waits too long (overdueWork) at most every leadReviewMs, tracked in hub_state.last_lead_review_at.
- * The clock starts when work is first held, so the first review comes leadReviewMs later at the earliest, and stops
- * when none is. Nothing is sent while no task waits too long, and the review goes out once one does. While the seat
+ * Needs attention goes first, at most every min(leadReviewMs, 15 minutes), in rotating batches of ten.
+ * The clock starts when work is first held or needs attention, and stops when none remains.
+ * Nothing is sent while no task waits too long or needs attention. While the seat
  * is empty nothing is sent and the clock keeps running, so a lead that takes the seat gets the review that is due.
  * Part of the tick's reconcile step. Returns the message, or null.
  */
 export function periodicLeadReview(ctx: HubContext): Message | null {
   return tx(ctx, (emit) => {
     const { lastLeadReviewAt } = getHubState(ctx);
-    const tasks = listTasks(ctx).filter((task) => UNDER_REVIEW.includes(task.status));
-    if (tasks.length === 0) {
+    if (getProject(ctx).paused) return null;
+    const allTasks = listTasks(ctx);
+    const tasks = allTasks.filter((task) => UNDER_REVIEW.includes(task.status));
+    const attention = attentionTasks(ctx, allTasks);
+    if (tasks.length === 0 && attention.length === 0) {
       if (lastLeadReviewAt !== null) updateHubState(ctx, { lastLeadReviewAt: null });
       return null;
     }
@@ -251,20 +256,34 @@ export function periodicLeadReview(ctx: HubContext): Message | null {
       updateHubState(ctx, { lastLeadReviewAt: now });
       return null;
     }
-    if (now - lastLeadReviewAt < ctx.config.leadReviewMs || seatHolderId(ctx) === null) return null;
+    const interval = attention.length > 0 ? Math.min(ctx.config.leadReviewMs, ATTENTION_REVIEW_MS) : ctx.config.leadReviewMs;
+    if (now - lastLeadReviewAt < interval || seatHolderId(ctx) === null) return null;
     const overdue = overdueWork(ctx, tasks, now);
-    if (overdue.length === 0) return null;
+    if (overdue.length === 0 && attention.length === 0) return null;
     updateHubState(ctx, { lastLeadReviewAt: now });
     const listed = overdue.slice(0, REVIEW_LIST_LIMIT);
     const rest = overdue.length - listed.length;
-    const minutes = Math.round(ctx.config.leadReviewMs / 60_000);
+    const minutes = Math.round(interval / 60_000);
+    const sections: string[] = [];
+    if (attention.length > 0) {
+      sections.push(attentionLines(attention, ATTENTION_BATCH_SIZE).join('\n') +
+        '\nInspect each listed task with get_task: resolve and unblock when its prerequisites are satisfied, ' +
+        'or record a concrete next step and owner. Preserve people-only holds, paused tasks, and review/publication gates; ' +
+        'do not unblock merely to empty the queue or create duplicate audits.');
+      const seat = leadSeat(ctx);
+      emit({ type: 'lead.attention_reminded', actor: 'system', data: {
+        agentId: seat.agentId, attemptId: seat.attemptId, runnerId: seat.runnerId,
+        taskIds: attention.slice(0, ATTENTION_BATCH_SIZE).map((task) => task.id), total: attention.length,
+      } });
+    }
+    if (overdue.length > 0) sections.push(
+      `Periodic review (at most every ${minutes} min) of work that waits long: ${listed.join('; ')}` +
+      `${rest > 0 ? `; and ${rest} more` : ''}. Review what is submitted, and check that work held this long is moving.`,
+    );
     return insertMessage(ctx, emit, {
       from: 'system',
       to: 'lead',
-      body:
-        `Periodic review (at most every ${minutes} min) of work that waits long: ${listed.join('; ')}` +
-        `${rest > 0 ? `; and ${rest} more` : ''}. Review what is submitted, and check that work held this long is ` +
-        'moving.',
+      body: sections.join('\n\n'),
     });
   });
 }

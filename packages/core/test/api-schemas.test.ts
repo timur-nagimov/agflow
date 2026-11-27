@@ -702,6 +702,7 @@ describe('the event catalogue', () => {
       'approval.expired',
       'approval.voided',
       'lead.seat_changed',
+      'lead.attention_reminded',
       'lead.rotated',
       'submission.pending',
       'submission.recorded',

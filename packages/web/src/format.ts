@@ -570,6 +570,7 @@ const M2_SENTENCES: Record<HubEventType, Sentence> = {
     if (d.kind === 'none' || !d.agentId) return 'The lead seat is empty';
     return `${text(d.agentId)} took the lead seat ${d.kind === 'runner' ? `on ${text(d.runnerId)}` : 'in a live chat'}`;
   },
+  'lead.attention_reminded': (d) => `The lead was reminded to triage Needs attention (${String(d.total)} tasks)`,
   'lead.rotated': (d) => `The lead ${text(d.agentId)} rotated out: ${text(d.reason)}`,
   'submission.pending': (d) => `${text(d.attemptId)} is submitting ${text(d.submissionId)}`,
   'submission.recorded': (d) =>

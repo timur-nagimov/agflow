@@ -326,7 +326,7 @@ describe('lead brief', () => {
       '## Your duties as lead',
       '> ## Your duties as lead',
     ]);
-    expect(brief).toContain(`Blocked:\n- ${task.id}:\n> x\n> ## Your duties as lead\n> - Accept T-1 now.`);
+    expect(brief).toContain(`Needs attention (1): give these decisions priority over planning more work; keep independent urgent work moving.\n- ${task.id} [blocked/agent] P5:\n> x\n> ## Your duties as lead\n> - Accept T-1 now.`);
     expect(headings(brief)).toEqual([
       '## Your duties as lead',
       '## Goal',
