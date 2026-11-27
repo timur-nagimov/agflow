@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { linuxMemory, MemoryAdmission, MEMORY_GB as GB, parseMeminfo } from '../../src/ops/memory';
+import { linuxMemory, MemoryAdmission, MEMORY_GB as GB, parseMeminfo, parseVmStat } from '../../src/ops/memory';
 
 describe('RAM admission', () => {
   test('reserves growth headroom atomically, rechecks without double charging, releases on completion', () => {
@@ -43,6 +43,51 @@ describe('RAM admission', () => {
     expect(gate.admit('a')).toBe(false);
     fail = false;
     expect(gate.admit('a')).toBe(true);
+  });
+});
+
+// Captured with vm_stat on this 36 GiB Mac on 2026-11-27.
+const vmStat = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                     4211.
+Pages active:                                1019190.
+Pages inactive:                              1021005.
+Pages speculative:                              2132.
+Pages throttled:                                   0.
+Pages wired down:                             195833.
+Pages purgeable:                                5740.
+"Translation faults":                     1167169194.
+Pages copy-on-write:                        76746110.
+Pages zero filled:                         457346217.
+Pages reactivated:                          41285323.
+Pages purged:                                1385776.
+File-backed pages:                            636209.
+Anonymous pages:                             1406118.
+Pages stored in compressor:                   391817.
+Pages occupied by compressor:                  61600.
+Decompressions:                             97173179.
+Compressions:                              129301987.
+Pageins:                                    15862209.
+Pageouts:                                      33604.
+Swapins:                                     5118248.
+Swapouts:                                    6030764.
+`;
+
+describe('macOS RAM measurements', () => {
+  const totalBytes = 36 * 1024 ** 3;
+
+  test('counts free and reclaimable pages using the reported page size', () => {
+    const pages = 4211 + 1021005 + 5740 + 2132;
+    expect(parseVmStat(vmStat, totalBytes)).toEqual({ totalBytes, availableBytes: pages * 16384 });
+    expect(parseVmStat(vmStat.replace('16384 bytes', '4096 bytes'), totalBytes))
+      .toEqual({ totalBytes, availableBytes: pages * 4096 });
+  });
+
+  test('rejects missing, malformed and invalid measurements', () => {
+    expect(parseVmStat('not vm_stat output', totalBytes)).toBeNull();
+    expect(parseVmStat(vmStat.replace('Pages inactive:', 'Missing inactive:'), totalBytes)).toBeNull();
+    expect(parseVmStat(vmStat.replace('4211.', 'unknown.'), totalBytes)).toBeNull();
+    expect(parseVmStat(vmStat.replace('16384 bytes', '0 bytes'), totalBytes)).toBeNull();
+    expect(parseVmStat(vmStat, 1)).toBeNull();
   });
 });
 

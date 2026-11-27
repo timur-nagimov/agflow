@@ -1,4 +1,5 @@
 // Admission only: never signal a running agent. Reservations are growth headroom, in addition to its current RAM.
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { freemem, totalmem } from 'node:os';
 import { dirname, posix } from 'node:path';
@@ -26,6 +27,15 @@ function valid(sample: MemorySample): boolean {
 export function parseMeminfo(text: string): MemorySample | null {
   const value = (key: string) => Number(text.match(new RegExp(`^${key}:\\s+(\\d+) kB$`, 'm'))?.[1]) * 1024;
   const sample = { totalBytes: value('MemTotal'), availableBytes: value('MemAvailable') };
+  return valid(sample) ? sample : null;
+}
+
+export function parseVmStat(text: string, totalBytes: number): MemorySample | null {
+  const pageSize = Number(text.match(/^Mach Virtual Memory Statistics: \(page size of (\d+) bytes\)$/m)?.[1]);
+  if (!Number.isSafeInteger(pageSize) || pageSize <= 0) return null;
+  const pages = ['free', 'inactive', 'purgeable', 'speculative'].reduce((sum, kind) =>
+    sum + Number(text.match(new RegExp(`^Pages ${kind}:\\s+(\\d+)\\.$`, 'm'))?.[1]), 0);
+  const sample = { totalBytes, availableBytes: pages * pageSize };
   return valid(sample) ? sample : null;
 }
 
@@ -88,10 +98,13 @@ export function linuxMemory(readFile: Read): MemorySample | null {
   return valid(sample) ? sample : null;
 }
 
-/** macOS uses free RAM conservatively; Linux uses MemAvailable bounded by cgroups v1/v2. A failure closes admission. */
+/** macOS includes reclaimable pages from vm_stat; Linux uses MemAvailable bounded by cgroups v1/v2. A failure closes admission. */
 export function sampleMemory(): MemorySample | null {
   try {
     if (process.platform === 'linux') return linuxMemory(read);
+    if (process.platform === 'darwin') {
+      return parseVmStat(execFileSync('/usr/bin/vm_stat', { encoding: 'utf8', timeout: 1000 }), totalmem());
+    }
     const sample = { totalBytes: totalmem(), availableBytes: freemem() };
     return valid(sample) ? sample : null;
   } catch {
