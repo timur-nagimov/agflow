@@ -101,7 +101,18 @@ export const TaskTierSchema = z
       'that need deep reasoning (architecture, hard algorithms, cross-cutting changes) strong',
   );
 
+export const TaskPlacementSchema = z
+  .strictObject({
+    runnerIds: z.array(z.string().regex(/^R-\d+$/)).min(1).max(100)
+      .refine((ids) => new Set(ids).size === ids.length, 'runner ids must be unique')
+      .optional()
+      .describe('Hard runner allowlist. The task waits if none is available; no wrong-host attempts.'),
+    vendor: VendorSchema.optional().describe('Required vendor, without fallback. Use vendorHint for a preference.'),
+  })
+  .nullable();
+
 const contractFields = {
+  placement: TaskPlacementSchema.optional(),
   title: z.string().min(1).max(200).refine(isSingleLine, SINGLE_LINE),
   kind: TaskKindSchema,
   objective: z.string().min(1).max(4000),

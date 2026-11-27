@@ -366,6 +366,8 @@ describe('unknown reset times', () => {
 
 test('refusals are named', () => {
   expect(PLACEMENT_REFUSALS).toEqual([
+    'runner_constraint',
+    'vendor_constraint',
     'offline',
     'draining',
     'git',
@@ -914,4 +916,21 @@ test.each(['claude', 'codex'] as const)('placement uses only advertised vendor %
   expect(placeLead(view, { rotatingFrom: null }).placement?.vendor).toBe(vendor);
   expect(place(view, candidate({ vendorHint: other, readySince: NOW }), project).placement).toBeNull();
   expect(place(view, candidate({ requirement: { step: 2, vendor: other } }), project).placement).toBeNull();
+});
+
+describe('hard task placement', () => {
+  test('an explicit required vendor overrides the automatic retry rotation and soft hint', () => {
+    const view = snapshot([runner({ vendors: [vendorSlot(), vendorSlot({ vendor: 'codex' })] })]);
+    const task = candidate({ placement: { vendor: 'claude' }, vendorHint: 'codex', requirement: { step: 3, vendor: 'codex' } });
+    expect(place(view, task, { projectPref: null }).placement?.vendor).toBe('claude');
+  });
+
+  test('missing pinned runners have an actionable wait reason', () => {
+    const view = snapshot([runner()]);
+    const missing = candidate({ placement: { runnerIds: ['R-99'] } });
+    const result = place(view, missing, { projectPref: null });
+    expect(result.placement).toBeNull();
+    expect(placementWords(view, missing, result.refused)).toContain('required runner(s): R-99');
+
+  });
 });

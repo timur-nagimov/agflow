@@ -54,7 +54,14 @@ export interface TaskCheck {
   timeoutS?: number;
 }
 
+/** Hard placement constraints; omitted fields impose no restriction. */
+export interface TaskPlacement {
+  runnerIds?: string[];
+  vendor?: Vendor;
+}
+
 export interface TaskContract {
+  placement?: TaskPlacement | null;
   title: string;
   kind: TaskKind;
   objective: string;

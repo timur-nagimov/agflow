@@ -699,8 +699,8 @@ describe('AGFLOW_REVIEW: what else sees a review', () => {
 
   test("the lead's guide says that agents review first green submissions, only while review and auto accept are on", () => {
     const line =
-      "- An agent of the other vendor reviews each task's first green submission before the hub accepts it; its " +
-      'rejections go back to the author, and its follow-ups and questions come to you.';
+      "- The hub requests review of each task's first green submission, preferring the other vendor with fallback/timeouts. " +
+      "Rejections return to the author; follow-ups come to you. People's mandatory vendor/review requirements still apply.";
     const guide = (config: { autoAccept?: boolean; review?: boolean; autoMerge?: boolean }) => {
       const hub = createTestHub(config);
       const lead = addAgent(hub.ctx, 'alice', 'lead');

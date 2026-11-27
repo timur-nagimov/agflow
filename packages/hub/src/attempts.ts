@@ -41,6 +41,7 @@ import {
   restoreSet,
   signatureApplies,
   taskBranchName,
+  taskPlacementRefusal,
   takeoverAnywhereCommand,
   takeoverRef,
   usableVendors,
@@ -269,6 +270,12 @@ export function startRunnerAttempt(ctx: HubContext, input: StartAttemptInput): S
     const runner = findRunnerRow(ctx, input.runnerId);
     if (!runner) throw notFound(`runner ${input.runnerId}`);
     const task = checkStart(ctx, input);
+    if (task?.placement) {
+      const snapshot = placementSnapshot(ctx);
+      const slot = snapshot.runners.find((slot) => slot.id === input.runnerId);
+      const refusal = slot && taskPlacementRefusal(task, slot, input.vendor);
+      if (!slot || refusal) throw conflict(`task placement refused: ${refusal ?? 'runner unavailable'}`);
+    }
     const now = ctx.now();
     const number = nextAttemptNumber(ctx, task?.id ?? null);
     const fence = issueFence(ctx);
@@ -558,6 +565,13 @@ export function resumeAttempt(ctx: HubContext, input: ResumeInput): ResumedAttem
     }
     if (before.runnerId === null) throw conflict(`attempt ${before.id} runs in a live chat, not on a runner`);
     if (before.stopRequested?.cause === 'takeover') throw conflict(`a take-over is in flight for attempt ${before.id}`);
+    const placementTask = before.taskId === null ? null : getTask(ctx, before.taskId);
+    if (placementTask?.placement) {
+      const snapshot = placementSnapshot(ctx);
+      const slot = snapshot.runners.find((slot) => slot.id === before.runnerId);
+      const refusal = slot && taskPlacementRefusal(placementTask, slot, before.vendor);
+      if (!slot || refusal) throw conflict(`task placement refused: ${refusal ?? 'runner unavailable'}`);
+    }
     const pending = pendingResumeOf(ctx, before.id);
     // Read before the cancel frees their rows: the resume carries them to the new fence (design 6.7, Backlog).
     const inFlight = messagesInFlight(ctx, before.id);

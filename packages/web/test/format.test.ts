@@ -600,6 +600,7 @@ const M2_EVENTS: Record<HubEventType, { data: Record<string, unknown>; subject: 
     'approval.expired': task({ ...ofApproval }),
     'approval.voided': task({ ...ofApproval }),
     'lead.seat_changed': none({ kind: 'runner', agentId: 'A-5', attemptId: 'lead-a5', runnerId: 'R-1' }),
+    'lead.attention_reminded': none({ agentId: 'A-5', attemptId: 'lead-a5', runnerId: 'R-1', taskIds: ['T-8'], total: 3 }),
     'lead.rotated': none({ attemptId: 'lead-a5', agentId: 'A-5', runnerId: 'R-1', reason: 'wake-ups' }),
     'submission.pending': task({ ...ofSubmission }),
     'submission.recorded': task({ ...ofSubmission, headSha: SHA, branch: 'agflow/T-8-parser' }),
@@ -732,6 +733,7 @@ describe('M2 events', () => {
     expect(describeEvent(m2Event('lead.seat_changed', { kind: 'none', agentId: null, attemptId: null, runnerId: null }))).toBe(
       'The lead seat is empty',
     );
+    expect(describeEvent(m2Event('lead.attention_reminded'))).toBe('The lead was reminded to triage Needs attention (3 tasks)');
     expect(describeEvent(m2Event('lead.rotated'))).toBe('The lead A-5 rotated out: wake-ups');
     expect(describeEvent(m2Event('submission.pending'))).toBe('T-8-a1 is submitting S-2');
     expect(describeEvent(m2Event('submission.recorded'))).toBe('T-8-a1 submitted S-2 at 0123456 on agflow/T-8-parser');
@@ -833,6 +835,7 @@ describe('M2 events', () => {
       'approval.expired': 'trouble',
       'approval.voided': 'closed',
       'lead.seat_changed': 'active',
+      'lead.attention_reminded': 'wait',
       'lead.rotated': 'wait',
       'submission.pending': 'active',
       'submission.recorded': 'review',

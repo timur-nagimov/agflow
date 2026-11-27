@@ -82,6 +82,7 @@ function contractOf(task: Task): TaskContract {
     priority: task.priority,
     // Undefined for a task that never had one; JSON leaves it out of the stored contract.
     vendorHint: task.vendorHint,
+    placement: task.placement,
     tier: task.tier,
   };
 }
@@ -246,6 +247,7 @@ export function createTasks(ctx: HubContext, inputs: NewTask[], actor: string): 
         dependsOn,
         priority: input.priority,
         vendorHint: input.vendorHint,
+        placement: input.placement,
         tier: input.tier,
       };
       const seq = nextId(ctx.db, 'task');
@@ -286,6 +288,13 @@ export function updateTask(ctx: HubContext, id: string, patch: TaskPatch, actor:
     for (const dependency of patch.dependsOn ?? []) {
       if (!findTask(ctx, dependency)) throw badRequest(`unknown task ${dependency}`);
       if (reaches(ctx, dependency, id)) throw badRequest(`depending on ${dependency} would create a dependency cycle`);
+    }
+    if (
+      patch.placement !== undefined &&
+      JSON.stringify(patch.placement) !== JSON.stringify(task.placement) &&
+      openRunnerAttempt(ctx, task)
+    ) {
+      throw conflict('placement cannot change while a runner attempt is open; stop it and wait for cleanup first');
     }
     const contract: TaskContract = { ...contractOf(task), ...patch };
     // A person's task exempts the people-only paths its owned paths include (design 7.3), so giving it more of them

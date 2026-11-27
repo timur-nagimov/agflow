@@ -97,13 +97,14 @@ function endedView(ctx: HubContext, task: Task, attempt: Attempt): EndedAttemptV
  */
 type PlacementPrefs = Pick<
   TaskCandidate,
-  'vendorHint' | 'requirement' | 'avoidRunner' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier'
+  'vendorHint' | 'requirement' | 'avoidRunner' | 'ownedPaths' | 'kind' | 'createdBy' | 'tier' | 'placement'
 >;
 
 function placementPrefs(ctx: HubContext, task: Task, attempts: readonly Attempt[]): PlacementPrefs {
   const ended = attempts.filter((attempt) => attempt.status === 'ended');
   return {
     vendorHint: task.vendorHint ?? null,
+    placement: task.placement,
     requirement: ladderRequirement(ctx, task.id),
     avoidRunner: runnerToAvoid(ended.map((attempt) => endedView(ctx, task, attempt))),
     ownedPaths: task.ownedPaths,
@@ -592,7 +593,7 @@ export interface WorkerLoad {
    */
   freeSlots: number;
   ready: number;
-  /** The ready tasks dispatch may start now (readySet): none while dispatch is held (dispatchHold). */
+  /** Ready tasks with an eligible placement now, considered individually; none while dispatch is held. */
   dispatchable: number;
   blockedOnDependencies: number;
   /** Submitted and waiting for the lead's verdict (SUBMITTED). */
@@ -634,6 +635,8 @@ export function workerLoad(ctx: HubContext): WorkerLoad {
   const running = runningWorkers(ctx);
   const free = workerSlotsFree({ workerTarget, maxWorkers: ctx.config.maxWorkers, runningWorkers: running });
   const tasks = listTasks(ctx);
+  const snapshot = placementSnapshot(ctx);
+  const { vendorPref } = getStaffing(ctx);
   const count = (statuses: readonly TaskStatus[]): number =>
     tasks.filter((task) => statuses.includes(task.status)).length;
   return {
@@ -643,7 +646,9 @@ export function workerLoad(ctx: HubContext): WorkerLoad {
     freeSlots: free === 0 ? 0 : Math.min(free, runnerSlots(ctx).idle),
     ready: count(['ready']),
     // None while dispatch is held, whatever the ready set holds.
-    dispatchable: dispatchHold(ctx) === null ? readySet(ctx).length : 0,
+    dispatchable: dispatchHold(ctx) === null
+      ? readySet(ctx).filter((task) => place(snapshot, task, { projectPref: vendorPref }).placement !== null).length
+      : 0,
     blockedOnDependencies: tasks.filter((task) => task.status === 'blocked' && task.blockedKind === 'deps').length,
     submitted: count(SUBMITTED),
     acceptedNotMerged: count(ACCEPTED_NOT_MERGED),
@@ -714,12 +719,33 @@ export function loadLines(ctx: HubContext, load: WorkerLoad): string[] {
 
 /** What an idle nudge asks of the lead; its order of improvements is the lead guide's (brief.ts). */
 const NUDGE_PLAN =
-  'Plan the next batch now, so that ready, independent tasks are at least as many as the worker slots, running plus ' +
+  'First inspect existing blocked tasks and ready-task wait reasons. Fix stale dependencies and placement constraints, ' +
+  'and unblock tasks whose prerequisites are satisfied. Keep host/vendor waits ready with placement constraints. ' +
+  'Use runner capacity and admission checks for parallelism; do not impose one-heavy-check-per-host limits. ' +
+  'Preserve explicit review/publication gates, scoped to the work they govern. ' +
+  'Do not create duplicate audits just to fill slots. If there is still uncovered useful work, plan the next batch now, ' +
+  'so that ready, independent tasks are at least as many as the worker slots, running plus ' +
   'free. Tasks blocked on dependencies count as planned: while they wait for work in progress, such as the skeleton, ' +
   'add only tasks that need none of it. Work through SPEC.md (or the goal) until every requirement is covered. Once ' +
   'it is, plan in this order: requirements docs/STATUS.md does not show working, defects from the latest demo check ' +
   'and gaps agents named, missing tests, demo polish, then new features a jury would notice. In the last hour before ' +
   'the deadline, plan only fixes.';
+
+/** Concrete scheduler waits, rather than another request to manufacture a backlog. */
+function idleWaitLines(ctx: HubContext): string[] {
+  const waiting = new Map<string, string>();
+  const ready = readySet(ctx, waiting);
+  const snapshot = placementSnapshot(ctx);
+  const { vendorPref } = getStaffing(ctx);
+  for (const task of ready) {
+    const { placement, refused } = place(snapshot, task, { projectPref: vendorPref });
+    if (!placement) waiting.set(task.id, placementWords(snapshot, task, refused));
+  }
+  const lines = [...waiting].slice(0, 8).map(([id, why]) => `- ${id}: ${why.slice(0, 300)}`);
+  const blocked = listTasks(ctx).filter((task) => task.status === 'blocked' && task.blockedKind !== 'deps');
+  if (blocked.length > 0) lines.push(`Also ${blocked.length} task(s) blocked for other reasons; inspect their contracts before unblocking.`);
+  return lines.length > 0 ? ['Existing task waits:', ...lines] : [];
+}
 
 /** The worker slots the lead plans for: those workers take now, and the free ones (WorkerLoad). */
 const workerSlots = (load: WorkerLoad): number => load.running + load.freeSlots;
@@ -756,7 +782,8 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
   const load = due && leadSeat(ctx).kind === 'runner' ? workerLoad(ctx) : null;
   // A task parked while main's check fails counts as dispatchable: it takes a slot by itself once main passes.
   const parked = load === null ? 0 : parkedTasks(ctx).size;
-  if (load === null || load.dispatchable + parked >= workerSlots(load)) {
+  // At full load a ready backlog is sufficient. Once slots are idle, only actually placeable tasks cover them.
+  if (load === null || (load.freeSlots === 0 ? readySet(ctx).length : load.dispatchable) + parked >= workerSlots(load)) {
     idleSince.delete(ctx);
     return null;
   }
@@ -767,6 +794,7 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
   const last = lastNudgeAt(ctx);
   if (last !== null && now - last < ctx.config.idleNudgeIntervalMs) return null;
   const lines = loadLines(ctx, load);
+  const waits = idleWaitLines(ctx);
   return tx(ctx, (emit) => {
     emit({ type: 'lead.idle_nudged', actor: 'system', data: { ...load, deadlineAt } });
     return insertMessage(ctx, emit, {
@@ -775,7 +803,8 @@ export function nudgeIdleLead(ctx: HubContext): Message | null {
       body:
         `Only ${load.dispatchable} ready task(s) are dispatchable${parked > 0 ? ` and ${parked} parked` : ''}, fewer ` +
         `than the ${workerSlots(load)} worker slot(s) (${load.running} running, ${load.freeSlots} free).\n` +
-        `${lines.join('\n')}\n\n${NUDGE_PLAN}`,
+        `${lines.join('\n')}\n\n${NUDGE_PLAN}` +
+        (waits.length ? `\n\n${waits.join('\n')}` : ''),
     });
   });
 }
